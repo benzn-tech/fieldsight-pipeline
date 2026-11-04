@@ -3346,6 +3346,9 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource:
+                # Also GET /days/{date}/inspections/walks/{walkKey}/open (multi-unit walks,
+                # Task 12): the walk report's result. Its 404 passthrough is the
+                # session_report_results/* entry on the ListBucket grant above.
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*
@@ -5396,6 +5399,9 @@ Resources:
         Variables:
           S3_BUCKET: !Ref IngestBucketName      # the lake: transcripts/ and users/*/audio/
           CHECK_GAPS_DB_FUNCTION: !Ref CheckGapsDbFunction
+          # A confirmation answer re-queues its walk report: an async invoke of
+          # item-writer, which runs checklist_reports.requeue_walk in the VPC (R31).
+          ITEM_WRITER_FUNCTION: !Ref ItemWriterFunction
           # The Ask STT key, never the recording pipeline's ELEVENLABS_API_KEY: up to
           # eight parallel posts per ask, and that key's credits running out would
           # stop recordings. No key -> stored transcript only, answer `partial`.
@@ -5421,6 +5427,11 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !GetAtt CheckGapsDbFunction.Arn
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt ItemWriterFunction.Arn
         - Version: '2012-10-17'
           Statement:
             # Read-only. What lambda_extract_session's gather/assemble read for one

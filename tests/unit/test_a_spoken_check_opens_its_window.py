@@ -116,3 +116,93 @@ def test_coming_back_without_anything_between_is_one_stretch():
             "resumed": [{"at": "11:02", "quote": "Back to the pre-pour."}]}]
     pre = es._timed_inspections(raw, interrupted_turns())[0]
     assert pre["segments"] == [{"from": "11:02:03", "to": "11:03:21"}]
+
+
+# Multi-unit walks (spec 2026-11-03): the opening's units, and each unit he
+# walks INTO, ride on the check so the report can give each unit its checklist.
+
+WALK = [("Starting", 2.0), ("the", 2.3), ("framing", 2.5), ("check,", 3.0), ("lot", 3.2),
+        ("150", 3.4), ("and", 3.6), ("lot", 3.8), ("151.", 4.0),
+        ("Now", 30.0), ("in", 30.3), ("lot", 30.6), ("151.", 30.9), ("Bye.", 80.0)]
+
+
+def walk_turns():
+    """Two turns: the opening, then (another speaker label from 30 s) "Now in lot 151." """
+    data = {"results": {"transcripts": [{"transcript": " ".join(w for w, _ in WALK)}],
+                        "items": [{"type": "pronunciation", "start_time": str(t),
+                                   "end_time": str(t + 0.3),
+                                   "speaker_label": "spk_0" if t < 30 else "spk_1",
+                                   "alternatives": [{"content": w, "confidence": "1.0"}]}
+                                  for w, t in WALK]}}
+    return normalize_transcript(data, FILE)["speaker_turns"]
+
+
+def test_the_opening_units_are_kept_normalized():
+    raw = [{"name": "framing check", "kind": "framing", "start_at": "11:02",
+            "start_quote": "Starting the framing check", "units_named": ["lot 150", "Lot 151"],
+            "unit_count": None}]
+    assert es.clean_inspections(raw)[0]["units"] == {"names": ["Lot 150", "Lot 151"], "count": 2}
+
+
+def test_a_count_alone_is_kept_when_no_unit_is_named():
+    raw = [{"name": "framing check", "start_at": "11:02", "units_named": [], "unit_count": 5}]
+    assert es.clean_inspections(raw)[0]["units"] == {"names": [], "count": 5}
+
+
+def test_an_entered_mark_without_a_unit_is_dropped():
+    raw = [{"name": "framing check", "start_at": "11:02",
+            "entered": [{"at": "11:03", "unit": "Kitchen", "quote": "into the kitchen"},
+                        {"at": "11:04", "unit": None, "quote": "next one"},
+                        {"unit": "Unit 3", "quote": "no time"},
+                        "prose",
+                        {"at": "11:05", "unit": "unit two", "quote": "now in unit two"}]}]
+    assert es.clean_inspections(raw)[0]["entered"] == [
+        {"unit": "Unit 2", "at": "11:05", "quote": "now in unit two"}]
+
+
+def test_entered_marks_are_capped_at_40():
+    raw = [{"name": "walk", "start_at": "11:02",
+            "entered": [{"at": "11:03", "unit": "Unit %d" % i, "quote": "q"} for i in range(1, 60)]}]
+    assert len(es.clean_inspections(raw)[0]["entered"]) == 40
+
+
+def test_entered_marks_are_timed_to_the_second():
+    turns = walk_turns()
+    assert len(turns) >= 2 and "Now in lot 151" in " ".join(w for w, _ in turns[1]["words"])
+    raw = [{"name": "framing check", "kind": "framing", "start_at": "11:02",
+            "start_quote": "Starting the framing check, lot 150 and lot 151.",
+            "units_named": ["Lot 150", "Lot 151"],
+            "entered": [{"at": "11:02", "unit": "lot 151", "quote": "Now in lot 151."},
+                        {"at": "11:02", "unit": "Lot 150", "quote": "words nobody said"}]}]
+    check = es._timed_inspections(raw, turns)[0]
+    found, unfound = check["entered"]
+    assert found == {"unit": "Lot 151", "at": "11:02", "at_s": "11:02:31",
+                     "quote": "Now in lot 151."}
+    assert unfound == {"unit": "Lot 150", "at": "11:02", "quote": "words nobody said"}
+    assert check["units"] == {"names": ["Lot 150", "Lot 151"], "count": 2}
+
+
+def test_a_check_without_units_cleans_as_before():
+    raw = [{"name": "Level 1 pre-pour check", "kind": "pre-pour", "start_at": "11:02",
+            "start_quote": "Starting the pre-pour check on level one.", "end_at": "11:02",
+            "end_quote": "Pre-pour check done."}]
+    assert es.clean_inspections(raw) == [
+        {"name": "Level 1 pre-pour check", "kind": "pre-pour", "start_at": "11:02",
+         "start_quote": "Starting the pre-pour check on level one.", "end_at": "11:02",
+         "end_quote": "Pre-pour check done.", "resumed": [],
+         "units": {"names": [], "count": None}, "entered": []}]
+
+
+def test_timing_that_fails_keeps_the_entered_minutes():
+    raw = [{"name": "walk", "start_at": "11:02",
+            "entered": [{"at": "11:03", "unit": "Unit 2", "quote": "now in unit two"}]}]
+    out = es._timed_inspections(raw, [{"abs_start": "not a time", "words": [("x", 1.0)]}])
+    assert out[0]["entered"] == [{"unit": "Unit 2", "at": "11:03", "quote": "now in unit two"}]
+
+
+def test_the_model_is_asked_for_units_entered_not_units_mentioned():
+    schema = es.EXTRACTION_SCHEMA
+    assert '"units_named"' in schema and '"unit_count"' in schema and '"entered"' in schema
+    src = open(es.__file__, encoding="utf-8").read()
+    assert "walks INTO a unit" in src and "not a unit he only mentions" in src
+    assert "an ordinary check in one room leaves it empty" in src

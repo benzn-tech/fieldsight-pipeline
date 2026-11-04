@@ -419,3 +419,509 @@ def test_a_hop_with_no_templates_is_no_template_not_an_error():
     out = w.run()
     assert out["status"] == "no_template"
     assert out["say"] == "I couldn't find a checklist set up for this check."
+
+
+# ---- a multi-unit walk (spec 2026-11-03, Task 10) ------------------------------
+
+SID2 = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+WALK = "walk:" + "ab" * 20
+WALK_WINDOW = {"name": "pre-pour", "template_id": "t-pp", "start_at": "10:03:00",
+               "report_date": DATE, "walk_key": WALK}
+WALK_HEADER = ("Unit | Item no | Answer | Comment | Responsible | Due | Evidence\n"
+               "--- | --- | --- | --- | --- | --- | ---\n")
+EARLIER_WORDS = "unit one formwork braced and plumb"
+
+
+WALK_SPANS = [{"session": "sid" + SID2, "segments": [{"from": "09:30:00", "to": "09:45:00"}]},
+              {"session": "sid" + SID, "segments": [{"from": "10:03:00", "to": None}]}]
+
+
+def walk_facts(sessions=("sid" + SID2, "sid" + SID), answers=(), names=("Unit 1", "Unit 2"),
+               start_at="09:30:00", spans=None):
+    if spans is None:
+        spans = [{"session": b, "segments": [{"from": "09:30:00", "to": "09:45:00"}]}
+                 for b in sessions if b != "sid" + SID] + [WALK_SPANS[1]]
+    return {WALK: {"key": WALK, "units": {"names": list(names), "count": None}, "entered": [],
+                   "sessions": list(sessions), "start_at": start_at, "answers": list(answers),
+                   "spans": spans}}
+
+
+def t2key(i, hhmmss, sid=SID2):
+    return "transcripts/%s/%s/F2SP01_%s_%s_sid%s_c%04d_off0.0_to29.0_srcwav.json" % (
+        FOLDER, DATE, DATE, hhmmss, sid, i)
+
+
+class WalkWorld(World):
+    """A walk over two recordings: SID2 (09:40, earlier) and the live SID. Each
+    session's stored transcript is assembled on its own: one device, but two
+    session clocks, and assemble's seam dedup assumes one."""
+
+    def __init__(self, model_rows="", answers=(), **over):
+        super().__init__(**over)
+        self.s3.objects[t2key(0, "09-40-00")] = b"{}"
+        self.s3.objects["users/%s/audio/%s/F2SP01_%s_09-40-00_sid%s_c0005.wav"
+                        % (FOLDER, DATE, DATE, SID2)] = _wav()
+        self.earlier = [{"abs_start": datetime(2026, 10, 20, 9, 40, 5),
+                         "abs_end": datetime(2026, 10, 20, 9, 40, 9), "text": EARLIER_WORDS}]
+        self.llm_answer = WALK_HEADER + model_rows
+        if "db" not in over:
+            self.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(answers=answers))
+
+    def assemble(self, bucket, keys):
+        self.assembled.append(list(keys))
+        if keys and all(SID2 in k for k in keys):
+            return list(self.earlier), []
+        return list(self.turns), []
+
+
+BOTH_UNITS_ROWS = (
+    "Unit 1 | 1 | Yes | braced | | | formwork is braced and plumb\n"
+    "Unit 2 | 2 | No | north side | | | edge protection is not installed on the north side\n")
+
+
+def test_final_check_lists_each_units_open_items_by_text():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    out = w.run()
+    assert out["status"] == "ok"
+    assert out["walk"] == {"key": WALK, "units": [
+        {"unit": "Unit 1", "not_covered": [{"n": 2, "text": "Edge protection installed"},
+                                           {"n": 3, "text": "Cover to steel checked"}],
+         "failed": []},
+        {"unit": "Unit 2", "not_covered": [{"n": 1, "text": "Formwork braced and plumb"},
+                                           {"n": 3, "text": "Cover to steel checked"}],
+         "failed": [{"n": 2, "text": "Edge protection installed", "comment": "north side"}]}]}
+    # Per unit, in walk order: not checked first, then the Nos. By text, never number.
+    assert out["questions"] == [
+        {"kind": "not_checked", "unit": "Unit 1", "item_text": "Edge protection installed", "comment": ""},
+        {"kind": "not_checked", "unit": "Unit 1", "item_text": "Cover to steel checked", "comment": ""},
+        {"kind": "not_checked", "unit": "Unit 2", "item_text": "Formwork braced and plumb", "comment": ""},
+        {"kind": "not_checked", "unit": "Unit 2", "item_text": "Cover to steel checked", "comment": ""},
+        {"kind": "confirm_no", "unit": "Unit 2", "item_text": "Edge protection installed",
+         "comment": "north side"}]
+    # The existing keys keep their meaning: every unit's open items, each naming its unit.
+    assert out["not_covered"] == [dict(g, unit=u["unit"]) for u in out["walk"]["units"]
+                                  for g in u["not_covered"]]
+    assert out["failed"] == [dict(out["walk"]["units"][1]["failed"][0], unit="Unit 2")]
+    assert out["items"] == 3
+    # The gap pass asked for the walk's per-unit table.
+    assert cd.walk_checklist.shape_sentence() in w.prompts[0][0]
+
+
+def test_more_than_three_go_to_the_phone():
+    out = WalkWorld(BOTH_UNITS_ROWS).run()
+    assert len(out["questions"]) == 5 and out["mode"] == "phone"
+    assert out["say"] == "5 items open across 2 units — the list is on your phone."
+
+
+DEVICE_ROWS = (
+    "Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+    "Unit 2 | 1 | Yes | | | | nothing else here\n"
+    "Unit 2 | 2 | No | north side | | | edge protection is not installed on the north side\n")
+
+
+def test_three_or_fewer_questions_stay_on_the_device():
+    out = WalkWorld(DEVICE_ROWS).run()
+    assert [(q["kind"], q["unit"], q["item_text"]) for q in out["questions"]] == [
+        ("not_checked", "Unit 2", "Cover to steel checked"),
+        ("confirm_no", "Unit 2", "Edge protection installed")]
+    assert out["mode"] == "device"
+    # The first question, read by its text -- never "item 3".
+    assert out["say"] == "Unit 2: Cover to steel checked — pass?"
+
+
+def test_a_no_is_read_back_for_confirmation():
+    w = WalkWorld(DEVICE_ROWS + "Unit 2 | 3 | Yes | | | | nothing else here\n")
+    out = w.run()
+    assert out["questions"] == [{"kind": "confirm_no", "unit": "Unit 2",
+                                 "item_text": "Edge protection installed", "comment": "north side"}]
+    assert out["mode"] == "device"
+    assert out["say"] == "Unit 2, Edge protection installed failed, north side — right?"
+
+
+def _answer(unit, item, answer, at="10:06:00", **over):
+    out = {"unit": unit, "item_text": item, "answer": answer, "comment": "", "move_to_unit": None,
+           "source": "device", "quote": "yes that one", "answered_at": at}
+    out.update(over)
+    return out
+
+
+def test_answers_already_given_are_not_asked_again():
+    answers = [_answer("Unit 2", "cover to steel checked", "Yes"),             # a fill
+               _answer("Unit 2", "Edge protection installed", "No", "10:06:10")]  # a confirmed No
+    out = WalkWorld(DEVICE_ROWS, answers=answers).run()
+    assert out["questions"] == [] and out["mode"] == "device"
+    assert out["walk"]["units"][1]["not_covered"] == []
+    assert out["say"] == "All 3 items on the Pre-pour Inspection Checklist are covered in both units."
+
+
+def test_a_disagreement_is_asked_by_what_the_recording_said():
+    # On site said Yes, the recording said No: read the No back. On site said
+    # No, the recording said Yes: ask it as not checked.
+    answers = [_answer("Unit 2", "Edge protection installed", "Yes"),
+               _answer("Unit 2", "Formwork braced and plumb", "No")]
+    out = WalkWorld(DEVICE_ROWS + "Unit 2 | 3 | Yes | | | | nothing else here\n",
+                    answers=answers).run()
+    assert [(q["kind"], q["item_text"]) for q in out["questions"]] == [
+        ("not_checked", "Formwork braced and plumb"), ("confirm_no", "Edge protection installed")]
+
+
+def test_a_walk_over_two_recordings_reads_both():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    out = w.run()
+    assert out["status"] == "ok"
+    assert w.gathered == [(FOLDER, DATE, "sid" + SID), (FOLDER, DATE, "sid" + SID2)]
+    # Each recording assembled on its own clock.
+    assert [all(SID2 in k for k in keys) for keys in w.assembled] == [False, True]
+    prompt = w.prompts[0][0]
+    # The walk opened at 09:30, before this recording's own window (10:03): the
+    # earlier recording's words are in, and so is this one's.
+    assert EARLIER_WORDS in prompt and SECRET_WORDS in prompt and "north side" in prompt
+    # Only the live recording's chunks are heard.
+    assert w.heard == [2, 3]
+    assert out["partial"] is False
+
+
+def test_more_than_five_walk_recordings_read_the_newest_five_and_say_partial():
+    older = ["sid%032x" % i for i in range(1, 6)]
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(sessions=older + ["sid" + SID]))
+    out = w.run()
+    assert [g[2] for g in w.gathered] == ["sid" + SID] + older[1:][::-1]
+    assert out["partial"] is True
+
+
+def test_a_walk_session_that_is_not_a_session_base_is_never_gathered():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.db = facts(live_windows=[WALK_WINDOW],
+                 walk=walk_facts(sessions=["../../x", "sid" + SID2, "sid" + SID]))
+    w.run()
+    assert [g[2] for g in w.gathered] == ["sid" + SID, "sid" + SID2]
+
+
+def test_a_walk_with_nothing_heard_leaves_every_unit_open_without_the_model():
+    w = WalkWorld()
+    w.turns, w.earlier, w.stt_text = [], [], {}
+    out = w.run()
+    assert w.prompts == []
+    assert [len(u["not_covered"]) for u in out["walk"]["units"]] == [3, 3]
+    # Silence is never Yes: both units, every item, go to the phone.
+    assert out["mode"] == "phone"
+    assert out["say"] == "6 items open across 2 units — the list is on your phone."
+
+
+def test_r44_a_unit_he_only_walked_into_is_asked_about_in_the_final_check():
+    """A count-only opening ("doing two units") and Unit 2 entered, but the
+    model wrote rows for Unit 1 only: Unit 2 is still a unit of the walk."""
+    w = WalkWorld("Unit 1 | 1 | Yes | braced | | | formwork is braced and plumb\n")
+    facts_ = walk_facts(names=())
+    facts_[WALK]["units"] = {"names": [], "count": 2}
+    facts_[WALK]["entered"] = [{"unit": "Unit 1", "at": "09:31", "quote": "unit one"},
+                               {"unit": "unit two", "at": "10:04", "quote": "unit two"}]
+    w.db = facts(live_windows=[WALK_WINDOW], walk=facts_)
+    out = w.run()
+    assert [u["unit"] for u in out["walk"]["units"]] == ["Unit 1", "Unit 2"]
+    assert [q["item_text"] for q in out["questions"] if q["unit"] == "Unit 2"] == [
+        "Formwork braced and plumb", "Edge protection installed", "Cover to steel checked"]
+
+
+R51_ROWS = BOTH_UNITS_ROWS + "Unit 9 | 1 | Yes | braced | | | formwork is braced and plumb\n"
+
+
+def _r51_world():
+    """Opening names Units 1 and 2, he entered Unit 3, and the model wrote a
+    row for Unit 9 -- a unit the walk never opened with or entered."""
+    w = WalkWorld(R51_ROWS)
+    facts_ = walk_facts()
+    facts_[WALK]["entered"] = [{"unit": "unit three", "at": "10:04", "quote": "unit three"}]
+    w.db = facts(live_windows=[WALK_WINDOW], walk=facts_)
+    return w, facts_[WALK]
+
+
+def test_r51_a_unit_seen_only_in_the_rows_is_reported_not_asked():
+    w, _ = _r51_world()
+    out = w.run()
+    # Unit 9 stays a (flagged) section of the result ...
+    assert [u["unit"] for u in out["walk"]["units"]] == ["Unit 1", "Unit 2", "Unit 3", "Unit 9"]
+    assert any(g["unit"] == "Unit 9" for g in out["not_covered"])
+    # ... but no final-check question is about it: the hop and the phone would refuse the answer.
+    assert "Unit 9" not in {q["unit"] for q in out["questions"]}
+    # The entered unit is still asked about in full, the named ones as before.
+    assert [q["item_text"] for q in out["questions"] if q["unit"] == "Unit 3"] == ITEMS
+    assert {q["unit"] for q in out["questions"]} == {"Unit 1", "Unit 2", "Unit 3"}
+
+
+def test_r51_every_asked_unit_is_one_the_answer_validator_accepts():
+    w, walk = _r51_world()
+    out = w.run()
+    accept = cd.units_mod.walk_units({"units": walk["units"]}, [{"entered": walk["entered"]}])
+    assert out["questions"]
+    for q in out["questions"]:
+        assert cd.units_mod.answer_units(accept, q["unit"])[2] is None, q
+
+
+def test_r51_the_say_line_counts_only_the_asked_units():
+    """Units 1-3 all good; Unit 9 (rows only) has open items but is not asked,
+    so "covered in all 3 units" is true -- never "all 4"."""
+    rows = ("Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 2 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 3 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 9 | 1 | Yes | braced | | | formwork is braced and plumb\n")
+    w, _ = _r51_world()
+    w.llm_answer = WALK_HEADER + rows
+    w.earlier = [dict(w.earlier[0], text="unit one formwork is braced and plumb all good"),
+                 dict(w.earlier[0], text="unit two formwork is braced and plumb all good"),
+                 dict(w.earlier[0], text="unit three formwork is braced and plumb all good")]
+    out = w.run()
+    assert out["questions"] == [] and out["mode"] == "device"
+    assert any(g["unit"] == "Unit 9" for g in out["not_covered"])
+    assert out["say"] == ("All 3 items on the Pre-pour Inspection Checklist are covered "
+                          "in all 3 units.")
+
+
+def test_r51_a_count_only_walk_with_nothing_entered_asks_nothing():
+    """No named and no entered unit: nothing is the walk's to ask or accept.
+    The say line is pinned."""
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    facts_ = walk_facts(names=())
+    facts_[WALK]["units"] = {"names": [], "count": 2}
+    w.db = facts(live_windows=[WALK_WINDOW], walk=facts_)
+    out = w.run()
+    assert [u["unit"] for u in out["walk"]["units"]] == ["Unit 1", "Unit 2"]
+    assert out["questions"] == [] and out["mode"] == "device"
+    assert out["say"] == "No unit of the Pre-pour Inspection Checklist has been heard yet."
+
+
+def test_r45_one_all_good_never_silences_another_units_questions():
+    # Said once; the model tagged ALL for both units. Unit 2 is asked about.
+    rows = ("Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 2 | ALL | Yes | | | | formwork is braced and plumb all good\n")
+    out = WalkWorld(rows).run()
+    assert out["walk"]["units"][0]["not_covered"] == []
+    assert [g["n"] for g in out["walk"]["units"][1]["not_covered"]] == [1, 2, 3]
+    assert len([q for q in out["questions"] if q["unit"] == "Unit 2"]) == 3
+
+
+def test_a_window_of_another_walk_is_an_ordinary_check():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.db = facts(live_windows=[dict(WALK_WINDOW, walk_key="walk:" + "cd" * 20)],
+                 walk=walk_facts())
+    w.llm_answer = World().llm_answer
+    out = w.run()
+    assert "walk" not in out and "questions" not in out and "mode" not in out
+
+
+def test_single_unit_check_done_is_unchanged():
+    expected = {
+        "status": "ok",
+        "say": ("1 item open on the Pre-pour Inspection Checklist: Cover to steel checked. "
+                "And 1 marked No: Edge protection installed."),
+        "check": {"name": "Pre-pour Inspection Checklist", "template_id": "t-pp"},
+        "not_covered": [{"n": 3, "text": "Cover to steel checked"}],
+        "failed": [{"n": 2, "text": "Edge protection installed", "comment": "north side"}],
+        "items": 3, "covered_until": calendar.timegm((2026, 10, 19, 21, 4, 59)), "partial": False}
+    assert World().run() == expected
+    w = World(db=facts(live_windows=[{"name": "pre-pour", "template_id": "t-pp",
+                                      "start_at": "10:03:00", "report_date": DATE,
+                                      "units": None, "entered": None, "walk_key": None}]))
+    assert w.run() == expected
+    assert w.gathered == [(FOLDER, DATE, "sid" + SID)]
+
+
+def test_the_walk_log_line_has_counts_and_no_words(caplog):
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    with caplog.at_level(logging.INFO):
+        w.run()
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("check_gaps {"))
+    for words in (SECRET_WORDS, EARLIER_WORDS, "north side", "Cover to steel", "Unit 2"):
+        assert words not in line
+    body = json.loads(line.split(" ", 1)[1])
+    assert body["units"] == 2 and body["questions"] == 5 and body["sessions"] == 2
+
+
+def test_a_recordings_no_that_mentions_the_site_is_still_read_back():
+    rows = (DEVICE_ROWS.replace("| north side |", "| not on site yet |")
+            + "Unit 2 | 3 | Yes | | | | nothing else here\n")
+    out = WalkWorld(rows).run()
+    assert [(q["kind"], q["comment"]) for q in out["questions"]] == [("confirm_no", "not on site yet")]
+
+
+def test_the_walk_say_lines_when_nothing_is_open():
+    label = "the Pre-pour Inspection Checklist"
+    assert cd.say_walk(label, 3, ["Unit 1"], [], False) == (
+        "All 3 items on the Pre-pour Inspection Checklist are covered in Unit 1.")
+    assert cd.say_walk(label, 3, ["Unit 1", "Unit 2", "Unit 3"], [], True) == (
+        "As of a minute ago, all 3 items on the Pre-pour Inspection Checklist are covered "
+        "in all 3 units.")
+    # An opening that counted more units than were heard never says all is covered.
+    assert cd.say_walk(label, 3, ["Unit 1", "Unit 2"], [], False, count=4) == (
+        "All 3 items on the Pre-pour Inspection Checklist are covered in both units; "
+        "2 of the 4 units were heard.")
+    assert cd.say_walk(label, 3, [], [], False) == (
+        "No unit of the Pre-pour Inspection Checklist has been heard yet.")
+
+
+SCAFFOLD_WORDS = "scaffold ties are in and the cover to steel is checked"
+
+
+def test_speech_outside_the_walks_spans_never_answers_a_walk_item():
+    """Between units he did a scaffold check at 09:50 in the earlier recording,
+    and spoke before this recording's walk window opened (10:02:30): neither
+    is the walk's, though both are after its opening."""
+    w = WalkWorld("Unit 1 | 3 | Yes | | | | the cover to steel is checked\n")
+    w.earlier = w.earlier + [{"abs_start": datetime(2026, 10, 20, 9, 50, 0),
+                              "abs_end": datetime(2026, 10, 20, 9, 50, 6), "text": SCAFFOLD_WORDS}]
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 30),
+                "abs_end": datetime(2026, 10, 20, 10, 2, 34),
+                "text": "before the walk window the cover to steel is checked"}] + w.turns
+    out = w.run()
+    prompt = w.prompts[0][0]
+    assert "scaffold" not in prompt and "before the walk window" not in prompt
+    assert EARLIER_WORDS in prompt and SECRET_WORDS in prompt and "north side" in prompt
+    assert {"n": 3, "text": "Cover to steel checked"} in out["walk"]["units"][0]["not_covered"]
+
+
+def test_a_recording_with_no_span_of_the_walk_is_not_read():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(spans=[WALK_SPANS[1]]))
+    w.run()
+    assert [g[2] for g in w.gathered] == ["sid" + SID]
+    assert EARLIER_WORDS not in w.prompts[0][0]
+
+
+class SlowWalkWorld(WalkWorld):
+    """Each assemble costs `cost` seconds of a clock that moves. No raw chunks
+    to hear, and the stored words end 5 s before the press, so nothing else
+    makes the answer partial."""
+
+    def __init__(self, cost, sessions, **over):
+        super().__init__(BOTH_UNITS_ROWS, **over)
+        self.t, self.cost = float(PRESSED + 1), cost
+        self.s3.objects = {k: v for k, v in self.s3.objects.items() if not k.endswith(".wav")}
+        self.turns = [{"abs_start": datetime(2026, 10, 20, 10, 4, 50),
+                       "abs_end": datetime(2026, 10, 20, 10, 4, 55), "text": SECRET_WORDS}]
+        self.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(sessions=sessions))
+        for b in sessions:
+            self.s3.objects["transcripts/%s/%s/F2SP01_%s_09-35-00_%s_c0000_off0.0_to29.0_srcwav.json"
+                            % (FOLDER, DATE, DATE, b)] = b"{}"
+        for b in sessions:
+            self.s3.objects["transcripts/%s/%s/F2SP01_%s_09-35-00_%s_c0000_off0.0_to29.0_srcwav.json"
+                            % (FOLDER, DATE, DATE, b)] = b"{}"
+
+    def assemble(self, bucket, keys):
+        self.t += self.cost
+        return super().assemble(bucket, keys)
+
+    def run(self, event=None):
+        ev = {"caller_sub": "sub-1", "check_name": "pre-pour check done", "pressed_at": PRESSED}
+        ev.update(event or {})
+        return cd.run(ev, db_hop=self.db_hop, s3=self.s3, bucket="lake", gather=self.gather,
+                      assemble=self.assemble, stt=self.stt, call_llm=self.call_llm,
+                      now=lambda: self.t)
+
+
+def test_walk_reads_stop_in_time_for_the_gap_pass_and_say_partial():
+    older = ["sid%032x" % i for i in range(1, 4)]
+    w = SlowWalkWorld(6, older + ["sid" + SID])
+    out = w.run()
+    # 30 s budget: this recording (t+6), the newest other (t+12), the next
+    # (t+18); then 12 s are left, under LLM_DEADLINE_S + 1, so the oldest is not read.
+    assert [g[2] for g in w.gathered] == ["sid" + SID, older[2], older[1]]
+    assert out["status"] == "ok" and out["partial"] is True
+    assert w.prompts[0][1]["deadline"] == cd.RUN_BUDGET_S - 18 - 1
+
+
+def test_walk_reads_with_time_to_spare_read_every_recording():
+    older = ["sid%032x" % i for i in range(1, 4)]
+    w = SlowWalkWorld(1, older + ["sid" + SID])
+    out = w.run()
+    assert [g[2] for g in w.gathered] == ["sid" + SID] + older[::-1]
+    assert out["partial"] is False
+
+
+# ---- R41: the final check's questions are stored for the phone -------------------
+
+class StoringWalkWorld(WalkWorld):
+    """check_done with its fire-and-forget store (R42) injected beside the
+    synchronous db_hop; records both."""
+
+    def __init__(self, *a, store_error=None, **kw):
+        super().__init__(*a, **kw)
+        self.stored, self.hop_actions, self.store_error = [], [], store_error
+
+    def db_hop(self, payload):
+        if payload.get("action"):
+            self.hop_actions.append(payload)
+        return super().db_hop(payload)
+
+    def store_final_check(self, payload):
+        self.stored.append(payload)
+        if self.store_error:
+            raise self.store_error
+
+    def run(self, event=None, stt="default", store="default"):
+        ev = {"caller_sub": "sub-1", "check_name": "pre-pour check done",
+              "spoken": "pre-pour check done", "pressed_at": PRESSED}
+        ev.update(event or {})
+        return cd.run(ev, db_hop=self.db_hop, s3=self.s3, bucket="lake",
+                      gather=self.gather, assemble=self.assemble,
+                      stt=self.stt if stt == "default" else stt, call_llm=self.call_llm,
+                      now=lambda: PRESSED + 1,
+                      store_final_check=self.store_final_check if store == "default" else store)
+
+
+def test_the_final_checks_questions_go_to_the_store_never_through_the_db_hop():
+    w = StoringWalkWorld(BOTH_UNITS_ROWS)
+    out = w.run()
+    assert out["mode"] == "phone" and len(out["questions"]) == 5
+    assert w.stored == [{"action": "store_final_check", "caller_sub": "sub-1", "walk_key": WALK,
+                         "questions": out["questions"], "pressed_at": PRESSED_ISO}]
+    assert w.hop_actions == []                       # the synchronous hop is not used for it
+
+
+PRESSED_ISO = "2026-10-19T21:05:00+00:00"            # PRESSED, as the store gets it (M6)
+
+
+def test_m6_the_store_carries_the_final_checks_own_time():
+    w = StoringWalkWorld(BOTH_UNITS_ROWS)
+    w.run(event={"pressed_at": None})                # no press time: the run's own start
+    assert w.stored[0]["pressed_at"] == "2026-10-19T21:05:01+00:00"
+
+
+def test_a_final_check_with_nothing_open_is_stored_too():
+    """Otherwise an older list keeps winning in GET /open and the phone shows
+    as open what the device just said was covered."""
+    answers = [_answer("Unit 2", "cover to steel checked", "Yes"),
+               _answer("Unit 2", "Edge protection installed", "No", "10:06:10")]
+    w = StoringWalkWorld(DEVICE_ROWS, answers=answers)
+    out = w.run()
+    assert out["questions"] == []
+    assert w.stored == [{"action": "store_final_check", "caller_sub": "sub-1", "walk_key": WALK,
+                         "questions": [], "pressed_at": PRESSED_ISO}]
+
+
+def test_a_failed_send_changes_neither_the_answer_nor_the_say_line(caplog):
+    plain = StoringWalkWorld(BOTH_UNITS_ROWS).run()
+    w = StoringWalkWorld(BOTH_UNITS_ROWS, store_error=RuntimeError("invoke refused"))
+    with caplog.at_level(logging.INFO):
+        out = w.run()
+    assert len(w.stored) == 1 and out == plain
+    assert "store_final_check" in caplog.text
+    assert "Edge protection" not in caplog.text
+    # not wired at all: logged, the answer stands
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert StoringWalkWorld(BOTH_UNITS_ROWS).run(store=None) == plain
+    assert "final check not stored" in caplog.text
+
+
+def test_an_ordinary_check_stores_no_final_check():
+    class Plain(World):
+        stored = []
+
+        def db_hop(self, payload):
+            if payload.get("action"):
+                self.stored.append(payload)
+            return super().db_hop(payload)
+    w = Plain()
+    out = w.run()
+    assert not out.get("walk") and w.stored == []

@@ -202,6 +202,17 @@ def checklist_sections(template):
     return out
 
 
+def item_in(template, item_text):
+    """The template's own wording of `item_text` (every checklist section of
+    the template, sub-sections included; whitespace and case folded), or None."""
+    want = " ".join(str(item_text).split()).casefold()
+    for items in checklist_sections(template).values():
+        for i in items:
+            if " ".join(str(i).split()).casefold() == want:
+                return str(i)
+    return None
+
+
 def apply(prose, template, transcript_text, report_date=None):
     """Rebuild every checklist section of the answer in place. Returns a report
     per section title, for the result's provenance.
