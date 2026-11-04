@@ -42,8 +42,9 @@ CLASSIFIED = {
     ("lambda_ws_connect.py", "lambda_handler"): (CALLER, "WebSocket $connect authorizer sub"),
     ("lambda_voice_resolve.py", "lambda_handler"): (CALLER, "Site Voice sender sub"),
     ("lambda_check_gaps_db.py", "_facts"): (CALLER, "check-done presser's caller_sub"),
-    ("lambda_check_gaps_db.py", "write_walk_answer"): (
-        CALLER, "confirmation answer's caller_sub (walk answers, Task 11)"),
+    ("lambda_check_gaps_db.py", "_caller_walk"): (
+        CALLER, "the caller_sub of both hop writes: a confirmation answer (Task 11) and a "
+                "final check's questions (R41)"),
     ("checklist_reports.py", "_recorder"): (
         CALLER, "the recorder acts as the caller of report generation (auto_generate, "
                 "requeue_walk)"),

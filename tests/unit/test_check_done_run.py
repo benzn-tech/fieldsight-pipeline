@@ -744,3 +744,68 @@ def test_walk_reads_with_time_to_spare_read_every_recording():
     out = w.run()
     assert [g[2] for g in w.gathered] == ["sid" + SID] + older[::-1]
     assert out["partial"] is False
+
+
+# ---- R41: the final check's questions are stored for the phone -------------------
+
+class StoringWalkWorld(WalkWorld):
+    """The hop's store_final_check is answered here; the facts read as before."""
+
+    def __init__(self, *a, store=None, **kw):
+        super().__init__(*a, **kw)
+        self.stored, self.store = [], store
+
+    def db_hop(self, payload):
+        if payload.get("action") == "store_final_check":
+            self.stored.append(payload)
+            if isinstance(self.store, Exception):
+                raise self.store
+            return self.store or {"status": "saved", "id": "fc-1"}
+        return super().db_hop(payload)
+
+
+def test_the_final_checks_questions_are_stored_through_the_hop():
+    w = StoringWalkWorld(BOTH_UNITS_ROWS)
+    out = w.run()
+    assert out["mode"] == "phone" and len(out["questions"]) == 5
+    assert w.stored == [{"action": "store_final_check", "caller_sub": "sub-1", "walk_key": WALK,
+                         "questions": out["questions"]}]
+
+
+def test_a_failed_store_changes_neither_the_answer_nor_the_say_line(caplog):
+    plain = StoringWalkWorld(BOTH_UNITS_ROWS).run()
+    for failure in (RuntimeError("hop down"), {"error": "db"}):
+        w = StoringWalkWorld(BOTH_UNITS_ROWS, store=failure)
+        with caplog.at_level(logging.INFO):
+            out = w.run()
+        assert len(w.stored) == 1
+        assert out == plain
+    assert "store_final_check" in caplog.text
+    assert "Edge protection" not in caplog.text
+
+
+def test_with_under_a_second_left_the_store_is_skipped_and_said(caplog):
+    out = StoringWalkWorld(BOTH_UNITS_ROWS).run()
+    called = []
+    with caplog.at_level(logging.INFO):
+        cd._store_final_check(lambda p: called.append(p), "sub-1", out,
+                              deadline=100.0, now=lambda: 100.0 - 0.6)
+    assert called == []
+    assert "final check not stored" in caplog.text
+    cd._store_final_check(lambda p: called.append(p) or {"status": "saved"}, "sub-1", out,
+                          deadline=100.0, now=lambda: 100.0 - 1.5)
+    assert len(called) == 1
+    assert cd.FINAL_CHECK_STORE_MIN_S == 1.0 and cd.RUN_BUDGET_S == 30
+
+
+def test_an_ordinary_check_stores_no_final_check():
+    class Plain(World):
+        stored = []
+
+        def db_hop(self, payload):
+            if payload.get("action"):
+                self.stored.append(payload)
+            return super().db_hop(payload)
+    w = Plain()
+    w.run()
+    assert w.stored == []

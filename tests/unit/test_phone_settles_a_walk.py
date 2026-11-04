@@ -93,7 +93,7 @@ def world(monkeypatch):
          "report": {"session": "sidA", "result_key": RESULT_KEY, "created_at": QUEUED,
                     "walk_key": KEY},
          "s3": S3({RESULT_KEY: _result([_unit("Unit 1"), _unit("Unit 2"), _unit("Unit 3")])}),
-         "visible": True, "self_folder": FOLDER, "versions": [], "bodies": {}}
+         "visible": True, "self_folder": FOLDER, "versions": [], "bodies": {}, "final": None}
 
     def resolve(conn, caller, user, what="media"):
         w["what"].append(what)
@@ -120,6 +120,8 @@ def world(monkeypatch):
     monkeypatch.setattr(org.report_templates, "get_version", get_version)
     monkeypatch.setattr(org.checklist_reports, "for_walk",
                         lambda conn, f, d, k: w["report"] if (f, d, k) == (FOLDER, DATE, KEY) else None)
+    monkeypatch.setattr(org.walk_final_checks, "latest",
+                        lambda conn, cos, k: w["final"] if (list(cos), k) == ([SITE_CO], KEY) else None)
     monkeypatch.setattr(org.walk_answers, "for_walk",
                         lambda conn, cos, k: list(w["answers"]) if list(cos) == [SITE_CO] else [])
 
@@ -438,7 +440,7 @@ def test_open_items_by_unit_from_the_latest_walk_report(world):
                         _answer("Unit 3", "Building wrap", "Yes", at=QUEUED - timedelta(minutes=4))]
     status, body = _get(world)
     assert status == 200
-    assert body == {"walkKey": KEY, "units": [
+    assert body == {"walkKey": KEY, "source": "report", "units": [
         {"unit": "Unit 1", "items": [
             {"item_text": "Insulation", "kind": "not_checked", "comment": ""},
             {"item_text": "Window flashings", "kind": "not_checked", "comment": ""},
@@ -496,3 +498,69 @@ def test_the_open_list_uses_the_final_checks_questions(monkeypatch):
     assert seen == [ITEMS]
     assert out == [{"unit": "Unit 1", "items": [
         {"item_text": "Insulation", "kind": "not_checked", "comment": ""}]}]
+
+
+# ---- R41: the final check's own list, until a newer report ---------------------
+
+def _final(at, questions=None):
+    return {"id": "fc", "created_at": at, "questions": questions if questions is not None else [
+        {"kind": "not_checked", "unit": "Unit 1", "item_text": "Insulation", "comment": ""},
+        {"kind": "not_checked", "unit": "Unit 3", "item_text": "Window flashings", "comment": ""},
+        {"kind": "confirm_no", "unit": "Unit 3", "item_text": "Building wrap",
+         "comment": "torn"}]}
+
+
+def test_right_after_a_final_check_the_list_is_served_with_no_report(world):
+    world["report"] = None
+    at = QUEUED
+    world["final"] = _final(at)
+    world["answers"] = [_answer("Unit 3", "Building wrap", "Yes", at=at + timedelta(seconds=20)),
+                        _answer("Unit 1", "Insulation", "No", at=at - timedelta(minutes=1))]
+    status, body = _get(world)
+    assert status == 200
+    assert body == {"walkKey": KEY, "source": "final_check", "units": [
+        {"unit": "Unit 1", "items": [
+            {"item_text": "Insulation", "kind": "not_checked", "comment": ""}]},  # answered before it
+        {"unit": "Unit 2", "items": []},
+        {"unit": "Unit 3", "items": [
+            {"item_text": "Window flashings", "kind": "not_checked", "comment": ""}]}]}
+    assert world["s3"].reads == []
+
+
+def test_a_newer_final_check_wins_over_an_older_report(world):
+    world["final"] = _final(QUEUED + timedelta(minutes=5),
+                            [{"kind": "not_checked", "unit": "Unit 2", "item_text": "Insulation",
+                              "comment": ""}])
+    status, body = _get(world)
+    assert (status, body["source"]) == (200, "final_check")
+    assert [u["items"] for u in body["units"]] == [
+        [], [{"item_text": "Insulation", "kind": "not_checked", "comment": ""}], []]
+
+
+def test_an_older_final_check_loses_to_a_newer_report(world):
+    world["final"] = _final(QUEUED - timedelta(minutes=5))
+    status, body = _get(world)
+    assert (status, body["source"]) == (200, "report")
+    assert all(u["items"] == [] for u in body["units"])         # the report's list: nothing open
+
+
+def test_a_final_check_is_served_while_no_report_has_finished(world):
+    world["report"] = dict(world["report"], result_key=RESULT_KEY.replace("r1", "r9"))
+    world["final"] = _final(QUEUED - timedelta(minutes=30))
+    status, body = _get(world)
+    assert (status, body["source"]) == (200, "final_check")
+
+
+def test_a_read_back_answered_on_the_phone_drops_out_of_the_final_checks_list(world):
+    world["report"] = None
+    world["final"] = _final(QUEUED)
+    world["answers"] = [dict(_answer("Unit 3", "Building wrap", "No",
+                                     at=QUEUED + timedelta(seconds=5)), asked_kind="confirm_no")]
+    body = _get(world)[1]
+    assert body["units"][2]["items"] == [
+        {"item_text": "Window flashings", "kind": "not_checked", "comment": ""}]
+
+
+def test_neither_a_report_nor_a_final_check_is_not_ready(world):
+    world["report"], world["final"] = None, None
+    assert _get(world) == (404, {"error": "not ready"})

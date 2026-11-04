@@ -423,6 +423,29 @@ def open_from_result(stored_walk, items, answers, queued_at):
     asked = {u["unit"]: [] for u in rebuilt}
     for q in walk_questions({"units": rebuilt, "conflicts": conflicts}, items):
         asked[q["unit"]].append(q)
+    return _laid_over(asked, after, by_text)
+
+
+def open_from_questions(questions, unit_names, items, answers, since):
+    """The phone's list from a final check's stored questions (R41), in the
+    same shape as open_from_result: every unit of `unit_names` in that order
+    (then any other unit a question names), each with its questions as the
+    device was given them. Answers given after `since` (the final check's
+    created_at) are laid over them by open_from_result's rules: an answer --
+    a read-back's included -- drops its question; a move drops the target's
+    and asks the source as not checked."""
+    by_text = {_fold(t): str(t) for t in items or []}
+    asked = {n: [] for n in unit_names or []}
+    for q in questions or []:
+        if isinstance(q, dict) and q.get("unit") and q.get("item_text"):
+            asked.setdefault(q["unit"], []).append(q)
+    after = [a for a in answers or []
+             if since is not None and a.get("created_at") is not None and a["created_at"] > since]
+    return _laid_over(asked, after, by_text)
+
+
+def _laid_over(asked, after, by_text):
+    """{unit: [question]} with the answers `after` laid over it, as the list."""
     names = {_answer_unit(n): n for n in asked}
 
     def at(unit_key, f):
@@ -682,6 +705,8 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
     except Exception:                                 # noqa: BLE001 -- the device must hear something
         logger.exception("check_gaps: failed")
         out = _result("error", say_error())
+    if out.get("walk") and out.get("questions"):
+        _store_final_check(db_hop, (event or {}).get("caller_sub"), out, deadline, now)
     timings["total"] = int((now() - started) * 1000)
     # Counts and timings only -- never what was said (the two-phase spec's rule).
     # A walk's unit names are his words too: only how many.
@@ -696,6 +721,31 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
                     sessions=sessions or 0, mode=out["mode"])
     logger.info("check_gaps %s", json.dumps(line))
     return out
+
+
+#: Below this much of RUN_BUDGET_S left, the final check is not stored (R41).
+FINAL_CHECK_STORE_MIN_S = 1.0
+
+
+def _store_final_check(db_hop, caller, out, deadline, now):
+    """The walk's open questions, as the device was given them, stored through
+    the hop (store_final_check) for the phone's list (R41). In either mode.
+    Best effort inside the run's budget: a failure is logged and never changes
+    the response or its say line. Counts only in the log."""
+    left = deadline - now()
+    if left < FINAL_CHECK_STORE_MIN_S:
+        logger.warning("check_gaps: final check not stored -- %.1f s of the budget left", left)
+        return
+    try:
+        got = db_hop({"action": "store_final_check", "caller_sub": caller,
+                      "walk_key": out["walk"]["key"], "questions": out["questions"]}) or {}
+    except Exception as e:                            # noqa: BLE001 -- the answer stands
+        logger.warning("check_gaps: store_final_check failed: %s", type(e).__name__)
+        return
+    if got.get("status") != "saved":
+        logger.warning("check_gaps: store_final_check refused: %s", got.get("error"))
+        return
+    logger.info("check_gaps: store_final_check saved questions=%d", len(out["questions"]))
 
 
 def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, timings, deadline):

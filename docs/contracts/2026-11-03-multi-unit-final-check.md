@@ -164,6 +164,7 @@ Both routes read the walk the way `GET /api/org/days/{date}/inspections` reads t
 200:
 ```json
 {"walkKey": "walk:…",
+ "source": "report",
  "units": [
    {"unit": "Unit 1", "items": [
      {"item_text": "Insulation",       "kind": "not_checked", "comment": ""},
@@ -175,12 +176,16 @@ Both routes read the walk the way `GET /api/org/days/{date}/inspections` reads t
 ```
 
 - **Shape.** This list is grouped by unit, and its key is camelCase `walkKey`. The final-check `questions` is a **flat** list with `unit` on each entry. The kinds and the order are the same in both, because both are built by `check_done.walk_questions`.
-- **Source.** The list comes from the latest **finished** walk report, with every answer given since that report was queued laid over it:
-  - an answer drops its question;
+- **Source.** `source` says where the list came from. The route serves the newer of two lists (R41):
+  - `"report"`: the latest **finished** walk report. While a re-queued report is still being written, or if it failed, this is the newest finished report it replaced (up to 5 back, R39).
+  - `"final_check"`: the walk's latest final check. Every final check that leaves questions open stores them (the `questions` of the device's response, as the device got them; `walk_final_checks`). This list is served when it is newer than the chosen report's queue time, or when no report has finished. So **right after the final check the list is there**, before any walk report exists. Every unit of the walk is listed in walk order, and units with nothing open get `"items": []`.
+
+  Either way, every answer given after that list was made is laid over it:
+  - an answer drops its question, a read-back's included;
   - a move drops the target's question and re-asks the origin as `not_checked`.
 
-  While a re-queued report is still being written, or if it failed, the route serves the newest finished report it replaced (up to 5 back, R39). The phone should still keep what it answered and drop it locally, because a server list can lag a fresh POST for a moment.
-- **Items.** The item wording is from the template version the report was written with, or else from the current version.
+  The phone should still keep what it answered and drop it locally, because a server list can lag a fresh POST for a moment.
+- **Items.** For `report`, the item wording is from the template version the report was written with, or else from the current version. For `final_check`, it is the template's wording as the final check stored it.
 
 Errors:
 
@@ -191,8 +196,8 @@ Errors:
 | 403 | `{"error": "not permitted to view this user's inspections"}` / `"you may only view your own inspections"` / `"no folder mapping for your account"` | The caller may not read this folder. |
 | 404 | `{"error": "user not found in your company"}` | An all-scope caller named an unknown folder. |
 | 404 | `{"error": "walk not found"}` | The key is malformed, the walk is not this folder's on this date, or it is not visible to the caller. |
-| 404 | `{"error": "not ready"}` | There is no walk report row yet. |
-| 404 | `{"error": "not ready", "status": "pending" \| "error" \| "done"}` | No finished walk report exists. `status` is the newest result's: `pending` means it has not been written yet, `error` means it failed, and `done` means the newest result is an ordinary report with no walk. |
+| 404 | `{"error": "not ready"}` | There is no final check and no walk report row yet. After a final check that left questions open, this only happens if storing it failed (the device's answer does not depend on it). |
+| 404 | `{"error": "not ready", "status": "pending" \| "error" \| "done"}` | There is no final check and no finished walk report. `status` is the newest result's: `pending` means it has not been written yet, `error` means it failed, and `done` means the newest result is an ordinary report with no walk. |
 | 500 | — | An S3 refusal (a missing IAM grant). It is raised, never served as "nothing open". |
 
 ### POST `/api/org/days/{date}/inspections/walks/{walkKey}/answers?user=`
@@ -257,7 +262,7 @@ CONFIRMING
 
 ## 5. Phone line
 
-- **The list.** Take it from the final check's `questions` when it is in hand, or else from GET `/open`. The two shapes are different (see above).
+- **The list.** Take it from GET `/open`. Right after a final check, GET serves that final check's questions (`source: "final_check"`), so the phone does **not** need to retry on `not ready` after a final check. If the device's `questions` are in hand, they are the same list, in a flat shape (see above).
 - **The buttons.** Each item has Pass / Fail / N/A, which POST `answer`. Send `asked_kind: "confirm_no"` for a read-back No.
 - **The voice note.** A hold-to-record voice note gives the reason for a Fail, sent as `voice_note_id`. The id is meant to come from the existing phone voice notes (migration 0089). **The phone line still has to confirm** that a 0089 note can carry a per-item note.
 - **Moves.** Every No offers "move to another unit", which POSTs `answer: null` with `move_to_unit`.
@@ -266,6 +271,6 @@ CONFIRMING
 ## Not built / open
 
 - **Web "settle later"** is the next phase. Whatever is unanswered on site stays "not checked" in the report.
-- **There is no push from the backend to the phone.** A walk report is first queued by extraction (`auto_generate`). So right after the device's `check_done`, GET `/open` can still return 404 `not ready`, which is exactly when the phone needs the list. Getting `questions` from the device's final-check response to the phone is a device↔phone channel that has **no owner yet**. Until one exists, the phone has to retry GET while it gets 404 `not ready`.
+- **There is no push from the backend to the phone.** The phone pulls GET `/open`. Since R41 the final check stores its questions, so GET has the list right after the final check, before any walk report exists. The store is best effort inside the final check's 30 s budget: it is skipped with under about 1 s left, and a failure is only logged. In that rare case GET answers `not ready` until the walk report finishes.
 - **The voice_note_id from migration 0089** still has to be confirmed with the phone line (above).
 - **The few-vs-many threshold (3) and the 30 s idle timeout** are first guesses. They are to be tuned on real TEST walks.

@@ -4,7 +4,8 @@ Lambda: check-gaps-db -- the in-VPC hop of "check done" (spec 2026-10-20).
 Invoked synchronously by CheckGapsFunction (non-VPC), the same split as
 AskAgent -> RagSearch: the VPC has no egress, so the function that calls the STT
 vendor and the model cannot reach Aurora, and this one, which can, never leaves
-the VPC. No S3. One write, and only that one: a walk_answers row (below).
+the VPC. No S3. It has exactly two writes, both below: a walk_answers row
+(write_walk_answer) and a walk_final_checks row (store_final_check).
 
 Event:  {"caller_sub": "<cognito sub>", "pressed_at": <epoch seconds>}
 Result: {"user": {id, company_id, folder_name} | None,
@@ -25,12 +26,25 @@ Event:  {"action": "write_walk_answer", "caller_sub", "walk_key", "unit", "item_
          "asked_kind": "not_checked" | "confirm_no" (default not_checked, R36)}   (multi-unit walks, Task 11, R4/R31)
 Result: {"status": "saved", "id", "company_id", "folder", "date", "walk_key"}
         or {"error": "..."} with nothing written.
-        The hop's only write: one walk_answers row, committed. It checks first
+        The hop's first write: one walk_answers row, committed. It checks first
         that the walk is the caller's (his folder), that `unit` and
         `move_to_unit` are units of the walk, and that `item_text` is an item of
         the walk's checklist. The row is under the walk's company (R22), by the
         caller, source 'device'. The walk report is re-queued by CheckGaps
         (item-writer, async), never from here.
+
+Event:  {"action": "store_final_check", "caller_sub", "walk_key",
+         "questions": [{"kind": "not_checked" | "confirm_no", "unit", "item_text",
+                        "comment"}]}   (at most 400; multi-unit walks, R41)
+Result: {"status": "saved", "id", "walk_key", "questions": <count>}
+        or {"error": "..."} with nothing written.
+        The hop's second write: one walk_final_checks row, committed -- the
+        open questions a final check left, which GET /open serves to the phone
+        until a newer walk report exists. The same caller and walk checks as
+        write_walk_answer: the walk is the caller's (his folder), every unit is
+        a unit of the walk and every item an item of its checklist (stored in
+        the template's wording, the unit normalized), under the walk's company
+        (R22).
 
 The only person this reads about is `caller_sub`, which the Ask worker took from
 the API authorizer. No session, folder or company is accepted from the event.
@@ -43,7 +57,7 @@ import checklist
 from db.connection import close_cached_connection, get_cached_connection, get_connection
 import nz_time
 from repositories import (inspection_windows, meeting_session, recordings, report_templates,
-                          sites, users, walk_answers)
+                          sites, users, walk_answers, walk_final_checks)
 import tenancy_status
 import units as units_mod
 
@@ -58,6 +72,7 @@ HMS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 MOVE_NOT_IN_WALK = units_mod.MOVE_NOT_IN_WALK
 MAX_QUOTE = 4000
 MAX_COMMENT = 2000
+MAX_QUESTIONS = 400
 
 
 def lambda_handler(event, context):
@@ -69,6 +84,8 @@ def lambda_handler(event, context):
         action = event.get("action")
         if action == "write_walk_answer":
             return _write_walk_answer(event)
+        if action == "store_final_check":
+            return _store_final_check(event)
         if action is not None:
             return {"error": "unknown action"}
         return _facts(event)
@@ -180,6 +197,82 @@ def _write_walk_answer(event):
     return _jsonable(out)
 
 
+def _caller_walk(conn, sub, key):
+    """(walk, None) or (None, {"error"}): the caller's walk `key`, checked the
+    one way both writes check it. The caller is resolved from the sub and
+    gated; the walk must be in his folder; its company is the opening's (R22),
+    or the only one. walk: {user, folder, company, date, units, body}."""
+    user = users.get_user_by_sub(conn, sub)
+    if not user:
+        return None, {"error": "unknown caller"}
+    blocked = tenancy_status.caller_blocked(conn, user, where="check-gaps-db")
+    if blocked:
+        return None, {"error": blocked}
+    folder = user.get("folder_name")
+    rows = inspection_windows.walk_rows(conn, folder, key) if folder else []
+    if not rows:
+        return None, {"error": "walk not found"}
+    # The opening is the window whose start gives the key; its company is the
+    # walk's (R22). A walk with no such window and one company is that company's.
+    opening, company = units_mod.walk_opening(rows, folder, key)
+    if opening is None:
+        return None, {"error": "walk company unclear"}
+    version = (report_templates.get_version(conn, opening["template_id"], None)
+               if opening.get("template_id") else None)
+    return {"user": user, "folder": folder, "company": company,
+            "date": str(opening.get("report_date"))[:10],
+            "units": units_mod.walk_units(opening, rows),
+            "body": (version or {}).get("body") or {}}, None
+
+
+def _store_final_check(event):
+    """Its own transaction, like _write_walk_answer. Counts only in the log."""
+    with get_connection() as conn:
+        out = store_final_check(conn, event)
+    logger.info("check-gaps-db: store_final_check status=%s questions=%s",
+                out.get("status") or "error:%s" % out.get("error"), out.get("questions", 0))
+    return _jsonable(out)
+
+
+def _question_shape_ok(q):
+    return (isinstance(q, dict) and q.get("kind") in units_mod.ASKED_KINDS
+            and isinstance(q.get("unit"), str) and isinstance(q.get("item_text"), str)
+            and (q.get("comment") is None or isinstance(q.get("comment"), str)))
+
+
+def store_final_check(conn, event):
+    """Check, then write one walk_final_checks row (R41). Returns the saved
+    facts or {"error": ...}; nothing is written unless every check passes."""
+    sub = event.get("caller_sub")
+    if not sub:
+        return {"error": "caller_sub required"}
+    key = event.get("walk_key")
+    if not isinstance(key, str) or not WALK_KEY_RE.match(key):
+        return {"error": "walk_key invalid"}
+    questions = event.get("questions")
+    if (not isinstance(questions, list) or len(questions) > MAX_QUESTIONS
+            or not all(_question_shape_ok(q) for q in questions)):
+        return {"error": "questions invalid"}
+
+    walk, err = _caller_walk(conn, sub, key)
+    if err:
+        return err
+    stored = []
+    for q in questions:
+        unit, _, why = units_mod.answer_units(walk["units"], q["unit"])
+        if why:
+            return {"error": why}
+        item = checklist.item_in(walk["body"], q["item_text"])
+        if item is None:
+            return {"error": "item not in checklist"}
+        stored.append({"kind": q["kind"], "unit": unit, "item_text": item,
+                       "comment": (q.get("comment") or "")[:MAX_COMMENT]})
+    new_id = walk_final_checks.add(conn, {
+        "company_id": walk["company"], "user_folder": walk["folder"],
+        "report_date": walk["date"], "walk_key": key, "questions": stored})
+    return {"status": "saved", "id": new_id, "walk_key": key, "questions": len(stored)}
+
+
 def write_walk_answer(conn, event):
     """Check, then write one walk_answers row. Returns the saved facts or
     {"error": ...}; nothing is written unless every check passes."""
@@ -204,32 +297,15 @@ def write_walk_answer(conn, event):
         if event.get(k) is not None and not isinstance(event.get(k), str):
             return {"error": "%s invalid" % k}
 
-    user = users.get_user_by_sub(conn, sub)
-    if not user:
-        return {"error": "unknown caller"}
-    blocked = tenancy_status.caller_blocked(conn, user, where="check-gaps-db")
-    if blocked:
-        return {"error": blocked}
-    folder = user.get("folder_name")
-    rows = inspection_windows.walk_rows(conn, folder, key) if folder else []
-    if not rows:
-        return {"error": "walk not found"}
+    walk, err = _caller_walk(conn, sub, key)
+    if err:
+        return err
+    user, folder, company, date = walk["user"], walk["folder"], walk["company"], walk["date"]
 
-    # The opening is the window whose start gives the key; its company is the
-    # walk's (R22). A walk with no such window and one company is that company's.
-    opening, company = units_mod.walk_opening(rows, folder, key)
-    if opening is None:
-        return {"error": "walk company unclear"}
-    date = str(opening.get("report_date"))[:10]
-
-    unit, target, why = units_mod.answer_units(units_mod.walk_units(opening, rows),
-                                               event.get("unit"), move)
+    unit, target, why = units_mod.answer_units(walk["units"], event.get("unit"), move)
     if why:
         return {"error": why}
-
-    version = (report_templates.get_version(conn, opening["template_id"], None)
-               if opening.get("template_id") else None)
-    item = checklist.item_in((version or {}).get("body") or {}, event.get("item_text") or "")
+    item = checklist.item_in(walk["body"], event.get("item_text") or "")
     if item is None:
         return {"error": "item not in checklist"}
 

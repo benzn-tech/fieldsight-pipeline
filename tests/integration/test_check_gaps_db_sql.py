@@ -154,3 +154,40 @@ def test_a_unit_or_item_outside_the_walk_writes_nothing(db):
     assert hop.write_walk_answer(db, _answer(w, unit="Unit 7"))["error"] == "unit not in walk"
     assert hop.write_walk_answer(db, _answer(w, item_text="Plumbing"))["error"] == "item not in checklist"
     assert wa.for_walk(db, [w["site_co"]], w["key"]) == []
+
+
+# ---- R41: the hop's second write, the final check's questions ---------------------
+
+from repositories import walk_final_checks as wfc  # noqa: E402
+
+
+def _store(w, **kw):
+    e = {"action": "store_final_check", "caller_sub": w["sub"], "walk_key": w["key"],
+         "questions": [{"kind": "not_checked", "unit": "unit 3", "item_text": "wall bracing",
+                        "comment": ""}]}
+    e.update(kw)
+    return e
+
+
+def test_the_hop_stores_the_final_check_under_the_walks_company(db):
+    w = _walk(db)
+    out = hop.store_final_check(db, _store(w))
+    assert out["status"] == "saved" and out["questions"] == 1
+    row = wfc.latest(db, [w["site_co"]], w["key"])
+    assert row["questions"] == [{"kind": "not_checked", "unit": "Unit 3",
+                                 "item_text": "Wall bracing", "comment": ""}]
+    assert row["created_at"] is not None
+    assert wfc.latest(db, [w["home"]], w["key"]) is None
+    got = db.execute("SELECT company_id, user_folder, report_date::text FROM walk_final_checks "
+                     "WHERE walk_key = %s", (w["key"],)).fetchall()
+    assert got == [(w["site_co"], "Ben", "2026-11-04")]
+
+
+def test_a_refused_final_check_stores_nothing_in_postgres(db):
+    w = _walk(db)
+    other = _walk(db, folder="Someone")
+    assert hop.store_final_check(db, _store(w, walk_key=other["key"])) == {"error": "walk not found"}
+    bad = [{"kind": "not_checked", "unit": "Unit 7", "item_text": "wall bracing", "comment": ""}]
+    assert hop.store_final_check(db, _store(w, questions=bad)) == {"error": "unit not in walk"}
+    assert db.execute("SELECT count(*) FROM walk_final_checks WHERE walk_key IN (%s, %s)",
+                      (w["key"], other["key"])).fetchone() == (0,)

@@ -270,3 +270,24 @@ def test_the_phones_open_list_is_the_final_checks_questions_from_a_stored_report
             {"item_text": "Flashings", "kind": "not_checked", "comment": ""},
             {"item_text": "Wrap", "kind": "confirm_no", "comment": "c"}]},
         {"unit": "Unit 2", "items": []}]
+
+
+def test_the_phones_open_list_from_a_final_checks_stored_questions():
+    """open_from_questions (R41): every walk unit in order, the questions as the
+    device was given them, and only answers after the final check laid over."""
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 11, 4, 9, 0, tzinfo=timezone.utc)
+    items = ["Insulation", "Wrap"]
+    questions = [{"kind": "not_checked", "unit": "Unit 2", "item_text": "Insulation", "comment": ""},
+                 {"kind": "confirm_no", "unit": "Unit 2", "item_text": "Wrap", "comment": "torn"},
+                 {"kind": "not_checked", "unit": "Lot 9", "item_text": "Wrap", "comment": ""}]
+    answers = [{"unit": "Unit 2", "item_text": "Insulation", "answer": "Yes", "move_to_unit": None,
+                "created_at": t0 - timedelta(seconds=1)},               # before: already in it
+               {"unit": "Unit 2", "item_text": "wrap", "answer": None, "move_to_unit": "Unit 1",
+                "created_at": t0 + timedelta(seconds=1)}]               # after: the No was Unit 1's
+    assert cd.open_from_questions(questions, ["Unit 1", "Unit 2"], items, answers, t0) == [
+        {"unit": "Unit 1", "items": []},
+        {"unit": "Unit 2", "items": [
+            {"item_text": "Insulation", "kind": "not_checked", "comment": ""},
+            {"item_text": "Wrap", "kind": "not_checked", "comment": ""}]},
+        {"unit": "Lot 9", "items": [{"item_text": "Wrap", "kind": "not_checked", "comment": ""}]}]

@@ -40,3 +40,15 @@ CREATE TABLE IF NOT EXISTS walk_answers (
   CHECK (answer IS NOT NULL OR move_to_unit IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_walk_answers_walk ON walk_answers (walk_key, created_at);
+
+-- The final check's open questions, as the device was given them (R41): what the
+-- phone shows until a newer walk report exists. One row per final check with
+-- questions; the newest one is read. Under the walk's company (R22).
+CREATE TABLE IF NOT EXISTS walk_final_checks (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id uuid NOT NULL REFERENCES companies(id),
+  user_folder text NOT NULL, report_date date NOT NULL, walk_key text NOT NULL,
+  questions jsonb NOT NULL,                  -- [{"kind", "unit", "item_text", "comment"}]
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_walk_final_checks_walk ON walk_final_checks (walk_key, created_at);

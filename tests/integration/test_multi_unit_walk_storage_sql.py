@@ -383,3 +383,31 @@ def test_a_walk_requeue_prepends_the_result_it_replaces(db):
     cr._record(db, cid, FOLDER, DATE, "sidA", plain, "Pre-line", "r9", "k9")
     assert db.execute("SELECT previous_results FROM checklist_reports "
                       "WHERE company_id = %s", (cid,)).fetchall() == [(None,)]
+
+
+# ---- R41: walk_final_checks -------------------------------------------------------
+
+from repositories import walk_final_checks as wfc  # noqa: E402
+
+
+def test_the_latest_final_check_is_read_within_the_walks_company(db):
+    cid, _, _ = _setup(db)
+    other, _, _ = _setup(db)
+    row = {"company_id": cid, "user_folder": FOLDER, "report_date": DATE, "walk_key": "wk-fc",
+           "questions": [{"kind": "confirm_no", "unit": "Unit 1", "item_text": "Insulation",
+                          "comment": "gaps"}]}
+    first = wfc.add(db, row)
+    db.execute("UPDATE walk_final_checks SET created_at = now() - interval '2 minutes' "
+               "WHERE id = %s", (first,))
+    second = wfc.add(db, dict(row, questions=[]))
+    got = wfc.latest(db, [cid], "wk-fc")
+    assert (got["id"], got["questions"]) == (second, [])
+    assert wfc.latest(db, [other], "wk-fc") is None
+    assert wfc.latest(db, [], "wk-fc") is None                  # no company reads nothing
+    assert db.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'walk_final_checks' "
+                      "AND indexdef LIKE '%%(walk_key, created_at)%%'").fetchone() is not None
+
+
+def test_final_checks_are_not_in_the_company_records_export():
+    import company_records_export as cre
+    assert "walk_final_checks" in dict(cre.NOT_EXPORTED)

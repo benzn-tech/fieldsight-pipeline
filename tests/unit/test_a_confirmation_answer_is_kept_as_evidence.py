@@ -580,3 +580,75 @@ def test_an_empty_event_is_as_today(monkeypatch):
     assert iw.lambda_handler({}, None) == {"results": []}
     assert iw.lambda_handler(None, None) == {"results": []}
     assert seen["requeued"] == []
+
+
+# ---- the hop's second write: the final check's question list (R41) -------------
+
+def _store(key, **kw):
+    e = {"action": "store_final_check", "caller_sub": "sub-1", "walk_key": key,
+         "questions": [{"kind": "not_checked", "unit": "unit three", "item_text": "wall  BRACING",
+                        "comment": ""},
+                       {"kind": "confirm_no", "unit": "Unit 1", "item_text": "Trusses",
+                        "comment": "two short"}]}
+    e.update(kw)
+    return e
+
+
+def _wire_store(monkeypatch):
+    key, seen = _wire_hop(monkeypatch)
+    seen["stored"] = []
+    monkeypatch.setattr(hop.walk_final_checks, "add",
+                        lambda c, row: seen["stored"].append(row) or "fc-id")
+    return key, seen
+
+
+def test_the_hop_stores_the_final_checks_questions_under_the_walks_company(monkeypatch, caplog):
+    key, seen = _wire_store(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        out = hop.lambda_handler(_store(key), None)
+    assert out == {"status": "saved", "id": "fc-id", "walk_key": key, "questions": 2}
+    assert seen["stored"] == [{
+        "company_id": SITE_CO, "user_folder": "Ben", "report_date": "2026-11-04", "walk_key": key,
+        "questions": [{"kind": "not_checked", "unit": "Unit 3", "item_text": "Wall bracing",
+                       "comment": ""},
+                      {"kind": "confirm_no", "unit": "Unit 1", "item_text": "Trusses",
+                       "comment": "two short"}]}]
+    assert seen["added"] == []                              # not an answer
+    assert seen["conns"] == 1                               # its own transaction
+    assert "Wall bracing" not in caplog.text and "two short" not in caplog.text
+
+
+@pytest.mark.parametrize("change, error", [
+    ({"walk_key": "walk:" + "b" * 40}, "walk not found"),
+    ({"walk_key": "nope"}, "walk_key invalid"),
+    ({"caller_sub": "someone-else"}, "unknown caller"),
+    ({"questions": "all of them"}, "questions invalid"),
+    ({"questions": [{"kind": "general", "unit": "Unit 1", "item_text": "Trusses"}]},
+     "questions invalid"),
+    ({"questions": [{"kind": "not_checked", "unit": "Unit 9", "item_text": "Trusses"}]},
+     "unit not in walk"),
+    ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Plumbing"}]},
+     "item not in checklist"),
+    ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses",
+                     "comment": 3}]}, "questions invalid"),
+    ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses"}] * 401},
+     "questions invalid"),
+])
+def test_a_refused_final_check_stores_nothing(monkeypatch, change, error):
+    key, seen = _wire_store(monkeypatch)
+    out = hop.lambda_handler(_store(key, **change), None)
+    assert out.get("error") == error, out
+    assert seen["stored"] == []
+
+
+def test_a_blocked_caller_stores_no_final_check(monkeypatch):
+    key, seen = _wire_store(monkeypatch)
+    monkeypatch.setattr(hop.tenancy_status, "caller_blocked", lambda c, u, where="": "company_inactive")
+    assert hop.lambda_handler(_store(key), None) == {"error": "company_inactive"}
+    assert seen["stored"] == []
+
+
+def test_the_hop_has_exactly_two_writes():
+    src = open(hop.__file__, encoding="utf-8").read()
+    assert "exactly two writes" in src
+    assert src.count("walk_answers.add(") == 1 and src.count("walk_final_checks.add(") == 1

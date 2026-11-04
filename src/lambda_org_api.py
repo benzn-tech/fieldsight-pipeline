@@ -187,6 +187,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voiceprints)
 from repositories import lake_objects
 from repositories import walk_answers
+from repositories import walk_final_checks
 import walk_body
 import check_done
 import checklist
@@ -5405,8 +5406,11 @@ def get_walk_open_items(conn, caller, date, key, event):
     stored `walk`), with the answers given since it was queued laid over it.
     While a re-queued report is still being written, or when it failed, from
     the newest finished one it replaced (previous_results, R39), with every
-    answer since THAT one was queued. 404 {"error": "not ready"} when none
-    finished -- and the device's
+    answer since THAT one was queued. When the walk's latest final check
+    (walk_final_checks, R41) is newer than that report, or no report has
+    finished, its stored questions are served instead, with the answers since
+    it laid over them. `source` says which: "report" or "final_check".
+    404 {"error": "not ready"} when neither exists -- and the device's
     final-check list is what the phone shows (Task 13). Items are the template
     version the report was written with (`templateVersion`), else the current."""
     walk, err = _phone_walk(conn, caller, date, key, event)
@@ -5416,23 +5420,38 @@ def get_walk_open_items(conn, caller, date, key, event):
     rep = checklist_reports.for_walk(conn, folder, date, key)
     if rep and not _own_rows_visible(conn, caller, folder, date, [rep]):
         rep = None
-    if not rep:
-        return error("not ready", 404)
-    result, queued_at, status = _latest_walk_result(folder, date, key, rep)
-    if result is None:
-        if status is None:
+    result, queued_at, status = (_latest_walk_result(folder, date, key, rep) if rep
+                                 else (None, None, None))
+    # R41: the final check's own list, when it is newer than the report chosen
+    # above or no report has finished -- in the walk's company (R22).
+    final = walk_final_checks.latest(
+        conn, [walk["company"]] if walk["company"] else walk["companies"], key)
+    use_final = final is not None and (
+        result is None or queued_at is None or final["created_at"] > queued_at)
+    if result is None and not use_final:
+        if rep and status is None:
             logger.warning("walk %s: its report result is not under its folder's day -- not read",
                            key)
+        if not rep or status is None:
             return error("not ready", 404)
         return error("not ready", 404, {"status": status})
-    stored = result["walk"]
-    found = walk_report.the_checklist(_walk_template_body(conn, walk, _result_version(result)))
     answers = walk_answers.for_walk(conn, walk["companies"], key)
-    units_open = check_done.open_from_result(stored, found[1] if found else [], answers,
-                                             queued_at)
-    logger.info("walk open items: units=%d open=%d answers=%d", len(units_open),
-                sum(len(u["items"]) for u in units_open), len(answers))
-    return ok({"walkKey": key, "units": units_open})
+    if use_final:
+        found = walk_report.the_checklist(_walk_template_body(conn, walk))
+        unit_names = (units_mod.walk_units(walk["opening"], walk["rows"]) if walk["opening"]
+                      else [])
+        units_open = check_done.open_from_questions(final["questions"], unit_names,
+                                                    found[1] if found else [], answers,
+                                                    final["created_at"])
+    else:
+        found = walk_report.the_checklist(_walk_template_body(conn, walk,
+                                                              _result_version(result)))
+        units_open = check_done.open_from_result(result["walk"], found[1] if found else [],
+                                                 answers, queued_at)
+    source = "final_check" if use_final else "report"
+    logger.info("walk open items: source=%s units=%d open=%d answers=%d", source,
+                len(units_open), sum(len(u["items"]) for u in units_open), len(answers))
+    return ok({"walkKey": key, "source": source, "units": units_open})
 
 
 def _requeue_after_answer(conn, walk):
