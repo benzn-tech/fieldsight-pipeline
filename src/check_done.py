@@ -42,6 +42,7 @@ import batch_stitch
 import checklist
 import inspection_match
 import nz_time
+import units as units_mod
 import walk_answers_overlay
 import walk_checklist
 from transcript_utils import (extract_base_time_from_filename, extract_chunk_index_from_filename,
@@ -358,6 +359,98 @@ def walk_questions(walk_result, items):
                 nos.append(dict(q, kind="confirm_no", comment=r.get("comment") or ""))
         out += open_ + nos
     return out
+
+
+_ON_SITE_ANSWERS = ("Yes", "No", "N/A")
+
+
+def _answer_unit(text):
+    return units_mod.normalize_unit(text or "") or _fold(text)
+
+
+def open_from_result(stored_walk, items, answers, queued_at):
+    """What is still open on the walk, per unit in walk order -- the phone's
+    list (Task 12): [{"unit", "items": [{"item_text", "kind", "comment"}]}].
+
+    `stored_walk` is a walk report's stored `walk` (walk_report.result): per
+    unit its checklist `report` (gaps, no rows), and the walk's `conflicts`.
+    The questions are walk_questions', over rows rebuilt from it: an item in
+    gaps.not_covered is not checked, in gaps.failed a No, in `conflicts` under
+    conflict; any other item was answered, and not with a No.
+
+    The report does not say who decided a No, so the walk's answers queued
+    with it (created_at up to `queued_at`, oldest first) are replayed as the
+    overlay judged them: an answer decides its (unit, item) on site; a move
+    decides the target's and reopens its source. Answers after `queued_at` are
+    not in the report and are laid over the list: an answer drops its
+    question, a move drops the target's and asks the source as not checked."""
+    by_text = {_fold(t): str(t) for t in items or []}
+    before, after = [], []
+    for a in answers or []:
+        late = queued_at is not None and a.get("created_at") is not None \
+            and a["created_at"] > queued_at
+        (after if late else before).append(a)
+    on_site = set()
+    for a in before:
+        u, f = _answer_unit(a.get("unit")), _fold(a.get("item_text"))
+        if a.get("move_to_unit"):
+            on_site.discard((u, f))
+            on_site.add((_answer_unit(a["move_to_unit"]), f))
+        elif a.get("answer") in _ON_SITE_ANSWERS:
+            on_site.add((u, f))
+
+    conflicts = (stored_walk or {}).get("conflicts") or []
+    rebuilt = []
+    for unit in (stored_walk or {}).get("units") or []:
+        name = unit.get("unit")
+        gaps = (unit.get("report") or {}).get("gaps") or {}
+        not_covered = {_fold(g.get("text")) for g in gaps.get("not_covered") or []
+                       if isinstance(g, dict)}
+        failed = {_fold(g.get("text")): g for g in gaps.get("failed") or [] if isinstance(g, dict)}
+        torn = {_fold(c.get("item")) for c in conflicts if c.get("unit") == name}
+        rows = []
+        for n, item in enumerate(items or [], start=1):
+            f = _fold(item)
+            row = {"n": n, "item": str(item), "answer": "", "comment": "", "state": "answered",
+                   "origin": "recording"}
+            if f in torn:
+                row["state"] = "check"
+            elif f in not_covered:
+                row["state"] = "not_checked"
+            elif f in failed:
+                row.update(answer="No", comment=failed[f].get("comment") or "",
+                           origin="on_site" if (_answer_unit(name), f) in on_site else "recording")
+            rows.append(row)
+        rebuilt.append({"unit": name, "rows": rows})
+
+    asked = {u["unit"]: [] for u in rebuilt}
+    for q in walk_questions({"units": rebuilt, "conflicts": conflicts}, items):
+        asked[q["unit"]].append(q)
+    names = {_answer_unit(n): n for n in asked}
+
+    def at(unit_key, f):
+        qs = asked.get(names.get(unit_key), [])
+        return qs, next((i for i, q in enumerate(qs) if _fold(q["item_text"]) == f), None)
+
+    for a in after:
+        u, f = _answer_unit(a.get("unit")), _fold(a.get("item_text"))
+        if a.get("move_to_unit"):
+            qs, i = at(_answer_unit(a["move_to_unit"]), f)
+            if i is not None:
+                qs.pop(i)
+            qs, i = at(u, f)
+            if i is not None:
+                qs[i] = dict(qs[i], kind="not_checked", comment="")
+            elif u in names and f in by_text:
+                qs.append({"kind": "not_checked", "unit": names[u], "item_text": by_text[f],
+                           "comment": ""})
+        elif a.get("answer") in _ON_SITE_ANSWERS:
+            qs, i = at(u, f)
+            if i is not None:
+                qs.pop(i)
+    return [{"unit": name, "items": [{"item_text": q["item_text"], "kind": q["kind"],
+                                      "comment": q.get("comment") or ""} for q in qs]}
+            for name, qs in asked.items()]
 
 
 def say_question(q):

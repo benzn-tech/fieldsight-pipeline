@@ -226,6 +226,61 @@ def walk_key(company_id, user_folder, date, template_id, start_at):
     return "walk:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+#: walk_key's shape -- what a walk key from a request must look like.
+WALK_KEY_RE = re.compile(r"^walk:[0-9a-f]{40}$")
+
+
+def walk_opening(rows, user_folder, key):
+    """(opening, company) of walk `key` from its windows in one folder
+    (inspection_windows.walk_rows): the window whose start gives the key, and
+    its company -- the walk's (R22). A walk with no such window and one company
+    is that company's, opened by its first matched window. (None, None) when no
+    window gives the key and the rows span companies: whose walk it is would be
+    a guess."""
+    for r in rows or []:
+        if r.get("template_id") and walk_key(
+                str(r["company_id"]), user_folder, str(r.get("report_date"))[:10],
+                str(r["template_id"]), r.get("start_at")) == key:
+            return r, str(r["company_id"])
+    companies = {str(r["company_id"]) for r in rows or []}
+    if len(companies) != 1:
+        return None, None
+    return next((r for r in rows if r.get("template_id")), rows[0]), companies.pop()
+
+
+def walk_units(opening, rows):
+    """The walk's units: the opening's names, then every unit entered in any of
+    its windows, normalized (normalize_unit). "Kitchen" is not a unit."""
+    out = []
+    opened = opening.get("units") if isinstance(opening.get("units"), dict) else {}
+    marks = [m.get("unit") for r in rows for m in r.get("entered") or [] if isinstance(m, dict)]
+    for raw in list(opened.get("names") or []) + marks:
+        u = normalize_unit(raw) if isinstance(raw, str) else None
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+UNIT_NOT_IN_WALK = "unit not in walk"
+#: walk_confirm.MOVE_NOT_IN_WALK: the device's handler answers by the next rule.
+MOVE_NOT_IN_WALK = "move_to_unit not in walk"
+
+
+def answer_units(walk_units_, unit, move_to_unit=None):
+    """(unit, move target or None, None) of an on-site answer, normalized, when
+    both are units of the walk (`walk_units_` = walk_units(...)); else
+    (None, None, why). The device's hop and the phone route both check here."""
+    u = normalize_unit(unit or "") if isinstance(unit, str) else None
+    if not u or u not in walk_units_:
+        return None, None, UNIT_NOT_IN_WALK
+    if not move_to_unit:
+        return u, None, None
+    target = normalize_unit(move_to_unit) if isinstance(move_to_unit, str) else None
+    if not target or target not in walk_units_:
+        return None, None, MOVE_NOT_IN_WALK
+    return u, target, None
+
+
 def _opens_a_walk(window):
     """The opening names two or more units or counts two or more. One name is
     an ordinary check (R8), so it opens nothing."""

@@ -241,3 +241,100 @@ def test_walk_companies_are_the_walks_windows_for_that_folder_and_day(db):
     assert iw.walk_companies(db, FOLDER, DATE, "wk-other") == []          # not this folder
     assert iw.walk_companies(db, "Someone_Else", DATE, "wk-other") == [str(other)]
 
+
+
+# ---- Task 12: the phone settles a walk (org-api routes over real SQL) --------------
+
+import io  # noqa: E402
+
+import lambda_org_api as org  # noqa: E402
+
+
+class _NoCommit:
+    """The request connection, minus commit: the test's work is rolled back after it."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self):
+        pass
+
+
+def test_the_walks_report_row_is_read_in_its_folders_day_only(db):
+    cid, _, tid = _setup(db)
+    key = units.walk_key(cid, FOLDER, DATE, tid, "10:00:00")
+    walk = {"name": "pre-line", "template_id": tid, "start_at": "10:00:00", "end_at": "10:20:00",
+            "segments": S1, "walk_key": key, "parts": [("sidA", "10:00:00")]}
+    cr._record(db, cid, FOLDER, DATE, "sidA", walk, "Pre-line", "r1", "k1")
+    row = cr.for_walk(db, FOLDER, DATE, key)
+    assert (row["result_key"], row["walk_key"], row["session"]) == ("k1", key, "sidA")
+    assert row["created_at"] is not None
+    assert cr.for_walk(db, "Someone_Else", DATE, key) is None
+    assert cr.for_walk(db, FOLDER, "2026-11-04", key) is None
+
+
+def test_a_phone_answer_settles_its_item_on_the_open_list(db, monkeypatch):
+    cid, _, tid = _setup(db)
+    folder = "walk_%s" % uuid.uuid4().hex[:8]
+    uid = db.execute("INSERT INTO users (company_id, email, global_role, folder_name, cognito_sub) "
+                     "VALUES (%s, %s, 'worker', %s, %s) RETURNING id",
+                     (cid, "%s@example.test" % uuid.uuid4().hex, folder,
+                      "sub-%s" % folder)).fetchone()[0]
+    key = units.walk_key(cid, folder, DATE, tid, "10:00:00")
+    iw.replace_for_session(db, cid, folder, DATE, "sidA", [
+        _window("pre-line units 1 and 2", "10:00:00", tid, "10:20:00",
+                {"names": ["Unit 1", "Unit 2"], "count": 2}, [], key)])
+    result_key = "session_report_results/%s/%s/day/r1.json" % (folder, DATE)
+    cr._record(db, cid, folder, DATE, "sidA",
+               {"name": "pre-line", "template_id": tid, "start_at": "10:00:00",
+                "end_at": "10:20:00", "segments": S1, "walk_key": key,
+                "parts": [("sidA", "10:00:00")]}, "Pre-line", "r1", result_key)
+    # The report was queued a minute ago (one transaction here: now() would tie).
+    db.execute("UPDATE checklist_reports SET created_at = now() - interval '1 minute' "
+               "WHERE walk_key = %s", (key,))
+    stored = {"status": "done", "walk": {
+        "key": key, "conflicts": [], "unmatched_answers": [], "summary": None,
+        "units": [{"unit": u, "report": {"gaps": {"not_covered": [{"n": 1, "text": "Insulation"}],
+                                                  "failed": []}}}
+                  for u in ("Unit 1", "Unit 2")]}}
+
+    class S3:
+        def get_object(self, Bucket, Key):
+            assert Key == result_key
+            return {"Body": io.BytesIO(json.dumps(stored).encode())}
+
+    requeued = []
+    monkeypatch.setattr(org, "_resolve_org_media_folder", lambda conn, c, u, what="media": (u, None))
+    monkeypatch.setattr(org, "_own_rows_visible", lambda conn, c, f, d, rows, field="session": rows)
+    monkeypatch.setattr(org.scope, "visible_scope", lambda conn, c: {"self_folder": folder})
+    monkeypatch.setattr(org, "s3", lambda: S3())
+    monkeypatch.setattr(org.checklist_reports, "requeue_walk",
+                        lambda conn, co, f, d, k: requeued.append((co, f, d, k)) or "b" * 32)
+    caller = {"id": str(uid), "company_id": str(cid), "global_role": "worker",
+              "folder_name": folder}
+    q = {"queryStringParameters": {"user": folder}}
+    conn = _NoCommit(db)
+
+    res = org.get_walk_open_items(conn, caller, DATE, key, q)
+    assert res["statusCode"] == 200
+    assert [len(u["items"]) for u in json.loads(res["body"])["units"]] == [1, 1]
+
+    res = org.post_walk_answer(conn, caller, DATE, key, dict(q, body=json.dumps(
+        {"unit": "unit 2", "item_text": "insulation", "answer": "N/A"})))
+    assert res["statusCode"] == 201, res["body"]
+    saved = db.execute("SELECT company_id, unit, item_text, answer, source, answered_by "
+                       "FROM walk_answers WHERE walk_key = %s", (key,)).fetchall()
+    assert saved == [(cid, "Unit 2", "Insulation", "N/A", "phone", uid)]
+    assert requeued == [(str(cid), folder, DATE, key)]
+
+    res = org.get_walk_open_items(conn, caller, DATE, key, q)
+    assert json.loads(res["body"])["units"] == [
+        {"unit": "Unit 1", "items": [{"item_text": "Insulation", "kind": "not_checked",
+                                      "comment": ""}]},
+        {"unit": "Unit 2", "items": []}]
+
+    # Another folder's day never reaches this walk.
+    res = org.get_walk_open_items(conn, caller, DATE, key, {"queryStringParameters": {"user": "X"}})
+    assert res["statusCode"] == 404

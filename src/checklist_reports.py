@@ -424,6 +424,18 @@ def for_day(conn, company_id, folder, date):
          folder, date)).fetchall()
 
 
+def for_walk(conn, folder, date, walk_key):
+    """Walk `walk_key`'s report row in this folder's day (one per walk,
+    uq_checklist_reports_walk), or None. Never by walk_key alone: the folder
+    and day are the ones the caller was authorized for. `created_at` is when
+    it was last queued -- answers written after it are not in its result."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, company_id, session, template_id, start_at, request_id, result_key, "
+        "walk_key, created_at FROM checklist_reports "
+        "WHERE walk_key = %s AND user_folder = %s AND report_date = %s",
+        (walk_key, folder, date)).fetchone()
+
+
 def recent_for_folder(conn, company_id, folder, since_date):
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, report_date, session, template_id, template_name, check_name, start_at, "

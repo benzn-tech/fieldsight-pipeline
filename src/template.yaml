@@ -3499,6 +3499,9 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource:
+                # Also GET /days/{date}/inspections/walks/{walkKey}/open (multi-unit walks,
+                # Task 12): the walk report's result. Its 404 passthrough is the
+                # session_report_results/* entry on the ListBucket grant above.
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_rolling/*

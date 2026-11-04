@@ -1950,7 +1950,7 @@ def _backfill_walks(conn, company_id, user_folder, date, session, rows):
             logger.exception("walk back-fill failed for %s/%s %s", user_folder, date, session)
 
 
-_WALK_KEY_RE = re.compile(r"^walk:[0-9a-f]{40}$")
+_WALK_KEY_RE = units.WALK_KEY_RE
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 

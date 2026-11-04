@@ -51,11 +51,11 @@ logger.setLevel(logging.INFO)
 
 SESSION_WINDOW_S = 300
 
-WALK_KEY_RE = re.compile(r"^walk:[0-9a-f]{40}$")
+WALK_KEY_RE = units_mod.WALK_KEY_RE
 HMS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 ANSWERS = ("Yes", "No", "N/A")
 #: walk_confirm.MOVE_NOT_IN_WALK: the device's handler answers by the next rule.
-MOVE_NOT_IN_WALK = "move_to_unit not in walk"
+MOVE_NOT_IN_WALK = units_mod.MOVE_NOT_IN_WALK
 MAX_QUOTE = 4000
 MAX_COMMENT = 2000
 
@@ -180,30 +180,6 @@ def _write_walk_answer(event):
     return _jsonable(out)
 
 
-def _walk_units(opening, rows):
-    """The walk's units: the opening's names, then every unit entered in any of
-    its windows, normalized (units.normalize_unit). "Kitchen" is not a unit."""
-    out = []
-    opened = opening.get("units") if isinstance(opening.get("units"), dict) else {}
-    marks = [m.get("unit") for r in rows for m in r.get("entered") or [] if isinstance(m, dict)]
-    for raw in list(opened.get("names") or []) + marks:
-        u = units_mod.normalize_unit(raw) if isinstance(raw, str) else None
-        if u and u not in out:
-            out.append(u)
-    return out
-
-
-def _checklist_item(body, item_text):
-    """The template's own wording of `item_text` (every checklist section of the
-    template, sub-sections included), or None."""
-    want = " ".join(str(item_text).split()).casefold()
-    for items in checklist.checklist_sections(body).values():
-        for i in items:
-            if " ".join(str(i).split()).casefold() == want:
-                return str(i)
-    return None
-
-
 def write_walk_answer(conn, event):
     """Check, then write one walk_answers row. Returns the saved facts or
     {"error": ...}; nothing is written unless every check passes."""
@@ -240,34 +216,19 @@ def write_walk_answer(conn, event):
 
     # The opening is the window whose start gives the key; its company is the
     # walk's (R22). A walk with no such window and one company is that company's.
-    opening, company = None, None
-    for r in rows:
-        if r.get("template_id") and units_mod.walk_key(
-                str(r["company_id"]), folder, str(r.get("report_date"))[:10],
-                str(r["template_id"]), r.get("start_at")) == key:
-            opening, company = r, str(r["company_id"])
-            break
+    opening, company = units_mod.walk_opening(rows, folder, key)
     if opening is None:
-        companies = {str(r["company_id"]) for r in rows}
-        if len(companies) != 1:
-            return {"error": "walk company unclear"}
-        opening = next((r for r in rows if r.get("template_id")), rows[0])
-        company = companies.pop()
+        return {"error": "walk company unclear"}
     date = str(opening.get("report_date"))[:10]
 
-    walk_units = _walk_units(opening, rows)
-    unit = units_mod.normalize_unit(event.get("unit") or "")
-    if not unit or unit not in walk_units:
-        return {"error": "unit not in walk"}
-    target = None
-    if move:
-        target = units_mod.normalize_unit(move)
-        if not target or target not in walk_units:
-            return {"error": MOVE_NOT_IN_WALK}
+    unit, target, why = units_mod.answer_units(units_mod.walk_units(opening, rows),
+                                               event.get("unit"), move)
+    if why:
+        return {"error": why}
 
     version = (report_templates.get_version(conn, opening["template_id"], None)
                if opening.get("template_id") else None)
-    item = _checklist_item((version or {}).get("body") or {}, event.get("item_text") or "")
+    item = checklist.item_in((version or {}).get("body") or {}, event.get("item_text") or "")
     if item is None:
         return {"error": "item not in checklist"}
 
