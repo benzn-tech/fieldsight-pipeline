@@ -58,6 +58,7 @@ import batch_stitch
 import chunk_stitch
 import self_introduction
 import status_suggestions
+import units
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
@@ -1075,8 +1076,34 @@ def clean_inspections(raw):
                     'start_quote': str(m.get('start_quote') or '')[:300],
                     'end_at': str(end)[:5] if end else None,
                     'end_quote': str(m.get('end_quote') or '')[:300] if end else None,
-                    'resumed': resumed})
+                    'resumed': resumed,
+                    'units': _opening_units(m),
+                    'entered': _clean_entered(m.get('entered'))})
     return out
+
+
+def _opening_units(m):
+    """The units the opening names, or the count he gave (multi-unit walks,
+    spec 2026-11-03) -- normalized in units.py, the one place a unit is read."""
+    names = m.get('units_named')
+    names = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+    return units.opening_units(names, m.get('unit_count'))
+
+
+def _clean_entered(raw):
+    """Each moment he walked INTO a unit: [{unit, at, quote}], at most 40. A
+    mark with no time, or whose unit is not a prefix and a number ("Kitchen"),
+    is dropped -- it could only open a unit nobody can name."""
+    out = []
+    for e in (raw if isinstance(raw, list) else []):
+        if not isinstance(e, dict) or not e.get('at'):
+            continue
+        unit = units.normalize_unit(e.get('unit'))
+        if unit is None:
+            continue
+        out.append({'unit': unit, 'at': str(e['at'])[:5],
+                    'quote': str(e.get('quote') or '')[:300]})
+    return out[:40]
 
 
 def time_inspections(items, turns):
@@ -1116,6 +1143,11 @@ def time_inspections(items, turns):
             m['end_at_s'] = timed(m['end_at'], m.get('end_quote'))
             said = _clock_s(m['end_at_s'] or m['end_at'])
         m['resumed'] = [dict(r, at_s=timed(r['at'], r.get('quote'))) for r in m.get('resumed') or []]
+        if 'entered' in m:
+            # Same stream and tolerance as the markers; an unfound quote keeps
+            # its minute and has no at_s (units.unit_stretches reads either).
+            m['entered'] = [(_time_one_marker(e, stream) if stream else None) or e
+                            for e in m['entered']]
         opens = [_clock_s(m['start_at_s'] or m['start_at'])] + \
             [_clock_s(r['at_s'] or r['at']) for r in m['resumed']]
         checks.append((m, said, sorted({o for o in opens if o is not None})))
@@ -1261,6 +1293,13 @@ EXTRACTION_SCHEMA = """{
       "resumed": [
         {"at": "HH:MM  (when he came BACK to this check after another one)",
          "quote": "those words, verbatim"}
+      ],
+      "units_named": ["every unit the opening names for a walk through several units, e.g. Lot 150, Lot 151; else []"],
+      "unit_count": "the number of units when he gives only a count, else null",
+      "entered": [
+        {"at": "HH:MM  (when he walked INTO the unit)",
+         "unit": "the unit, e.g. Unit 2 / Lot 167 / Room 102",
+         "quote": "those words, verbatim"}
       ]
     }
   ],
@@ -1391,6 +1430,13 @@ def _instructions_block():
    - Do NOT record a check only discussed, planned or described ("we need the fire stopping
      inspection next week", "this is how an inspection works"). An empty array is the normal
      answer for a meeting.
+   - UNITS. units_named lists every unit the opening names, a range expanded (Lot 150 to 154 is
+     Lot 150, Lot 151, ... Lot 154); unit_count is the number when he gives only a count. entered
+     lists each moment he walks INTO a unit (Unit 2, Lot 167, Room 102), not a unit he only mentions.
+     units_named is only for an opening that names units for a walk through several units --
+     an ordinary check in one room leaves it empty and unit_count null. "Back to Unit 2, forgot
+     the nogs" or "next door Unit 5 is the same" is not entering it. Most checks have no
+     entered marks; [] is the normal answer.
 1. Split the transcript into topics BY SUBJECT -- one topic per distinct subject or work item.
    - Start a NEW topic whenever the conversation moves to a genuinely DIFFERENT subject (a
      different work item, trade, location, or concern) -- even if only a minute passes, even if the

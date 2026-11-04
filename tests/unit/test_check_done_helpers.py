@@ -244,3 +244,50 @@ def test_a_named_check_that_matches_nothing_is_no_template_even_with_a_live_wind
     windows = [{"template_id": "t-pp", "start_at": "10:30:00"}]
     tpl, window, closest = cd.choose_template("scaffold check done", [STEEL, PREPOUR], windows)
     assert tpl is None and window is None and closest
+
+
+def test_the_phones_open_list_is_the_final_checks_questions_from_a_stored_report():
+    """open_from_result (Task 12): rows rebuilt from a stored walk report;
+    answers queued with it decide who settled a No, later ones are laid over."""
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 11, 4, 9, 0, tzinfo=timezone.utc)
+    items = ["Insulation", "Wrap", "Flashings"]
+
+    def unit(name, nc=(), failed=()):
+        return {"unit": name, "report": {"gaps": {
+            "not_covered": [{"n": items.index(t) + 1, "text": t} for t in nc],
+            "failed": [{"n": items.index(t) + 1, "text": t, "comment": "c"} for t in failed]}}}
+
+    stored = {"units": [unit("Unit 1", nc=["Flashings"], failed=["Wrap"]),
+                        unit("Unit 2", failed=["Wrap", "Insulation"])],
+              "conflicts": []}
+    answers = [{"unit": "Unit 2", "item_text": "wrap", "answer": "No", "move_to_unit": None,
+                "created_at": t0 - timedelta(minutes=1)},                 # decided on site
+               {"unit": "Unit 2", "item_text": "Insulation", "answer": "Yes",
+                "move_to_unit": None, "created_at": t0 + timedelta(minutes=1)}]   # since
+    assert cd.open_from_result(stored, items, answers, t0) == [
+        {"unit": "Unit 1", "items": [
+            {"item_text": "Flashings", "kind": "not_checked", "comment": ""},
+            {"item_text": "Wrap", "kind": "confirm_no", "comment": "c"}]},
+        {"unit": "Unit 2", "items": []}]
+
+
+def test_the_phones_open_list_from_a_final_checks_stored_questions():
+    """open_from_questions (R41): every walk unit in order, the questions as the
+    device was given them, and only answers after the final check laid over."""
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 11, 4, 9, 0, tzinfo=timezone.utc)
+    items = ["Insulation", "Wrap"]
+    questions = [{"kind": "not_checked", "unit": "Unit 2", "item_text": "Insulation", "comment": ""},
+                 {"kind": "confirm_no", "unit": "Unit 2", "item_text": "Wrap", "comment": "torn"},
+                 {"kind": "not_checked", "unit": "Lot 9", "item_text": "Wrap", "comment": ""}]
+    answers = [{"unit": "Unit 2", "item_text": "Insulation", "answer": "Yes", "move_to_unit": None,
+                "created_at": t0 - timedelta(seconds=1)},               # before: already in it
+               {"unit": "Unit 2", "item_text": "wrap", "answer": None, "move_to_unit": "Unit 1",
+                "created_at": t0 + timedelta(seconds=1)}]               # after: the No was Unit 1's
+    assert cd.open_from_questions(questions, ["Unit 1", "Unit 2"], items, answers, t0) == [
+        {"unit": "Unit 1", "items": []},
+        {"unit": "Unit 2", "items": [
+            {"item_text": "Insulation", "kind": "not_checked", "comment": ""},
+            {"item_text": "Wrap", "kind": "not_checked", "comment": ""}]},
+        {"unit": "Lot 9", "items": [{"item_text": "Wrap", "kind": "not_checked", "comment": ""}]}]

@@ -157,3 +157,28 @@ def test_the_removed_announcement_texts_never_reach_our_log(caplog):
         root.info("check_gaps status=%s", "ok")
     assert "Photo captured" not in caplog.text
     assert "check_gaps status=ok" in caplog.text
+
+
+# ---- R42: the final check's questions are stored fire-and-forget ----------------
+
+def test_the_handler_wires_the_final_check_store_as_an_event_invoke(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(h.check_done, "run", lambda event, **kw: seen.update(kw) or {"status": "ok"})
+    h.lambda_handler({"caller_sub": "s", "pressed_at": 1}, None)
+    assert seen["store_final_check"] is h.store_final_check
+    assert seen["db_hop"] is h.db_hop
+
+    monkeypatch.setattr(h, "CHECK_GAPS_DB_FUNCTION", "db-fn")
+    fake = FakeLambda()
+    monkeypatch.setattr(h, "_get_lambda", lambda: fake)
+    payload = {"action": "store_final_check", "caller_sub": "s", "walk_key": "walk:" + "a" * 40,
+               "questions": []}
+    assert h.store_final_check(payload) is None                  # never waits for an answer
+    assert fake.calls == [{"FunctionName": "db-fn", "InvocationType": "Event",
+                           "Payload": json.dumps(payload)}]
+
+
+def test_the_final_check_store_without_a_db_function_raises_for_the_caller_to_log(monkeypatch):
+    monkeypatch.setattr(h, "CHECK_GAPS_DB_FUNCTION", "")
+    with pytest.raises(RuntimeError):
+        h.store_final_check({"action": "store_final_check"})

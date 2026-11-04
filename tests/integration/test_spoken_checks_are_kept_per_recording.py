@@ -86,3 +86,45 @@ def test_a_checklist_report_is_recorded_once_and_listed(db):
     day = cr.for_day(db, cid, FOLDER, DATE)
     assert [(r["request_id"], r["end_at"], r["segments"]) for r in day] == [("r2", "11:03:21", segs)]
     assert [r["request_id"] for r in cr.recent_for_folder(db, cid, FOLDER, "2026-10-01")] == ["r2"]
+
+
+def test_two_recordings_of_one_walk_share_one_walk_key(db):
+    import lambda_item_writer as lam
+    cid, uid, tid = _setup(db)
+    opening = {"name": "pre-pour lots", "kind": "pre-pour", "start_at": "10:00",
+               "start_at_s": "10:00:04", "end_at": "10:20", "end_at_s": "10:20:00",
+               "end_source": "recording_stop", "start_quote": "q",
+               "units": {"names": ["Lot 150", "Lot 151", "Lot 152"], "count": 3}}
+    later = {"name": "pre-pour", "kind": "pre-pour", "start_at": "11:00",
+             "start_at_s": "11:00:09", "end_at": None, "end_source": "recording_stop",
+             "start_quote": "q"}
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidA", [opening])
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidB", [later])
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidA", [opening])   # re-extracted
+    day = iw.for_day(db, cid, FOLDER, DATE)
+    keys = [r["walk_key"] for r in day]
+    assert [r["session"] for r in day] == ["sidA", "sidB"]
+    assert keys[0] and keys[0] == keys[1]
+    assert [w["walk_key"] for w in iw.open_walks(db, cid, FOLDER, DATE, tid)] == keys
+
+
+def test_a_walk_extracted_after_its_later_recording_still_claims_it(db):
+    """R13: B (no opening, 10:30) is extracted before A (the opening, 10:00)."""
+    import lambda_item_writer as lam
+    cid, uid, tid = _setup(db)
+    opening = {"name": "pre-pour lots", "kind": "pre-pour", "start_at": "10:00",
+               "start_at_s": "10:00:00", "end_source": "recording_stop", "start_quote": "q",
+               "units": {"names": ["Lot 150", "Lot 151"], "count": 2}}
+    later = {"name": "pre-pour", "kind": "pre-pour", "start_at": "10:30",
+             "start_at_s": "10:30:00", "end_source": "recording_stop", "start_quote": "q"}
+    earlier = dict(later, start_at="09:30", start_at_s="09:30:00")
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidB", [later])
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidC", [earlier])
+    assert [r["walk_key"] for r in iw.for_day(db, cid, FOLDER, DATE)] == [None, None]
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidA", [opening])
+    day = {r["session"]: r["walk_key"] for r in iw.for_day(db, cid, FOLDER, DATE)}
+    import units
+    key = units.walk_key(cid, FOLDER, DATE, tid, "10:00:00")
+    assert day == {"sidA": key, "sidB": key, "sidC": None}, "a check before the opening is not his walk"
+    other, ouid, otid = _setup(db)
+    assert iw.backfill_walk(db, other, FOLDER, DATE, otid, "09:00:00", "walk:x", "sidZ") == 0
