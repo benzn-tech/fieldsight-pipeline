@@ -211,6 +211,65 @@ def test_auto_generate_queues_one_report_for_a_walk_over_two_recordings(db):
     assert [(r[0], r[3]) for r in _reports(db, cid)] == [("sidA", "r2")]   # the opening's recording
 
 
+def test_r47_an_opening_extracted_after_a_self_keyed_later_recording_makes_one_walk(db):
+    """I1: B (13:00, no opening, enters Units 3 and 4) is extracted first and
+    keys itself; then A (10:00, "pre-line units 1 to 4") is extracted. One
+    key, one report."""
+    import lambda_item_writer as lam
+    cid, uid, tid = _setup(db)
+    folder = "walk_%s" % uuid.uuid4().hex[:8]
+    db.execute("INSERT INTO users (company_id, email, global_role, folder_name, cognito_sub) "
+               "VALUES (%s, %s, 'gm', %s, %s)",
+               (cid, "%s@example.test" % uuid.uuid4().hex, folder, "sub-%s" % folder))
+    a = {"name": "pre-line units 1 to 4", "kind": "pre-line", "start_at": "10:00",
+         "start_at_s": "10:00:00", "end_at": "10:20", "end_at_s": "10:20:00",
+         "end_source": "said", "start_quote": "q",
+         "units": {"names": ["Unit 1", "Unit 2", "Unit 3", "Unit 4"], "count": 4},
+         "entered": [{"unit": "Unit 1", "at": "10:01", "at_s": "10:01:00", "quote": "unit one"},
+                     {"unit": "Unit 2", "at": "10:10", "at_s": "10:10:00", "quote": "unit two"}]}
+    b = {"name": "pre-line", "kind": "pre-line", "start_at": "13:00", "start_at_s": "13:00:00",
+         "end_at": "13:15", "end_at_s": "13:15:00", "end_source": "said", "start_quote": "q",
+         "entered": [{"unit": "Unit 3", "at": "13:01", "at_s": "13:01:00", "quote": "unit three"},
+                     {"unit": "Unit 4", "at": "13:08", "at_s": "13:08:00", "quote": "unit four"}]}
+    calls = []
+
+    def generate(conn, caller, date, event):
+        calls.append(json.loads(event["body"]))
+        return {"statusCode": 202, "body": json.dumps({"requestId": "r%d" % len(calls)})}
+
+    rows_b = lam._store_inspections(db, cid, uid, folder, DATE, "sidB", [b])
+    key_b = units.walk_key(cid, folder, DATE, tid, "13:00:00")
+    assert [r["walk_key"] for r in rows_b] == [key_b]               # keyed itself
+    cr.auto_generate(db, cid, folder, DATE, "sidB", rows_b, generate=generate)
+    assert [r[4] for r in _reports(db, cid)] == [key_b]
+
+    rows_a = lam._store_inspections(db, cid, uid, folder, DATE, "sidA", [a])
+    key_a = units.walk_key(cid, folder, DATE, tid, "10:00:00")
+    assert {r["session"]: r["walk_key"] for r in iw.for_day(db, cid, folder, DATE)} == {
+        "sidA": key_a, "sidB": key_a}
+    cr.auto_generate(db, cid, folder, DATE, "sidA", rows_a, generate=generate)
+    assert [r[4] for r in _reports(db, cid)] == [key_a], "one walk, one report"
+    assert calls[-1]["walk"]["key"] == key_a
+    assert [m["unit"] for m in calls[-1]["walk"]["entered"]] == ["Unit 1", "Unit 2", "Unit 3",
+                                                                 "Unit 4"]
+
+
+def test_r47_a_walk_with_its_own_opening_is_never_reclaimed(db):
+    """A later recording that OPENS its own walk keeps it."""
+    import lambda_item_writer as lam
+    cid, uid, tid = _setup(db)
+    later = {"name": "pre-line units 5 and 6", "kind": "pre-line", "start_at": "13:00",
+             "start_at_s": "13:00:00", "end_source": "recording_stop", "start_quote": "q",
+             "units": {"names": ["Unit 5", "Unit 6"], "count": 2}}
+    first = dict(later, name="pre-line units 1 and 2", start_at="10:00", start_at_s="10:00:00",
+                 units={"names": ["Unit 1", "Unit 2"], "count": 2})
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidB", [later])
+    lam._store_inspections(db, cid, uid, FOLDER, DATE, "sidA", [first])
+    day = {r["session"]: r["walk_key"] for r in iw.for_day(db, cid, FOLDER, DATE)}
+    assert day == {"sidA": units.walk_key(cid, FOLDER, DATE, tid, "10:00:00"),
+                   "sidB": units.walk_key(cid, FOLDER, DATE, tid, "13:00:00")}
+
+
 def test_a_walk_that_turns_back_into_a_plain_check_loses_its_walk_key(db):
     """Re-extraction finds no walk any more: the plain upsert lands on the walk
     row's (session, template, start) and must not leave it tagged as a walk."""

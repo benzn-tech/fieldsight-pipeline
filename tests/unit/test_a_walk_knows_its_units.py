@@ -278,7 +278,7 @@ def test_a_later_window_of_the_same_recording_continues_its_walk(monkeypatch):
     monkeypatch.setattr(lam.inspection_windows, "checklist_templates", lambda c, co, u: [tpl])
     monkeypatch.setattr(lam.inspection_match, "match", lambda w, ts: (tpl, 1.0))
     monkeypatch.setattr(lam.inspection_windows, "open_walks", lambda *a: [])
-    monkeypatch.setattr(lam.inspection_windows, "backfill_walk", lambda *a: 0, raising=False)
+    monkeypatch.setattr(lam.inspection_windows, "backfill_walk", lambda *a, **k: 0, raising=False)
     monkeypatch.setattr(lam.inspection_windows, "replace_for_session",
                         lambda c, co, f, d, s, rows: stored.update(rows=rows))
 

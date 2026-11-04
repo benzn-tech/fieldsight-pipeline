@@ -103,19 +103,21 @@ def _record_walk(conn, company_id, folder, date, session, w, tpl_name, request_i
     start_at), still applies to a walk row, and ON CONFLICT can name only one
     of the two. It fires when a window was an ordinary check's report before it
     became part of a walk: the same recording re-extracted, or a later recording
-    a walk claimed afterwards (R13). That report IS this walk's part, so it is
-    removed first. In a savepoint: a failure here costs this report's row, never
-    the extraction that called it."""
+    a walk claimed afterwards (R13), or the report of a walk the later recording
+    keyed itself before this walk's opening re-claimed it (R47). That report IS
+    this walk's part, so it is removed first -- an ordinary report or another
+    walk key's, never this walk's own row. In a savepoint: a failure here costs
+    this report's row, never the extraction that called it."""
     with conn.transaction():
         for part_session, part_start in w.get("parts") or []:
             conn.execute(
-                "DELETE FROM checklist_reports WHERE walk_key IS NULL AND session = %s "
-                "AND template_id = %s AND start_at = %s",
-                (part_session, str(w["template_id"]), part_start))
+                "DELETE FROM checklist_reports WHERE (walk_key IS NULL OR walk_key <> %s) "
+                "AND session = %s AND template_id = %s AND start_at = %s",
+                (w["walk_key"], part_session, str(w["template_id"]), part_start))
         conn.execute(
-            "DELETE FROM checklist_reports WHERE walk_key IS NULL AND session = %s "
-            "AND template_id = %s AND start_at = %s",
-            (session, str(w["template_id"]), w["start_at"]))
+            "DELETE FROM checklist_reports WHERE (walk_key IS NULL OR walk_key <> %s) "
+            "AND session = %s AND template_id = %s AND start_at = %s",
+            (w["walk_key"], session, str(w["template_id"]), w["start_at"]))
         conn.execute(
             "INSERT INTO checklist_reports (company_id, user_folder, report_date, session, "
             "template_id, template_name, check_name, start_at, end_at, segments, request_id, "

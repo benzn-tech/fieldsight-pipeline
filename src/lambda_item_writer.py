@@ -1929,21 +1929,27 @@ def _assign_walks(conn, company_id, user_folder, date, session, rows):
 
 def _backfill_walks(conn, company_id, user_folder, date, session, rows):
     """R13: a recording that OPENS a walk may be extracted after a later
-    recording of the same walk, which found no walk and stored none. Each walk
-    this recording opens claims those later, keyless, opening-less windows.
-    The latest opening claims first, so an earlier walk never reaches past a
-    later one. After the windows are stored, in its own savepoint, and never
-    fatal: the windows are already kept."""
+    recording of the same walk, which found no walk and stored none -- or, by
+    entering two or more units, keyed a walk of its own (R47). Each walk this
+    recording opens claims those later, opening-less windows: the keyless
+    ones, and -- for a window with a spoken opening -- the self-keyed ones,
+    whole. The latest opening claims first, so an earlier walk never reaches
+    past a later one. After the windows are stored, in its own savepoint, and
+    never fatal: the windows are already kept."""
     if conn is None or company_id is None:
         return
     opened = [r for r in rows if r.get("walk_key") and r["walk_key"] == units.walk_key(
         company_id, user_folder, date, r["template_id"], r["start_at"])]
     for r in sorted(opened, key=lambda r: r["start_at"], reverse=True):
+        tid = r["template_id"]
+        self_key = ((lambda start, tid=tid: units.walk_key(company_id, user_folder, date, tid,
+                                                           start))
+                    if units._opens_a_walk(r) else None)
         try:
             with conn.transaction():
                 n = inspection_windows.backfill_walk(conn, company_id, user_folder, date,
-                                                     r["template_id"], r["start_at"],
-                                                     r["walk_key"], session)
+                                                     tid, r["start_at"], r["walk_key"],
+                                                     session, self_key=self_key)
             if n:
                 logger.info("walk %s claimed %d later window(s)", r["walk_key"], n)
         except Exception:  # noqa: BLE001 -- the windows are stored; only the back-fill is lost
