@@ -323,31 +323,84 @@ def test_before_any_report_it_is_not_ready(world):
     assert _get(world) == (404, {"error": "not ready", "status": "pending"})
 
 
-def test_while_the_new_report_is_written_the_previous_one_is_read(world):
-    """R37: a requeue moves the old result to previous_result_key. Until the new
-    result exists the list comes from the previous one, with every answer
-    given since THAT report was queued laid over it."""
-    prev_key = RESULT_KEY.replace("r1", "r0")
-    earlier = QUEUED - timedelta(minutes=10)
-    world["s3"].objects[prev_key] = _result(
-        [_unit("Unit 1", not_covered=["Insulation", "Window flashings"]), _unit("Unit 2")])
-    world["report"] = {"session": "sidA", "result_key": RESULT_KEY.replace("r1", "r9"),
-                       "created_at": QUEUED, "walk_key": KEY,
-                       "previous_result_key": prev_key, "previous_queued_at": earlier}
-    # given after the previous report was queued (and before the new one)
-    world["answers"] = [_answer("Unit 1", "Insulation", "Yes", at=earlier + timedelta(minutes=1))]
+def _key(n):
+    return RESULT_KEY.replace("r1", n)
+
+
+def _iso(t):
+    return t.isoformat()                       # as jsonb_build_object writes a timestamptz
+
+
+def test_two_quick_answers_still_read_the_last_finished_report(world):
+    """R39: each requeue prepends the result it replaces, written or not. Two
+    answers before the first new result lands: the current result and the
+    newest previous one are unwritten, and the list comes from the last
+    finished one, with every answer since IT was queued laid over it."""
+    t0 = QUEUED - timedelta(minutes=10)
+    world["s3"].objects = {_key("r0"): _result(
+        [_unit("Unit 1", not_covered=["Insulation", "Window flashings"]), _unit("Unit 2")])}
+    world["report"] = {"session": "sidA", "result_key": _key("r9"), "created_at": QUEUED,
+                       "walk_key": KEY,
+                       "previous_results": [{"key": _key("r8"), "queued_at": _iso(t0 + timedelta(minutes=1))},
+                                            {"key": _key("r0"), "queued_at": _iso(t0)}]}
+    world["answers"] = [_answer("Unit 1", "Insulation", "Yes", at=t0 + timedelta(seconds=30)),
+                        _answer("Unit 2", "Insulation", "No", at=t0 + timedelta(minutes=2))]
     status, body = _get(world)
     assert status == 200
-    assert body["units"][0] == {"unit": "Unit 1", "items": [
-        {"item_text": "Window flashings", "kind": "not_checked", "comment": ""}]}
-    # neither written: not ready
-    del world["s3"].objects[prev_key]
+    assert body["units"] == [
+        {"unit": "Unit 1", "items": [
+            {"item_text": "Window flashings", "kind": "not_checked", "comment": ""}]},
+        {"unit": "Unit 2", "items": []}]
+    assert world["s3"].reads == [_key("r9"), _key("r8"), _key("r0")]
+
+
+def test_a_failed_newest_report_falls_back_to_the_previous_finished_one(world):
+    world["s3"].objects = {_key("r9"): {"status": "error", "error": "x"},
+                           _key("r0"): _result([_unit("Unit 1", not_covered=["Insulation"])])}
+    world["report"] = {"session": "sidA", "result_key": _key("r9"), "created_at": QUEUED,
+                       "walk_key": KEY,
+                       "previous_results": [{"key": _key("r0"),
+                                             "queued_at": _iso(QUEUED - timedelta(minutes=5))}]}
+    status, body = _get(world)
+    assert status == 200
+    assert body["units"][0]["items"] == [
+        {"item_text": "Insulation", "kind": "not_checked", "comment": ""}]
+
+
+def test_none_finished_is_not_ready_with_the_newest_status(world):
+    world["s3"].objects = {_key("r8"): {"status": "error", "error": "x"}}
+    world["report"] = {"session": "sidA", "result_key": _key("r9"), "created_at": QUEUED,
+                       "walk_key": KEY,
+                       "previous_results": [{"key": _key("r8"), "queued_at": _iso(QUEUED)}]}
     assert _get(world) == (404, {"error": "not ready", "status": "pending"})
-    # a previous key outside the folder's day is never read
-    world["s3"].reads.clear()
-    world["report"]["previous_result_key"] = "session_report_results/Other/%s/day/r0.json" % DATE
+    world["report"]["previous_results"] = None
+    assert _get(world) == (404, {"error": "not ready", "status": "pending"})
+
+
+def test_at_most_five_previous_results_are_read_and_never_outside_the_day(world):
+    old = [{"key": _key("p%d" % i), "queued_at": _iso(QUEUED - timedelta(minutes=i))}
+           for i in range(1, 7)]
+    old[1]["key"] = "session_report_results/Other/%s/day/p2.json" % DATE
+    world["s3"].objects = {_key("p6"): _result([_unit("Unit 1")])}     # only the 6th is done
+    world["report"] = {"session": "sidA", "result_key": _key("r9"), "created_at": QUEUED,
+                       "walk_key": KEY, "previous_results": old}
     assert _get(world)[0] == 404
-    assert world["s3"].reads == [RESULT_KEY.replace("r1", "r9")]
+    assert world["s3"].reads == [_key("r9"), _key("p1"), _key("p3"), _key("p4"), _key("p5")]
+
+
+def test_an_item_of_the_reports_template_version_may_be_answered(world):
+    """The phone shows the items of the version the stored report used; the
+    POST must take them even when the current version dropped one."""
+    world["bodies"][1] = {"sections": [{"key": "c", "title": "Pre-line", "kind": "checklist",
+                                        "items": ["Insulation", "Old item"]}]}
+    res = _result([_unit("Unit 1")])
+    res["templateVersion"] = 1
+    world["s3"].objects[RESULT_KEY] = res
+    status, body = _post(world, {"unit": "Unit 1", "item_text": "old ITEM", "answer": "Yes"})
+    assert status == 201, body
+    assert world["added"][0]["item_text"] == "Old item"
+    assert _post(world, {"unit": "Unit 1", "item_text": "Roof", "answer": "Yes"}) == (
+        400, {"error": "item not in checklist"})
 
 
 def test_the_items_are_the_template_version_the_report_used(world):

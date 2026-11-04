@@ -5359,6 +5359,42 @@ def _walk_result(folder, date, result_key):
     return json.loads(obj["Body"].read().decode("utf-8")), None
 
 
+def _queued_at(value):
+    """A previous_results entry's queued_at (jsonb text) as a datetime, or None."""
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_walk_result(folder, date, key, rep):
+    """(result, queued_at, newest status) of walk `key`: the first finished
+    result (status done, its `walk` this walk's) among the row's current
+    result and then its previous_results, newest first, at most
+    checklist_reports.PREVIOUS_RESULTS_KEPT (R39) -- with when THAT one was
+    queued. (None, None, status) when none finished; the status is the current
+    result's (pending / error / done without a walk), None when its key is not
+    under the folder's day."""
+    candidates = [(rep.get("result_key"), rep.get("created_at"))]
+    for p in (rep.get("previous_results") or [])[:checklist_reports.PREVIOUS_RESULTS_KEPT]:
+        if isinstance(p, dict) and p.get("key"):
+            candidates.append((p["key"], _queued_at(p.get("queued_at"))))
+    newest = None
+    for i, (result_key, queued_at) in enumerate(candidates):
+        if i and queued_at is None:
+            continue                       # no queue time: its answers cannot be laid over
+        result, missing = _walk_result(folder, date, result_key)
+        if i == 0:
+            newest = missing if result is None else (result.get("status") or "pending")
+        stored = (result or {}).get("walk")
+        if result is not None and result.get("status") == "done" and isinstance(stored, dict) \
+                and stored.get("key") == key:
+            return result, queued_at, newest
+    return None, None, newest
+
+
 def get_walk_open_items(conn, caller, date, key, event):
     """GET /api/org/days/{date}/inspections/walks/{walkKey}/open?user= -- the
     walk's open items per unit, for the phone: {"walkKey", "units": [{"unit",
@@ -5367,9 +5403,10 @@ def get_walk_open_items(conn, caller, date, key, event):
 
     From the LATEST walk report (its checklist_reports row -> result_key -> the
     stored `walk`), with the answers given since it was queued laid over it.
-    While a re-queued report is still being written, from the one it replaced
-    (previous_result_key, R37), with every answer since THAT one was queued.
-    404 {"error": "not ready"} when neither is there -- and the device's
+    While a re-queued report is still being written, or when it failed, from
+    the newest finished one it replaced (previous_results, R39), with every
+    answer since THAT one was queued. 404 {"error": "not ready"} when none
+    finished -- and the device's
     final-check list is what the phone shows (Task 13). Items are the template
     version the report was written with (`templateVersion`), else the current."""
     walk, err = _phone_walk(conn, caller, date, key, event)
@@ -5381,21 +5418,14 @@ def get_walk_open_items(conn, caller, date, key, event):
         rep = None
     if not rep:
         return error("not ready", 404)
-    result, status = _walk_result(folder, date, rep.get("result_key"))
-    queued_at = rep.get("created_at")
-    if result is None and status == "pending" and rep.get("previous_result_key"):
-        previous, _ = _walk_result(folder, date, rep["previous_result_key"])
-        if previous is not None and previous.get("status") == "done":
-            result, queued_at = previous, rep.get("previous_queued_at")
+    result, queued_at, status = _latest_walk_result(folder, date, key, rep)
     if result is None:
         if status is None:
             logger.warning("walk %s: its report result is not under its folder's day -- not read",
                            key)
             return error("not ready", 404)
         return error("not ready", 404, {"status": status})
-    stored = result.get("walk") if isinstance(result.get("walk"), dict) else None
-    if result.get("status") != "done" or not stored or stored.get("key") != key:
-        return error("not ready", 404, {"status": result.get("status") or "pending"})
+    stored = result["walk"]
     found = walk_report.the_checklist(_walk_template_body(conn, walk, _result_version(result)))
     answers = walk_answers.for_walk(conn, walk["companies"], key)
     units_open = check_done.open_from_result(stored, found[1] if found else [], answers,
@@ -5426,6 +5456,24 @@ def _requeue_after_answer(conn, walk):
     return queued
 
 
+def _answerable_item(conn, caller, walk, item_text):
+    """The template's wording of `item_text`: from the current version, else
+    from the version the latest finished walk report used -- the items GET
+    /open shows -- or None."""
+    item = checklist.item_in(_walk_template_body(conn, walk), item_text)
+    if item is not None:
+        return item
+    folder, date = walk["folder"], walk["date"]
+    rep = checklist_reports.for_walk(conn, folder, date, walk["key"])
+    if not rep or not _own_rows_visible(conn, caller, folder, date, [rep]):
+        return None
+    result, _, _ = _latest_walk_result(folder, date, walk["key"], rep)
+    version = _result_version(result) if result else None
+    if version is None:
+        return None
+    return checklist.item_in(_walk_template_body(conn, walk, version), item_text)
+
+
 def post_walk_answer(conn, caller, date, key, event):
     """POST /api/org/days/{date}/inspections/walks/{walkKey}/answers?user= --
     body {"unit", "item_text", "answer": "Yes" | "No" | "N/A" | null,
@@ -5434,8 +5482,9 @@ def post_walk_answer(conn, caller, date, key, event):
     walker only (R38) -- in the walk's company (R22); then the walk report
     queued again (R17). The unit and move target must be units of the walk and
     the item an item of its checklist -- the device hop's checks
-    (units.answer_rule, units.answer_units, checklist.item_in). `asked_kind` is
-    the question answered (R36), not_checked when absent.
+    (units.answer_rule, units.answer_units, checklist.item_in -- of the current
+    template version or the one the latest stored walk report used).
+    `asked_kind` is the question answered (R36), not_checked when absent.
     201 {"status": "saved", "id", "walkKey", "requeued"}."""
     walk, err = _phone_walk(conn, caller, date, key, event)
     if err is not None:
@@ -5467,7 +5516,7 @@ def post_walk_answer(conn, caller, date, key, event):
                                                body.get("unit"), move)
     if why:
         return error(why, 400)
-    item = checklist.item_in(_walk_template_body(conn, walk), body.get("item_text") or "")
+    item = _answerable_item(conn, caller, walk, body.get("item_text") or "")
     if item is None:
         return error("item not in checklist", 400)
 

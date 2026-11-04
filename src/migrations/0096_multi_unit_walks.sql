@@ -12,10 +12,10 @@ ALTER TABLE inspection_windows ADD COLUMN IF NOT EXISTS walk_key text;   -- NULL
 ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS walk_key text;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_checklist_reports_walk
   ON checklist_reports (walk_key) WHERE walk_key IS NOT NULL;
--- Re-queueing a walk replaces its result_key; the result it replaces, and when
--- that one was queued, stay readable while the new one is written (R37).
-ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS previous_result_key text;
-ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS previous_queued_at timestamptz;
+-- Re-queueing a walk replaces its result_key. The results it replaced stay
+-- readable while the new one is written, or when it failed (R39):
+-- [{"key", "queued_at"}], newest first, at most 5. NULL = none.
+ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS previous_results jsonb;
 
 -- Answers given on site at the final check (device or phone). Each one is
 -- report evidence, stored with its transcript. A move ("that No was unit 3")

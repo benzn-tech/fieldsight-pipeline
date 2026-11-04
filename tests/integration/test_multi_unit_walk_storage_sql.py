@@ -354,26 +354,32 @@ def test_an_answer_keeps_the_kind_of_question_it_answers(db):
             wa.add(db, _answer(cid, uid, "wk-kind", asked_kind="general"))
 
 
-def test_a_walk_requeue_keeps_the_previous_result_to_read_meanwhile(db):
-    """R37: re-queueing a walk replaces its result_key; the old one, and when it
-    was queued, move to previous_result_key / previous_queued_at."""
+def test_a_walk_requeue_prepends_the_result_it_replaces(db):
+    """R39: re-queueing a walk replaces its result_key; the old key and when it
+    was queued are prepended to previous_results, newest first, at most 5."""
+    from datetime import datetime
     cid, _, tid = _setup(db)
     key = units.walk_key(cid, FOLDER, DATE, tid, "10:00:00")
     walk = {"name": "pre-line", "template_id": tid, "start_at": "10:00:00", "end_at": "10:20:00",
             "segments": S1, "walk_key": key, "parts": [("sidA", "10:00:00")]}
     cr._record(db, cid, FOLDER, DATE, "sidA", walk, "Pre-line", "r1", "k1")
-    first = cr.for_walk(db, FOLDER, DATE, key)
-    assert (first["previous_result_key"], first["previous_queued_at"]) == (None, None)
+    assert cr.for_walk(db, FOLDER, DATE, key)["previous_results"] in (None, [])
     db.execute("UPDATE checklist_reports SET created_at = now() - interval '5 minutes' "
                "WHERE walk_key = %s", (key,))
     queued_1 = cr.for_walk(db, FOLDER, DATE, key)["created_at"]
     cr._record(db, cid, FOLDER, DATE, "sidA", walk, "Pre-line", "r2", "k2")
     row = cr.for_walk(db, FOLDER, DATE, key)
-    assert (row["result_key"], row["previous_result_key"]) == ("k2", "k1")
-    assert row["previous_queued_at"] == queued_1 and row["created_at"] > queued_1
-    # an ordinary check's row carries no previous walk result
+    assert row["result_key"] == "k2"
+    assert [p["key"] for p in row["previous_results"]] == ["k1"]
+    assert datetime.fromisoformat(row["previous_results"][0]["queued_at"]) == queued_1
+    for n in range(3, 9):
+        cr._record(db, cid, FOLDER, DATE, "sidA", walk, "Pre-line", "r%d" % n, "k%d" % n)
+    row = cr.for_walk(db, FOLDER, DATE, key)
+    assert row["result_key"] == "k8"
+    assert [p["key"] for p in row["previous_results"]] == ["k7", "k6", "k5", "k4", "k3"]
+    # an ordinary check's row carries no previous walk results
     plain = {"name": "pre-line", "template_id": tid, "start_at": "10:00:00",
              "end_at": "10:20:00", "segments": S1}
-    cr._record(db, cid, FOLDER, DATE, "sidA", plain, "Pre-line", "r3", "k3")
-    assert db.execute("SELECT previous_result_key, previous_queued_at FROM checklist_reports "
-                      "WHERE company_id = %s", (cid,)).fetchall() == [(None, None)]
+    cr._record(db, cid, FOLDER, DATE, "sidA", plain, "Pre-line", "r9", "k9")
+    assert db.execute("SELECT previous_results FROM checklist_reports "
+                      "WHERE company_id = %s", (cid,)).fetchall() == [(None,)]

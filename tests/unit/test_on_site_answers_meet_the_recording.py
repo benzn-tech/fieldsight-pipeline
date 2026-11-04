@@ -304,3 +304,18 @@ def test_a_read_back_no_answered_on_site_is_not_asked_again():
     opened = check_done.open_from_result(stored, ITEMS, [], None)
     assert ("Handrail fixed" not in
             [i["item_text"] for u in opened if u["unit"] == "Unit 1" for i in u["items"]])
+
+
+def test_a_read_back_answer_keeps_the_recordings_line_refs():
+    """The comment names the recording's basis; its line refs stay with it."""
+    walk = _walk()
+    _row(_unit(walk, "Unit 1"), 2)["refs"] = ["L3"]       # the recording's line
+    got = overlay.apply(walk, [dict(_ans("Unit 1", "Handrail fixed", "Yes"),
+                                    asked_kind="confirm_no")], ITEMS)
+    assert _row(_unit(got, "Unit 1"), 2)["refs"] == ["L3"]
+
+
+def test_the_overlay_has_no_line_longer_than_the_house_limit():
+    import walk_answers_overlay
+    longest = max(len(line) for line in open(walk_answers_overlay.__file__, encoding="utf-8"))
+    assert longest <= 120                     # pyproject line-length

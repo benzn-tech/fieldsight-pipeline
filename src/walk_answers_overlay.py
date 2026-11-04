@@ -93,12 +93,13 @@ def _draw(row, base, site, report):
         # R36: read back to him and answered -- his choice, the recording's basis kept.
         rec = base["row"]
         at = _hhmm(site)
-        basis = "recording: %s — '%s'" % (rec["answer"], rec["evidence"]) if rec["evidence"]             else "recording: %s" % rec["answer"]
+        basis = ("recording: %s — '%s'" % (rec["answer"], rec["evidence"]) if rec["evidence"]
+                 else "recording: %s" % rec["answer"])
         row.update(copy.deepcopy(rec))
         row.update(answer=site["answer"], state="answered", origin="on_site",
                    comment=_with(site.get("comment"), "(on site%s; %s)" % (
                        ", " + at if at else "", basis)),
-                   evidence=site.get("quote") or "", refs=[])
+                   evidence=site.get("quote") or "")       # the recording's refs stay
         if site["answer"] != "No":
             row.update(responsible="", due="")
     else:
