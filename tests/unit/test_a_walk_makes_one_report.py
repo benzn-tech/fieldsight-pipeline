@@ -197,6 +197,36 @@ def test_parts_never_end_inside_a_stretch_even_when_one_stretch_is_over_size():
     assert walk_report.parts(lines, st, max_words=5000) == ["\n".join(ln for _, ln in lines)]
 
 
+def test_a_walk_part_is_split_when_units_times_items_would_exceed_the_rows_cap():
+    # Short speech, but 4 units x 60 items = 240 rows > 150: parts of 2 units each.
+    lines, st = [], []
+    for k in range(4):
+        at = "09:0%d:00" % k
+        lines.append((at, "[%s] in unit %d now" % (at, k + 1)))
+        st.append({"unit": "Unit %d" % (k + 1), "from": at,
+                   "to": "09:0%d:00" % (k + 1) if k < 3 else None})
+    assert walk_report.MAX_PART_ROWS == 150
+    got = walk_report.parts(lines, st, items=60)
+    assert [len(p.splitlines()) for p in got] == [2, 2]
+    assert walk_report.parts(lines, st, items=30) == ["\n".join(ln for _, ln in lines)]
+    # A stretch with no unit adds no rows; a unit seen twice in a part counts once.
+    st2 = [{"unit": None, "from": "09:00:00", "to": "09:01:00"},
+           {"unit": "Unit 1", "from": "09:01:00", "to": "09:02:00"},
+           {"unit": "Unit 2", "from": "09:02:00", "to": "09:03:00"},
+           {"unit": "Unit 1", "from": "09:03:00", "to": None}]
+    back = [("09:0%d:00" % k, "[09:0%d:00] line %d" % (k, k)) for k in range(4)]
+    assert walk_report.parts(back, st2, items=75) == ["\n".join(ln for _, ln in back)]
+    assert [len(p.splitlines()) for p in walk_report.parts(back, st2, items=76)] == [2, 1, 1]
+
+
+def test_the_worker_splits_a_long_checklist_walk_by_rows(run):
+    items = ["Item %d" % i for i in range(80)]           # 2 units x 80 = 160 rows
+    tpl = dict(TEMPLATE, sections=[TEMPLATE["sections"][0],
+                                   dict(TEMPLATE["sections"][1], items=items)])
+    _, _, prompts = run(walk=WALK, template=tpl)
+    assert len([p for p in prompts if IS_WALK in p]) == 2
+
+
 # ---- photographs -------------------------------------------------------------------
 
 def test_a_photo_goes_to_the_unit_current_at_its_time(run):

@@ -926,13 +926,14 @@ def _walk_items_wrap(source):
 
 def _start_walk_calls(items, turns, stretches, budget, source):
     """The walk call(s), started now and run alongside the main call. Over
-    walk_report.MAX_PART_WORDS the transcript is split at unit stretch
-    boundaries (walk_report.parts); the parts run in parallel, so each has the
-    whole of `budget` -- the same wall-clock window as the main call, never
-    past it. Returns the futures, in part order."""
+    walk_report.MAX_PART_WORDS, or over walk_report.MAX_PART_ROWS rows (units
+    x items) of output, the transcript is split at unit stretch boundaries
+    (walk_report.parts); the parts run in parallel, so each has the whole of
+    `budget` -- the same wall-clock window as the main call, never past it.
+    Returns the futures, in part order."""
     lines = [(t["at"].strftime("%H:%M:%S") if hasattr(t.get("at"), "strftime") else None,
               t["line"]) for t in turns]
-    texts = walk_report.parts(lines, stretches)
+    texts = walk_report.parts(lines, stretches, items=len(items))
     prompts = [walk_report.prompt(items, text, _walk_items_wrap(source)) for text in texts]
     logger.info("walk: %d part(s), %s words", len(prompts),
                 "/".join(str(len(t.split())) for t in texts))

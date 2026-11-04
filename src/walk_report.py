@@ -34,6 +34,10 @@ DASH = " — "
 UNLISTED = "Not in the opening list — confirm this unit."
 NOT_APPLIED = "On-site answers not applied"
 MAX_PART_WORDS = 6000
+#: Rows (units x checklist items) one walk call is asked to write, at most: the
+#: call's max_tokens is 8000 (lambda_session_report._walk_call) and a truncated
+#: part fails the whole report (final review M5).
+MAX_PART_ROWS = 150
 
 
 def _is_checklist(s):
@@ -110,28 +114,40 @@ def _stretch_index(stretches, hhmmss):
     return None
 
 
-def parts(lines, stretches, max_words=MAX_PART_WORDS):
-    """The walk transcript as one text, or -- over `max_words` -- several,
-    each a run of whole stretches. `lines` are (HH:MM:SS, line) in transcript
-    order; each line keeps its head. A part never ends inside a stretch, so a
-    single stretch longer than `max_words` is a part of its own, over size."""
+def parts(lines, stretches, max_words=MAX_PART_WORDS, items=0, max_rows=MAX_PART_ROWS):
+    """The walk transcript as one text, or -- over `max_words`, or when its
+    units x `items` (the checklist's length) would be over `max_rows` rows of
+    model output -- several, each a run of whole stretches. `lines` are
+    (HH:MM:SS, line) in transcript order; each line keeps its head. A part
+    never ends inside a stretch, so a single stretch longer than `max_words`
+    (or one unit with more than `max_rows` items) is a part of its own, over
+    size. A stretch with no unit adds no rows."""
     lines = list(lines)
     words = lambda ls: sum(len(ln.split()) for _, ln in ls)  # noqa: E731
-    if words(lines) <= max_words:
-        return ["\n".join(ln for _, ln in lines)] if lines else []
+    stretches = stretches or []
+
+    def unit_of(k):
+        return stretches[k].get("unit") if k is not None else None
+
+    def rows(units_seen):
+        return len({u for u in units_seen if u}) * max(0, int(items or 0))
+
     runs, key = [], object()
     for at, ln in lines:
         k = _stretch_index(stretches, at)
         if not runs or k != key:
-            runs.append([])
+            runs.append((unit_of(k), []))
             key = k
-        runs[-1].append((at, ln))
-    out, cur = [], []
-    for run in runs:
-        if cur and words(cur) + words(run) > max_words:
+        runs[-1][1].append((at, ln))
+    if words(lines) <= max_words and rows(u for u, _ in runs) <= max_rows:
+        return ["\n".join(ln for _, ln in lines)] if lines else []
+    out, cur, cur_units = [], [], set()
+    for unit, run in runs:
+        if cur and (words(cur) + words(run) > max_words or rows(cur_units | {unit}) > max_rows):
             out.append(cur)
-            cur = []
+            cur, cur_units = [], set()
         cur = cur + run
+        cur_units.add(unit)
     if cur:
         out.append(cur)
     return ["\n".join(ln for _, ln in p) for p in out]
