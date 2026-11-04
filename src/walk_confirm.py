@@ -52,7 +52,11 @@ _ACCEPT = {"pass", "passed", "yes", "yep", "good", "all good", "ok", "okay", "fi
 _ACCEPT_FILLER = {"um", "uh", "er", "erm", "ah", "hmm", "mm", "actually", "sorry"}
 # R46: on a not-checked question a No needs one of these first, and no hedge.
 _NO_FIRST = {"no", "fail", "failed"}
-_HEDGE = re.compile(r"^no (?:idea|wait)\b|\bnot sure\b|\bdont know\b|\bdunno\b")
+# R50: "no worries" / "no issues" / "not yet" / "I haven't" are not a No -- and
+# "no issues" (it's fine) is not a Yes either: they go to the phone.
+_HEDGE = re.compile(r"^no (?:idea|wait)\b|\bnot sure\b|\bdont know\b|\bdunno\b"
+                    r"|\bno (?:worries|problems?|dramas?|issues?)\b|\bnot yet\b"
+                    r"|\bi (?:havent|didnt)\b")
 # R48: a move naming two units ("unit 2 and 3", "units 2 and 3") is a skip.
 _JOIN = {"and", "or", "to", "plus"}
 TWO_UNITS = object()
@@ -150,7 +154,8 @@ def parse_answer(text, kind, units):
        (R34);
     3. it starts with fail / failed / no (on a read-back No also fails) -> No,
        the rest is its comment; on a not-checked question a hedge ("no idea",
-       "no wait", "not sure", "don't know") anywhere -> None (R46);
+       "no wait", "not sure", "don't know", "no worries", "no issues",
+       "not yet", "I haven't", "I didn't") anywhere -> None (R46, R50);
     4. it starts with not applicable / n a / na / doesn't apply -> N/A;
     5. anything else -> None."""
     norm = _norm(text)

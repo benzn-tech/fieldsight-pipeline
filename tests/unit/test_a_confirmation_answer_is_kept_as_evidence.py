@@ -147,6 +147,26 @@ def test_r46_a_hedge_is_a_skip_never_a_no(said):
     assert wc.parse_answer(said, "not_checked", UNITS) is None, said
 
 
+# ---- R50: "no worries" is not a No (nor a Yes) -- it goes to the phone --------
+
+@pytest.mark.parametrize("said", [
+    "no worries", "No worries.", "no problems", "no problem", "No dramas", "no drama",
+    "no issues", "No issue.", "not yet", "I haven't", "i havent", "I didn't", "i didnt",
+    "dunno", "No, I haven't looked", "no i havent looked", "um, no worries"])
+def test_r50_a_hedge_is_never_stored_as_a_no(said):
+    parsed = wc.parse_answer(said, "not_checked", UNITS)
+    assert parsed is None, (said, parsed)
+
+
+def test_r50_a_plain_no_is_still_a_no():
+    assert wc.parse_answer("no", "not_checked", UNITS) == {"answer": "No", "comment": ""}
+    assert wc.parse_answer("No.", "not_checked", UNITS) == {"answer": "No", "comment": ""}
+    assert wc.parse_answer("no, rebar is short", "not_checked", UNITS) == {
+        "answer": "No", "comment": "rebar is short"}
+    assert wc.parse_answer("fail", "not_checked", UNITS) == {"answer": "No", "comment": ""}
+    assert wc.parse_answer("yes", "not_checked", UNITS) == {"answer": "Yes"}
+
+
 def test_r46_a_no_needs_no_fail_or_failed_first():
     assert wc.parse_answer("No, the strap is missing", "not_checked", UNITS) == {
         "answer": "No", "comment": "the strap is missing"}
