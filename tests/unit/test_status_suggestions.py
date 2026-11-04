@@ -153,3 +153,55 @@ def test_no_prior_pass_means_no_instruction_and_no_suggestion(monkeypatch):
     out = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, min_interval_s=0)
     assert "status_suggestion" not in captured["prompt"]
     assert "status_suggestion" not in json.dumps(out["topics"])
+
+
+# focus_quote: verified on the whole line, shown as the part about the item. Under whole-chunk
+# transcription one "line" is ~90 s of talk and fed every suggestion in it the same wall of text.
+LONG_LINE = ("Okay, see. Yeah, update. Tom's order, the PVC pipe, locked down. Arrives on the "
+             "thirteenth. So we don't need the scaffolds actually anymore. Lower tier scaffold's "
+             "coming down. Pretty good. The switchboard, yeah, the quote is stopped. But the "
+             "electricians can't gather any material. The purlin can't be delivered till Monday. "
+             "Rang them this morning. I'll call him this afternoon.")
+
+
+def test_focus_quote_keeps_only_the_sentences_about_the_item():
+    assert ss.focus_quote(LONG_LINE, "Level 2 scaffold inspection - book inspection") == (
+        "So we don't need the scaffolds actually anymore. Lower tier scaffold's coming down.")
+    assert ss.focus_quote(LONG_LINE, "Switchboard upgrade - get electrician approval") == (
+        "The switchboard, yeah, the quote is stopped. But the electricians can't gather any "
+        "material.")
+
+
+def test_focus_quote_leaves_a_short_quote_alone():
+    q = "Sarah sent the drawings over so that one is done. Good."
+    assert ss.focus_quote(q, "Sarah to send the drawings") == q
+
+
+def test_focus_quote_never_guesses_when_no_sentence_names_the_item():
+    # ASR misheard the item ("Hinkley options" for PVC pipe): show the whole line, not a guess.
+    assert ss.focus_quote(LONG_LINE, "Hinkley options for east wall") == LONG_LINE
+
+
+def test_focus_quote_takes_the_next_sentence_after_a_bare_mention():
+    q = ("Right, a few updates for everyone on site this afternoon before the rain. The bracing. "
+         "We don't need that any more, engineer signed it off. Concrete is booked for Thursday "
+         "morning and the pump is confirmed as well.")
+    assert ss.focus_quote(q, "Install temporary bracing") == (
+        "The bracing. We don't need that any more, engineer signed it off.")
+
+
+def test_focus_quote_matches_chinese_by_bigram():
+    q = ("今天先说几件事情，大家注意一下现场的安全问题。防水卷材已经订好了，周四到。"
+         "瓷砖颜色业主还没定，在等他回复。下午还要开一个协调会，大家准时参加。")
+    assert ss.focus_quote(q, "订二楼的防水卷材") == "防水卷材已经订好了，周四到。"
+
+
+def test_a_kept_suggestion_carries_the_focused_quote():
+    child = {"action": "Level 2 scaffold inspection - book inspection", "item_id": PRIOR_ID}
+    child["status_suggestion"] = {"status": "closed", "at": "10:00:00", "quote": LONG_LINE}
+    topics = [{"topic_title": "t", "action_items": [child]}]
+    prior = [PriorItem("A1", "action_items", child["action"], PRIOR_ID)]
+    seen = []
+    ss.filter_suggestions(topics, prior, lambda q, at: seen.append(q) or _verified(q, at))
+    assert seen == [LONG_LINE]                       # the check still sees the whole line
+    assert child["status_suggestion"]["quote"].startswith("So we don't need the scaffolds")
