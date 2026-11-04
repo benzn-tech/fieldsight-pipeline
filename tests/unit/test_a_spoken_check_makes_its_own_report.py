@@ -346,7 +346,10 @@ def test_a_malformed_mark_is_dropped_before_the_body_is_built(walked, caplog):
     walk = walked["calls"][0][3]["walk"]
     assert walk["entered"] == WALK_A["entered"] + WALK_B["entered"]
     assert walk["stretches"] == BOTH_STRETCHES
-    assert "dropped 2 mark" in caplog.text
+    assert "dropped 2 of 5 mark" in caplog.text
+    # Counts only: a mark's quote is his words, and the unit is his too.
+    assert "unit three" not in caplog.text and "no time at all" not in caplog.text
+    assert "Unit 3" not in caplog.text
 
 
 @pytest.mark.parametrize("marks", [

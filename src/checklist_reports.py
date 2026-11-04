@@ -318,12 +318,12 @@ def _queue_walk(conn, generate, caller, company_id, folder, date, session, key, 
               if any(s and s in (t.get("source_s3_key") or "") for s in sessions)]
     others = [o for o in day if o.get("walk_key") != key and o.get("session") in sessions]
     # A mark whose time is not HH:MM:SS (a model's "9:01:00") would open a
-    # stretch at a time no clock sorts right: it is dropped, and said so.
+    # stretch at a time no clock sorts right: it is dropped, and said so --
+    # counts only (R48): a mark carries his words (quote) and his unit names.
     marks = [m for m in w["entered"] if walk_body.is_hms(units._hhmmss(m))]
     if len(marks) < len(w["entered"]):
-        logger.warning("walk %s: dropped %d mark(s) with no HH:MM:SS time: %s", key,
-                       len(w["entered"]) - len(marks),
-                       [m for m in w["entered"] if m not in marks])
+        logger.warning("walk %s: dropped %d of %d mark(s) with no HH:MM:SS time", key,
+                       len(w["entered"]) - len(marks), len(w["entered"]))
     w["entered"] = marks
     body = request_body(w, tpl, check_topics(w, others, topics) or None)
     body["walk"] = {"key": key, "units": w["units"], "entered": w["entered"],
