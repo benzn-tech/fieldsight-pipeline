@@ -1,8 +1,10 @@
 """The final check's open questions for a multi-unit walk (migration 0096, R41).
 
-Written by the check-done hop each time the final check of a walk leaves
-questions open; read by GET /open, which serves the newest of these and the
-latest finished walk report. Never read by walk_key alone.
+Written by the check-done hop for every final check of a walk -- an empty
+list when it left nothing open -- dated by the final check's own time, not the
+store's (an async store can land late). Read by GET /open, which serves the
+newest of these when it is newer than the latest finished walk report, or when
+none has finished. Never read by walk_key alone.
 """
 import json
 
@@ -10,12 +12,13 @@ from psycopg.rows import dict_row
 
 
 def add(conn, row):
-    """One final check's questions. Returns its id."""
+    """One final check's questions. `created_at` is the final check's time
+    (tz-aware); absent, the insert's. Returns its id."""
     new_id = conn.execute(
-        "INSERT INTO walk_final_checks (company_id, user_folder, report_date, walk_key, questions) "
-        "VALUES (%s, %s, %s, %s, %s::jsonb) RETURNING id",
+        "INSERT INTO walk_final_checks (company_id, user_folder, report_date, walk_key, questions, "
+        "created_at) VALUES (%s, %s, %s, %s, %s::jsonb, COALESCE(%s, now())) RETURNING id",
         (str(row["company_id"]), row["user_folder"], row["report_date"], row["walk_key"],
-         json.dumps(row["questions"])),
+         json.dumps(row["questions"]), row.get("created_at")),
     ).fetchone()[0]
     return str(new_id)
 

@@ -163,6 +163,7 @@ from repositories import walk_final_checks as wfc  # noqa: E402
 
 def _store(w, **kw):
     e = {"action": "store_final_check", "caller_sub": w["sub"], "walk_key": w["key"],
+         "pressed_at": datetime.now(timezone.utc).isoformat(),
          "questions": [{"kind": "not_checked", "unit": "unit 3", "item_text": "wall bracing",
                         "comment": ""}]}
     e.update(kw)
@@ -181,6 +182,21 @@ def test_the_hop_stores_the_final_check_under_the_walks_company(db):
     got = db.execute("SELECT company_id, user_folder, report_date::text FROM walk_final_checks "
                      "WHERE walk_key = %s", (w["key"],)).fetchall()
     assert got == [(w["site_co"], "Ben", "2026-11-04")]
+
+
+def test_m6_a_final_check_is_dated_by_its_own_time_not_the_store(db):
+    """A retried async store lands late: it must not look newer than the
+    final check that came after it."""
+    w = _walk(db)
+    assert hop.store_final_check(db, _store(w))["questions"] == 1          # pressed just now
+    pressed = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=7)
+    assert hop.store_final_check(db, _store(w, questions=[],
+                                            pressed_at=pressed.isoformat()))["questions"] == 0
+    got_at = db.execute("SELECT created_at FROM walk_final_checks WHERE walk_key = %s "
+                        "AND questions = '[]'::jsonb", (w["key"],)).fetchone()[0]
+    assert got_at == pressed
+    assert wfc.latest(db, [w["site_co"]], w["key"])["questions"] != [], "the late store is older"
+    assert hop.store_final_check(db, _store(w, pressed_at="soon")) == {"error": "pressed_at invalid"}
 
 
 def test_a_refused_final_check_stores_nothing_in_postgres(db):

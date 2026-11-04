@@ -34,21 +34,27 @@ Result: {"status": "saved", "id", "company_id", "folder", "date", "walk_key"}
         (item-writer, async), never from here.
 
 Event:  {"action": "store_final_check", "caller_sub", "walk_key",
+         "pressed_at": "<ISO 8601 with a zone>",
          "questions": [{"kind": "not_checked" | "confirm_no", "unit", "item_text",
                         "comment"}]}   (at most 400; multi-unit walks, R41)
 Result: {"status": "saved", "id", "walk_key", "questions": <count>, "skipped": <count>}
         or {"error": "..."} with nothing written.
         The hop's second write: one walk_final_checks row, committed -- the
         open questions a final check left ([] when nothing is open), which GET
-        /open serves to the phone until a newer walk report exists. Sent
-        fire-and-forget (Event) by CheckGaps (R42). The same caller and walk
+        /open serves to the phone when it is newer than the walk report it
+        would otherwise serve, or when no walk report has finished. Sent
+        fire-and-forget (Event) by CheckGaps (R42). The row's created_at is
+        the final check's own time (`pressed_at`, never later than the store
+        itself), so an Event retry that lands late never looks newer than the
+        answers given after the final check (M6). The same caller and walk
         checks as write_walk_answer -- the walk is the caller's (his folder),
         under the walk's company (R22) -- refuse the write, as does a list that
-        is not one or has over 400 entries. A question that does not fit (unit
-        not of the walk, item not of its checklist, malformed) is skipped and
-        counted; the rest are stored, in the template's wording, the unit
-        normalized. Result also carries "skipped"; a non-empty list of which
-        nothing fits is refused ("no question fits the walk").
+        is not one or has over 400 entries, or a missing or zoneless
+        pressed_at. A question that does not fit (unit not of the walk, item
+        not of its checklist, malformed) is skipped and counted; the rest are
+        stored, in the template's wording, the unit normalized. Result also
+        carries "skipped"; a non-empty list of which nothing fits is refused
+        ("no question fits the walk").
 
 The only person this reads about is `caller_sub`, which the Ask worker took from
 the API authorizer. No session, folder or company is accepted from the event.
@@ -56,6 +62,7 @@ the API authorizer. No session, folder or company is accepted from the event.
 import json
 import logging
 import re
+from datetime import datetime, timezone
 
 import checklist
 from db.connection import close_cached_connection, get_cached_connection, get_connection
@@ -245,9 +252,30 @@ def _question_shape_ok(q):
             and (q.get("comment") is None or isinstance(q.get("comment"), str)))
 
 
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _pressed_at(value):
+    """The final check's time from its ISO text (with a zone), never later
+    than now; None when it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        at = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        return None
+    return min(at.astimezone(timezone.utc), _now())
+
+
 def store_final_check(conn, event):
-    """Check, then write one walk_final_checks row (R41). Returns the saved
-    facts or {"error": ...}; nothing is written unless every check passes."""
+    """Check, then write one walk_final_checks row (R41), dated by the final
+    check's own time (M6). Returns the saved facts or {"error": ...}: a bad
+    caller, walk, question list or pressed_at writes nothing; a question that
+    no longer fits the walk is skipped and counted, and a non-empty list of
+    which none fits writes nothing (R43)."""
     sub = event.get("caller_sub")
     if not sub:
         return {"error": "caller_sub required"}
@@ -257,6 +285,9 @@ def store_final_check(conn, event):
     questions = event.get("questions")
     if not isinstance(questions, list) or len(questions) > MAX_QUESTIONS:
         return {"error": "questions invalid"}
+    pressed = _pressed_at(event.get("pressed_at"))
+    if pressed is None:
+        return {"error": "pressed_at invalid"}
 
     walk, err = _caller_walk(conn, sub, key)
     if err:
@@ -279,7 +310,8 @@ def store_final_check(conn, event):
         return {"error": "no question fits the walk", "skipped": len(questions)}
     new_id = walk_final_checks.add(conn, {
         "company_id": walk["company"], "user_folder": walk["folder"],
-        "report_date": walk["date"], "walk_key": key, "questions": stored})
+        "report_date": walk["date"], "walk_key": key, "questions": stored,
+        "created_at": pressed})
     return {"status": "saved", "id": new_id, "walk_key": key, "questions": len(stored),
             "skipped": len(questions) - len(stored)}
 

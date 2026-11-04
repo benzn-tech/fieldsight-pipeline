@@ -710,7 +710,8 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
     if out.get("walk"):
         # Every walk's final check, nothing open included: an empty list must
         # replace an older one on the phone (R41).
-        _store_final_check(store_final_check, (event or {}).get("caller_sub"), out)
+        _store_final_check(store_final_check, (event or {}).get("caller_sub"), out,
+                           _pressed_iso(event, started))
     timings["total"] = int((now() - started) * 1000)
     # Counts and timings only -- never what was said (the two-phase spec's rule).
     # A walk's unit names are his words too: only how many.
@@ -727,18 +728,32 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
     return out
 
 
-def _store_final_check(send, caller, out):
+def _pressed_iso(event, started):
+    """The final check's own time, ISO 8601 UTC: the press (pressed_at, epoch
+    seconds), else when this run started -- the same time _answer reads."""
+    try:
+        at = int((event or {}).get("pressed_at") or started)
+    except (TypeError, ValueError):
+        at = int(started)
+    return datetime.fromtimestamp(at, timezone.utc).isoformat()
+
+
+def _store_final_check(send, caller, out, pressed_at):
     """The walk's questions as the device was given them -- [] when nothing is
     open -- sent to the hop's store_final_check for the phone's list (R41), in
-    either mode. Fire and forget (R42): `send` is an async invoke, never the
-    synchronous db_hop, so the answer does not wait on the write. A failure to
-    send is logged (counts only) and changes nothing."""
+    either mode, with the final check's own time (`pressed_at`, ISO): the row
+    is dated by it, so an Event retry that lands late never looks newer than
+    the answers given after this final check (M6). Fire and forget (R42):
+    `send` is an async invoke, never the synchronous db_hop, so the answer
+    does not wait on the write. A failure to send is logged (counts only) and
+    changes nothing."""
     if send is None:
         logger.warning("check_gaps: final check not stored -- no store wired")
         return
     try:
         send({"action": "store_final_check", "caller_sub": caller,
-              "walk_key": out["walk"]["key"], "questions": out.get("questions") or []})
+              "walk_key": out["walk"]["key"], "questions": out.get("questions") or [],
+              "pressed_at": pressed_at})
     except Exception as e:                            # noqa: BLE001 -- the answer stands
         logger.warning("check_gaps: store_final_check not sent: %s", type(e).__name__)
         return

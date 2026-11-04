@@ -651,8 +651,13 @@ def test_an_empty_event_is_as_today(monkeypatch):
 
 # ---- the hop's second write: the final check's question list (R41) -------------
 
+PRESSED_ISO = "2026-11-03T21:10:00+00:00"          # the final check's own time (M6)
+PRESSED_DT = datetime(2026, 11, 3, 21, 10, tzinfo=timezone.utc)
+
+
 def _store(key, **kw):
     e = {"action": "store_final_check", "caller_sub": "sub-1", "walk_key": key,
+         "pressed_at": PRESSED_ISO,
          "questions": [{"kind": "not_checked", "unit": "unit three", "item_text": "wall  BRACING",
                         "comment": ""},
                        {"kind": "confirm_no", "unit": "Unit 1", "item_text": "Trusses",
@@ -666,6 +671,7 @@ def _wire_store(monkeypatch):
     seen["stored"] = []
     monkeypatch.setattr(hop.walk_final_checks, "add",
                         lambda c, row: seen["stored"].append(row) or "fc-id")
+    monkeypatch.setattr(hop, "_now", lambda: NOW)
     return key, seen
 
 
@@ -680,7 +686,8 @@ def test_the_hop_stores_the_final_checks_questions_under_the_walks_company(monke
         "questions": [{"kind": "not_checked", "unit": "Unit 3", "item_text": "Wall bracing",
                        "comment": ""},
                       {"kind": "confirm_no", "unit": "Unit 1", "item_text": "Trusses",
-                       "comment": "two short"}]}]
+                       "comment": "two short"}],
+        "created_at": PRESSED_DT}]                          # when it was pressed, not stored
     assert seen["added"] == []                              # not an answer
     assert seen["conns"] == 1                               # its own transaction
     assert "Wall bracing" not in caplog.text and "two short" not in caplog.text
@@ -694,6 +701,10 @@ def test_the_hop_stores_the_final_checks_questions_under_the_walks_company(monke
     ({"questions": None}, "questions invalid"),
     ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses"}] * 401},
      "questions invalid"),
+    ({"pressed_at": None}, "pressed_at invalid"),
+    ({"pressed_at": "yesterday"}, "pressed_at invalid"),
+    ({"pressed_at": "2026-11-03T21:10:00"}, "pressed_at invalid"),     # no zone
+    ({"pressed_at": 1793740200}, "pressed_at invalid"),
 ])
 def test_a_refused_final_check_stores_nothing(monkeypatch, change, error):
     key, seen = _wire_store(monkeypatch)
@@ -730,6 +741,17 @@ def test_an_empty_final_check_is_stored_and_all_unfit_is_refused(monkeypatch):
         {"kind": "not_checked", "unit": "Unit 9", "item_text": "Trusses"}]), None)
     assert out == {"error": "no question fits the walk", "skipped": 1}
     assert len(seen["stored"]) == 1
+
+
+def test_m6_a_late_retried_store_keeps_the_final_checks_own_time(monkeypatch):
+    """An Event retry minutes later must not look newer than answers given
+    after the real final check; a device clock ahead never dates it later
+    than the store."""
+    key, seen = _wire_store(monkeypatch)
+    hop.lambda_handler(_store(key, pressed_at="2026-11-04T10:10:00+13:00"), None)
+    assert seen["stored"][0]["created_at"] == PRESSED_DT
+    hop.lambda_handler(_store(key, pressed_at="2026-11-03T22:00:00+00:00"), None)   # after NOW
+    assert seen["stored"][1]["created_at"] == NOW
 
 
 def test_a_blocked_caller_stores_no_final_check(monkeypatch):

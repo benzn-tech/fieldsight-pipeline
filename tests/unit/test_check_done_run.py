@@ -807,8 +807,17 @@ def test_the_final_checks_questions_go_to_the_store_never_through_the_db_hop():
     out = w.run()
     assert out["mode"] == "phone" and len(out["questions"]) == 5
     assert w.stored == [{"action": "store_final_check", "caller_sub": "sub-1", "walk_key": WALK,
-                         "questions": out["questions"]}]
+                         "questions": out["questions"], "pressed_at": PRESSED_ISO}]
     assert w.hop_actions == []                       # the synchronous hop is not used for it
+
+
+PRESSED_ISO = "2026-10-19T21:05:00+00:00"            # PRESSED, as the store gets it (M6)
+
+
+def test_m6_the_store_carries_the_final_checks_own_time():
+    w = StoringWalkWorld(BOTH_UNITS_ROWS)
+    w.run(event={"pressed_at": None})                # no press time: the run's own start
+    assert w.stored[0]["pressed_at"] == "2026-10-19T21:05:01+00:00"
 
 
 def test_a_final_check_with_nothing_open_is_stored_too():
@@ -820,7 +829,7 @@ def test_a_final_check_with_nothing_open_is_stored_too():
     out = w.run()
     assert out["questions"] == []
     assert w.stored == [{"action": "store_final_check", "caller_sub": "sub-1", "walk_key": WALK,
-                         "questions": []}]
+                         "questions": [], "pressed_at": PRESSED_ISO}]
 
 
 def test_a_failed_send_changes_neither_the_answer_nor_the_say_line(caplog):
