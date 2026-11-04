@@ -43,8 +43,11 @@ def test_rule_1_a_no_that_names_a_unit_of_the_walk_is_a_move():
 
 
 def test_rule_2_a_pass_is_yes():
-    for said in ("Pass.", "yes", "Good", "OK", "right", "Correct!"):
+    for said in ("Pass.", "yes", "Good", "OK", "all good", "fine"):
         assert wc.parse_answer(said, "not_checked", UNITS) == {"answer": "Yes"}, said
+    # R46: "right" / "correct" are not an acceptance on a not-checked question.
+    for said in ("right", "Correct!"):
+        assert wc.parse_answer(said, "not_checked", UNITS) is None, said
 
 
 def test_rule_2_a_read_back_no_confirmed_stays_no():
@@ -80,7 +83,8 @@ def test_an_acknowledgement_with_a_pass_on_a_read_back_no_is_a_skip():
 
 
 def test_rule_4_is_anchored_to_the_start():
-    assert wc.parse_answer("pass, n a for the lintel", "not_checked", UNITS) == {"answer": "Yes"}
+    # R46: a pass with more words after it is a skip, not a Yes.
+    assert wc.parse_answer("pass, n a for the lintel", "not_checked", UNITS) is None
     assert wc.parse_answer("the lintel is na", "not_checked", UNITS) is None
 
 
@@ -118,6 +122,57 @@ def test_a_move_names_only_a_unit_of_the_walk():
         "answer": "No", "comment": "that was Unit 2"}
     # No walk units at all: never a move.
     assert "move_to" not in (wc.parse_answer("no that was unit 2", "confirm_no", []) or {})
+
+
+# ---- R46: a not-checked Yes is a whole acceptance; a hedge is never an answer --
+
+@pytest.mark.parametrize("said", [
+    "okay hang on", "right, let me check", "good question, not sure", "ok so the",
+    "yes but the strap is loose", "right", "correct", "pass, n a for the lintel"])
+def test_r46_an_acknowledgement_followed_by_more_words_is_a_skip_on_not_checked(said):
+    assert wc.parse_answer(said, "not_checked", UNITS) is None, said
+
+
+@pytest.mark.parametrize("said", [
+    "pass", "Passed.", "yes", "Yep", "good", "All good.", "ok.", "Okay", "fine",
+    "um, all good", "uh yes"])
+def test_r46_a_whole_acceptance_is_yes_on_not_checked(said):
+    assert wc.parse_answer(said, "not_checked", UNITS) == {"answer": "Yes"}, said
+
+
+@pytest.mark.parametrize("said", [
+    "no idea", "No idea.", "not sure", "no, not sure", "no wait", "No, wait, it's fine",
+    "I don't know", "no I don't know", "failed? not sure"])
+def test_r46_a_hedge_is_a_skip_never_a_no(said):
+    assert wc.parse_answer(said, "not_checked", UNITS) is None, said
+
+
+def test_r46_a_no_needs_no_fail_or_failed_first():
+    assert wc.parse_answer("No, the strap is missing", "not_checked", UNITS) == {
+        "answer": "No", "comment": "the strap is missing"}
+    assert wc.parse_answer("Failed", "not_checked", UNITS) == {"answer": "No", "comment": ""}
+    assert wc.parse_answer("it's a no", "not_checked", UNITS) is None
+
+
+def test_r46_keeps_the_read_back_rules():
+    # R32/R34 are unchanged: an acknowledgement confirms a read-back No, an
+    # explicit pass is Yes, both at once is a skip.
+    assert wc.parse_answer("okay", "confirm_no", UNITS) == {"answer": "No", "confirmed": True}
+    assert wc.parse_answer("pass", "confirm_no", UNITS) == {"answer": "Yes"}
+    assert wc.parse_answer("yes it passes", "confirm_no", UNITS) is None
+
+
+@pytest.mark.parametrize("said", [
+    "no, unit 2 and 3", "No, units 2 and 3.", "no that was unit two and unit three",
+    "wrong one, unit 2 or 3", "no, unit 2 unit 3", "no it's lots 150 and 151"])
+def test_r48_a_move_that_names_two_units_is_a_skip(said):
+    assert wc.parse_answer(said, "confirm_no", UNITS + ["Lot 150", "Lot 151"]) is None, said
+
+
+def test_r48_a_hundred_and_is_still_one_unit():
+    walk = UNITS + ["Lot 105"]
+    assert wc.parse_answer("no that was lot one hundred and five", "confirm_no", walk) == {
+        "move_to": "Lot 105"}
 
 
 # ---- handle -------------------------------------------------------------------
@@ -204,6 +259,18 @@ def test_nothing_heard_is_a_skip():
     out, hop_fn, _ = _run(_event(text=None, audio_b64=base64.b64encode(b"x").decode()),
                           stt=lambda d, f: "")
     assert out["status"] == "skipped" and hop_fn.calls == []
+
+
+@pytest.mark.parametrize("heard", [
+    "[background noise]", "(wind)", "[Music] [silence]", "...", "Recording started.",
+    "(wind) okay", "[inaudible] ok."])
+def test_r46_heard_noise_or_a_marker_is_a_skip(heard):
+    # The only ASR noise filter this repo has is a list of non-speech markers
+    # (lambda_extraction_backlog._NON_SPEECH); bracketed audio-event tags go too.
+    # Wind STT'd as "(wind) okay" must not pass an item.
+    audio = base64.b64encode(b"wav").decode()
+    out, hop_fn, _ = _run(_event(text=None, audio_b64=audio), stt=lambda d, f: heard)
+    assert out["status"] == "skipped" and hop_fn.calls == [], heard
 
 
 def test_a_move_writes_the_target_and_says_so():

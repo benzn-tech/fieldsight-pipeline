@@ -7,7 +7,9 @@ the walk report to be queued again. The device keeps the question list and asks
 the next question itself.
 
 It is never general Ask: an answer that is not pass / fail / N/A / a move is
-skipped, and the question stays on the phone.
+skipped, and the question stays on the phone. On a not-checked question a Yes
+is a WHOLE acceptance ("pass", "all good"), never an answer that merely starts
+with one ("okay, hang on"), and a hedge ("no idea") is never a No (R46).
 
 Pure apart from the injected `stt`, `db_write`, `requeue` and `now`. It logs
 counts and status only, never what was said.
@@ -44,13 +46,30 @@ _NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight",
                  "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
                  "sixty", "seventy", "eighty", "ninety", "hundred", "and", "oh", "zero", "o"}
 _UNIT_TOKEN = re.compile(r"[a-z]+|\d+[a-z](?![a-z])|\d+")   # units._TOKEN's split
-_YES = {"pass", "passed", "passes", "yes", "good", "ok", "okay", "right", "correct"}
+# R46: on a not-checked question the WHOLE answer, filler aside, must be one of
+# these -- "okay, hang on" is not a pass.
+_ACCEPT = {"pass", "passed", "yes", "yep", "good", "all good", "ok", "okay", "fine"}
+_ACCEPT_FILLER = {"um", "uh", "er", "erm", "ah", "hmm", "mm", "actually", "sorry"}
+# R46: on a not-checked question a No needs one of these first, and no hedge.
+_NO_FIRST = {"no", "fail", "failed"}
+_HEDGE = re.compile(r"^no (?:idea|wait)\b|\bnot sure\b|\bdont know\b|\bdunno\b")
+# R48: a move naming two units ("unit 2 and 3", "units 2 and 3") is a skip.
+_JOIN = {"and", "or", "to", "plus"}
+TWO_UNITS = object()
+# Heard text that is a non-speech marker, not an answer. There is no ASR
+# hallucination classifier in this repo: VAD gating drops silent recording
+# chunks before STT (not applicable to one answer clip), and the only text
+# filter is lambda_extraction_backlog._NON_SPEECH -- its markers are copied here
+# (that Lambda is not importable from CheckGaps), plus any bracketed audio-event
+# tag the STT writes ("(wind)", "[music]").
+_NON_SPEECH = ("recording started", "recording stopped")   # the bracketed ones: _TAG
+_TAG = re.compile(r"\([^)]*\)|\[[^\]]*\]")
 # R32: on a read-back No an acknowledgement confirms the No; only an explicit
 # pass turns it into Yes.
 _CONFIRM = {"right", "correct", "yes", "yeah", "yep", "ok", "okay", "good"}
 _PASS = re.compile(r"^(?:actually )?(?:it )?(?:pass|passed|passes)\b")
 _PASS_WORD = re.compile(r"\b(?:pass|passed|passes)\b")
-_NO = {"fail", "failed", "fails", "no"}
+_NO = {"fail", "failed", "fails", "no"}       # rule 3 on a read-back No, as before
 # Rule 4, anchored to the start like rules 2 and 3.
 _NA = re.compile(r"^(?:(?:it|that|this|its|thats) (?:is )?)?"
                  r"(?:not applicable|n a|na|doesnt apply|does not apply)\b")
@@ -67,16 +86,28 @@ def _norm(text):
 def _move_phrase(norm):
     """The unit the answer moves to when the whole answer is a move, else None:
     [no | nope | wrong] [that was | that's | it was | it's | should be |
-    belongs to] <unit>, with only filler ("actually", "sorry") besides."""
+    belongs to] <unit>, with only filler ("actually", "sorry") besides.
+    TWO_UNITS when the move names two or more units ("unit 2 and 3", "units 2
+    and 3", "unit 2 unit 3") -- R48: never a move to the first of them."""
     words = " ".join(w for w in norm.split() if w not in _FILLER)
     m = _MOVE.match(words)
     if not m:
         return None
     tok = _UNIT_TOKEN.findall(m.group("unit"))
-    if not tok or tok[0] not in units_mod.PREFIXES or len(tok) < 2:
+    if not tok or len(tok) < 2:
         return None
-    if not all(t[0].isdigit() or t in _NUMBER_WORDS for t in tok[1:]):
+    plural = tok[0].endswith("s") and tok[0][:-1] in units_mod.PREFIXES
+    if tok[0] not in units_mod.PREFIXES and not plural:
         return None
+    rest = tok[1:]
+    if not all(t[0].isdigit() or t in _NUMBER_WORDS or t in units_mod.PREFIXES or t in _JOIN
+               for t in rest):
+        return None
+    # "and" only joins a number after "hundred" ("one hundred and five").
+    joined = any(t in _JOIN and not (t == "and" and i and rest[i - 1] == "hundred")
+                 for i, t in enumerate(rest))
+    if plural or joined or any(t in units_mod.PREFIXES for t in rest):
+        return TWO_UNITS
     return units_mod.normalize_unit(m.group("unit"))
 
 
@@ -85,7 +116,22 @@ def _move_to(norm, units):
     walk = {units_mod.normalize_unit(u) for u in units or [] if isinstance(u, str)}
     walk.discard(None)
     u = _move_phrase(norm)
-    return u if u and u in walk else None
+    return u if u and u is not TWO_UNITS and u in walk else None
+
+
+def _accepted(norm):
+    """The whole answer, filler aside, is one acceptance (R46)."""
+    return " ".join(w for w in norm.split() if w not in _ACCEPT_FILLER) in _ACCEPT
+
+
+def _not_speech(text):
+    """Heard text that carries a non-speech marker or an audio-event tag, or
+    has no word made of letters ("...") -- not an answer, whatever else it
+    says (R46). Wind STT'd as "(wind) okay" must not pass an item."""
+    low = (text or "").lower()
+    if _TAG.search(low) or any(m in low for m in _NON_SPEECH):
+        return True
+    return not re.search(r"[a-z]", low)
 
 
 def parse_answer(text, kind, units):
@@ -93,19 +139,26 @@ def parse_answer(text, kind, units):
 
     1. the whole answer is a move to a unit of the walk -- [no / wrong / nope]
        [that was / that's / it was / it's / should be / belongs to] <unit> --
-       (a read-back No only);
-    2. it starts with pass / yes / good / ok / right / correct -> Yes; for a
-       read-back No (R32) an acknowledgement (right / correct / yes / yeah /
-       ok / okay / good / that's right / yep) confirms the No, and only an
-       explicit pass ("pass", "it passes", "actually it passes") is Yes; both
-       at once ("yes it passes") is ambiguous -> None (R34);
-    3. it starts with fail / no / failed -> No, the rest is its comment;
+       (a read-back No only); a move naming two or more units -> None (R48);
+    2. on a not-checked question (R46) the WHOLE answer, filler ("um",
+       "actually") aside, is pass / passed / yes / yep / good / all good / ok
+       / okay / fine -> Yes; an acknowledgement followed by more words ("okay
+       hang on") -> None. For a read-back No (R32) an acknowledgement (right /
+       correct / yes / yeah / ok / okay / good / that's right / yep) confirms
+       the No, and only an explicit pass ("pass", "it passes", "actually it
+       passes") is Yes; both at once ("yes it passes") is ambiguous -> None
+       (R34);
+    3. it starts with fail / failed / no (on a read-back No also fails) -> No,
+       the rest is its comment; on a not-checked question a hedge ("no idea",
+       "no wait", "not sure", "don't know") anywhere -> None (R46);
     4. it starts with not applicable / n a / na / doesn't apply -> N/A;
     5. anything else -> None."""
     norm = _norm(text)
     if not norm:
         return None
     if kind == "confirm_no":
+        if _move_phrase(norm) is TWO_UNITS:
+            return None
         target = _move_to(norm, units)
         if target:
             return {"move_to": target}
@@ -119,9 +172,12 @@ def parse_answer(text, kind, units):
             if _PASS_WORD.search(norm):
                 return None
             return {"answer": "No", "confirmed": True}
-    if first in _YES:
-        return {"answer": "Yes"}
-    if first in _NO:
+    else:
+        if _accepted(norm):
+            return {"answer": "Yes"}
+        if _HEDGE.search(norm):
+            return None
+    if first in (_NO if kind == "confirm_no" else _NO_FIRST):
         m = _NO_REST.match((text or "").strip())
         return {"answer": "No", "comment": (m.group(1) if m else "").strip()}
     if _NA.match(norm):
@@ -133,7 +189,7 @@ def _named_units(text):
     """The unit a whole-answer move names, as the one candidate a move may go
     to. Whether it is the walk's is the hop's to say (it reads the walk)."""
     u = _move_phrase(_norm(text))
-    return [u] if u else []
+    return [u] if u and u is not TWO_UNITS else []
 
 
 def _out(status, say):
@@ -189,6 +245,9 @@ def handle(event, *, stt, db_write, now, requeue=None):
     if quote is None:
         logger.info("walk-confirm: status=error reason=%s", why)
         return _out("error", SAY_SKIP)
+    if _not_speech(quote):
+        logger.info("walk-confirm: status=skipped kind=%s reason=not_speech", kind)
+        return _out("skipped", SAY_SKIP)
 
     # The current unit is not somewhere to move to: "no, that was Unit 3" while
     # on Unit 3 is a No, by rule 3.

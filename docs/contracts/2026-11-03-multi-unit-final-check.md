@@ -142,16 +142,20 @@ The first rule that applies wins. Text is lower-cased and punctuation is ignored
    - A unit mentioned in passing is not a move. "No, the nogging in Unit 2 is missing" is a No with that comment.
    - A move to the current unit is not a move. It falls through to rule 3.
    - A move to a unit the hop says is not one of the walk's is parsed again by the next rule. It is not a skip.
+   - A move that names two or more units ("no, unit 2 and 3", "units 2 and 3", "unit 2 unit 3") is **skipped** to the phone (R48). "One hundred and five" is one unit.
    - On `not_checked`, "no, that was Unit 2" is a No with the comment "that was Unit 2".
 2. **Pass.**
-   - On `not_checked`: an answer that starts with pass / passed / yes / good / ok / okay / right / correct is **Yes**.
+   - On `not_checked` (R46): **Yes** only when the **whole** answer, filler ("um", "uh", "actually") aside, is one of pass / passed / yes / yep / good / all good / ok / okay / fine. An acknowledgement followed by more words ("okay hang on", "right, let me check", "pass, n/a for the lintel") is **skipped**, and so are "right" and "correct" alone.
    - On `confirm_no` (R32/R34):
      - an acknowledgement (right / correct / yes / yeah / yep / ok / okay / good / that's right) **confirms the No**;
      - only an explicit pass ("pass", "passed", "it passes", "actually it passes") gives **Yes**;
      - both together ("yes it passes", "that's right, pass") are ambiguous, so the item is **skipped** to the phone.
-3. **Fail.** An answer that starts with fail / failed / fails / no is **No**. The rest of the answer is its comment ("Fail, the nogging is missing." → comment "the nogging is missing.").
+3. **Fail.** An answer that starts with fail / failed / no (on `confirm_no` also fails) is **No**. The rest of the answer is its comment ("Fail, the nogging is missing." → comment "the nogging is missing.").
+   - On `not_checked` a hedge is never a No (R46): "no idea", "no wait", or "not sure" / "don't know" anywhere in the answer is **skipped**.
 4. **N/A.** An answer that starts with not applicable / N/A / n.a. / na / doesn't apply (optionally after "it's"/"that's") is **N/A**. This rule is anchored to the start, so "the lintel is na" is a skip.
 5. **Anything else is skipped** (it goes to the phone). It is never routed to Ask.
+
+Before these rules, heard text that is not speech is **skipped** (R46): a bracketed audio-event tag ("(wind)", "[music]", "[inaudible]"), "recording started/stopped", or no letters at all ("..."). The repo has no ASR hallucination classifier; this marker list is the one `lambda_extraction_backlog` uses.
 
 ## 3. Phone routes (org-api)
 
