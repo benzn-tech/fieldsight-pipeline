@@ -8,11 +8,15 @@ customer wording and order as an ordinary check. On top of that:
   * "this one's all good" (Item no ALL, Answer Yes) fills only that unit's
     unanswered items, each saying so: covered by '<quote>' (HH:MM). It never
     overwrites a No, and with unit stretches it must have been said inside
-    that unit's stretch;
+    that unit's stretch; without stretches it must claim a line of its own
+    that no other unit's all-good claimed (R45) -- one quote never covers two
+    units;
   * a finding that names no unit goes to General -- kept, never guessed into
     a unit -- if its evidence is in the transcript;
-  * a unit named in the opening with no rows still gets its section, every
-    item not checked; a unit not named in the opening is flagged.
+  * the walk's units are the opening's names, the units he entered and the
+    units in the rows (R44): a unit named or walked into with no rows still
+    gets its section, every item not checked; a unit not named in the opening
+    is flagged (when the opening named any).
 
 `rows` is the structured form of each unit's table (each row's `origin` is
 "recording"; the on-site overlay changes it); `render` turns rows into
@@ -32,6 +36,7 @@ ALL = "ALL"
 OUTSIDE = "all good outside the unit"
 NO_EVIDENCE = "evidence not in the transcript"
 NOT_YES = "all good answer is not Yes"
+NOT_PLACED = "all good not placed"
 _SUMMARY_CELL = {"not_checked": "Not checked", "check": "Check"}
 _TIME_RE = re.compile(r"^\[(\d\d:\d\d(?::\d\d)?)")
 
@@ -140,7 +145,9 @@ def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dr
     so the line that times a quote is chosen per unit: with stretches, the
     first matching line inside this unit's stretch; without, the first
     matching line no earlier unit's all-good has claimed (`claimed`, line
-    indices, updated here)."""
+    indices, updated here). Without stretches an ALL row with no unclaimed
+    line left is dropped (NOT_PLACED, R45): the final check has no stretches,
+    and one "all good" must never silence another unit's questions."""
     chosen = None
     for line in model_rows:
         if not _is_all(line):
@@ -163,6 +170,8 @@ def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dr
                     why = OUTSIDE
             else:
                 hit = next((ln for ln in lines if ln[0] not in claimed), None)
+                if hit is None:
+                    why = NOT_PLACED
             if not why and chosen is None and hit is not None:
                 claimed.add(hit[0])
                 at = hit[1]
@@ -219,22 +228,34 @@ def _general(model_rows, t_words):
     return kept, dropped
 
 
-def build(model_text, items, transcript_text, opening, stretches=None, report_date=None):
+def _normalized(raw_names):
+    out = []
+    for n in raw_names or []:
+        u = units_mod.normalize_unit(n) if isinstance(n, str) else None
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def build(model_text, items, transcript_text, opening, stretches=None, report_date=None,
+          known_units=None):
     """The walk's checklists: {"units", "general", "general_dropped", "summary"}.
 
     `opening` is the window's units dict ({"names", "count"}); only names are
-    flagged against. Units come in walk order: the opening's names, then units
-    first seen in the rows."""
+    flagged against. `known_units` are the units he entered (each entered
+    mark's unit, in walk order). The walk's units are all three (R44), in walk
+    order: the opening's names, then the entered units, then units first seen
+    in the rows -- every one a section, all items not checked when no row is
+    about it."""
     parsed = _parsed_rows(model_text)
     grouped = {}
     for u, row in parsed:
         grouped.setdefault(u, []).append(row)
-    names = []
-    for n in (opening or {}).get("names") or []:
-        u = units_mod.normalize_unit(n)
-        if u and u not in names:
-            names.append(u)
-    order = names + [u for u in grouped if u != GENERAL and u not in names]
+    names = _normalized((opening or {}).get("names"))
+    order = list(names)
+    for u in _normalized(known_units) + [u for u in grouped if u != GENERAL]:
+        if u not in order:
+            order.append(u)
     t_words = checklist.transcript_words(transcript_text)
     # All-good rows are timed in row order, so an earlier unit claims its
     # line before a later unit that said the same words.

@@ -409,6 +409,56 @@ def test_no_unit_rows_means_no_summary():
     assert _titles(secs) == ["General"]
 
 
+# ---- R44: a unit he walked into is a section, and nothing on site is dropped ----
+
+ENTERED_LINES = [
+    (9, 0, 10, "doing two units today"),
+    (9, 1, 5, "now in unit one"),
+    (9, 1, 30, "the studs are all straight here"),
+    (9, 2, 10, "two nogs are missing by the door"),
+    (9, 3, 5, "now in unit two"),
+]
+UNIT1_ONLY = "\n".join(WALK_ANSWER.splitlines()[:4])
+COUNT_ONLY = dict(WALK, units={"names": [], "count": 2})
+MOVE = {"unit": "Unit 1", "item_text": ITEMS[1], "answer": None, "comment": "",
+        "move_to_unit": "Unit 2", "source": "device", "quote": "no that was unit two",
+        "voice_note_id": None, "answered_at": "09:09:00", "asked_kind": "confirm_no"}
+
+
+def test_r44_an_entered_unit_he_said_nothing_about_is_a_section_all_not_checked(run):
+    meta, sections, _ = run(walk=COUNT_ONLY, lines=ENTERED_LINES, walk_answer=UNIT1_ONLY)
+    assert _titles(sections) == ["Inspection Details", U1, U2, "Summary", "Anything else"]
+    by = {s["title"]: s for s in sections}
+    assert by[U2]["paragraphs"][2:] == ["%s |  | %s |  | " % (it, checklist.NOT_COVERED)
+                                        for it in ITEMS]
+    assert meta["walk"]["summary"]["rows"][1] == ["Unit 2"] + ["Not checked"] * 3
+
+
+def test_r44_a_move_to_a_unit_known_only_by_entering_it_applies(run):
+    meta, sections, _ = run(walk=dict(COUNT_ONLY, answers=[MOVE]), lines=ENTERED_LINES,
+                            walk_answer=UNIT1_ONLY)
+    w = meta["walk"]
+    assert w["unmatched_answers"] == []
+    assert w["summary"]["rows"] == [["Unit 1", "Yes", "Not checked", "Not checked"],
+                                    ["Unit 2", "Not checked", "No", "Not checked"]]
+    assert walk_report.NOT_APPLIED not in _titles(sections)
+
+
+def test_r44_an_on_site_answer_that_cannot_be_applied_is_shown_in_the_report(run):
+    lost = [dict(ANSWER_ROW, unit="Unit 9"),
+            dict(MOVE, item_text=ITEMS[0], move_to_unit="Unit 2")]      # Unit 1 item 1 is a Yes
+    meta, sections, _ = run(walk=dict(WALK, answers=lost))
+    assert _titles(sections) == ["Inspection Details", "General", U1, U2, U3, "Summary",
+                                 walk_report.NOT_APPLIED, "Anything else"]
+    assert walk_report.NOT_APPLIED == "On-site answers not applied"
+    by = {s["title"]: s for s in sections}
+    assert by[walk_report.NOT_APPLIED]["paragraphs"] == [
+        "Unit 9 — Nogs fitted at 800 centres: Yes (on site, 09:09) — unit not in the walk",
+        "Unit 1 — Studs straight and plumb: move to Unit 2 (on site, 09:09) — "
+        "moved item is not a No"]
+    assert len(meta["walk"]["unmatched_answers"]) == 2
+
+
 # ---- no walk: today's report ------------------------------------------------------------
 
 # The prompt and the sections the renderer got, as the worker wrote them before

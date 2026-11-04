@@ -949,10 +949,13 @@ def _walk_result(walk, tpl, items, paragraphs, transcript_text, check, covered_u
     """The walk's answer: per-unit gaps (walk_checklist.build with no unit
     stretches -- the live marks lag the words), the on-site answers so far laid
     over them, and the questions still open. not_covered / failed keep their
-    meaning across the walk: every unit's, each naming its unit."""
+    meaning across the walk: every unit's, each naming its unit. Every unit he
+    entered is a unit of the walk (R44), so one he said nothing about is asked
+    about in full."""
+    entered = [m.get("unit") for m in walk.get("entered") or [] if isinstance(m, dict)]
     built = walk_checklist.build("\n".join(paragraphs), items, transcript_text,
                                  opening=walk.get("units"), stretches=None,
-                                 report_date=nz_time.nz_today())
+                                 report_date=nz_time.nz_today(), known_units=entered)
     result = walk_answers_overlay.apply(built, walk.get("answers") or [], items)
     units = []
     for u in result["units"]:

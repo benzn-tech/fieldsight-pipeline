@@ -11,7 +11,9 @@ module is the assembly between them, in this order:
   3. per unit, "<unit> -- <checklist title>", a unit not in the opening list
      saying so first;
   4. Summary, the unit-by-item grid;
-  5. the catch-all.
+  5. "On-site answers not applied", one line per on-site answer the overlay
+     could not place (R44) -- an answer is never dropped silently;
+  6. the catch-all.
 
 Every unit table is drawn by walk_checklist.render from its rows, the same
 way the on-site overlay redraws it. Each unit section carries its checklist
@@ -30,6 +32,7 @@ GENERAL = wc.GENERAL
 SUMMARY = "Summary"
 DASH = " — "
 UNLISTED = "Not in the opening list — confirm this unit."
+NOT_APPLIED = "On-site answers not applied"
 MAX_PART_WORDS = 6000
 
 
@@ -157,6 +160,20 @@ def general_section(entries):
     return _section(GENERAL, paragraphs, [[] for _ in paragraphs])
 
 
+def not_applied_lines(answers):
+    """One line per on-site answer the overlay could not place: "<unit> —
+    <item>: <answer, or move to <unit>> (on site, HH:MM) — <reason>"."""
+    out = []
+    for a in answers or []:
+        move = a.get("move_to_unit")
+        said = ("move to %s" % move) if move else (a.get("answer") or "no answer")
+        at = str(a.get("answered_at") or "")[:5]
+        out.append("%s%s%s: %s (on site%s) — %s" % (
+            a.get("unit") or "?", DASH, a.get("item_text") or "?", said,
+            ", " + at if at else "", a.get("reason") or "not applied"))
+    return out
+
+
 def sections(template, main_prose, walk, name=None):
     """The walk report's sections (_prose_sections-shaped), in report order.
 
@@ -190,6 +207,9 @@ def sections(template, main_prose, walk, name=None):
         paragraphs = [" | ".join(cols), " | ".join(["---"] * len(cols))]
         paragraphs += [" | ".join(_cell(c) for c in row) for row in summ["rows"]]
         out.append(_section(SUMMARY, paragraphs, [[] for _ in paragraphs], walk=True))
+    lost = not_applied_lines(walk.get("unmatched_answers"))
+    if lost:
+        out.append(_section(NOT_APPLIED, lost, [[] for _ in lost], walk=True))
     return out + tail
 
 

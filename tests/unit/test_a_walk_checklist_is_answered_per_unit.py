@@ -226,10 +226,58 @@ def test_the_same_all_good_without_stretches_takes_the_next_unclaimed_line():
     got = wc.build(TWICE_ROWS, ITEMS, TWICE, OPENING)
     assert _row(_unit(got, "Unit 1"), 1)["comment"] == "covered by 'this one is all good' (10:01)"
     assert _row(_unit(got, "Unit 3"), 1)["comment"] == "covered by 'this one is all good' (10:10)"
-    # A third unit saying it again finds no line left, so it says no time.
+
+
+def test_r45_one_all_good_never_covers_two_units_without_stretches():
+    # C2: said once, in Unit 1; the model tagged ALL for Unit 1 and Unit 2.
+    once = "[10:01:10] Ben Lin (spk_1): Unit one, this ones all good."
+    rows = HEADER + ("| Unit 1 | ALL | Yes | | | | this ones all good |\n"
+                     "| Unit 2 | ALL | Yes | | | | this ones all good |\n")
+    got = wc.build(rows, ITEMS, once, {"names": ["Unit 1", "Unit 2"], "count": 2})
+    assert [r["answer"] for r in _unit(got, "Unit 1")["rows"]] == ["Yes"] * 3
+    u2 = _unit(got, "Unit 2")
+    assert [r["state"] for r in u2["rows"]] == ["not_checked"] * 3
+    assert "all_good" not in u2["report"]
+    assert {"item": "ALL", "reason": wc.NOT_PLACED} in u2["report"]["dropped"]
+    assert wc.NOT_PLACED == "all good not placed"
+
+
+def test_r45_a_third_unit_saying_it_again_with_no_line_left_is_dropped():
     got = wc.build(TWICE_ROWS + "| Unit 2 | ALL | Yes | | | | this one is all good |\n",
                    ITEMS, TWICE, OPENING)
-    assert _row(_unit(got, "Unit 2"), 1)["comment"] == "covered by 'this one is all good'"
+    u2 = _unit(got, "Unit 2")
+    assert [r["state"] for r in u2["rows"]] == ["not_checked"] * 3
+    assert {"item": "ALL", "reason": wc.NOT_PLACED} in u2["report"]["dropped"]
+
+
+# ---- R44: the walk's units are the opening's, the entered ones and the rows' --
+
+ENTERED_ONLY = "\n".join([
+    "[10:00:05] Ben Lin (spk_1): Doing four units today.",
+    "[10:01:10] Ben Lin (spk_1): Unit one, the smoke alarm is installed and tested.",
+    "[10:05:10] Ben Lin (spk_1): Into unit two now.",
+])
+
+
+def test_r44_an_entered_unit_with_no_rows_gets_its_section_every_item_not_checked():
+    rows = HEADER + "| Unit 1 | 1 | Yes | | | | the smoke alarm is installed and tested |\n"
+    got = wc.build(rows, ITEMS, ENTERED_ONLY, {"names": [], "count": 4},
+                   known_units=["Unit 1", "unit two"])
+    assert [u["unit"] for u in got["units"]] == ["Unit 1", "Unit 2"]
+    u2 = _unit(got, "Unit 2")
+    assert [r["state"] for r in u2["rows"]] == ["not_checked"] * 3
+    assert [g["n"] for g in u2["report"]["gaps"]["not_covered"]] == [1, 2, 3]
+    assert u2["flagged_unlisted"] is False       # no names to flag against
+    assert [row[0] for row in got["summary"]["rows"]] == ["Unit 1", "Unit 2"]
+
+
+def test_r44_walk_order_is_names_then_entered_then_rows_and_only_names_flag():
+    rows = HEADER + ("| Unit 9 | 1 | Yes | | | | the smoke alarm is installed and tested |\n"
+                     "| Unit 1 | 1 | Yes | | | | the smoke alarm is installed and tested |\n")
+    got = wc.build(rows, ITEMS, ENTERED_ONLY, {"names": ["Unit 1", "Unit 3"], "count": 2},
+                   known_units=["Unit 2", "Unit 1", "Kitchen", None])
+    assert [u["unit"] for u in got["units"]] == ["Unit 1", "Unit 3", "Unit 2", "Unit 9"]
+    assert [u["flagged_unlisted"] for u in got["units"]] == [False, False, True, True]
 
 
 def test_a_header_with_another_spelling_is_not_a_finding():

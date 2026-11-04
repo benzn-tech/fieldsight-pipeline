@@ -609,6 +609,31 @@ def test_a_walk_with_nothing_heard_leaves_every_unit_open_without_the_model():
     assert out["say"] == "6 items open across 2 units — the list is on your phone."
 
 
+def test_r44_a_unit_he_only_walked_into_is_asked_about_in_the_final_check():
+    """A count-only opening ("doing two units") and Unit 2 entered, but the
+    model wrote rows for Unit 1 only: Unit 2 is still a unit of the walk."""
+    w = WalkWorld("Unit 1 | 1 | Yes | braced | | | formwork is braced and plumb\n")
+    facts_ = walk_facts(names=())
+    facts_[WALK]["units"] = {"names": [], "count": 2}
+    facts_[WALK]["entered"] = [{"unit": "Unit 1", "at": "09:31", "quote": "unit one"},
+                               {"unit": "unit two", "at": "10:04", "quote": "unit two"}]
+    w.db = facts(live_windows=[WALK_WINDOW], walk=facts_)
+    out = w.run()
+    assert [u["unit"] for u in out["walk"]["units"]] == ["Unit 1", "Unit 2"]
+    assert [q["item_text"] for q in out["questions"] if q["unit"] == "Unit 2"] == [
+        "Formwork braced and plumb", "Edge protection installed", "Cover to steel checked"]
+
+
+def test_r45_one_all_good_never_silences_another_units_questions():
+    # Said once; the model tagged ALL for both units. Unit 2 is asked about.
+    rows = ("Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 2 | ALL | Yes | | | | formwork is braced and plumb all good\n")
+    out = WalkWorld(rows).run()
+    assert out["walk"]["units"][0]["not_covered"] == []
+    assert [g["n"] for g in out["walk"]["units"][1]["not_covered"]] == [1, 2, 3]
+    assert len([q for q in out["questions"] if q["unit"] == "Unit 2"]) == 3
+
+
 def test_a_window_of_another_walk_is_an_ordinary_check():
     w = WalkWorld(BOTH_UNITS_ROWS)
     w.db = facts(live_windows=[dict(WALK_WINDOW, walk_key="walk:" + "cd" * 20)],
