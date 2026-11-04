@@ -328,10 +328,15 @@ def _fold(text):
     return " ".join((text or "").split()).casefold()
 
 
-def walk_questions(walk_result, items):
+def walk_questions(walk_result, items, ask_units=None):
     """What is still open on the walk, as questions: per unit in walk order,
     its not-checked items first, then its Nos (each read back to confirm),
     items in template order and by their TEXT.
+
+    `ask_units` (R51), when given, are the only units asked about -- the
+    walk's units (units.walk_units: opened with or entered), the set the hop
+    and the phone accept answers for. A unit seen only in the model's rows
+    stays a report section but is not asked. None asks every unit.
 
     An item the on-site answers already decided is not asked again. An item
     under conflict (on site and the recording disagree) is asked by what the
@@ -340,9 +345,12 @@ def walk_questions(walk_result, items):
     conflicts = {(c.get("unit"), _fold(c.get("item"))): c
                  for c in (walk_result or {}).get("conflicts") or []}
     order = {_fold(t): i for i, t in enumerate(items or [])}
+    asked = None if ask_units is None else {_answer_unit(u) for u in ask_units}
     out = []
     for unit in (walk_result or {}).get("units") or []:
         name = unit["unit"]
+        if asked is not None and _answer_unit(name) not in asked:
+            continue
         rows = sorted(unit.get("rows") or [], key=lambda r: order.get(_fold(r["item"]), len(order)))
         open_, nos = [], []
         for r in rows:
@@ -966,7 +974,8 @@ def _walk_result(walk, tpl, items, paragraphs, transcript_text, check, covered_u
     over them, and the questions still open. not_covered / failed keep their
     meaning across the walk: every unit's, each naming its unit. Every unit he
     entered is a unit of the walk (R44), so one he said nothing about is asked
-    about in full."""
+    about in full. A unit first seen in the rows is a flagged section, never
+    asked (R51): the hop would refuse its answer."""
     entered = [m.get("unit") for m in walk.get("entered") or [] if isinstance(m, dict)]
     built = walk_checklist.build("\n".join(paragraphs), items, transcript_text,
                                  opening=walk.get("units"), stretches=None,
@@ -980,7 +989,11 @@ def _walk_result(walk, tpl, items, paragraphs, transcript_text, check, covered_u
                             if r["state"] == "not_checked"],
             "failed": [{"n": r["n"], "text": r["item"], "comment": r["comment"] or ""}
                        for r in u["rows"] if r["state"] == "answered" and r["answer"] == "No"]})
-    questions = walk_questions(result, items)
+    # R51: asked only about the units the hop and the phone accept answers for
+    # -- units.walk_units over the opening and every entered mark, exactly as
+    # lambda_check_gaps_db._caller_walk builds it.
+    ask = units_mod.walk_units({"units": walk.get("units")}, [{"entered": walk.get("entered")}])
+    questions = walk_questions(result, items, ask_units=ask)
     label = "the " + (tpl.get("name") or "checklist")
     say = say_walk(label, len(items), [u["unit"] for u in units], questions, partial,
                    (walk.get("units") or {}).get("count"))

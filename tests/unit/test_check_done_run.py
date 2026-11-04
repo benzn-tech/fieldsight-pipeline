@@ -624,6 +624,41 @@ def test_r44_a_unit_he_only_walked_into_is_asked_about_in_the_final_check():
         "Formwork braced and plumb", "Edge protection installed", "Cover to steel checked"]
 
 
+R51_ROWS = BOTH_UNITS_ROWS + "Unit 9 | 1 | Yes | braced | | | formwork is braced and plumb\n"
+
+
+def _r51_world():
+    """Opening names Units 1 and 2, he entered Unit 3, and the model wrote a
+    row for Unit 9 -- a unit the walk never opened with or entered."""
+    w = WalkWorld(R51_ROWS)
+    facts_ = walk_facts()
+    facts_[WALK]["entered"] = [{"unit": "unit three", "at": "10:04", "quote": "unit three"}]
+    w.db = facts(live_windows=[WALK_WINDOW], walk=facts_)
+    return w, facts_[WALK]
+
+
+def test_r51_a_unit_seen_only_in_the_rows_is_reported_not_asked():
+    w, _ = _r51_world()
+    out = w.run()
+    # Unit 9 stays a (flagged) section of the result ...
+    assert [u["unit"] for u in out["walk"]["units"]] == ["Unit 1", "Unit 2", "Unit 3", "Unit 9"]
+    assert any(g["unit"] == "Unit 9" for g in out["not_covered"])
+    # ... but no final-check question is about it: the hop and the phone would refuse the answer.
+    assert "Unit 9" not in {q["unit"] for q in out["questions"]}
+    # The entered unit is still asked about in full, the named ones as before.
+    assert [q["item_text"] for q in out["questions"] if q["unit"] == "Unit 3"] == ITEMS
+    assert {q["unit"] for q in out["questions"]} == {"Unit 1", "Unit 2", "Unit 3"}
+
+
+def test_r51_every_asked_unit_is_one_the_answer_validator_accepts():
+    w, walk = _r51_world()
+    out = w.run()
+    accept = cd.units_mod.walk_units({"units": walk["units"]}, [{"entered": walk["entered"]}])
+    assert out["questions"]
+    for q in out["questions"]:
+        assert cd.units_mod.answer_units(accept, q["unit"])[2] is None, q
+
+
 def test_r45_one_all_good_never_silences_another_units_questions():
     # Said once; the model tagged ALL for both units. Unit 2 is asked about.
     rows = ("Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"
