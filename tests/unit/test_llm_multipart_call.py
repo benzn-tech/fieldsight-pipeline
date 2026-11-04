@@ -149,3 +149,101 @@ def test_config_errors_carry_the_not_configured_prefix(monkeypatch):
     monkeypatch.setattr(lu, "LLM_PROVIDER", "anthropic")
     assert lu.call_llm_parts(PARTS, model=GEM, max_tokens=1)[1].startswith(
         lu.PARTS_NOT_CONFIGURED)
+
+
+# ---- reasoning / provider pin (spec 2026-10-31 B2) -------------------------
+# Both None is the request above, byte for byte; the pins above are that proof.
+
+def test_reasoning_rides_on_the_request_and_buys_its_headroom(monkeypatch):
+    sent = _stub(monkeypatch, [_ok()])
+    lu.call_llm_parts(PARTS, model=GEM, max_tokens=16000, caller="t",
+                      reasoning={"effort": "low"})
+    assert sent[0]["reasoning"] == {"effort": "low"}
+    # Reasoning tokens are completion tokens: the caller's number stays the answer's.
+    assert sent[0]["max_tokens"] == 16000 + lu.REASONING_HEADROOM_TOKENS
+    assert sent[0]["temperature"] == 0 and "provider" not in sent[0]
+
+
+def test_a_provider_pin_rides_on_the_request_without_headroom(monkeypatch):
+    pin = {"only": ["coreweave/fp8"], "allow_fallbacks": False}
+    sent = _stub(monkeypatch, [_ok()])
+    lu.call_llm_parts(PARTS, model=GEM, max_tokens=16000, caller="t", provider=pin)
+    assert sent[0]["provider"] == pin
+    assert sent[0]["max_tokens"] == 16000 and "reasoning" not in sent[0]
+
+
+def test_reasoning_and_pin_never_ride_on_a_fallback_model(monkeypatch):
+    """A fallback on another vendor would 400 under an endpoint pin that names someone
+    else -- the Ask judge's rule, for the same reason."""
+    monkeypatch.setenv("TEMPLATE_DIGITISE_FALLBACK_MODELS", "vendor/vision-b")
+    sent = _stub(monkeypatch, [_err(503)] * lu.MAX_ATTEMPTS + [_ok("from-b", "vendor/vision-b")])
+    text, err = lu.call_llm_parts(
+        PARTS, model=GEM, max_tokens=100, fallback_env="TEMPLATE_DIGITISE_FALLBACK_MODELS",
+        caller="t", reasoning={"enabled": False},
+        provider={"only": ["coreweave/fp8"], "allow_fallbacks": False})
+    assert (text, err) == ("from-b", None)
+    assert sent[0]["reasoning"] == {"enabled": False} and "provider" in sent[0]
+    last = sent[-1]
+    assert last["model"] == "vendor/vision-b"
+    assert "reasoning" not in last and "provider" not in last and last["max_tokens"] == 100
+
+
+def test_a_cut_off_names_the_budget_that_was_on_the_wire(monkeypatch):
+    _stub(monkeypatch, [_cut("")])
+    _, err = lu.call_llm_parts(PARTS, model=GEM, max_tokens=100, caller="t",
+                               reasoning={"effort": "low"})
+    assert err.startswith(lu.PARTS_CUT_OFF)
+    assert "max_tokens=%d" % (100 + lu.REASONING_HEADROOM_TOKENS) in err
+
+
+# ---- the shared parsers --------------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None), ("", None), ("  ", None),
+    ("off", {"enabled": False}), (" OFF ", {"enabled": False}),
+    ("low", {"effort": "low"}), ("medium", {"effort": "medium"}), ("High", {"effort": "high"}),
+])
+def test_parse_reasoning(raw, expected):
+    assert lu.parse_reasoning(raw) == expected
+
+
+def test_parse_reasoning_warns_on_an_unknown_value_naming_the_setting(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        assert lu.parse_reasoning("turbo", name="TEMPLATE_DIGITISE_REASONING") is None
+    assert any("TEMPLATE_DIGITISE_REASONING" in r.getMessage() for r in caplog.records)
+
+
+def test_muse_refuses_off_so_the_field_is_omitted_with_a_warning(caplog):
+    """`{"enabled": false}` is a hard 400 on muse ("Reasoning is mandatory for this
+    endpoint"): one setting meant for another model must not fail every read."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        got = lu.parse_reasoning("off", model="meta/muse-spark-1.3-contributor",
+                                 name="TEMPLATE_DIGITISE_REASONING")
+    assert got is None
+    assert any("TEMPLATE_DIGITISE_REASONING" in r.getMessage() and "muse" in r.getMessage()
+               for r in caplog.records)
+    assert lu.parse_reasoning("low", model="meta/muse-spark-1.3-contributor") == {
+        "effort": "low"}
+    assert lu.parse_reasoning("off", model="deepseek/deepseek-v4.1-flash") == {
+        "enabled": False}
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None), ("", None), (" , ", None),
+    ("coreweave/fp8", {"only": ["coreweave/fp8"], "allow_fallbacks": False}),
+    ("coreweave/fp8, other/tag", {"only": ["coreweave/fp8", "other/tag"],
+                                  "allow_fallbacks": False}),
+])
+def test_parse_provider(raw, expected):
+    assert lu.parse_provider(raw) == expected
+
+
+def test_reasoning_off_buys_no_headroom(monkeypatch):
+    """`{"enabled": false}` spends no reasoning tokens, so the budget stays the answer's."""
+    sent = _stub(monkeypatch, [_ok("{}", "deepseek/deepseek-v4.1-flash")])
+    lu.call_llm_parts(PARTS, model="deepseek/deepseek-v4.1-flash", max_tokens=16000,
+                      caller="t", reasoning={"enabled": False})
+    assert sent[0]["reasoning"] == {"enabled": False}
+    assert sent[0]["max_tokens"] == 16000
