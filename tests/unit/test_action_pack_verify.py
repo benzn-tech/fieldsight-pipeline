@@ -771,3 +771,29 @@ def test_nothing_model_checked_stores_no_verifier_model(monkeypatch):
                                                 verify=apv.verify))
     assert fake.calls == [] and payload["models"]["verifier"] is None
     assert payload["conclusion"][0]["confidence"] == "uncertain"
+
+
+# ---- ref dates (spec 2026-11-05 §6.2, §7.2) ------------------------------------------------
+
+def test_verify_prompt_carries_ref_dates():
+    row = dict(item_row(SID1, "Inspect scaffold before Monday"),
+               deadline_text="end of next week", raised_on="2026-10-20")
+    registry, items, _ = fixture(items={SID1: row}, extra_registry={
+        "R2": entry("R2", "chunk", "Ann: we pour next Friday.",
+                    item={"ref": "R2", "kind": "chunk", "date": "2026-10-28",
+                          "text": "Ann: we pour next Friday."})})
+    registry["R1"]["item"]["date"] = "2026-10-30T09:00:00+13:00"
+    el = {"type": "update_item", "target_stable_id": SID1,
+          "proposed": {"deadline": "2026-10-31"}, "rationale": "r",
+          "refs": ["R1", "R2", row["ref"], "D1"]}
+    p = apv.build_prompt("action", el, registry=registry, items=items)
+    assert "R1 | topic | said_on 2026-10-30 (Fri) | Ann: scaffold" in p
+    assert "R2 | chunk | said_on 2026-10-28 (Wed) | Ann: we pour next Friday." in p
+    assert f"{row['ref']} | item | said_on 2026-10-20 (Tue) | Inspect scaffold" in p
+    assert "D1 | document | said_on - | Cure concrete" in p
+    assert ('target item: Inspect scaffold before Monday (current status open) | '
+            'deadline_text "end of next week" | raised_on 2026-10-20 (Tue)') in p
+    # A target with neither key still renders, and says it has no raise date.
+    bare = apv.build_prompt("action", dict(el, refs=["D1"]), registry=registry,
+                            items={SID1: item_row(SID1, "Inspect scaffold before Monday")})
+    assert "(current status open) | raised_on -" in bare and "deadline_text" not in bare
