@@ -162,6 +162,7 @@ import report_sections
 import report_template
 import report_modules
 import report_photos
+import location_grouping
 import photo_binding
 import photo_rebind
 import session_scope
@@ -12852,9 +12853,17 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                 # Grouped by location when he said where he was. ADDITIVE:
                 # photo_filenames stays the flat, complete list, so a client
                 # that ignores this renders exactly what it rendered before.
-                groups = _photo_groups(conn, caller, user, date, photos)
+                markers = _day_markers(conn, caller, user, date)
+                groups = _photo_groups(markers, photos, user, date)
                 if groups is not None:
                     shape["photo_groups"] = groups
+                # Topics AND photos by place, in visit order (Track L). Same
+                # gate and same markers as photo_groups; set only when it has
+                # something to say, and its failure never takes photo_groups.
+                located = _location_groups(markers, shape.get("topics") or [],
+                                           photos, user, date)
+                if located is not None:
+                    shape["location_groups"] = located
                 # `photos` ONLY. The 404's `uploads` also carries sessions and
                 # duration from `range_stats` (site-clipped, author-filtered,
                 # tombstoned); this body already reports those from `day_stats`
@@ -12975,7 +12984,30 @@ def _day_photo_block(conn, caller, user, date):
         return None
 
 
-def _photo_groups(conn, caller, user, date, photos):
+def _day_markers(conn, caller, user, date):
+    """The day's location markers, read once for both groupings. None (logged)
+    when they cannot be read -- which both groupings treat as "no markers"."""
+    try:
+        company = _read_company(caller, user)
+        return location_markers.for_day(conn, company, user, date)
+    except Exception:  # noqa: BLE001 - grouping is an addition, never a 500
+        logger.exception("location markers unavailable for %s/%s", user, date)
+        return None
+
+
+def _location_groups(markers, topics, photos, user, date):
+    """`location_grouping.group_day` for the day view, or None. Never raises."""
+    if not markers:
+        return None
+    try:
+        # No aliases yet: a later step can load `name_aliases` `place:` rows.
+        return location_grouping.group_day(markers, topics, photos)
+    except Exception:  # noqa: BLE001 - photo_groups must survive this failing
+        logger.exception("location groups unavailable for %s/%s", user, date)
+        return None
+
+
+def _photo_groups(markers, photos, user, date):
     """The day's photos grouped by WHERE HE SAID HE WAS, or None.
 
     None, not [], when there are no markers: absent means "nobody said where
@@ -12991,8 +13023,6 @@ def _photo_groups(conn, caller, user, date, photos):
     Never raises: the flat list is the answer, this is an improvement on it.
     """
     try:
-        company = _read_company(caller, user)
-        markers = location_markers.for_day(conn, company, user, date)
         if not markers:
             return None
         groups, order = {}, []

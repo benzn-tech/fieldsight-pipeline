@@ -93,8 +93,8 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_org_api.py` (`_photo_groups` → delegate to `location_grouping.group_day`; add `shape["location_groups"]`)
 - Test: `tests/unit/test_org_api_location_groups.py`
 
-- [ ] **Step 1:** Keep `photo_groups` shape byte-identical for existing clients (derive it from `group_day`), and add `location_groups` = the full `Group` list with `topic_ids`. Same `None` semantics, same cross-user gate, same never-raise wrapper.
-- [ ] **Step 2:** Test the gate (site-clipped caller: neither key), the no-marker day (neither key), and a marker day (both keys, and `photo_groups` equals what the old code produced on the same fixture — replay, do not re-derive).
+- [x] **Step 1:** (done: `photo_groups` kept on its own code path — ruling — markers read once by `_day_markers`; `location_groups` added, topic ids = `topics[].topic_id`) Keep `photo_groups` shape byte-identical for existing clients (derive it from `group_day`), and add `location_groups` = the full `Group` list with `topic_ids`. Same `None` semantics, same cross-user gate, same never-raise wrapper.
+- [x] **Step 2:** (done: `tests/unit/test_org_api_location_groups.py`, 8 tests) Test the gate (site-clipped caller: neither key), the no-marker day (neither key), and a marker day (both keys, and `photo_groups` equals what the old code produced on the same fixture — replay, do not re-derive).
 
 ---
 
