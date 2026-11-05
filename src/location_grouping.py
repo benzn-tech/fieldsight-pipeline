@@ -36,20 +36,28 @@ Rules that carry the design:
   place is a NEW group -- Level 1 -> Level 2 -> Level 1 is three groups,
   because "back on Level 1" is what he did. A place he announced where
   nothing fell gives no group: empty groups are never emitted.
-- None is a stop in the walk like any other. The opening None group ("before
-  he said where he was") and a later None group ("more than CARRY_MINUTES
-  after the last announcement") are separate groups when a place lies between
-  them. Items with NO time at all (unparseable time_range, unreadable photo
-  time) go in a None group at the END of the walk -- merged into the last
-  group if that is already None -- because having no time means having no
-  position in the walk, and putting them under the opening group would claim
-  they came before the first announcement.
+- None is a stop in the walk like any other, and every None group says WHY
+  in `reason`:
+    "before_first" -- before the day's first announcement (the item's time
+                      is earlier than the first marker's, compared in seconds
+                      with the same convention as `locate`);
+    "expired"      -- more than CARRY_MINUTES after the last announcement;
+    "no_time"      -- the item has no parseable time at all.
+  Groups are merged only when both place and reason match, so two adjacent
+  None groups with different reasons stay apart: each gets its own heading.
+  "no_time" items (unparseable time_range, unreadable photo time) go in one
+  group at the END of the walk, because having no time means having no
+  position in it; putting them under the opening group would claim they came
+  before the first announcement.
 
 Group shape:
     {"location": label | None,   # canonical label, e.g. "Level 1"
      "kind": kind | None,        # place_normalise kind: level/room/zone/block/other
      "key": place_key | None,    # ADDED to the plan's shape: Task 4 needs a
                                  #   stable identity to compare places by
+     "reason": None | "before_first" | "expired" | "no_time",
+                                 # ADDED: why a None group has no place;
+                                 #   always None on a placed group
      "order": int,               # 0-based visit order, contiguous
      "topic_ids": [...],
      "photos": [filename, ...],          # bound to this group's topics
@@ -58,7 +66,8 @@ Group shape:
 A topic's id is its `id`, else its `topic_id`, else -- only when it has
 neither -- its index in the `topics` list.
 
-Photos are given as bare filenames or dicts with `s3_key` / `filename`;
+Photos are given as bare filenames or dicts with `filename` / `s3_key` (the
+first of those that is a non-empty string);
 they are compared by basename. The `photos` argument is the universe: every
 photo in it appears exactly once across all groups, and a `related_photos`
 entry naming a file NOT in it is ignored rather than invented into the day.
@@ -67,14 +76,14 @@ Markers that are not dicts or have no `at` / `location` are skipped, as
 `location_markers.for_day` already skips them on read; dropping one lets the
 previous marker's carry run on, which is what the day view does today.
 
-Never raises on bad data; returns None when there are no markers ("nobody
-said where they were" stays distinct from a list, as in the day view's
-`_photo_groups`).
+Never raises on bad data; returns None when there are no usable markers --
+none given, or every one dropped by that filter ("nobody said where they
+were" stays distinct from a list, as in the day view's `_photo_groups`).
 
 Pure: no database, no network.
 """
 from photo_binding import parse_time_range, photo_time
-from place_normalise import _resolve, normalise, place_key
+from place_normalise import normalise, place_key, resolve
 from repositories.location_markers import locate
 
 
@@ -96,7 +105,7 @@ def _place(markers, when, aliases):
         key = place_key(raw, aliases)
         # Label from the alias-resolved text, so label, kind and key agree:
         # "the new block" aliased to "Block C" is labelled "Block C".
-        got = normalise(_resolve(raw, aliases))
+        got = normalise(resolve(raw, aliases))
     except ValueError:
         return None
     return key, got["label"], got["kind"]
@@ -127,9 +136,31 @@ def _seconds(when):
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + (int(parts[2]) if len(parts) == 3 else 59)
 
 
+def _marker_seconds(m):
+    """A marker's time in seconds, as `locate` reads it: `at_s` when it has
+    one, else `at` at second 0 of its minute; None when unreadable."""
+    for when in (m.get("at_s"), str(m.get("at") or "")[:5]):
+        parts = str(when or "").split(":")
+        if len(parts) in (2, 3):
+            try:
+                return (int(parts[0]) * 3600 + int(parts[1]) * 60
+                        + (int(parts[2]) if len(parts) == 3 else 0))
+            except ValueError:
+                pass
+    return None
+
+
+def _none_reason(first_s, when):
+    """Why `when` has no place: before the first marker, or past the carry."""
+    if first_s is not None and _seconds(when) < first_s:
+        return "before_first"
+    return "expired"
+
+
 def _basename(photo):
     if isinstance(photo, dict):
-        photo = photo.get("filename") or photo.get("s3_key")
+        photo = next((v for v in (photo.get("filename"), photo.get("s3_key"))
+                      if isinstance(v, str) and v.strip()), None)
     if not isinstance(photo, str) or not photo.strip():
         return None
     return photo.rsplit("/", 1)[-1]
@@ -146,9 +177,11 @@ def _topic_id(topic, index):
 def group_day(markers, topics, photos, *, aliases=None):
     """The day's topics and photos grouped by place, in visit order, or None
     when there are no markers. See the module docstring for every rule."""
-    if not markers:
-        return None
     marks = _clean_markers(markers)
+    if not marks:
+        return None
+    firsts = [s for s in map(_marker_seconds, marks) if s is not None]
+    first_s = min(firsts) if firsts else None
 
     # The universe of photos, by basename, first occurrence wins.
     names, seen_names = [], set()
@@ -195,27 +228,33 @@ def group_day(markers, topics, photos, *, aliases=None):
             continue
         when = photo_time(n)
         if when:
-            timed.append((_seconds(when), 1, j, ("photo", n, _place(marks, when, aliases))))
+            timed.append((_seconds(when), 1, j, ("photo", n, _place(marks, when, aliases), when)))
         else:
-            untimed.append(("photo", n, None))
+            untimed.append(("photo", n, None, None))
     timed.sort(key=lambda x: x[:3])
 
     groups = []
     group_of_topic = {}
 
-    def group_for(place):
+    def group_for(place, reason):
         key = place[0] if place else None
-        if groups and groups[-1]["key"] == key:
+        if groups and groups[-1]["key"] == key and groups[-1]["reason"] == reason:
             return groups[-1]
         g = {"location": place[1] if place else None,
              "kind": place[2] if place else None,
-             "key": key, "order": len(groups),
+             "key": key, "reason": reason, "order": len(groups),
              "topic_ids": [], "photos": [], "unbound_photos": []}
         groups.append(g)
         return g
 
-    def add(item, place):
-        g = group_for(place)
+    def add(item, place, when):
+        if place:
+            reason = None
+        elif when:
+            reason = _none_reason(first_s, when)
+        else:
+            reason = "no_time"
+        g = group_for(place, reason)
         if item[0] == "topic":
             g["topic_ids"].append(item[2][1])
             group_of_topic[item[1]] = g
@@ -223,9 +262,12 @@ def group_day(markers, topics, photos, *, aliases=None):
             g["unbound_photos"].append(item[1])
 
     for *_, item in timed:
-        add(item, item[2][3] if item[0] == "topic" else item[2])
+        if item[0] == "topic":
+            add(item, item[2][3], item[2][2])
+        else:
+            add(item, item[2], item[3])
     for item in untimed:
-        add(item, None)
+        add(item, None, None)
 
     # Bound photos join their topic's group, in the day's photo order.
     for n in names:

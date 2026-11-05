@@ -365,6 +365,14 @@ def _resolve(text, aliases):
     return table.get(_casefold_collapse(_strip_prefix(text))) or text
 
 
+def resolve(text, aliases=None):
+    """The place text `aliases` pins `text` to, or `text` itself -- the text
+    `place_key` normalises. Callers that need a group's label to agree with its
+    key normalise this. Raises ValueError on None or blank text, as
+    `normalise` does."""
+    return _resolve(text, aliases)
+
+
 def place_key(text, aliases=None):
     """The key groups are keyed on: "kind:value".
 

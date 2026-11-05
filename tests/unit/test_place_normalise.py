@@ -335,3 +335,13 @@ def test_a_slash_or_dash_range_is_other(two, one):
 def test_a_dash_inside_one_code_is_not_a_range(text, label):
     assert normalise(text)["kind"] != "other"
     assert normalise(text)["label"].startswith(label)
+
+
+def test_resolve_returns_the_alias_target_or_the_text():
+    from place_normalise import resolve
+    aliases = {"place:the new block": "place:Block C"}
+    assert resolve("The  New Block", aliases) == "Block C"
+    assert resolve("Level 2", aliases) == "Level 2"
+    assert resolve("Level 2") == "Level 2"
+    with pytest.raises(ValueError):
+        resolve("  ", aliases)
