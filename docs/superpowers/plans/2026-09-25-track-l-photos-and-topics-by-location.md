@@ -165,6 +165,14 @@ Not code in this repo, and the thing that decides whether Tasks 2–7 show anyth
 
 ## Findings
 
+### TEST verification — 2026-11-06 (deploy run 42026544929, develop 0d8217b7)
+
+Read-only invoke of `fieldsight-test-org-api` `/timeline` as the owner's alias user Ben_Lin_test2:
+- 2026-10-27 (7 markers, 14 photos): 200; `photo_filenames`, `photo_groups` and `location_groups` present; 4 groups in visit order (before_first 9 topics / "Inside" `other` 5 / Level 5 2 / expired 4); all 14 photos appear once; sections `Summary, Actions, Closed today, Open Questions, Decisions, Locations, Photos`, with Locations headed "Before any location was announced / Inside / Level 5 / Location not stated".
+- 2026-10-24 (no markers, 9 photos): 200; only `photo_filenames`; sections unchanged (no Locations).
+
+Task 8 (measure again) is due about 2026-11-20.
+
 ### Task 1 — 2026-11-05, last 30 days, `scripts/measure_location_markers.py` (read-only)
 
 C1 = the platform's own company (internal/owner testing); C2 = a customer company. The label map and the raw strings stay in a local file and are not committed.
