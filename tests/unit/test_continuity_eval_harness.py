@@ -495,3 +495,57 @@ def test_planned_runs_is_pure_and_covers_every_arm_and_rep():
     assert {p["arm"] for p in plan} == set(run_mod.ARMS)
     assert {p["rep"] for p in plan} == set(run_mod.REPS)
     assert all(p["n_steps"] == 2 for p in plan)  # shape a: [0.95, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Prod-config run (Task 13 step 4): same sessions as an earlier run, same prompt as
+# the flip will ship.
+# ---------------------------------------------------------------------------
+
+def test_pinned_sessions_keeps_pinned_order_and_reports_missing():
+    a = {"user_folder": "u", "date": "2026-09-01", "session_base": "a", "n_segments": 9}
+    b = {"user_folder": "u", "date": "2026-09-02", "session_base": "b", "n_segments": 7}
+    pinned = [{**b, "n_segments": 1, "config_env": "test"},
+              {"user_folder": "gone", "date": "2026-09-03", "session_base": "c"},
+              {**a, "n_segments": 1}]
+    chosen, missing = run_mod.pinned_sessions(pinned, [a, b])
+    assert chosen == [b, a]  # pinned order, current n_segments
+    assert [m["session_base"] for m in missing] == ["c"]
+
+
+def test_sessions_file_overrides_sessions_count_on_dry_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    s1 = {"env": "prod", "user_folder": "u", "date": "2026-09-01", "session_base": "s1",
+          "n_segments": 5}
+    s2 = {**s1, "session_base": "s2"}
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions", lambda env, **kw: [s1, s2])
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    pinned = tmp_path / "pinned.json"
+    pinned.write_text(json.dumps([s2]), encoding="utf-8")
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_pinned"
+    run_mod.main(["--env", "prod", "--sessions", "1", "--sessions-file", str(pinned),
+                  "--shapes", "a", "--out", str(out_dir), "--dry-run",
+                  "--status-instruction"])
+
+    written = json.loads((out_dir / "sessions.json").read_text(encoding="utf-8"))
+    assert [s["session_base"] for s in written] == ["s2"]
+    assert written[0]["status_instruction"] is True
+
+
+def test_status_instruction_rides_on_the_continuity_block(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.status_suggestions.INSTRUCTION)
+    monkeypatch.setattr(run_mod.les, "build_extraction_prompt",
+                         lambda *a, continuity_block="", **k:
+                         (prompts.append(continuity_block) or "p", {}))
+    monkeypatch.setattr(run_mod.les, "render_transcript", lambda turns: ("", {}))
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm", lambda *a, **k: (None, "stop"))
+    prior = [{"topic": "t", "action_items": [{"action": "Order the door hardware",
+                                               "item_id": "6f1c2a4e-8b0d-4c3e-9a51-2d7f0e9b6c11"}]}]
+    run_mod._run_one_step("u", "2026-09-01", "s", [], 1, arm="with_block",
+                          is_first=False, is_final=False, prior_topics=prior)
+    assert prompts and run_mod.status_suggestions.INSTRUCTION.strip()[:40] in prompts[0]
