@@ -80,10 +80,10 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - `group_day(markers, topics, photos, *, aliases=None) -> list[Group]` where `Group = {"location": label|None, "kind", "order", "topic_ids": [...], "photos": [filename...], "unbound_photos": [...]}`, in first-visit order.
 - `place_of(markers, hhmm) -> label|None` wrapping `location_markers.locate` + `place_normalise`.
 
-- [ ] **Step 1: Topic placement.** A topic's place is `place_of(markers, start_of(time_range))`; a topic that starts before the first marker is `None`. A topic whose window spans two markers stays with the place it **started** in — he was there when he began talking about it; the next marker is a new place, not a split of this topic.
-- [ ] **Step 2: Photo placement.** A photo bound to a topic (`related_photos`) follows its topic's place. A photo bound to no topic is placed by its own time with `place_of`, into the group's `unbound_photos`. A photo bound to two topics goes with the earlier topic and is not listed twice.
-- [ ] **Step 3: Consecutive visits to the same place merge**; a return to a place after another place is a **new** group (Level 1 → Level 2 → Level 1 renders three groups, in that order). Say so in the docstring: the day is a walk, and "back on Level 1" is what he did.
-- [ ] **Step 4: Tests** on a hand-built day: three markers, five topics (one before any marker, one spanning two), eight photos (two unbound, one double-bound). Assert order, membership, and that every photo appears exactly once across all groups.
+- [x] **Step 1: Topic placement.** (done: `src/location_grouping.py`) A topic's place is `place_of(markers, start_of(time_range))`; a topic that starts before the first marker is `None`. A topic whose window spans two markers stays with the place it **started** in — he was there when he began talking about it; the next marker is a new place, not a split of this topic.
+- [x] **Step 2: Photo placement.** (done; bound photo follows its earliest topic) A photo bound to a topic (`related_photos`) follows its topic's place. A photo bound to no topic is placed by its own time with `place_of`, into the group's `unbound_photos`. A photo bound to two topics goes with the earlier topic and is not listed twice.
+- [x] **Step 3: Consecutive visits to the same place merge**; a return to a place after another place is a **new** group (Level 1 → Level 2 → Level 1 renders three groups, in that order). Say so in the docstring: the day is a walk, and "back on Level 1" is what he did.
+- [x] **Step 4: Tests** (done: 18; also `reason` on null groups: before_first / expired / no_time, empty groups never emitted, all-unusable markers → None) on a hand-built day: three markers, five topics (one before any marker, one spanning two), eight photos (two unbound, one double-bound). Assert order, membership, and that every photo appears exactly once across all groups.
 
 ---
 
