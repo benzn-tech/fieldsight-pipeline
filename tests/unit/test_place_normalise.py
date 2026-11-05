@@ -264,3 +264,42 @@ def test_chinese_basements_are_the_english_basement():
 def test_fix_round_1_labels_are_fixed_points(text):
     got = normalise(text)
     assert place_key(got["label"]) == place_key(text)
+
+
+# --- fix round 2 ---------------------------------------------------------------
+
+def test_a_letter_code_is_never_a_measurement():
+    keys = {place_key(t) for t in ("level 2 zone A m", "level 2 zone I m", "level 2 zone")}
+    assert len(keys) == 3
+    assert normalise("level 2 zone A m")["kind"] == "zone"
+
+
+@pytest.mark.parametrize("measured, place", [
+    ("basement 2 m from the wall", "basement 2 from the wall"),
+    ("stair 3 m from the wall", "stair 3 from the wall"),
+    ("basement 2 m", "basement 2"),
+    ("stair 2 m", "stair 2"),
+])
+def test_a_measured_basement_or_stair_is_other(measured, place):
+    assert normalise(measured)["kind"] == "other"
+    assert not same_place(measured, place)
+
+
+@pytest.mark.parametrize("two, one", [
+    ("zone A and B", "zone A"),
+    ("level 2 and 3", "Level 2"),
+    ("level 2 to 3", "Level 2"),
+    ("room 101 and 102", "room 101"),
+    ("level 2 & 3", "Level 2"),
+    ("level 2 through 3", "Level 2"),
+    ("level 2到3", "Level 2"),
+    ("level 2和3", "Level 2"),
+    ("level 2至3", "Level 2"),
+])
+def test_an_elliptical_second_place_is_other(two, one):
+    assert normalise(two)["kind"] == "other"
+    assert not same_place(two, one)
+
+
+def test_a_connector_before_another_part_is_still_one_place():
+    _same("level 2 and zone 4", "Level 2 Zone 4")

@@ -38,7 +38,11 @@ wrong place, and nobody sees it.
   is the room's ("Room L2" is not level 2). A lone letter right after a part
   is that part's code letter ("Level 2 A" is not "Level 2").
 - A phrase that gives one part two values ("level 2 to level 3", "room 101
-  and room 102") names two places, so it is kind "other", not either one.
+  and room 102"), or a part followed by a connector and a second code ("level
+  2 and 3", "zone A to B", "二楼到3"), names two places, so it is kind
+  "other", not either one. So is any phrase with a measurement in it: what is
+  left after removing "2 m" would spell the very place the measurement ruled
+  out ("basement 2 m from the wall" is not Basement 2).
 - Anything with no part -- a farm or site name, a landmark, "inside", a bare
   "level" -- is kind "other", valued as content_hash.normalize gives it. It is
   never guessed into a level.
@@ -96,6 +100,8 @@ _CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六":
 _CN_LEVEL = re.compile(r"(地下|负|負)?([一二两三四五六七八九十]+|\d+)\s*[楼层樓層]")
 # A number followed by one of these is a measurement, not a level or a code:
 # "floor 3 metres from the wall" names no floor.
+# "level 2 and 3", "zone A to B": a connector then a second code names two places.
+_CONNECT = frozenset(("and", "to", "through", "thru", "到", "和", "至"))
 _MEASURE = frozenset(("m", "mm", "cm", "metre", "metres", "meter", "meters", "millimetre",
                       "millimetres", "millimeter", "millimeters", "centimetre", "centimetres"))
 # "1.01" is room 101 written with the floor split off; "1.1" or "10.1" is not.
@@ -129,7 +135,7 @@ def _cn_levels(text):
 
 def _tokens(text):
     out = []
-    text = _MINUS.sub(" minus ", _cn_levels(unicodedata.normalize("NFC", text)))
+    text = _MINUS.sub(" minus ", _cn_levels(unicodedata.normalize("NFC", text))).replace("&", " and ")
     for t in _TOKEN.findall(text.casefold()):
         m = _SPLIT.fullmatch(t)
         # A token right after a room prefix is the room's code: "Room L2" is
@@ -166,6 +172,21 @@ def _number(tok, i, ordinal=False):
     return None
 
 
+def _codelike(w):
+    """True when `w` could be a second code or number ("3", "B", "C4", "three")."""
+    return ((len(w) == 1 and w.isascii() and w.isalpha()) or any(c.isdigit() for c in w)
+            or w in _ONES or w in _TEENS or w in _TENS or w in _ORDINALS)
+
+
+def _has_measurement(tok):
+    """True when a number is followed by a length ("basement 2 m from the
+    wall"). Such a phrase is a distance, and reading a place out of what is
+    left of it would spell the very place the measurement ruled out."""
+    return any(w in _MEASURE and i and (tok[i - 1].isdigit() or tok[i - 1] in _ONES
+                                         or tok[i - 1] in _TEENS or tok[i - 1] in _TENS)
+               for i, w in enumerate(tok))
+
+
 def _measured(tok, got):
     """`got` (value, next index), or None when the number is a measurement ("3 m")."""
     return None if got and got[1] < len(tok) and tok[got[1]] in _MEASURE else got
@@ -176,7 +197,10 @@ def _code(tok, i):
     a number, or a letter-number code ("C4"), written in capitals -- or None."""
     w = tok[i] if i < len(tok) else ""
     if w.isascii() and w.replace(".", "").isalnum() and (len(w) == 1 or any(c.isdigit() for c in w)):
-        return _measured(tok, (w.upper(), i + 1))
+        got = (w.upper(), i + 1)
+        # A bare letter is never a number, so it is never a measurement:
+        # "zone A m" is still Zone A.
+        return _measured(tok, got) if any(c.isdigit() for c in w) else got
     got = _measured(tok, _number(tok, i))
     return (str(got[0]), got[1]) if got else None
 
@@ -249,6 +273,8 @@ def _parts(tok):
         nonlocal conflict
         if j < len(tok) and len(tok[j]) == 1 and tok[j].isascii() and tok[j].isalpha():
             label, j = f"{label} {tok[j].upper()}", j + 1
+        if j + 1 < len(tok) and tok[j] in _CONNECT and _codelike(tok[j + 1]):
+            conflict = True
         if slots.setdefault(slot, label) != label:
             conflict = True
         return j
@@ -303,7 +329,9 @@ def normalise(text):
     None or blank text: no words is not a place, and an empty group key would
     gather everything nobody placed."""
     _require_text(text)
-    slots, words, compass, conflict = _parts(_tokens(text))
+    tok = _tokens(text)
+    slots, words, compass, conflict = _parts(tok)
+    conflict = conflict or _has_measurement(tok)
     # Two different values for one part ("level 2 to level 3") is two places,
     # not one; keeping either would merge it into a place it is not.
     if not slots or conflict:
