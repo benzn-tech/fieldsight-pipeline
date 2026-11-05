@@ -24,6 +24,7 @@ from pathlib import Path
 import item_continuity
 import lambda_extract_session as les
 import llm_utils
+import status_suggestions
 
 from scripts.continuity_eval import paths as paths_mod
 from scripts.continuity_eval import sessions as sessions_mod
@@ -41,6 +42,12 @@ EXTRACT_SESSION_FUNCTION = {
 ARMS = ("baseline", "with_block")
 REPS = (1, 2, 3)
 DEFAULT_SHAPE_NAMES = ("a", "b")
+
+# What rides on the continuity block besides the prior list. main() sets it from
+# --status-instruction: the deployed extractor appends status_suggestions.INSTRUCTION
+# when STATUS_SUGGESTIONS is on, so a prod-config run for a flip of both flags must
+# measure continuity under the same prompt.
+EXTRA_INSTRUCTION = ""
 
 
 def void(run):
@@ -77,7 +84,8 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
         prior_list = item_continuity.prior_items({"topics": prior_topics})
     else:
         prior_list = []
-    continuity_block = item_continuity.render_block(prior_list) if prior_list else ""
+    continuity_block = (item_continuity.render_block(prior_list, EXTRA_INSTRUCTION)
+                        if prior_list else "")
 
     prompt, _stats = les.build_extraction_prompt(
         user_folder, date, session_base, turns, n_segments,
@@ -202,6 +210,19 @@ def _select_shapes(names):
     return {name: all_shapes[name] for name in names if name in all_shapes}
 
 
+def pinned_sessions(pinned, candidates):
+    """The candidates whose (user_folder, date, session_base) appear in `pinned` (a
+    previous run's sessions.json), in `pinned`'s order, plus the pinned entries no longer
+    listed (deleted or below the segment floor since). Candidates supply the current
+    n_segments."""
+    def key(s):
+        return (s["user_folder"], s["date"], s["session_base"])
+    by_key = {key(c): c for c in candidates}
+    chosen = [by_key[key(p)] for p in pinned if key(p) in by_key]
+    missing = [p for p in pinned if key(p) not in by_key]
+    return chosen, missing
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", choices=("test", "prod"), required=True,
@@ -218,12 +239,22 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="Output directory (gitignored).")
     parser.add_argument("--shapes", default=",".join(DEFAULT_SHAPE_NAMES),
                          help="Comma-separated shape names to run (a, b, c).")
+    parser.add_argument("--sessions-file", default=None,
+                         help="A previous run's sessions.json: run exactly those sessions "
+                              "(those still listed) instead of the first --sessions "
+                              "candidates, so two runs stay comparable.")
+    parser.add_argument("--status-instruction", action="store_true",
+                         help="Append status_suggestions.INSTRUCTION to the continuity "
+                              "block, as the deployed extractor does with "
+                              "STATUS_SUGGESTIONS on.")
     parser.add_argument("--dry-run", action="store_true",
                          help="List what would run; makes no LLM call.")
     parser.add_argument("--profile", default=sessions_mod.DEFAULT_PROFILE)
     parser.add_argument("--region", default=sessions_mod.DEFAULT_REGION)
     args = parser.parse_args(argv)
     config_env = args.config_env if args.config_env is not None else args.env
+    global EXTRA_INSTRUCTION
+    EXTRA_INSTRUCTION = status_suggestions.INSTRUCTION if args.status_instruction else ""
 
     out_dir = paths_mod.require_run_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -232,7 +263,13 @@ def main(argv=None):
 
     client = sessions_mod.s3_client(profile=args.profile, region=args.region)
     candidates = sessions_mod.list_candidate_sessions(args.env, client=client)
-    chosen = candidates[: args.sessions]
+    if args.sessions_file:
+        chosen, missing = pinned_sessions(
+            json.loads(Path(args.sessions_file).read_text(encoding="utf-8")), candidates)
+        if missing:
+            print(json.dumps({"pinned_sessions_missing": len(missing)}))
+    else:
+        chosen = candidates[: args.sessions]
 
     # sessions.json stays the list `label.py._session_env_by_key` already reads
     # (each entry's existing "env" field IS data_env, from list_candidate_sessions).
@@ -240,7 +277,8 @@ def main(argv=None):
     # config ran the extractions -- the same value as data_env unless the caller
     # passed `--config-env` (spec §7 "Decision rule": a prod-sessions run under
     # TEST config).
-    sessions_out = [{**s, "data_env": s.get("env", args.env), "config_env": config_env}
+    sessions_out = [{**s, "data_env": s.get("env", args.env), "config_env": config_env,
+                      **({"status_instruction": True} if args.status_instruction else {})}
                      for s in chosen]
     (out_dir / "sessions.json").write_text(
         json.dumps(sessions_out, ensure_ascii=False, indent=2), encoding="utf-8")
