@@ -915,11 +915,19 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     lines = []
     for base, tr in tagged:
         at = tr.get("abs_start")
+        # One speaker's consecutive words are one long turn, so a turn can
+        # start a few seconds before the window and hold its first words: a
+        # turn is kept when any of it (abs_start..abs_end) is inside. A turn
+        # with no usable end keeps the start rule.
+        end = tr.get("abs_end")
+        if not (hasattr(at, "strftime") and hasattr(end, "strftime") and end >= at):
+            end = None
         if walk is not None:
-            # A walk: only turns that start inside a span of their own recording.
-            if not (hasattr(at, "strftime") and _in_spans(spans.get(base), _hhmmss(at))):
+            # A walk: only turns that meet a span of their own recording.
+            if not (hasattr(at, "strftime") and _in_spans(
+                    spans.get(base), _hhmmss(at), _hhmmss(end) if end else None)):
                 continue
-        elif floor is not None and hasattr(at, "strftime") and at < floor:
+        elif floor is not None and hasattr(at, "strftime") and (end or at) < floor:
             continue
         if (tr.get("text") or "").strip():
             lines.append("[%s] %s" % (_hhmmss(at), tr["text"].strip()))

@@ -925,3 +925,48 @@ def test_an_ordinary_check_stores_no_final_check():
     w = Plain()
     out = w.run()
     assert not out.get("walk") and w.stored == []
+
+
+# ---- a long turn that starts before the window (TEST smoke 2026-11-06, D1) ------
+# One speaker's consecutive words are one long turn, so a turn can start a few
+# seconds before the window and hold the check's first words: it is kept when
+# any of it is inside the window (start..abs_end), and dropped only when all of
+# it is before.
+
+def test_a_walk_keeps_a_turn_that_starts_before_the_span_and_ends_inside_it():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 52),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 30),
+                "text": "starting in unit one formwork braced"}] + w.turns
+    w.run()
+    assert "starting in unit one formwork braced" in w.prompts[0][0]
+
+
+def test_a_walk_still_drops_a_turn_wholly_before_the_span():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 40),
+                "abs_end": datetime(2026, 10, 20, 10, 2, 55),
+                "text": "talk about the weather first"}] + w.turns
+    w.run()
+    assert "talk about the weather first" not in w.prompts[0][0]
+
+
+def test_a_check_keeps_a_turn_that_starts_before_the_window_and_ends_inside_it():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:20",
+                                      "report_date": DATE}]))
+    w.turns = w.turns + [{"abs_start": datetime(2026, 10, 20, 10, 3, 12),
+                          "abs_end": datetime(2026, 10, 20, 10, 3, 40),
+                          "text": "cover to steel is checked at fifty"}]
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "cover to steel is checked at fifty" in prompt
+    assert SECRET_WORDS not in prompt, "10:03:05-10:03:09 is wholly before the window"
+
+
+def test_a_turn_with_no_end_keeps_the_start_rule():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:20",
+                                      "report_date": DATE}]))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 3, 12), "abs_end": None,
+                "text": "cover to steel is checked at fifty"}]
+    w.run()
+    assert "cover to steel is checked at fifty" not in w.prompts[0][0]
