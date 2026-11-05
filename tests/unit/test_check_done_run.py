@@ -925,3 +925,132 @@ def test_an_ordinary_check_stores_no_final_check():
     w = Plain()
     out = w.run()
     assert not out.get("walk") and w.stored == []
+
+
+# ---- a long turn that starts before the window (TEST smoke 2026-11-06, D1) ------
+# One speaker's consecutive words are one long turn, so a turn can start a few
+# seconds before the window and hold the check's first words: it is kept when
+# any of it is inside the window (start..abs_end), and dropped only when all of
+# it is before.
+
+def test_a_walk_keeps_a_turn_that_starts_before_the_span_and_ends_inside_it():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 52),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 30),
+                "text": "starting in unit one formwork braced"}] + w.turns
+    w.run()
+    assert "starting in unit one formwork braced" in w.prompts[0][0]
+
+
+def test_a_walk_still_drops_a_turn_wholly_before_the_span():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 40),
+                "abs_end": datetime(2026, 10, 20, 10, 2, 55),
+                "text": "talk about the weather first"}] + w.turns
+    w.run()
+    assert "talk about the weather first" not in w.prompts[0][0]
+
+
+def test_a_check_keeps_a_turn_that_starts_before_the_window_and_ends_inside_it():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:20",
+                                      "report_date": DATE}]))
+    w.turns = w.turns + [{"abs_start": datetime(2026, 10, 20, 10, 3, 12),
+                          "abs_end": datetime(2026, 10, 20, 10, 3, 40),
+                          "text": "cover to steel is checked at fifty"}]
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "cover to steel is checked at fifty" in prompt
+    assert SECRET_WORDS not in prompt, "10:03:05-10:03:09 is wholly before the window"
+
+
+def test_a_turn_with_no_end_keeps_the_start_rule():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:20",
+                                      "report_date": DATE}]))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 3, 12), "abs_end": None,
+                "text": "cover to steel is checked at fifty"}]
+    w.run()
+    assert "cover to steel is checked at fifty" not in w.prompts[0][0]
+
+
+# A kept turn that starts before the window may hold an earlier check's words
+# (two back-to-back checks in one long turn): it is kept only when it starts
+# at most MAX_LEAD_S before, and the prompt then says to find the start.
+
+def test_the_8s_smoke_case_is_kept_and_the_walk_prompt_carries_the_caution():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 52),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 30),
+                "text": "starting in unit one formwork braced"}] + w.turns
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "starting in unit one formwork braced" in prompt
+    assert cd.EARLY_WALK.strip() in prompt
+
+
+def test_a_walk_prompt_has_no_caution_when_every_turn_starts_inside():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.run()
+    assert cd.EARLY_WALK.strip() not in w.prompts[0][0]
+
+
+def test_a_walk_drops_a_turn_that_starts_more_than_120s_before_the_span():
+    assert cd.MAX_LEAD_S == 120
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 0, 59),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 30),
+                "text": "the end of another check"}] + w.turns
+    w.run()
+    assert "the end of another check" not in w.prompts[0][0]
+
+
+def test_a_check_drops_a_turn_that_starts_more_than_120s_before_the_window():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:20",
+                                      "report_date": DATE}]))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 1, 19),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 40),
+                "text": "the end of another check"}]
+    w.run()
+    assert "the end of another check" not in w.prompts[0][0]
+
+
+def test_back_to_back_checks_in_one_long_turn_get_the_find_the_start_caution():
+    # Check B starts at 10:01:50; one turn 10:00:00-10:02:00 holds the end of
+    # check A as well.
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:01:50",
+                                      "report_date": DATE}]))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 0, 0),
+                "abs_end": datetime(2026, 10, 20, 10, 2, 0),
+                "text": "check a done. starting check b. formwork is braced and plumb"}]
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "starting check b" in prompt
+    assert cd.FIND_START in prompt
+    assert "The transcript starts where he started this check." not in prompt
+
+
+def test_a_check_whose_turns_start_inside_the_window_has_no_caution():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:00",
+                                      "report_date": DATE}]))
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "The transcript starts where he started this check." in prompt
+    assert cd.FIND_START not in prompt
+
+
+def test_the_final_check_places_two_units_all_goods_in_one_long_turn():
+    """D2: the entered marks reach walk_checklist.build, so Unit 2's all-good
+    in the same long turn as Unit 1's is placed, not NOT_PLACED."""
+    facts_ = walk_facts()
+    facts_[WALK]["entered"] = [
+        {"unit": "Unit 1", "at": "10:03", "at_s": "10:03:06", "quote": "starting in unit one"},
+        {"unit": "Unit 2", "at": "10:03", "at_s": "10:03:40", "quote": "walking into unit two now"}]
+    w = WalkWorld(("Unit 1 | ALL | Yes | | | | everything else in this one is good\n"
+                   "Unit 2 | ALL | Yes | | | | everything else in this one is all good\n"),
+                  db=facts(live_windows=[WALK_WINDOW], walk=facts_))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 3, 5),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 55),
+                "text": ("starting in unit one, formwork is braced. everything else in this "
+                         "one is good. walking into unit two now. everything else in this one "
+                         "is all good.")}]
+    out = w.run()
+    assert [u["not_covered"] for u in out["walk"]["units"]] == [[], []]
