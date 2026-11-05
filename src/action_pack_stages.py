@@ -423,6 +423,14 @@ class Plan:
     document_queries: list
     web: action_pack_web.WebQueries
     clamped: bool = False
+    # Plan v2 (spec 2026-11-05 §3.2.1, §4.2): tolerated, never required. An absent or
+    # malformed key is empty here and named in `defaulted`.
+    change_scope: str = "named"
+    targets: list = field(default_factory=list)
+    stated_values: list = field(default_factory=list)
+    delegations: list = field(default_factory=list)
+    sub_tasks: list = field(default_factory=list)
+    defaulted: list = field(default_factory=list)
 
 
 @dataclass
@@ -552,7 +560,12 @@ Return ONLY a JSON object with exactly these keys:
   "date_to": "YYYY-MM-DD",
   "record_queries": ["short subject phrases to search the site records for"],
   "document_queries": ["the named standard, specification or procedure to look up in the project's own documents"],
-  "web_queries": [{{"id": "q1", "text": "an English web search query"}}]
+  "web_queries": [{{"id": "q1", "text": "an English web search query"}}],
+  "change_scope": "named",
+  "targets": [{{"id": "t1", "task_no": 12, "phrase": null}}, {{"id": "t2", "task_no": null, "phrase": "a short phrase naming the item"}}],
+  "stated_values": [{{"target": "t1", "field": "deadline", "value": "YYYY-MM-DD"}}],
+  "delegations": [{{"target": "t2", "field": "deadline"}}],
+  "sub_tasks": [{{"id": "s1", "ask": "short paraphrase of one ask", "kind": "close", "targets": ["t1"]}}]
 }}
 
 Rules:
@@ -560,10 +573,31 @@ Rules:
 - date_from..date_to: the period the instruction is about, at most {max_days} days, ending no later than today. With no period named, use the last 14 days. A relative date in the instruction itself ("last week", "next Friday") resolves against today.
 - record_queries: at most {max_rq}; document_queries: at most {max_dq} (empty when no standard or procedure is involved). Each at most {qmax} characters.
 - web_queries: at most {max_wq}, each at most {wmax} characters, in English, written ONLY from the instruction and any standard it names (for example "NZS 3109 concrete curing requirements"). Leave it empty when the project's records and documents should be enough. Ids are short (letters, digits, - or _).
+- change_scope: "tidy" only when the instruction hands you bulk changes to open items ("tidy up the open items", "close whatever is finished"); otherwise "named".
+- targets: the existing items the instruction names, at most {max_targets}; ids t1, t2, ... Use task_no when the user gives a task number (#12), else phrase: a short phrase (at most {phrase_max} characters, the instruction's own words) naming the item. Empty when no item is named.
+- stated_values: values the user gave, at most {max_values}. field is one of deadline, responsible, priority (low, medium, high) or status ({statuses}); target is a target id or null. A deadline is a date YYYY-MM-DD, resolved against today (the instruction is spoken today).
+- delegations: a value the user asked you to fill in when it is missing ("if there is no due date, set one"), at most {max_values}; field is deadline only; target is a target id or null.
+- sub_tasks: one per separate ask in the instruction, at most {max_sub_tasks}; ids s1, s2, ...; ask is a short paraphrase (at most {ask_max} characters) in the instruction's language; kind is one of {kinds}; targets lists the target ids it concerns. A single-ask instruction has one sub-task, and the reading lists the sub-tasks.
 """
 
 _PLAN_KEYS = ("reading", "title", "language", "site_matches", "date_from", "date_to",
               "record_queries", "document_queries", "web_queries")
+# Plan v2 (spec 2026-11-05 §3.2.1, §4.2): optional. Absent = empty; malformed = empty and
+# named in Plan.defaulted (run_trace.plan_key_defaulted) -- never a rejected plan.
+_PLAN_V2_KEYS = ("change_scope", "targets", "stated_values", "delegations", "sub_tasks")
+CHANGE_SCOPES = ("named", "tidy")
+MAX_TARGETS = 10
+MAX_STATED_VALUES = 10
+MAX_DELEGATIONS = 10
+MAX_SUB_TASKS = 8
+PHRASE_MAX_CHARS = 200
+ASK_MAX_CHARS = 200
+STATED_FIELDS = ("deadline", "responsible", "priority", "status")
+DELEGATED_FIELDS = ("deadline",)
+SUB_TASK_KINDS = ("close", "update", "create", "review", "standards", "draft", "other")
+# Ids become run_trace keys (target_resolution) and call ids: a closed shape.
+_TARGET_ID = re.compile(r"^t[0-9]{1,2}$")
+_SUB_TASK_ID = re.compile(r"^s[0-9]{1,2}$")
 
 
 def _str_list(value, max_items, max_chars):
@@ -579,13 +613,152 @@ def _str_list(value, max_items, max_chars):
     return out
 
 
+def _task_no(value):
+    """A positive int task number (a digit string is accepted; never a bool/float)."""
+    if isinstance(value, str) and value.strip().isdecimal():
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 < value < 2**31 else None
+
+
+def _entry_ok(e, required, optional=()):
+    return isinstance(e, dict) and set(required) <= set(e) <= set(required) | set(optional)
+
+
+def _target_ref(value, target_ids):
+    """(ok, ref): null, or one of this plan's target ids."""
+    if value is None:
+        return True, None
+    return (value in target_ids), value
+
+
+def _v2_change_scope(value, target_ids=()):
+    return value if value in CHANGE_SCOPES else None
+
+
+def _v2_targets(value, target_ids=()):
+    if not isinstance(value, list) or len(value) > MAX_TARGETS:
+        return None
+    out, seen = [], set()
+    for t in value:
+        if not _entry_ok(t, ("id",), ("task_no", "phrase")):
+            return None
+        tid = t["id"]
+        if not isinstance(tid, str) or not _TARGET_ID.match(tid) or tid in seen:
+            return None
+        no = None if t.get("task_no") is None else _task_no(t["task_no"])
+        phrase = None if t.get("phrase") is None else _str(t["phrase"], PHRASE_MAX_CHARS)
+        if (t.get("task_no") is not None and no is None) or \
+                (t.get("phrase") is not None and phrase is None) or (no is None and not phrase):
+            return None
+        seen.add(tid)
+        out.append({"id": tid, "task_no": no, "phrase": phrase})
+    return out
+
+
+def _stated_value(fld, value):
+    if fld == "deadline":
+        d = _iso_date(value)
+        return d.isoformat() if d else None
+    if fld == "priority":
+        p = _str(value, PRIORITY_MAX_CHARS)
+        p = p.lower() if p else None
+        return p if p in action_pack_view.ACTION_PRIORITIES else None
+    if fld == "status":
+        s = _str(value, SHORT_FIELD_MAX_CHARS)
+        s = s.lower() if s else None
+        return s if s in ITEM_STATUSES else None
+    return _str(value, SHORT_FIELD_MAX_CHARS)                       # responsible
+
+
+def _v2_stated_values(value, target_ids=()):
+    if not isinstance(value, list) or len(value) > MAX_STATED_VALUES:
+        return None
+    out = []
+    for e in value:
+        if not _entry_ok(e, ("field", "value"), ("target",)):
+            return None
+        ok, ref = _target_ref(e.get("target"), target_ids)
+        if not ok or e["field"] not in STATED_FIELDS:
+            return None
+        v = _stated_value(e["field"], e["value"])
+        if v is None:
+            return None
+        out.append({"target": ref, "field": e["field"], "value": v})
+    return out
+
+
+def _v2_delegations(value, target_ids=()):
+    if not isinstance(value, list) or len(value) > MAX_DELEGATIONS:
+        return None
+    out = []
+    for e in value:
+        if not _entry_ok(e, ("field",), ("target",)):
+            return None
+        ok, ref = _target_ref(e.get("target"), target_ids)
+        if not ok or e["field"] not in DELEGATED_FIELDS:
+            return None
+        out.append({"target": ref, "field": e["field"]})
+    return out
+
+
+def _v2_sub_tasks(value, target_ids=()):
+    if not isinstance(value, list) or len(value) > MAX_SUB_TASKS:
+        return None
+    out, seen = [], set()
+    for e in value:
+        if not _entry_ok(e, ("id", "ask", "kind"), ("targets",)):
+            return None
+        sid, ask = e["id"], _str(e["ask"], ASK_MAX_CHARS)
+        refs = e.get("targets") if e.get("targets") is not None else []
+        if (not isinstance(sid, str) or not _SUB_TASK_ID.match(sid) or sid in seen
+                or ask is None or e["kind"] not in SUB_TASK_KINDS
+                or not isinstance(refs, list) or len(refs) > MAX_TARGETS
+                or not all(isinstance(r, str) and r in target_ids for r in refs)):
+            return None
+        seen.add(sid)
+        out.append({"id": sid, "ask": ask, "kind": e["kind"],
+                    "targets": list(dict.fromkeys(refs))})
+    return out
+
+
+_V2_VALIDATORS = {"change_scope": _v2_change_scope, "targets": _v2_targets,
+                  "stated_values": _v2_stated_values, "delegations": _v2_delegations,
+                  "sub_tasks": _v2_sub_tasks}
+
+
+def _plan_v2(obj):
+    """The v2 fields of a plan answer -> (fields, defaulted key names). Absent keys are
+    empty (change_scope `named`) and not counted; a malformed key is emptied and counted.
+    A reference to a target id the plan does not keep (after `targets` was checked)
+    makes that whole key malformed."""
+    out = {"change_scope": "named", "targets": [], "stated_values": [], "delegations": [],
+           "sub_tasks": []}
+    defaulted = []
+    target_ids = set()
+    for key in _PLAN_V2_KEYS:                      # targets before the keys that name them
+        if key not in obj:
+            continue
+        val = _V2_VALIDATORS[key](obj[key], target_ids)
+        if val is None:
+            defaulted.append(key)
+            continue
+        out[key] = val
+        if key == "targets":
+            target_ids = {t["id"] for t in val}
+    return out, defaulted
+
+
 def validate_plan(obj, today):
-    """(Plan, None) or (None, error code). Strict: exactly _PLAN_KEYS, each well-typed. A
-    range longer than MAX_PLAN_DAYS keeps its most recent days, and an end after today is
-    capped at today (Plan.clamped); a range wholly in the future is invalid."""
+    """(Plan, None) or (None, error code). The core keys are strict: _PLAN_KEYS must all be
+    present, each well-typed, and nothing outside _PLAN_KEYS + _PLAN_V2_KEYS. The v2 keys are
+    tolerant (_plan_v2). A range longer than MAX_PLAN_DAYS keeps its most recent days, and an
+    end after today is capped at today (Plan.clamped); a range wholly in the future is
+    invalid."""
     if not isinstance(obj, dict):
         return None, "not_object"
-    if set(obj) != set(_PLAN_KEYS):
+    if not set(_PLAN_KEYS) <= set(obj) <= set(_PLAN_KEYS) | set(_PLAN_V2_KEYS):
         return None, "keys"
     reading = _str(obj["reading"], READING_MAX_CHARS)
     title = _str(obj["title"], TITLE_MAX_CHARS)
@@ -616,9 +789,11 @@ def validate_plan(obj, today):
         web = action_pack_web.WebQueries.from_plan(obj["web_queries"])
     except action_pack_web.WebQueryError as exc:
         return None, "web_" + exc.code
+    v2, defaulted = _plan_v2(obj)
     return Plan(reading=reading, title=title, language=language,
                 site_matches=obj["site_matches"], date_from=lo, date_to=hi,
-                record_queries=rq, document_queries=dq, web=web, clamped=clamped), None
+                record_queries=rq, document_queries=dq, web=web, clamped=clamped,
+                defaulted=defaulted, **v2), None
 
 
 REPAIR = ("\n\nYour previous answer was rejected ({code}). Answer again with ONLY the JSON "
@@ -638,7 +813,10 @@ def plan_stage(run: Run) -> Plan:
         instruction=str((ctx.pack or {}).get("instruction") or "").replace("```", "'''"),
         title_max=TITLE_MAX_CHARS, max_days=MAX_PLAN_DAYS, max_rq=MAX_RECORD_QUERIES,
         max_dq=MAX_DOC_QUERIES, qmax=QUERY_MAX_CHARS, max_wq=action_pack_web.MAX_QUERIES,
-        wmax=action_pack_web.MAX_QUERY_CHARS)
+        wmax=action_pack_web.MAX_QUERY_CHARS, max_targets=MAX_TARGETS,
+        phrase_max=PHRASE_MAX_CHARS, max_values=MAX_STATED_VALUES,
+        statuses=", ".join(ITEM_STATUSES), max_sub_tasks=MAX_SUB_TASKS,
+        ask_max=ASK_MAX_CHARS, kinds=", ".join(SUB_TASK_KINDS))
     prompt, code = base, None
     for attempt in range(2):
         if attempt:
@@ -666,6 +844,11 @@ def plan_stage(run: Run) -> Plan:
             if plan.web.ids and not run.deps.web_on():
                 run.trace["web_disabled"] = len(plan.web.ids)   # planned, never searched
             run.trace["plan_days"] = (plan.date_to - plan.date_from).days + 1
+            # Plan v2: the scope code, key names and counts only (never a phrase or ask).
+            run.trace["plan_scope"] = plan.change_scope
+            run.trace["plan_key_defaulted"] = list(plan.defaulted)
+            run.trace["plan_targets"] = len(plan.targets)
+            run.trace["plan_sub_tasks"] = len(plan.sub_tasks)
             return plan
         logger.info("action agent plan rejected pack=%s code=%s", ctx.pack_id, code)
     raise agent.ModelFailure("plan schema")

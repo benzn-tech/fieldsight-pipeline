@@ -229,7 +229,9 @@ def test_payload_passes_the_store_checks_and_cites_only_what_survives():
     assert ctx.cps[0]["reading"] == "Review the 10-10 pour." and ctx.cps[0]["title"]
     trace = payload["run_trace"]
     assert trace["truncated"] is False and trace["rounds"] >= 1
-    assert all(isinstance(v, (int, bool, dict, list)) for v in trace.values())
+    # Counts and codes only (plan_scope is a code since PR-3).
+    assert all(isinstance(v, (int, bool, dict, list, str)) for v in trace.values())
+    assert action_pack_view.fail_trace_error(trace) is None
 
 
 def test_round_one_is_deterministic_and_pinned_to_the_site():
@@ -815,3 +817,124 @@ def test_judge_call_without_writer_model_is_unchanged(monkeypatch):
     st.judge_call("p", max_tokens=10, model=WRITER, deadline=100.0, caller="c", info={})
     assert seen[0] == {"model": WRITER, "max_tokens": 10, "deadline": 1100.0, "caller": "c",
                        "attempt_timeout": 100.0}
+
+
+# ---- PR-3 Task 3.1: plan v2 keys, tolerant (spec 2026-11-05 §3.2.1, §4.2) ----------------
+
+V2 = {"change_scope": "named",
+      "targets": [{"id": "t1", "task_no": 4, "phrase": None},
+                  {"id": "t2", "task_no": None, "phrase": "door hardware"}],
+      "stated_values": [{"target": "t1", "field": "deadline", "value": "2026-11-13"},
+                        {"target": None, "field": "priority", "value": "high"}],
+      "delegations": [{"target": "t2", "field": "deadline"}],
+      "sub_tasks": [{"id": "s1", "ask": "close #4", "kind": "close", "targets": ["t1"]},
+                    {"id": "s2", "ask": "set a due date", "kind": "update",
+                     "targets": ["t2"]}]}
+V2_UNNAMED = dict(
+    V2, stated_values=[{"target": None, "field": "priority", "value": "high"}],
+    delegations=[{"target": None, "field": "deadline"}],
+    sub_tasks=[{"id": "s1", "ask": "tidy up", "kind": "other", "targets": []}])
+
+
+def test_plan_v1_answer_still_valid():
+    plan, err = st.validate_plan(plan_obj(), TODAY)
+    assert err is None
+    assert plan.change_scope == "named" and plan.defaulted == []
+    assert (plan.targets, plan.stated_values, plan.delegations, plan.sub_tasks) == (
+        [], [], [], [])
+
+
+def test_plan_v2_answer_is_kept():
+    plan, err = st.validate_plan(plan_obj(**dict(V2, change_scope="tidy")), TODAY)
+    assert err is None and plan.defaulted == []
+    assert plan.change_scope == "tidy"
+    assert plan.targets == V2["targets"]
+    assert plan.stated_values == V2["stated_values"]
+    assert plan.delegations == V2["delegations"]
+    assert plan.sub_tasks == V2["sub_tasks"]
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("targets", "t1"),
+    ("targets", [{"id": "t1", "task_no": None, "phrase": None}]),       # names nothing
+    ("targets", [{"id": "t 1", "task_no": 3, "phrase": None}]),         # id not a code
+    ("targets", [{"id": "t1", "task_no": 3, "phrase": None}] * 2),      # duplicate id
+    ("targets", [{"id": "t1", "task_no": True, "phrase": None}]),
+    ("targets", [{"id": "t1", "task_no": None, "phrase": "x" * 201}]),
+    ("targets", [{"id": "t1", "task_no": 3, "phrase": None, "extra": 1}]),
+    ("stated_values", [{"target": None, "field": "deadline", "value": "next Friday"}]),
+    ("stated_values", [{"target": None, "field": "colour", "value": "red"}]),
+    ("stated_values", [{"target": None, "field": "priority", "value": "urgent"}]),
+    ("stated_values", [{"target": None, "field": "status", "value": "reopened"}]),
+    ("stated_values", [{"target": "t9", "field": "priority", "value": "high"}]),
+    ("delegations", [{"target": None, "field": "priority"}]),
+    ("sub_tasks", [{"id": "s1", "ask": "x", "kind": "dance", "targets": []}]),
+    ("sub_tasks", [{"id": "s1", "ask": "", "kind": "close", "targets": []}]),
+    ("sub_tasks", [{"id": "s1", "ask": "x", "kind": "close", "targets": ["t9"]}]),
+])
+def test_plan_v2_malformed_key_defaulted(key, bad):
+    # A bad `targets` would also default every key naming t1/t2 (pinned below): here the
+    # others name no target, so each case shows a bad key costing only itself.
+    base = V2 if key != "targets" else V2_UNNAMED
+    plan, err = st.validate_plan(plan_obj(**dict(base, **{key: bad})), TODAY)
+    assert err is None
+    assert getattr(plan, key) == [] and plan.defaulted == [key]
+    for other in ("targets", "stated_values", "delegations", "sub_tasks"):
+        if other != key:
+            assert getattr(plan, other) == base[other], other
+
+
+def test_plan_v2_target_refs_follow_a_defaulted_targets_key():
+    """stated_values / delegations / sub_tasks naming a target that is no longer there are
+    defaulted too: a reference to a dropped target is a reference to nothing."""
+    plan, err = st.validate_plan(plan_obj(**dict(V2, targets="t1")), TODAY)
+    assert err is None
+    assert plan.defaulted == ["targets", "stated_values", "delegations", "sub_tasks"]
+
+
+@pytest.mark.parametrize("scope", [None, "", "everything", 3])
+def test_plan_invalid_scope_is_named(scope):
+    plan, err = st.validate_plan(plan_obj(**dict(V2, change_scope=scope)), TODAY)
+    assert err is None and plan.change_scope == "named"
+    assert plan.defaulted == ["change_scope"]
+
+
+def test_plan_v2_caps():
+    many = [{"id": f"t{i}", "task_no": i, "phrase": None} for i in range(1, 12)]
+    plan, err = st.validate_plan(plan_obj(targets=many), TODAY)
+    assert err is None and plan.targets == [] and plan.defaulted == ["targets"]
+    ten = many[:10]
+    plan, _ = st.validate_plan(plan_obj(targets=ten), TODAY)
+    assert len(plan.targets) == 10 and plan.defaulted == []
+    subs = [{"id": f"s{i}", "ask": "x", "kind": "other", "targets": []} for i in range(9)]
+    plan, _ = st.validate_plan(plan_obj(sub_tasks=subs), TODAY)
+    assert plan.sub_tasks == [] and plan.defaulted == ["sub_tasks"]
+    sv = [{"target": None, "field": "priority", "value": "high"}] * 11
+    plan, _ = st.validate_plan(plan_obj(stated_values=sv), TODAY)
+    assert plan.stated_values == [] and plan.defaulted == ["stated_values"]
+
+
+def test_plan_unknown_extra_key_rejected():
+    plan, err = st.validate_plan(plan_obj(**V2, extra=1), TODAY)
+    assert plan is None and err == "keys"
+    core = plan_obj(**V2)
+    del core["reading"]
+    assert st.validate_plan(core, TODAY) == (None, "keys")
+
+
+def test_plan_v2_trace_is_counts_shaped():
+    model = Model(plan=[plan_obj(**dict(V2, delegations="bad"))])
+    payload = st.run(make_ctx(), deps(model=model))
+    trace = payload["run_trace"]
+    assert trace["plan_scope"] == "named"
+    assert trace["plan_key_defaulted"] == ["delegations"]
+    assert trace["plan_targets"] == 2 and trace["plan_sub_tasks"] == 2
+    assert action_pack_view.fail_trace_error(trace) is None
+
+
+def test_plan_prompt_states_the_v2_keys():
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    prompt = next(c["prompt"] for c in model.calls if c["caller"] == "action_plan")
+    for key in ("change_scope", "targets", "stated_values", "delegations", "sub_tasks"):
+        assert f'"{key}"' in prompt, key
