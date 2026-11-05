@@ -1275,3 +1275,176 @@ def test_web_call_without_cost_carries_the_plugin_fee(or_key):
                                                          "completion_tokens": 100})]))
     assert r["openrouter_cost_usd"] == pytest.approx(
         (1000 * 0.13 + 100 * 0.65) / 1e6 + ledger.WEB_PLUGIN_USD_PER_CALL_2026_10_31)
+
+
+# --------------------------- spec rev 4.3 §4.5: grader_v2, gold v1.1, round 1
+
+def test_edit_prompts_are_the_incumbent_plus_the_rule():
+    assert set(prompts.EDITS.values()) <= set(prompts.CANDIDATES)
+    assert not set(prompts.EDITS) & set(prompts.CANDIDATES)       # never a round-0 cell
+    for edit, base in prompts.EDITS.items():
+        text = prompts.load(edit)
+        assert text == prompts.with_rule(prompts.load(base))
+        assert text.count(prompts.EDIT_RULE) == 1
+        assert text.index(prompts.EDIT_RULE) + len(prompts.EDIT_RULE) == \
+            text.index("## Question\n")
+        assert prompts.step_of(edit) == prompts.CANDIDATES[base]
+        assert prompts.edit_of(base) == edit
+        kw = {"question": "Q"}
+        if prompts.CANDIDATES[base] == "verify":
+            kw["draft"] = "D"
+        text.format(**kw)                                         # placeholders intact
+    assert "give no number for that\nfuture period" in prompts.EDIT_RULE
+
+
+def test_grader_v2_changes_only_the_unsure_rubric():
+    v1, v2 = prompts.load("grader_v1"), prompts.load("grader_v2")
+    assert "instead of giving a figure" in v1 and "instead of giving a figure" not in v2
+    assert "whoever it is attributed to" in v2
+    assert 'starts with "if" applies only when its condition' in v2
+    assert v1.split("## Question")[1] == v2.split("## Question")[1]   # same inputs
+    v2.format(question="q", kind="unsure", expected="- e", variants="- v", answer="a")
+    assert grade.GRADER_PROMPT == "grader_v2"
+
+
+def test_grade_one_records_its_grader_prompt():
+    fake = GraderFake()
+    g = grade.grade_one("Q?", GOLD, "an answer", [], call=fake)
+    assert g["grader_prompt"] == "grader_v2" and "whoever it is attributed" in fake.prompts[0]
+    fake = GraderFake()
+    g = grade.grade_one("Q?", GOLD, "an answer", [], call=fake, grader="grader_v1")
+    assert g["grader_prompt"] == "grader_v1" and "whoever" not in fake.prompts[0]
+
+
+def test_only_ungraded_regrades_rows_of_another_grader(tmp_path):
+    _calls_file(tmp_path)
+    v1 = grade.validate(_g_argv(tmp_path, "--grader", "grader_v1", "--confirm-calls", "28"),
+                        {"CORROBORATION_API_KEY": "k"}, REPO)
+    grade.run(v1, call=GraderFake(), stdout=io.StringIO())
+    with pytest.raises(SystemExit):        # every v1 row is pending for v2
+        grade.validate(_g_argv(tmp_path, "--only-ungraded", "--confirm-calls", "0"),
+                       {"CORROBORATION_API_KEY": "k"}, REPO)
+    v2 = grade.validate(_g_argv(tmp_path, "--only-ungraded", "--confirm-calls", "28"),
+                        {"CORROBORATION_API_KEY": "k"}, REPO)
+    fake = GraderFake()
+    grade.run(v2, call=fake, stdout=io.StringIO())
+    assert len(fake.prompts) == 28
+    after = [json.loads(l) for l in open(tmp_path / "grades_r0.jsonl", encoding="utf-8")]
+    assert {g["grader_prompt"] for g in after if g["label"] != "no_answer"} == {"grader_v2"}
+
+
+GOOD5 = ["correct"] * 4 + ["correctly_unsure"]
+UNSURE5 = {"t5": "unsure"}
+
+
+def _r0_cells_for_round1():
+    """v2 cells: haiku verify at ceiling (skipped); the other verify cells have
+    t5 partial; haiku single t4 wrong; web_v1 beats merged_v1."""
+    part = ["correct"] * 4 + ["partial"]
+    c = []
+    for m in ("gemini", "deepseek", "sonnet", "muse"):
+        c.append(_cell("verify_v2", part, model=m, kinds=UNSURE5))
+    c.append(_cell("verify_v2", GOOD5, model="haiku", kinds=UNSURE5))
+    c.append(_cell("verify_v1", ["wrong"] * 5, model="haiku", kinds=UNSURE5))
+    for m in ("deepseek", "muse", "sonnet"):
+        c.append(_cell("web_v1", part, step="single", model=m, kinds=UNSURE5))
+        c.append(_cell("merged_v1", ["wrong"] + part[1:], step="single", model=m,
+                       kinds=UNSURE5))
+    c.append(_cell("web_v1", ["correct"] * 3 + ["wrong", "partial"], step="single",
+                   model="haiku", kinds=UNSURE5))
+    return _cells(*c)
+
+
+def test_round1_cells_take_each_incumbents_edit_and_skip_ceilings():
+    cells = matrix.round1_cells(_r0_cells_for_round1())
+    assert sorted(cells) == sorted(
+        [("verify", "verify_v2_e1", m) for m in ("gemini", "deepseek", "sonnet", "muse")]
+        + [("single", "web_v1_e1", m) for m in ("deepseek", "muse", "sonnet", "haiku")])
+    vendor = [{"sonnet": 2, "haiku": 1}.get(m, 0) for _, _, m in cells]
+    assert vendor == sorted(vendor)
+
+
+def _r1_argv(out, *extra):
+    return ["--out", str(out), "--round", "1", "--search-price-per-1000", "10", *extra]
+
+
+def test_round1_refuses_without_round0_files(tmp_path):
+    with pytest.raises(SystemExit):
+        matrix.validate(_r1_argv(tmp_path, "--dry-run"), {}, REPO)
+    (tmp_path / "cells_r0.json").write_text(json.dumps(_r0_cells_for_round1()), "utf-8")
+    with pytest.raises(SystemExit):                       # no stored gemini drafts
+        matrix.validate(_r1_argv(tmp_path, "--dry-run"), {}, REPO)
+
+
+def test_round1_runs_the_edits_on_round0_stored_drafts(tmp_path):
+    _m_run(tmp_path)                                       # round 0 with fakes
+    r0 = _rows(tmp_path)
+    drafts = {(r["item"], r["rep"]): r["text"] for r in r0
+              if r["cell"] == "draft/draft_v1/gemini"}
+    (tmp_path / "cells_r0.json").write_text(json.dumps(_r0_cells_for_round1()), "utf-8")
+    cells = matrix.round1_cells(_r0_cells_for_round1())
+    upper = matrix.plan(cells)["upper"]
+    with pytest.raises(SystemExit):
+        matrix.validate(_r1_argv(tmp_path, "--confirm-calls", "525"), KEYS, REPO)
+    args = matrix.validate(_r1_argv(tmp_path, "--confirm-calls", str(upper)), KEYS, REPO)
+    clock = Clock()
+    or_fake, client = OrFake(clock), ClaudeFake(clock)
+    code, summary = matrix.run(args, items=_m_items(), client=client, or_call=or_fake,
+                               clock=clock, stdout=io.StringIO())
+    assert code == 0 and summary["round"] == 1
+    assert not [c for c in or_fake.calls if c["profile"] == "gemini" and not c["web"]]
+    rows = [json.loads(l) for l in open(tmp_path / "matrix_r1_calls.jsonl", encoding="utf-8")]
+    assert len(rows) == len(cells) * 15
+    assert all(r["run_id"].startswith("r1-") and r["round"] == 1 for r in rows)
+    assert {r["cell"] for r in rows} == {matrix._cell_id(c) for c in cells}
+    for r in rows:
+        assert r["prompt_sha256"] == prompts.sha(r["prompt_id"])
+        assert prompts.EDIT_RULE.splitlines()[0] in r["text"]
+        if r["step"] == "verify":
+            assert drafts[(r["item"], r["rep"])] in r["text"]        # paired draft
+    assert (tmp_path / "matrix_r1_summary.json").exists()
+    assert len(_rows(tmp_path)) == 330                    # round 0 untouched
+    # grade.py --round 1 grades that file and refuses round-0 rows.
+    gargs = ["--out", str(tmp_path), "--calls", "matrix_r1_calls.jsonl", "--seed", "7",
+             "--set", _gold_file(tmp_path), "--round", "1"]
+    n = len(grade.split(rows)[0])
+    a = grade.validate(gargs + ["--confirm-calls", str(n)], {"CORROBORATION_API_KEY": "k"},
+                       REPO)
+    grade.run(a, call=GraderFake(), stdout=io.StringIO())
+    assert (tmp_path / "grades_r1.jsonl").exists() and (tmp_path / "cells_r1.json").exists()
+    with pytest.raises(SystemExit):
+        grade.validate(["--out", str(tmp_path), "--calls", "matrix_r0_calls.jsonl",
+                        "--seed", "7", "--round", "1", "--dry-run"], {}, REPO)
+
+
+def test_keep_round1_needs_stability_on_the_other_items():
+    inc = _cell("verify_v2", ["correct"] * 4 + ["partial"], kinds=UNSURE5)
+    win = _cell("verify_v2_e1", GOOD5, kinds=UNSURE5)
+    assert sf.keep_edit(inc, win) and sf.keep_round1(inc, win)
+    wobbly = _cell("verify_v2_e1", GOOD5, kinds=UNSURE5,
+                   stable=[True, True, False, True, True])
+    assert sf.keep_edit(inc, wobbly) and not sf.keep_round1(inc, wobbly)
+    same = _cell("verify_v2_e1", ["correct"] * 4 + ["partial"], kinds=UNSURE5)
+    assert not sf.keep_round1(inc, same)
+    d = sf.round1_decisions(_cells(inc), _cells(win))
+    assert d == [("verify", "sonnet", "verify_v2", "verify_v2_e1", True)]
+
+
+def test_stratified_draw_is_fresh_and_spans_the_unsure_strata():
+    rows = []
+    for i in range(40):
+        kind = "unsure" if i % 4 == 0 else "standard"
+        ans = ("about $12 per metre today" if i % 8 == 0 else "cannot be known") \
+            if kind == "unsure" else f"fact {i}"
+        rows.append({"run_id": f"r0-{i:04d}", "cell": f"c{i % 5}", "kind": kind,
+                     "answer": ans, "v1_label": "wrong" if i == 4 else "correctly_unsure"})
+    exclude = {"r0-0000", "r0-0001"}
+    a = sf.stratified_draw(rows, n=10, seed=3, exclude=exclude, min_unsure=4)
+    assert a == sf.stratified_draw(rows, n=10, seed=3, exclude=exclude, min_unsure=4)
+    ids = {r["run_id"] for r in a}
+    assert len(a) == 10 and not ids & exclude
+    uns = [r for r in a if r["kind"] == "unsure"]
+    assert len(uns) == 4
+    assert any(r["v1_label"] == "wrong" for r in uns)
+    assert any(r["v1_label"] != "wrong" and sf._has_digit(r["answer"]) for r in uns)
+    assert any(not sf._has_digit(r["answer"]) for r in uns)

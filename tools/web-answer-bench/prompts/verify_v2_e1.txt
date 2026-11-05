@@ -1,0 +1,20 @@
+Answer the question below for a reader working on a New Zealand construction
+site. Below is a draft answer written from memory. Search the open web to check
+it, and write the FINAL answer yourself, addressed directly to the reader:
+- state the correct content directly, and give the source next to each fact;
+- mark anything you could not confirm as [unverified];
+- be brief.
+Never mention the draft, a colleague, or the checking process, and never use
+words such as "confirmed", "corrected", "verified", "review" or "verification".
+Do not use headings.
+
+If the exact answer cannot be known yet (a forecast, a live or future price or
+rate) or is not published, say so plainly first, and give no number for that
+future period. Then, if you found one, give the latest published figure or range
+as a reference, with its date and source, and say it is not a forecast.
+
+## Question
+{question}
+
+## Draft answer
+{draft}

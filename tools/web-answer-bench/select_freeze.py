@@ -57,6 +57,39 @@ def best_round0(cells_json, step, model):
     return min(cells, key=key)["prompt_id"]
 
 
+def cell_of(cells_json, step, prompt_id, model):
+    for c in _load_cells(cells_json).values():
+        if (c["step"], c["prompt_id"], c["model_key"]) == (step, prompt_id, model):
+            return c
+    raise KeyError((step, prompt_id, model))
+
+
+def keep_round1(incumbent, edit):
+    """Spec rev 4.3 §4.5: keep_edit, and the edit is stable on every non-unsure
+    item where the incumbent's majority is good (the edit targets unsure items,
+    so hedging that spills onto standard / current items must not pass)."""
+    if not keep_edit(incumbent, edit):
+        return False
+    for item, inc in incumbent["items"].items():
+        if inc.get("kind") == "unsure" or inc["majority"] not in GOOD:
+            continue
+        e = edit["items"].get(item) or {}
+        if not e.get("stable") or e.get("majority") not in GOOD:
+            return False
+    return True
+
+
+def round1_decisions(cells_r0, cells_r1):
+    """[(step, model, incumbent id, edit id, kept)] for every round-1 cell."""
+    out = []
+    for c in sorted(_load_cells(cells_r1).values(),
+                    key=lambda c: (c["step"], c["model_key"])):
+        base = prompts.EDITS[c["prompt_id"]]
+        inc = cell_of(cells_r0, c["step"], base, c["model_key"])
+        out.append((c["step"], c["model_key"], base, c["prompt_id"], keep_round1(inc, c)))
+    return out
+
+
 def keep_edit(incumbent, edit):
     """Spec §4.4: keep the edit only if no item's majority is worse and at least
     one item is better on which the incumbent was stable. An item the edit has
@@ -156,6 +189,42 @@ def spot_check_sheet(grades, n=10, seed=0):
     return "\n".join(lines) + "\n"
 
 
+def _has_digit(text):
+    return any(ch.isdigit() for ch in grade.blind(text or ""))
+
+
+def stratified_draw(rows, n=10, seed=0, exclude=(), min_unsure=4):
+    """Spec rev 4.3 §4.5 grader check v2: a fresh draw (refs in `exclude` left
+    out) with >= min_unsure answers on unsure items, spread over three strata:
+    figure-as-answer (v1 label wrong), a figure given (digit in the answer),
+    bare refusal (no digit). The rest is drawn across cells as spot_check_sheet."""
+    rng = random.Random(seed)
+    pool = sorted((r for r in rows if r["run_id"] not in set(exclude)),
+                  key=lambda r: r["run_id"])
+    rng.shuffle(pool)
+    unsure = [r for r in pool if r.get("kind") == "unsure"]
+    strata = [[r for r in unsure if r.get("v1_label") == "wrong"],
+              [r for r in unsure if r.get("v1_label") != "wrong" and _has_digit(r["answer"])],
+              [r for r in unsure if r.get("v1_label") != "wrong"
+               and not _has_digit(r["answer"])]]
+    picked = []
+    while len(picked) < min(min_unsure, len(unsure)) and any(strata):
+        for st in strata:
+            if st and len(picked) < min_unsure:
+                picked.append(st.pop(0))
+    taken = {r["run_id"] for r in picked}
+    by_cell = {}
+    for r in pool:
+        if r["run_id"] not in taken and r.get("kind") != "unsure":
+            by_cell.setdefault(r.get("cell"), []).append(r)
+    while len(picked) < n and any(by_cell.values()):
+        for cell in sorted(by_cell, key=str):
+            if by_cell[cell] and len(picked) < n:
+                picked.append(by_cell[cell].pop(0))
+    rng.shuffle(picked)
+    return picked
+
+
 def _sheet_main(args):
     calls = {}
     with open(os.path.join(args.out, "matrix_r0_calls.jsonl"), encoding="utf-8") as f:
@@ -193,7 +262,15 @@ def main(argv=None):
     sh.add_argument("--seed", type=int, required=True)
     sh.add_argument("--n", type=int, default=10)
     sh.add_argument("--set", default=os.path.join(HERE, "set.v1.jsonl"))
+    kp = sub.add_parser("keep", help="round-1 keep / reject per (step, model)")
+    kp.add_argument("--out", required=True)
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
+    if args.cmd == "keep":
+        for step, model, base, edit, kept in round1_decisions(
+                os.path.join(args.out, "cells_r0.json"),
+                os.path.join(args.out, "cells_r1.json")):
+            print(f"{step}/{model}: {base} -> {edit}: {'KEEP' if kept else 'reject'}")
+        return 0
     return _sheet_main(args)
 
 

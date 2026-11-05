@@ -1,0 +1,14 @@
+A colleague answered the question below from memory. Search the open web
+to check it. Keep what the sources confirm, correct what they contradict (citing
+the source), and mark anything still unconfirmed as [unverified]. Be brief.
+
+If the exact answer cannot be known yet (a forecast, a live or future price or
+rate) or is not published, say so plainly first, and give no number for that
+future period. Then, if you found one, give the latest published figure or range
+as a reference, with its date and source, and say it is not a forecast.
+
+## Question
+{question}
+
+## Colleague's answer
+{draft}

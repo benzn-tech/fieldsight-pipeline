@@ -1,7 +1,7 @@
 # Claude + web search for Ask's web answer — bench design
 
-Date: 2026-10-27 · Line: ASR+LLM优化v3 (Ask orchestration / web) · Status: rev 4.2 (Fable
-review applied, §11). Stage 0 has run (owner, $1.42); the rest is not yet built.
+Date: 2026-10-27 · Line: ASR+LLM优化v3 (Ask orchestration / web) · Status: rev 4.3 (round-0
+result, owner gold rule for unsure items, round 1; §4.5, §11). Stage 0 and round 0 have run.
 
 ## 1. Problem
 
@@ -336,6 +336,90 @@ overwrites another model's.
 §4.0), (2) the owner has confirmed the 5 `tune` gold answers, and (3) `grade.py`
 (§5.1) exists.
 
+### 4.5 Round 0 result, owner grader check, round 1 (rev 4.3, 2026-11-05)
+
+**Round 0** ran 11-03/04 (22 cells × 15 runs, Anthropic $3.77 of the $18 matrix pool,
+OpenRouter ≈ $1.50; grader re-run after a 429 streak, #1213). Searching cells are
+mostly at ceiling on the 5 tune items (verify_v2: gemini, DeepSeek, Haiku, muse all
+5/5 stable); exceptions: Sonnet verify_v2 (t3, t4 unstable), Haiku web_v1 (t4 wrong
+stable), muse merged_v1 / DeepSeek verify_v1 (t5 wrong, unstable). Tune labels stay
+non-evidential (§4.4).
+
+**Owner grader check (§4.4)**: 10 tune answers, owner labels vs grader_v1 labels:
+**9 / 10 agree (90 % ≥ 80 %)**. The one disagreement (t5, timber price next quarter) is
+not a grader error: the grader applied t5's gold ("cannot be known; unsure")
+correctly. The owner's note sets a different standard: *an unsure answer to a
+price / forecast question should say it cannot be known **and** give a current
+reference figure, saying it may stay flat but is hard to predict*; a bare refusal
+is `partial`. This is the owner's gold decision (t5 was "owner spot-check pending").
+
+**Gold v1.1 (owner rule).** Rows of kind `unsure` that ask for a future or live
+**price / rate** get a second expected fact, the reference the owner asked for:
+- t5 (timber next quarter): *"gives a current merchant or published price for common
+  framing sizes as a reference, with its date or source, not as next quarter's
+  price"*; variant: the current range the owner accepts (owner step, below).
+- u1 (MBIE levy 2028): *"gives the current rate as a reference: $1.75 per $1,000 incl
+  GST (r1's confirmed figure)"*; variants as r1 (`$1.52 + GST per $1,000`). The value
+  is in gold so a fabricated "current" figure is caught (Fable rev 4.3 #5).
+- u2 (concrete this week): **conditional** — *"if it gives a figure, it is a dated
+  published guide or range labelled indicative, not this week's price; saying no
+  public figure exists and to get a supplier quote is equally good"*. A required
+  reference would contradict u2's first fact (Fable #2).
+u3 (false premise) and u4 (not published) are unchanged. Changed rows carry
+`gold_rev: "v1.1"`; the owner's note covered t5 only, so u1 / u2 stay
+`confirmed: false` until the owner ticks them (owner step); unconfirmed rows are
+excluded (§3). The file name stays `set.v1.jsonl`. Per §3 every stored answer is
+re-graded, nothing re-run.
+
+**Grader v2.** grader_v1 hard-codes the old standard ("says so plainly instead of
+giving a figure"; "gives a figure anyway → wrong"), so `grader_v2` replaces those
+lines only:
+- `correctly_unsure`: kind `unsure`; says plainly that what was asked cannot be known
+  or is not published, and states every expected fact.
+- Kind `unsure`: **any number given for the future period or live moment asked is
+  `wrong`, whatever its attribution** ("BRANZ expects +3 %" included); a direction
+  without a number ("may stay flat, hard to predict") is allowed. A figure clearly
+  labelled current / past with a date or source is allowed, and must match the
+  expected / variant value when gold gives one. Unsure but missing an expected fact →
+  `partial`.
+- An expected fact starting with "if" applies only when its condition holds.
+- *A* date or source must be stated; which website is still not judged.
+`grade.py` takes `--grader` (default `grader_v2`) and writes `grader_prompt` on every
+row; `--round` picks `grades_r<n>.jsonl` / `cells_r<n>.json`. Round 0 (330 rows,
+≈ $0.03) is re-graded with v2 into a fresh file, the v1 file kept; the v1→v2 label
+flip count on non-unsure items is reported as a grader test-retest figure.
+
+**Grader check v2 (not circular).** v2 was written to agree with the owner on the one
+ref that disagreed, so the same 10 refs prove nothing (Fable #7). A fresh blind draw:
+new seed, the 10 refs excluded, 10 round-0 answers, of which ≥ 4 are on unsure items
+and span bare refusal, reference figure and figure-as-answer (stratified on v1
+labels and on whether the answer text holds a digit). The owner labels them under
+v1.1 gold before v2's labels exist; v2 must agree on ≥ 8 / 10. The original 10 are
+reported as a regression check only.
+
+**Owner steps (one page):** (1) tick u1, u2 gold and give t5's acceptable range;
+(2) label the 10 fresh answers. Then the v2 re-grade runs.
+
+**Round 1** (§4.4 "Rounds 1-2"; at most one more round after it). Per (model, step ∈
+{verify, single}) the incumbent is `best_round0` on the v2 cells (gemini: verify only,
+the A′ delta, §4.2; muse / DeepSeek informational). One edit per incumbent: the
+incumbent text plus one paragraph placed just before `## Question` —
+*"If the exact answer cannot be known yet (a forecast, a live or future price or
+rate) or is not published, say so plainly first, and give no number for that future
+period. Then, if you found one, give the latest published figure or range as a
+reference, with its date and source, and say it is not a forecast."* Edit id
+`<incumbent>_e1`, one text per incumbent prompt (the cell key carries the model).
+A (model, step) whose v2 incumbent has every item at `correct` / `correctly_unsure`
+is skipped. Verify cells verify round 0's stored gemini drafts, same item and rep.
+Runs `r1-NNNN` in `matrix_r1_calls.jsonl`, same ledger and pools; dry run prints
+calls and $ upper, stated to the owner first.
+**Keep rule for round 1** = `keep_edit` **and** the edit is stable on every
+non-unsure item where the incumbent's majority is good (the edit targets t5, so
+(b) passes on t5 almost by construction; the extra stability guard catches hedging
+spilling onto `current` items — Fable #8). Expected outcome: a t5 win; the real guard
+is the scored run's 8 current items. Cells with unstable t5 can only be kept on
+another item (§4.4 (b)).
+
 ## 5. Grading
 
 ### 5.1 Blind grader
@@ -621,3 +705,11 @@ rev 4.2 — Fable re-check (READY-WITH-FIXES), all applied:
 3. MED per-model `max_uses` (Sonnet 3, Haiku 2) in §4.2 / §7; no further re-probes.
 4. LOW status line, $1.42 everywhere. Matrix sub-cap / scored reserve are prose
    until the matrix harness implements them in `ledger.py`.
+
+rev 4.3 — 2026-11-05, round 0 done; owner grader check 9/10; owner gold rule for
+price / forecast unsure items (gold v1.1 on t5, u1, u2); grader_v2; full round-0 re-grade;
+round 1 = one shared rule edit per incumbent (§4.5).
+rev 4.3.1 — Fable review (READY-WITH-FIXES), applied: u2 conditional (#2); u1/u2 need the
+owner's tick (#3); future numbers always wrong (#4); reference values in gold (#5);
+fresh stratified owner check instead of the same 10 (#7); round-1 stability guard (#8);
+v1→v2 flip count (#10); --grader/--round + grader_prompt field (#11).

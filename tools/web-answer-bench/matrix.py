@@ -1,4 +1,7 @@
-"""Prompt x model matrix, round 0: every candidate prompt on every admitted model.
+"""Prompt x model matrix. Round 0: every candidate prompt on every admitted
+model. Round 1 (spec rev 4.3 §4.5): per (model, step) the best round-0 cell's
+`_e1` edit, verify cells on round 0's stored gemini drafts; needs --cells-r0
+(default <out>/cells_r0.json, graded by grader_v2) and writes matrix_r1_*.
 
 Spec: docs/superpowers/specs/2026-10-27-claude-web-answer-bench-design.md §4.4, §6, §7
 Plan: docs/superpowers/plans/2026-10-28-web-answer-prompt-matrix.md (Task 5)
@@ -96,12 +99,41 @@ def round0_cells():
     return sorted(cells, key=_run_order)
 
 
-def stale_rows(rows):
-    """Rows whose cell is not a round-0 cell (a removed model or cell, e.g.
+def round1_cells(cells_r0):
+    """Spec rev 4.3 §4.5: per (model, step in verify / single) the best round-0
+    cell's edit, unless that incumbent already has every item good (the keep
+    rule could never pass). gemini: verify only (the A' delta)."""
+    import select_freeze                                  # lazy: it imports grade -> matrix
+    cells = []
+    for model in MODEL_KEYS:
+        for step in ("verify", "single"):
+            if model == "gemini" and step != "verify":
+                continue
+            try:
+                inc = select_freeze.best_round0(cells_r0, step, model)
+            except KeyError:
+                continue
+            c = select_freeze.cell_of(cells_r0, step, inc, model)
+            if all(it["majority"] in select_freeze.GOOD for it in c["items"].values()):
+                continue
+            cells.append((step, prompts.edit_of(inc), model))
+    return sorted(cells, key=_run_order)
+
+
+def round_cells(rnd, cells_r0=None):
+    return round0_cells() if rnd == 0 else round1_cells(cells_r0)
+
+
+def calls_file(rnd):
+    return f"matrix_r{rnd}_calls.jsonl"
+
+
+def stale_rows(rows, cells=None):
+    """Rows whose cell is not in this round (a removed model or cell, e.g.
     mimo, gemini verify_v1): `summarize()` reads every row, so an --out
-    holding any is refused, never summarized."""
-    cells = {_cell_id(c) for c in round0_cells()}
-    return [r for r in rows if r.get("cell") not in cells]
+    holding any is refused, never summarized. Default: round 0."""
+    ids = {_cell_id(c) for c in (round0_cells() if cells is None else cells)}
+    return [r for r in rows if r.get("cell") not in ids]
 
 
 def calls_upper(cell):
@@ -157,7 +189,9 @@ def unconfirmed_tune(path):
 def validate(argv, env, repo_root=REPO):
     ap = argparse.ArgumentParser(prog="matrix")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--round", type=int, required=True, choices=[0])
+    ap.add_argument("--round", type=int, required=True, choices=[0, 1])
+    ap.add_argument("--cells-r0", help="round 1: round 0's cells json (grader_v2); "
+                    "default <out>/cells_r0.json")
     ap.add_argument("--search-price-per-1000", type=float, required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm-calls", type=int)
@@ -169,11 +203,23 @@ def validate(argv, env, repo_root=REPO):
     if out == Path(repo_root).resolve() or Path(repo_root).resolve() in out.parents:
         stage0._refuse("--out must be outside the repository")
     ledger_mod.refuse_if_locked(out, stage0._refuse)
-    stale = stale_rows(_load_done(os.path.join(str(out), "matrix_r0_calls.jsonl")))
+    cells_r0 = None
+    if args.round == 1:
+        cells_r0 = args.cells_r0 or os.path.join(str(out), "cells_r0.json")
+        if not os.path.isfile(cells_r0):
+            stage0._refuse("round 1 needs round 0's cells json (--cells-r0)")
+        with open(cells_r0, encoding="utf-8") as f:
+            cells_r0 = json.load(f)
+        if not os.path.isfile(os.path.join(str(out), calls_file(0))):
+            stage0._refuse("round 1 verifies round 0's stored gemini drafts: "
+                           f"no {calls_file(0)} in --out")
+    args.cells = round_cells(args.round, cells_r0)
+    stale = stale_rows(_load_done(os.path.join(str(out), calls_file(args.round))),
+                       args.cells)
     if stale:
-        stage0._refuse(f"--out holds {len(stale)} rows of cells not in round 0 "
-                       f"({len({r.get('cell') for r in stale})} cells); use a fresh --out "
-                       "(e.g. matrix_r0b)")
+        stage0._refuse(f"--out holds {len(stale)} rows of cells not in round "
+                       f"{args.round} ({len({r.get('cell') for r in stale})} cells); use a "
+                       "fresh --out (e.g. matrix_r0b)")
     if args.search_price_per_1000 < 0:
         stage0._refuse("--search-price-per-1000 must be >= 0")
     if args.openrouter_cap < 0:
@@ -190,7 +236,7 @@ def validate(argv, env, repo_root=REPO):
         unconfirmed = unconfirmed_tune(args.set)
         if unconfirmed:
             stage0._refuse("tune gold not confirmed: " + ", ".join(unconfirmed))
-        upper = plan(round0_cells())["upper"]
+        upper = plan(args.cells)["upper"]
         if args.confirm_calls != upper:
             stage0._refuse(f"--confirm-calls must equal the upper bound {upper} "
                            "(run --dry-run first)")
@@ -284,7 +330,8 @@ def summarize(records):
 
 
 def _write_summary(out, summary):
-    with open(os.path.join(out, "matrix_r0_summary.json"), "w", encoding="utf-8",
+    name = f"matrix_r{summary.get('round', 0)}_summary.json"
+    with open(os.path.join(out, name), "w", encoding="utf-8",
               newline="") as f:
         json.dump(summary, f, indent=2)
 
@@ -331,12 +378,13 @@ def _or_blocked(path, cap):
 def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monotonic,
         stdout=sys.stdout):
     """Returns (exit code, summary). `client` and `or_call` are injected."""
-    cells = round0_cells()
+    rnd = getattr(args, "round", 0)
+    cells = getattr(args, "cells", None) or round0_cells()
     p = plan(cells, price_per_1000=args.search_price_per_1000)
     ledger_path = os.path.join(args.out, "anthropic_ledger.json")
     ledger = Ledger(ledger_path)
     or_cap = getattr(args, "openrouter_cap", OPENROUTER_CAP_USD)
-    calls_path = os.path.join(args.out, "matrix_r0_calls.jsonl")
+    calls_path = os.path.join(args.out, calls_file(rnd))
     done_before = {(r.get("cell"), r.get("item"), r.get("rep"))
                    for r in _load_done(calls_path)}
     # What is still to spend: a resumed run is not refused for rows it has paid.
@@ -347,7 +395,7 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
     claude_todo = any((_cell_id(c), it["id"], rep) not in done_before
                       for c in cells if c[2] in CLAUDE
                       for rep in range(REPS) for it in items)
-    print(f"matrix r0 plan: {p['cells']} cells, {p['runs']} runs, upper bound "
+    print(f"matrix r{rnd} plan: {p['cells']} cells, {p['runs']} runs, upper bound "
           f"{p['upper']} calls (Anthropic {p['anthropic_upper']}, OpenRouter "
           f"{p['openrouter_upper']}), <= {p['searches_upper']} Anthropic searches, "
           f"Anthropic <= ${p['anthropic_usd_upper']:.2f} at "
@@ -376,13 +424,15 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
 
     os.makedirs(args.out, exist_ok=True)
     unsure = stage0.unsure_ids(items)
-    summary = {"round": 0, "plan": p, "hard_stop": False, "openrouter_cap_hit": False}
+    summary = {"round": rnd, "plan": p, "hard_stop": False, "openrouter_cap_hit": False}
     # Runs skipped because the OpenRouter pool was spent: no row is written, so a
     # resume runs them. A verify whose gemini draft was skipped is skipped too.
     or_cut, cut_drafts = set(), set()
     records = _load_done(calls_path)
     done = {(r["cell"], r["item"], r["rep"]) for r in records}
-    drafts = {(r["item"], r["rep"]): (r["text"], r["latency_ms"]) for r in records
+    # Round 1 verifies round 0's stored gemini drafts (same item / rep, spec §4.5).
+    draft_rows = records if rnd == 0 else _load_done(os.path.join(args.out, calls_file(0)))
+    drafts = {(r["item"], r["rep"]): (r["text"], r["latency_ms"]) for r in draft_rows
               if r["cell"] == _cell_id(GEMINI_DRAFT) and r["outcome"] == "ok" and r.get("text")}
     seq = max([int(r["run_id"].split("-")[1]) for r in records] or [0])
     if records:
@@ -416,7 +466,7 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
                         or_cut.add(_cell_id(cell))
                         continue
                     seq += 1
-                    rec = {"run_id": f"r0-{seq:04d}", "round": 0, "cell": _cell_id(cell),
+                    rec = {"run_id": f"r{rnd}-{seq:04d}", "round": rnd, "cell": _cell_id(cell),
                            "step": step, "prompt_id": pid, "model_key": model,
                            "model": CLAUDE[model][0] if model in CLAUDE
                            else openrouter_bench.PROFILES[model]["model"],

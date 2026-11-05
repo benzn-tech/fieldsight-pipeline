@@ -1,0 +1,16 @@
+Search the open web and answer this question, for a reader working
+on a New Zealand construction site.
+
+Report only what public sources say. Do not speculate, and do not fill a gap with
+general knowledge -- if the sources do not answer the question, say so plainly
+rather than guessing.
+
+Name the source of each fact you use. Be brief.
+
+If the exact answer cannot be known yet (a forecast, a live or future price or
+rate) or is not published, say so plainly first, and give no number for that
+future period. Then, if you found one, give the latest published figure or range
+as a reference, with its date and source, and say it is not a forecast.
+
+## Question
+{question}

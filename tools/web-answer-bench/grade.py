@@ -76,7 +76,7 @@ _sleep = time.sleep                # tests patch this; run(sleep=...) overrides
 NO_ANSWER = "no_answer"
 UNGRADED = "ungraded"
 _RANK = {NO_ANSWER: -1, **{label: i for i, label in enumerate(ORDER)}}
-GRADER_PROMPT = "grader_v1"
+GRADER_PROMPT = "grader_v2"     # spec rev 4.3 §4.5; grader_v1 is the round-0 original
 GRADER_TIMEOUT_S = 30.0          # not on a reader's clock
 GRADER_MAX_TOKENS = 256
 # Upper input of one grader prompt (question + gold + an answer of <= 2048
@@ -145,9 +145,9 @@ def _lines(values):
 
 
 def grade_one(question, gold, answer, domains, *, urls=(), call=openrouter_bench.call,
-              check_sources=True, sleep=time.sleep):
+              check_sources=True, sleep=time.sleep, grader=GRADER_PROMPT):
     flagged = source_flag(answer, domains, urls) if check_sources else []
-    prompt = prompts.load(GRADER_PROMPT).format(
+    prompt = prompts.load(grader).format(
         question=question, kind=gold.get("kind") or "standard",
         expected=_lines(gold.get("expected") or []),
         variants=_lines(gold.get("variants") or []), answer=blind(answer))
@@ -167,7 +167,8 @@ def grade_one(question, gold, answer, domains, *, urls=(), call=openrouter_bench
             "source_checked": bool(check_sources), "source_flag": bool(flagged),
             "flagged_hosts": flagged, "grader_outcome": r.get("outcome"),
             "grader_http_status": r.get("http_status"),
-            "grader_calls": attempt, "grader_cost_usd": round(cost, 8)}
+            "grader_calls": attempt, "grader_cost_usd": round(cost, 8),
+            "grader_prompt": grader}
 
 
 def majority(labels):
@@ -202,17 +203,23 @@ def split(rows):
             [r for r in live if not (r.get("answer") or "").strip()], skipped)
 
 
-def _read_grades(out):
-    path = os.path.join(out, "grades_r0.jsonl")
+def grades_file(rnd=0):
+    return f"grades_r{rnd}.jsonl"
+
+
+def _read_grades(out, rnd=0):
+    path = os.path.join(out, grades_file(rnd))
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def pending(todo, grades):
-    """--only-ungraded: the runs with no label yet, or an ungraded one."""
-    labelled = {g["run_id"] for g in grades if g.get("label") != UNGRADED}
+def pending(todo, grades, grader=GRADER_PROMPT):
+    """--only-ungraded: the runs with no label yet, an ungraded one, or one by
+    another grader prompt (a row without `grader_prompt` is grader_v1's)."""
+    labelled = {g["run_id"] for g in grades if g.get("label") != UNGRADED
+                and g.get("grader_prompt", "grader_v1") == grader}
     return [r for r in todo if r["run_id"] not in labelled]
 
 
@@ -255,6 +262,8 @@ def validate(argv, env, repo_root=REPO):
     ap.add_argument("--out", required=True)
     ap.add_argument("--calls", required=True)
     ap.add_argument("--seed", type=int, required=True)
+    ap.add_argument("--round", type=int, default=0, choices=[0, 1])
+    ap.add_argument("--grader", default=GRADER_PROMPT, choices=["grader_v1", "grader_v2"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm-calls", type=int)
     ap.add_argument("--only-ungraded", action="store_true")
@@ -277,16 +286,17 @@ def validate(argv, env, repo_root=REPO):
     if not calls.exists():
         _refuse(f"no calls file {calls.name} in --out (run matrix.py first)")
     args.out, args.calls = str(out), str(calls)
-    stale = matrix.stale_rows(_read_calls(args.calls))
+    rows = _read_calls(args.calls)
+    stale = matrix.stale_rows(rows) if args.round == 0 else         [r for r in rows if r.get("round") != args.round]
     if stale:
-        _refuse(f"{calls.name} holds {len(stale)} rows of cells not in round 0; "
+        _refuse(f"{calls.name} holds {len(stale)} rows not of round {args.round}; "
                 "grade a fresh matrix --out")
     if not args.dry_run:
         if not args.openrouter_key_file and not env.get("CORROBORATION_API_KEY"):
             _refuse("missing environment variable(s): CORROBORATION_API_KEY")
         todo = split(_read_calls(args.calls))[0]
         if args.only_ungraded:
-            todo = pending(todo, _read_grades(args.out))
+            todo = pending(todo, _read_grades(args.out, args.round), args.grader)
         n = len(todo)
         if args.confirm_calls != n:
             _refuse(f"--confirm-calls must equal the answers to grade {n} "
@@ -305,13 +315,15 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=None):
     ledger_path = os.path.join(args.out, "anthropic_ledger.json")
     or_cap = getattr(args, "openrouter_cap", ledger_mod.OPENROUTER_CAP_USD)
     todo, empty, skipped = split(rows)
-    previous = _read_grades(args.out) if args.only_ungraded else []
+    rnd = getattr(args, "round", 0)
+    grader = getattr(args, "grader", GRADER_PROMPT)
+    previous = _read_grades(args.out, rnd) if args.only_ungraded else []
     if args.only_ungraded:
-        todo = pending(todo, previous)
+        todo = pending(todo, previous, grader)
     info = {"to_grade": len(todo), "no_answer": len(empty), "skipped": len(skipped)}
     print(f"grade: {len(todo)} grader calls (1 per answer, no retry), {len(empty)} runs "
           f"without an answer (no_answer), {len(skipped)} skipped (no_draft), "
-          f"seed {args.seed}", file=stdout)
+          f"seed {args.seed}, {grader}", file=stdout)
     upper = len(todo) * grader_upper()
     room = ledger_mod.openrouter_room(ledger_path, or_cap)
     print(f"grade: openrouter upper ${upper:.2f}, pool "
@@ -349,7 +361,7 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=None):
         draft_text = r.get("step") == "draft" or r.get("answer_source") in DRAFT_SOURCES
         res = grade_one(g["question"], g, r["answer"], r.get("result_domains") or [],
                         urls=r.get("result_urls") or [], call=call,
-                        check_sources=not draft_text, sleep=sleep)
+                        check_sources=not draft_text, sleep=sleep, grader=grader)
         ledger_mod.add_openrouter_spend(ledger_path, res["grader_cost_usd"])
         if res["grader_http_status"] == 429:
             streak += 1
@@ -361,14 +373,14 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=None):
             continue        # a 429 row is left out until the streak resolves
         streak = 0
         out_rows.append(dict(res, run_id=r["run_id"], order=n))
-    tmp = os.path.join(args.out, "grades_r0.jsonl.tmp")
+    tmp = os.path.join(args.out, grades_file(rnd) + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         for g in out_rows:
             f.write(json.dumps(g) + "\n")
-    os.replace(tmp, os.path.join(args.out, "grades_r0.jsonl"))
+    os.replace(tmp, os.path.join(args.out, grades_file(rnd)))
     labels = {g["run_id"]: g["label"] for g in out_rows}
     cells = build_cells(rows, labels, gold)
-    with open(os.path.join(args.out, "cells_r0.json"), "w", encoding="utf-8",
+    with open(os.path.join(args.out, f"cells_r{rnd}.json"), "w", encoding="utf-8",
               newline="") as f:
         json.dump(cells, f, indent=2)
     counts = Counter(labels.values())
