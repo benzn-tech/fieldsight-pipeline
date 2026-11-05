@@ -131,8 +131,17 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_session_finalize.py` (the confirmation email's topic table gains a *Where* column from `group_day`, blank when unknown)
 - `fieldsight-ui` (separate repo): a "By location" toggle on the day view reading `location_groups`. Out of this repo's scope; note the payload contract in `BACKEND-CONTEXT.md`.
 
-- [ ] **Step 1:** Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
-- [ ] **Step 2:** Write the `location_groups` contract into the UI repo's backend-context doc.
+- [ ] **Step 1:** **Deferred 2026-11-06.** The email table's three-column header (AGENDA ITEM / ASSIGNED / DUE DATE) is literal on BOTH the email and the frontend's Preview & copy (owner, 2026-10-08). A *Where* column must land in both at once, so it waits for the UI line. Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
+- [x] **Step 2:** (contract below, handed to the UI line, which owns fieldsight-ui) Write the `location_groups` contract into the UI repo's backend-context doc.
+
+**`location_groups` contract (org-api `/timeline` rendered day, PR #1228):**
+- Present only when the day has usable location markers AND the caller may see the whole day. A cross-user or site-clipped caller never gets it. Absent ≠ `[]`.
+- `photo_groups` (older key) may be present while `location_groups` is absent; do not infer one from the other.
+- Shape: `[{location: str|null, kind: "level"|"room"|"zone"|"block"|"other"|null, key: str|null, order: int, reason: null|"before_first"|"expired"|"no_time", topic_ids: [int], photos: [filename], unbound_photos: [filename]}]`, in visit order. A return to a place is a new group.
+- `topic_ids` are the same response's `topics[].topic_id` (positions, valid only within that response).
+- `photos` = photos bound to those topics; `unbound_photos` = photos bound to no topic, placed by their own time. Every photo appears once across all groups.
+- Null-group headings the report uses: before_first "Before any location was announced", expired "Location not stated", no_time "Time not recorded".
+- The day report's `sections` also carry a "Locations" `entries` section (title = place, note = topic titles); photos stay in the Photos section.
 
 ---
 
