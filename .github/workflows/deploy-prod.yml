@@ -231,6 +231,29 @@ jobs:
           if [ -n "${{ vars.PROD_ACTION_VERIFIER_FALLBACKS }}" ]; then
             ACTION_VERIFIER_FALLBACKS_PARAM="ActionVerifierFallbacks=${{ vars.PROD_ACTION_VERIFIER_FALLBACKS }}"
           fi
+          # The pack writer and the hide switch (spec 2026-11-05 §8.2). Same bare-"Key="
+          # guard: an unset variable keeps the template Default (writer Muse, no reasoning
+          # key, no pin, no fallbacks; hide 'on').
+          ACTION_WRITER_MODEL_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_WRITER_MODEL }}" ]; then
+            ACTION_WRITER_MODEL_PARAM="ActionWriterModel=${{ vars.PROD_ACTION_WRITER_MODEL }}"
+          fi
+          ACTION_WRITER_REASONING_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_WRITER_REASONING }}" ]; then
+            ACTION_WRITER_REASONING_PARAM="ActionWriterReasoning=${{ vars.PROD_ACTION_WRITER_REASONING }}"
+          fi
+          ACTION_WRITER_PROVIDER_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_WRITER_PROVIDER }}" ]; then
+            ACTION_WRITER_PROVIDER_PARAM="ActionWriterProvider=${{ vars.PROD_ACTION_WRITER_PROVIDER }}"
+          fi
+          ACTION_WRITER_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_WRITER_FALLBACKS }}" ]; then
+            ACTION_WRITER_FALLBACKS_PARAM="ActionWriterFallbacks=${{ vars.PROD_ACTION_WRITER_FALLBACKS }}"
+          fi
+          ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_VERIFIER_HIDE_UNSUPPORTED }}" ]; then
+            ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM="ActionVerifierHideUnsupported=${{ vars.PROD_ACTION_VERIFIER_HIDE_UNSUPPORTED }}"
+          fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.PROD_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.PROD_ASK_JUDGE_MODEL }}"
@@ -414,6 +437,11 @@ jobs:
               $ACTION_PACKS_PARAM \
               $ACTION_VERIFIER_MODEL_PARAM \
               $ACTION_VERIFIER_FALLBACKS_PARAM \
+              $ACTION_WRITER_MODEL_PARAM \
+              $ACTION_WRITER_REASONING_PARAM \
+              $ACTION_WRITER_PROVIDER_PARAM \
+              $ACTION_WRITER_FALLBACKS_PARAM \
+              $ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

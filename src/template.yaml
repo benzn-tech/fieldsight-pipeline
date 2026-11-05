@@ -325,23 +325,69 @@ Parameters:
       tasks; 'internal' opens them to platform_admin only; 'on' to everyone
       with access. Read per call (an env edit is the rollback).
 
-  ActionVerifierModel:
+  ActionWriterModel:
+    Type: String
+    Default: 'meta/muse-spark-1.3-contributor'
+    Description: >-
+      Action packs writer (planner, rounds, write; spec 2026-11-05 §8.2). Set =
+      only the ACTION_WRITER_* settings route it, even when it equals the Ask
+      judge model. Empty = the Ask judge's routing (ASK_JUDGE_*), as before. A
+      claude-* id goes to the Claude API, never OpenRouter. Set via
+      TEST_ACTION_WRITER_MODEL / PROD_ACTION_WRITER_MODEL.
+
+  ActionWriterReasoning:
     Type: String
     Default: ''
     Description: >-
-      Action packs verifier model (spec 2026-11-01 §4.4, §14 S6). Empty = the
-      cheap model in code (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL).
-      It must be a different model family from the writer (the Ask judge) as
-      actually served, or every pack fails 'model'. Set via
+      Action packs writer reasoning: off, low, medium or high; empty = the
+      model's default (no reasoning key). 'off' aimed at muse is dropped with a
+      warning. Set via TEST_ACTION_WRITER_REASONING / PROD_ACTION_WRITER_REASONING.
+
+  ActionWriterProvider:
+    Type: String
+    Default: ''
+    Description: >-
+      Action packs writer OpenRouter endpoint pin, comma-separated tags (e.g.
+      coreweave/fp8); empty = no pin. Set via TEST_ACTION_WRITER_PROVIDER /
+      PROD_ACTION_WRITER_PROVIDER.
+
+  ActionWriterFallbacks:
+    Type: String
+    Default: ''
+    Description: >-
+      Action packs writer fallbacks, comma-separated; empty = none (a writer
+      outage fails the pack 'model'). Set via TEST_ACTION_WRITER_FALLBACKS /
+      PROD_ACTION_WRITER_FALLBACKS.
+
+  ActionVerifierModel:
+    Type: String
+    Default: 'claude-opus-5-5'
+    Description: >-
+      Action packs verifier model (spec 2026-11-01 §4.4, §14 S6; 2026-11-05
+      §8.2). A claude-* id goes to the Claude API (ANTHROPIC_API_KEY). Empty =
+      the cheap model in code (CORROBORATION_CHEAP_MODEL /
+      web_answer.CHEAP_MODEL). It must be a different model family from the
+      writer as actually served, or every pack fails 'model'. Set via
       TEST_ACTION_VERIFIER_MODEL / PROD_ACTION_VERIFIER_MODEL.
 
   ActionVerifierFallbacks:
     Type: String
-    Default: ''
+    Default: 'claude-sonnet-5-5,google/gemini-3.8-flash'
     Description: >-
       Action packs verifier fallbacks, comma-separated, tried in order when the
-      verifier is in the writer's family (§14 S6). Empty = none. Set via
-      TEST_ACTION_VERIFIER_FALLBACKS / PROD_ACTION_VERIFIER_FALLBACKS.
+      verifier fails or is in the writer's family (§14 S6). Set via
+      TEST_ACTION_VERIFIER_FALLBACKS / PROD_ACTION_VERIFIER_FALLBACKS (a set
+      variable replaces this default).
+
+  ActionVerifierHideUnsupported:
+    Type: String
+    Default: 'on'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      Action packs (spec 2026-11-05 §7): 'on' hides a conclusion the verifier
+      marks unsupported (today's policy); 'off' shows it. Set via
+      TEST_ACTION_VERIFIER_HIDE_UNSUPPORTED /
+      PROD_ACTION_VERIFIER_HIDE_UNSUPPORTED (literally on or off).
 
   CompanyStatusEnforce:
     Type: String
@@ -2707,14 +2753,18 @@ Resources:
       Environment:
         Variables:
           ACTION_PACKS: !Ref ActionPacks
-          # Writer = the Ask judge setting; verifier empty (the parameter default) = the
-          # cheap model in code (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL).
-          # Fallbacks empty by default: the verifier must be a different family from the
-          # writer actually used (S6), so any fallback is a deliberate choice (repo
-          # variables *_ACTION_VERIFIER_MODEL / *_ACTION_VERIFIER_FALLBACKS).
-          ACTION_WRITER_MODEL: !Ref AskJudgeModel
+          # Writer = its own parameters (spec 2026-11-05 §8.2): set, only ACTION_WRITER_*
+          # route it; empty, the Ask judge's routing (ASK_JUDGE_* below) as before.
+          # Verifier: Opus on the Claude API by default; it must be a different family
+          # from the writer actually used (S6). Repo variables *_ACTION_WRITER_* /
+          # *_ACTION_VERIFIER_* override each default.
+          ACTION_WRITER_MODEL: !Ref ActionWriterModel
+          ACTION_WRITER_REASONING: !Ref ActionWriterReasoning
+          ACTION_WRITER_PROVIDER: !Ref ActionWriterProvider
+          ACTION_WRITER_FALLBACKS: !Ref ActionWriterFallbacks
           ACTION_VERIFIER_MODEL: !Ref ActionVerifierModel
           ACTION_VERIFIER_FALLBACKS: !Ref ActionVerifierFallbacks
+          ACTION_VERIFIER_HIDE_UNSUPPORTED: !Ref ActionVerifierHideUnsupported
           # Per-run token cap (§4.2 cost guard): over it the run stores what is verified
           # as a partial pack (run_trace.truncated).
           ACTION_TOKEN_CAP: '400000'
