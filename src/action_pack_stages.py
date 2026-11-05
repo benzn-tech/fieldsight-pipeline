@@ -12,8 +12,10 @@
             pack's site. -> ctx.checkpoint(reading=, title=).
     Gather  `as_of` is taken first. Round 1 is deterministic (no model): day_overview over
             the range (7-day windows), the site's open items (items tool), and
-            search_project_documents for the plan's document queries. Then up to 7
-            model-chosen rounds (8 in all) of at most 4 calls each, validated against an
+            search_project_documents for the plan's document queries; alongside them, on
+            worker threads, one all-status items lookup per planner target (<= 4), each
+            resolved in code (action_pack_targets -> run.resolution). Then up to 7
+            model-chosen rounds (8 in all; ACTION_MAX_ROUNDS lowers it) of at most 4 calls each, validated against an
             allowlist; web_search only by a planned query id. Every records/documents/items
             call is pinned to the pack's site. ctx.checkpoint() after every round. Stops on
             `done`, rounds exhausted, the gather deadline or the token cap (truncated).
