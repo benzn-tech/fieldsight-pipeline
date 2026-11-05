@@ -251,3 +251,37 @@ def test_a_group_with_photos_but_no_titled_topic_gets_no_empty_heading():
     assert all(e["topics"] for e in entries)
     # The photograph is still in the report.
     assert _name(9, 0) in [p["name"] for p in _section(sections, "Photos")["items"]]
+
+
+WALK = [{"at": "10:00", "location": "Level 1"},
+        {"at": "10:10", "location": "Level 2"},
+        {"at": "10:20", "location": "level one"}]
+
+
+def test_a_place_with_only_photos_does_not_split_locations():
+    """Final review I-1, pinned as designed. The payload's `location_groups`
+    is built from every photo of the day, so an unbound photo taken on Level 2
+    makes Level 2 a stop in the walk: three groups. The report's Locations
+    shows only places with topics, so the same day is one "Level 1" entry --
+    feeding the day's photos in would give two "Level 1" headings back to back."""
+    import location_grouping
+
+    topics = [_topic("A", "10:02 - 10:03"), _topic("B", "10:22 - 10:23")]
+    groups = location_grouping.group_day(WALK, topics, [_name(10, 12)])
+    assert [(g["location"], g["topic_ids"], g["unbound_photos"]) for g in groups] == [
+        ("Level 1", [0], []), ("Level 2", [], [_name(10, 12)]), ("Level 1", [1], [])]
+
+    sec = _section(rs.build(_fixture(topics=topics, location_markers=WALK)), "Locations")
+    assert [(e["title"], e["topics"]) for e in sec["items"]] == [("Level 1", ["A", "B"])]
+
+
+def test_adjacent_rows_of_one_place_merge_when_a_group_between_is_skipped():
+    """Final review M-1: Level 1 (A), Level 2 (an untitled topic -- no entry),
+    Level 1 (B) would be two "Level 1" headings in a row. One, topics in order."""
+    topics = [_topic("A", "10:02 - 10:03", [_name(10, 2)]),
+              _topic("", "10:12 - 10:13", [_name(10, 12)]),
+              _topic("B", "10:22 - 10:23", [_name(10, 22)])]
+    sec = _section(rs.build(_fixture(topics=topics, location_markers=WALK)), "Locations")
+    assert [(e["title"], e["topics"], e["note"]) for e in sec["items"]] == [
+        ("Level 1", ["A", "B"], "A · B")]
+    assert [p["name"] for p in sec["items"][0]["photos"]] == [_name(10, 2), _name(10, 22)]

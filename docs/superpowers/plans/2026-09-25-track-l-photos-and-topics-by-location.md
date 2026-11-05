@@ -144,6 +144,7 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - `photos` = photos bound to those topics; `unbound_photos` = photos bound to no topic, placed by their own time. Every photo appears once across all groups.
 - Null-group headings the report uses: before_first "Before any location was announced", expired "Location not stated", no_time "Time not recorded".
 - The day report's `sections` also carry a "Locations" `entries` section (title = place, note = topic titles); photos stay in the Photos section.
+- Locations shows only places with topics: a place where only photos were taken does not split it, so it can show fewer groups than the payload's `location_groups`.
 
 ---
 

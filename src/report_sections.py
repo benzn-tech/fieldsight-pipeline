@@ -503,6 +503,10 @@ def _locations(topics, report, photos):
     The photographs grouped are the ones the Photos section lists (the topics'
     `related_photos`), so the two sections never disagree about what the day's
     photographs are. Never raises: a grouping failure drops this section only.
+
+    Locations shows only places with topics: a place where only photos were
+    taken does not split it, so it can show fewer groups than the payload's
+    `location_groups`.
     """
     markers = report.get("location_markers")
     if not markers or not isinstance(markers, list):
@@ -543,9 +547,19 @@ def _locations(topics, report, photos):
         # be an empty heading; its photographs are still in Photos.
         if not titles:
             continue
+        title = g.get("location") or _NO_PLACE.get(g.get("reason"), _NO_PLACE["expired"])
+        # A skipped group between two groups of one place (Level 1, an
+        # untitled topic elsewhere, Level 1) would leave two "Level 1"
+        # headings back to back. One heading, its topics in order.
+        if rows and rows[-1]["title"] == title:
+            prev = rows[-1]
+            for t in titles:
+                _add(prev["topics"], t)
+            prev["photos"] += [r for r in refs if r not in prev["photos"]]
+            prev["note"] = _join(*prev["topics"])
+            continue
         rows.append({
-            "title": g.get("location") or _NO_PLACE.get(g.get("reason"),
-                                                        _NO_PLACE["expired"]),
+            "title": title,
             "status": "",
             "note": _join(*titles),
             "topics": titles,
