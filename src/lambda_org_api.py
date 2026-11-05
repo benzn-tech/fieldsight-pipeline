@@ -440,6 +440,17 @@ def _write_refused(conn, caller, company_id, where):
     return None
 
 
+def _uuid_or_none(value):
+    """The canonical text of a UUID, or None for anything else -- so a malformed id is
+    answered before it reaches SQL (a cast error would abort the request transaction)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
 def parse_body(event):
     """Return the parsed JSON body dict, or None on malformed JSON."""
     raw = event.get("body") or "{}"
