@@ -89,27 +89,28 @@ jobs:
           ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
           VOICE_LLM_BEARER: ${{ secrets.VOICE_LLM_BEARER_TEST }}
           VOICE_SESSION_SIGNING_KEY: ${{ secrets.VOICE_SESSION_SIGNING_KEY_TEST }}
+        # (Kept outside `run:`: GitHub caps the run template at 21,000 chars.)
+        # KEYFRAME FEATURE (H-1) — activating it on TEST needs BOTH repo vars set:
+        #   * TEST_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
+        #     (KeyframeFfmpegLayerArn below). Intended value:
+        #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
+        #     — a runtime-agnostic layer (CompatibleRuntimes [python3.11, python3.12])
+        #     bundling /opt/bin/ffmpeg, so it loads on the 3.11 KeyframeFunction next to
+        #     the cp311-only PsycopgLayer. This flips HasKeyframeFfmpegLayer ->
+        #     HasKeyframeStack true so KeyframeFunction is actually CREATED on TEST and
+        #     the feature can be verified BEFORE prod. Unset => empty => keyframe stack
+        #     stays uncreated (today's behavior, merge-safe). NOTE: distinct from
+        #     TEST_VAD_LAYER_ARN (the cp312-only fieldsight-vad-layer that feeds
+        #     VadFunction) — do not conflate the two.
+        #   * TEST_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
+        #     Left default false so merging does NOT auto-enable emission; flip it
+        #     deliberately only after the created stack + its IAM are verified on TEST.
         run: |
           # A space inside any --parameter-overrides "Key=Value" breaks SAM's parser.
           # DB secret ARN: read from the db stack's export; passed as a plain
           # parameter because {{resolve:secretsmanager:...}} can't compose
           # with Fn::ImportValue (only with Parameters).
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
-          # KEYFRAME FEATURE (H-1) — activating it on TEST needs BOTH repo vars set:
-          #   * TEST_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
-          #     (KeyframeFfmpegLayerArn below). Intended value:
-          #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
-          #     — a runtime-agnostic layer (CompatibleRuntimes [python3.11, python3.12])
-          #     bundling /opt/bin/ffmpeg, so it loads on the 3.11 KeyframeFunction next to
-          #     the cp311-only PsycopgLayer. This flips HasKeyframeFfmpegLayer ->
-          #     HasKeyframeStack true so KeyframeFunction is actually CREATED on TEST and
-          #     the feature can be verified BEFORE prod. Unset => empty => keyframe stack
-          #     stays uncreated (today's behavior, merge-safe). NOTE: distinct from
-          #     TEST_VAD_LAYER_ARN (the cp312-only fieldsight-vad-layer that feeds
-          #     VadFunction) — do not conflate the two.
-          #   * TEST_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
-          #     Left default false so merging does NOT auto-enable emission; flip it
-          #     deliberately only after the created stack + its IAM are verified on TEST.
           # SAM's --parameter-overrides REJECTS a bare "Key=" with an empty value, so the
           # ffmpeg-layer override is only appended when the var is actually set; unset =>
           # the token is omitted and the template Default ('') keeps the stack uncreated.
@@ -200,6 +201,29 @@ jobs:
           ACTION_VERIFIER_FALLBACKS_PARAM=""
           if [ -n "${{ vars.TEST_ACTION_VERIFIER_FALLBACKS }}" ]; then
             ACTION_VERIFIER_FALLBACKS_PARAM="ActionVerifierFallbacks=${{ vars.TEST_ACTION_VERIFIER_FALLBACKS }}"
+          fi
+          # The pack writer and the hide switch (spec 2026-11-05 §8.2). Same bare-"Key="
+          # guard: an unset variable keeps the template Default (writer Muse, no reasoning
+          # key, no pin, no fallbacks; hide 'on').
+          ACTION_WRITER_MODEL_PARAM=""
+          if [ -n "${{ vars.TEST_ACTION_WRITER_MODEL }}" ]; then
+            ACTION_WRITER_MODEL_PARAM="ActionWriterModel=${{ vars.TEST_ACTION_WRITER_MODEL }}"
+          fi
+          ACTION_WRITER_REASONING_PARAM=""
+          if [ -n "${{ vars.TEST_ACTION_WRITER_REASONING }}" ]; then
+            ACTION_WRITER_REASONING_PARAM="ActionWriterReasoning=${{ vars.TEST_ACTION_WRITER_REASONING }}"
+          fi
+          ACTION_WRITER_PROVIDER_PARAM=""
+          if [ -n "${{ vars.TEST_ACTION_WRITER_PROVIDER }}" ]; then
+            ACTION_WRITER_PROVIDER_PARAM="ActionWriterProvider=${{ vars.TEST_ACTION_WRITER_PROVIDER }}"
+          fi
+          ACTION_WRITER_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.TEST_ACTION_WRITER_FALLBACKS }}" ]; then
+            ACTION_WRITER_FALLBACKS_PARAM="ActionWriterFallbacks=${{ vars.TEST_ACTION_WRITER_FALLBACKS }}"
+          fi
+          ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM=""
+          if [ -n "${{ vars.TEST_ACTION_VERIFIER_HIDE_UNSUPPORTED }}" ]; then
+            ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM="ActionVerifierHideUnsupported=${{ vars.TEST_ACTION_VERIFIER_HIDE_UNSUPPORTED }}"
           fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
@@ -329,6 +353,11 @@ jobs:
               $ACTION_PACKS_PARAM \
               $ACTION_VERIFIER_MODEL_PARAM \
               $ACTION_VERIFIER_FALLBACKS_PARAM \
+              $ACTION_WRITER_MODEL_PARAM \
+              $ACTION_WRITER_REASONING_PARAM \
+              $ACTION_WRITER_PROVIDER_PARAM \
+              $ACTION_WRITER_FALLBACKS_PARAM \
+              $ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

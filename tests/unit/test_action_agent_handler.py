@@ -598,3 +598,67 @@ def test_ctx_gives_each_stage_its_deadline_and_the_time_left(env):
     assert ctx.left() == 100.0
     with pytest.raises(ValueError):
         ctx.deadline_for("plan")
+
+
+# ---- PR-1 Task 1.2: writer routing independent of the Ask judge (spec §8.2) ----------
+
+MUSE = "meta/muse-spark-1.3-contributor"
+_WRITER_KEYS = ("ACTION_WRITER_MODEL", "ACTION_WRITER_REASONING", "ACTION_WRITER_PROVIDER",
+                "ACTION_WRITER_FALLBACKS")
+
+
+def _judge_env(monkeypatch, model="judge/x"):
+    for k in _WRITER_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ASK_JUDGE_MODEL", model)
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "high")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/y")
+
+
+def test_writer_routing_explicit_ignores_judge(monkeypatch):
+    _judge_env(monkeypatch)
+    monkeypatch.setenv("ACTION_WRITER_MODEL", "judge/x")
+    r = agent.writer_routing()
+    assert r.explicit is True and r.model == "judge/x"
+    assert r.chain == ["judge/x"]
+    assert r.extras == {}
+
+
+def test_writer_routing_explicit_reads_writer_settings(monkeypatch):
+    _judge_env(monkeypatch)
+    monkeypatch.setenv("ACTION_WRITER_MODEL", " " + MUSE + " ")
+    monkeypatch.setenv("ACTION_WRITER_REASONING", "high")
+    monkeypatch.setenv("ACTION_WRITER_PROVIDER", "meta/fp8")
+    monkeypatch.setenv("ACTION_WRITER_FALLBACKS", " a/b , ," + MUSE + ",a/b,c/d")
+    r = agent.writer_routing()
+    assert r.model == MUSE
+    assert r.chain == [MUSE, "a/b", "c/d"]
+    assert r.extras == {"reasoning": {"effort": "high"},
+                        "provider": {"only": ["meta/fp8"], "allow_fallbacks": False}}
+
+
+def test_writer_routing_muse_off_dropped(monkeypatch):
+    _judge_env(monkeypatch)
+    monkeypatch.setenv("ACTION_WRITER_MODEL", MUSE)
+    monkeypatch.setenv("ACTION_WRITER_REASONING", "off")
+    assert agent.writer_routing().extras == {}
+
+
+def test_writer_routing_unset_is_judge(monkeypatch):
+    _judge_env(monkeypatch)
+    monkeypatch.setenv("ACTION_WRITER_MODEL", "  ")
+    r = agent.writer_routing()
+    assert r.explicit is False and r.chain is None and r.extras is None
+    assert r.model == "judge/x" == agent.writer_model()
+
+
+def test_verifier_hide_default_on(monkeypatch):
+    monkeypatch.delenv("ACTION_VERIFIER_HIDE_UNSUPPORTED", raising=False)
+    assert agent.verifier_hide_unsupported() is True
+    for raw in ("ON", "on", "", "yes", "nonsense"):
+        monkeypatch.setenv("ACTION_VERIFIER_HIDE_UNSUPPORTED", raw)
+        assert agent.verifier_hide_unsupported() is True
+    for raw in ("off", " OFF ", "Off"):
+        monkeypatch.setenv("ACTION_VERIFIER_HIDE_UNSUPPORTED", raw)
+        assert agent.verifier_hide_unsupported() is False

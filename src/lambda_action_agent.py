@@ -118,6 +118,50 @@ def writer_model() -> str:
         llm_tools_client._primary_model()
 
 
+@dataclass
+class WriterRouting:
+    """How the writer (planner, rounds, write) is routed (spec 2026-11-05 §8.2).
+
+    `explicit` = ACTION_WRITER_MODEL is set: `chain` is the writer's whole chain and
+    `extras` the provider pin / reasoning for its first entry -- only ACTION_WRITER_*
+    settings apply, even when the model equals ASK_JUDGE_MODEL. Not explicit = today's
+    Ask-judge routing (`chain` and `extras` None)."""
+    model: str
+    chain: Optional[list]
+    extras: Optional[dict]
+    explicit: bool
+
+
+def writer_routing() -> WriterRouting:
+    """Read per call. ACTION_WRITER_FALLBACKS is comma-separated, de-duplicated, never the
+    primary again (unset = none); ACTION_WRITER_PROVIDER / ACTION_WRITER_REASONING are
+    parsed by llm_utils (reasoning with the writer model, so `off` aimed at muse is
+    dropped with a warning)."""
+    import llm_utils
+    model = (os.environ.get("ACTION_WRITER_MODEL") or "").strip()
+    if not model:
+        return WriterRouting(model=writer_model(), chain=None, extras=None, explicit=False)
+    chain = [model]
+    for m in (s.strip() for s in (os.environ.get("ACTION_WRITER_FALLBACKS") or "").split(",")):
+        if m and m not in chain:
+            chain.append(m)
+    extras = {}
+    provider = llm_utils.parse_provider(os.environ.get("ACTION_WRITER_PROVIDER"))
+    if provider is not None:
+        extras["provider"] = provider
+    reasoning = llm_utils.parse_reasoning(os.environ.get("ACTION_WRITER_REASONING"),
+                                          model=model, name="ACTION_WRITER_REASONING")
+    if reasoning is not None:
+        extras["reasoning"] = reasoning
+    return WriterRouting(model=model, chain=chain, extras=extras, explicit=True)
+
+
+def verifier_hide_unsupported() -> bool:
+    """ACTION_VERIFIER_HIDE_UNSUPPORTED: False only for the literal `off` (any case,
+    stripped); unset or anything else is True, today's behaviour."""
+    return (os.environ.get("ACTION_VERIFIER_HIDE_UNSUPPORTED") or "").strip().lower() != "off"
+
+
 def verifier_model() -> str:
     """ACTION_VERIFIER_MODEL, else the cheap model (CORROBORATION_CHEAP_MODEL / its in-code
     default in web_answer)."""

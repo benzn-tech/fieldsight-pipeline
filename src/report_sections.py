@@ -37,10 +37,13 @@ outrank a real one merely for containing characters. The text the model wrote is
 still what gets displayed.
 """
 
+import logging
 from datetime import date as _date
 
 import due_dates
 import due_display
+
+logger = logging.getLogger(__name__)
 
 #: The Library's section vocabulary (scripts/api/template-store.js). A kind
 #: outside this set has no renderer on the other side.
@@ -108,6 +111,7 @@ def build(report):
     # users: one bad shape meant no report for this user and every user after
     # them. A section that comes out short beats a lost nightly run.
     topics = [t for t in (report.get("topics") or []) if isinstance(t, dict)]
+    photos = _photos(topics, report)
 
     sections = [
         _summary(report),
@@ -118,7 +122,8 @@ def build(report):
         _dates(report),
         _issues(report),
         _safety(report),
-        _photos(topics, report),
+        _locations(topics, report, photos),
+        photos,
     ]
     return [s for s in sections if s]
 
@@ -467,6 +472,102 @@ def _safety(report):
     if not rows:
         return None
     return {"title": "Safety", "kind": "entries", "items": rows}
+
+
+#: The heading of a group with no place, by why it has none. "Location not
+#: stated", never "after <place>": two expired windows can merge into one group,
+#: and a heading naming either place would be wrong for the other.
+_NO_PLACE = {
+    "before_first": "Before any location was announced",
+    "expired": "Location not stated",
+    "no_time": "Time not recorded",
+}
+
+
+def _locations(topics, report, photos):
+    """The day's topics and photographs under the places he said out loud, in
+    the order he visited them (Track L). None when nobody said where they were.
+
+    The markers arrive on `report["location_markers"]`, put there by a caller
+    that is allowed to know them: a place plus a minute is a fact about where
+    the person was, so a site-clipped reader's caller never attaches them.
+
+    One entry per group, in the `entries` shape both renderers already draw:
+    the place as `title`, the topic titles as `note`. `topics` and `photos`
+    carry the same content structured -- `photos` are the very `{name, key}`
+    items the Photos section lists, so a renderer that learns to draw them can
+    fetch them. Neither renderer draws them today, which is why the Photos
+    section stays complete: taking the located photographs out of it would make
+    them vanish from the report rather than move.
+
+    The photographs grouped are the ones the Photos section lists (the topics'
+    `related_photos`), so the two sections never disagree about what the day's
+    photographs are. Never raises: a grouping failure drops this section only.
+
+    Locations shows only places with topics: a place where only photos were
+    taken does not split it, so it can show fewer groups than the payload's
+    `location_groups`.
+    """
+    markers = report.get("location_markers")
+    if not markers or not isinstance(markers, list):
+        return None
+    items = (photos or {}).get("items") or []
+    by_base = {}
+    for item in items:
+        by_base.setdefault(item["name"].rsplit("/", 1)[-1], item)
+    try:
+        # Lazy: location_grouping reaches `repositories.location_markers`, which
+        # imports psycopg, and this module promises callers it does not. Only a
+        # caller that supplies markers pays for it.
+        import location_grouping
+        groups = location_grouping.group_day(markers, topics, [i["name"] for i in items])
+    except Exception:  # noqa: BLE001 - one section, never the report
+        logger.exception("locations could not be grouped")
+        return None
+    if not groups:
+        return None
+
+    by_id = {}
+    for i, t in enumerate(topics):
+        # The identity group_day returns: `id`, else `topic_id`, else position.
+        tid = t["id"] if t.get("id") is not None else (
+            t["topic_id"] if t.get("topic_id") is not None else i)
+        by_id.setdefault(tid, t)
+
+    rows = []
+    for g in groups:
+        titles = []
+        for tid in g.get("topic_ids") or []:
+            t = by_id.get(tid) or {}
+            _add(titles, t.get("topic_title") or t.get("title"))
+        refs = [by_base[n] for n in (g.get("photos") or []) + (g.get("unbound_photos") or [])
+                if n in by_base]
+        # A heading needs something under it that a reader can see. No
+        # renderer draws `photos` yet, so a group of only photographs would
+        # be an empty heading; its photographs are still in Photos.
+        if not titles:
+            continue
+        title = g.get("location") or _NO_PLACE.get(g.get("reason"), _NO_PLACE["expired"])
+        # A skipped group between two groups of one place (Level 1, an
+        # untitled topic elsewhere, Level 1) would leave two "Level 1"
+        # headings back to back. One heading, its topics in order.
+        if rows and rows[-1]["title"] == title:
+            prev = rows[-1]
+            for t in titles:
+                _add(prev["topics"], t)
+            prev["photos"] += [r for r in refs if r not in prev["photos"]]
+            prev["note"] = _join(*prev["topics"])
+            continue
+        rows.append({
+            "title": title,
+            "status": "",
+            "note": _join(*titles),
+            "topics": titles,
+            "photos": refs,
+        })
+    if not rows:
+        return None
+    return {"title": "Locations", "kind": "entries", "items": rows}
 
 
 def _photos(topics, report=None):

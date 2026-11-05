@@ -107,8 +107,8 @@ def test_the_chain_backstop_and_the_run_window_fit_the_timeout(fn):
 def test_env_names_the_switch_the_models_the_hops_and_the_buckets(fn):
     env = _env(fn)
     assert env["ACTION_PACKS"] == {"Ref": "ActionPacks"}
-    assert env["ACTION_WRITER_MODEL"] == {"Ref": "AskJudgeModel"}
-    # parameters defaulting to empty -> the cheap model in code (web_answer.CHEAP_MODEL)
+    # The writer has its own parameter (spec 2026-11-05 §8.2), no longer the Ask judge's.
+    assert env["ACTION_WRITER_MODEL"] == {"Ref": "ActionWriterModel"}
     assert env["ACTION_VERIFIER_MODEL"] == {"Ref": "ActionVerifierModel"}
     assert env["ACTION_VERIFIER_FALLBACKS"] == {"Ref": "ActionVerifierFallbacks"}
     assert int(env["ACTION_TOKEN_CAP"]) > 0
@@ -154,12 +154,43 @@ def test_the_switch_reaches_exactly_org_api_and_the_worker(tpl):
         assert _env(tpl["Resources"][name])["ACTION_PACKS"] == {"Ref": "ActionPacks"}
 
 
-@pytest.mark.parametrize("name", ["ActionVerifierModel", "ActionVerifierFallbacks"])
-def test_the_verifier_parameters_default_empty(tpl, name):
-    """Empty = the cheap model in code, no fallbacks: no model id invented in the
-    template. Only the worker reads them."""
-    p = tpl["Parameters"][name]
-    assert p["Type"] == "String" and p["Default"] == ""
+# PR-1 (spec 2026-11-05 §8.2): the writer and verifier settings, all read by the worker only.
+ACTION_MODEL_PARAMS = {
+    # parameter: (env var, default)
+    "ActionWriterModel": ("ACTION_WRITER_MODEL", "meta/muse-spark-1.3-contributor"),
+    "ActionWriterReasoning": ("ACTION_WRITER_REASONING", ""),
+    "ActionWriterProvider": ("ACTION_WRITER_PROVIDER", ""),
+    "ActionWriterFallbacks": ("ACTION_WRITER_FALLBACKS", ""),
+    "ActionVerifierModel": ("ACTION_VERIFIER_MODEL", "claude-opus-5-5"),
+    "ActionVerifierFallbacks": ("ACTION_VERIFIER_FALLBACKS",
+                                "claude-sonnet-5-5,google/gemini-3.8-flash"),
+    "ActionVerifierHideUnsupported": ("ACTION_VERIFIER_HIDE_UNSUPPORTED", "on"),
+}
+
+
+def test_action_agent_env_has_writer_settings(fn):
+    """Env parity: every new variable is on the worker, from its own parameter."""
+    env = _env(fn)
+    for param, (var, _) in ACTION_MODEL_PARAMS.items():
+        assert env[var] == {"Ref": param}, var
+    assert env["ACTION_WRITER_MODEL"] == {"Ref": "ActionWriterModel"}
+
+
+def test_action_template_defaults(tpl):
+    """Exactly the plan's Global Constraints values. Claude ids are bare `claude-*` (the
+    Claude API route, never OpenRouter's `anthropic/...`)."""
+    for param, (_, default) in ACTION_MODEL_PARAMS.items():
+        p = tpl["Parameters"][param]
+        assert p["Type"] == "String" and p["Default"] == default, param
+    assert tpl["Parameters"]["ActionVerifierHideUnsupported"]["AllowedValues"] == ["on", "off"]
+    assert tpl["Parameters"]["ActionWriterReasoning"]["AllowedPattern"] ==         "^(|off|minimal|low|medium|high|xhigh|max)$"
+    import llm_tools_client
+    for m in ("claude-opus-5-5", "claude-sonnet-5-5"):
+        assert llm_tools_client.is_claude(m) and "/" not in m
+
+
+@pytest.mark.parametrize("name", sorted(ACTION_MODEL_PARAMS))
+def test_the_action_model_parameters_reach_only_the_worker(tpl, name):
     readers = {n for n, res in tpl["Resources"].items()
                if res.get("Type") == "AWS::Serverless::Function"
                and {"Ref": name} in ((((res.get("Properties") or {}).get("Environment")

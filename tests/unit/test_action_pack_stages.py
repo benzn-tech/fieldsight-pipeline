@@ -766,3 +766,52 @@ def test_ask_item_line_unchanged():
         "R3 | 2026-10-28 09:15 | Alpha | Ann | Pour / review — Pour '''next Friday''' ok")
     assert ask_orchestrator._item_line({"ref": "R4", "kind": "chunk", "date": None,
                                         "text": "x"}) == "R4 | - | - | - | - — x"
+
+
+# ---- PR-1 Task 1.2: judge_call routes the writer by ACTION_WRITER_* ------------------
+
+def _spy_complete_json(monkeypatch):
+    import llm_tools_client as tc
+    seen = []
+
+    def complete_json(prompt, **kw):
+        seen.append(kw)
+        return tc.ChatTurn(text="{}", model="served", requested_model=kw.get("model") or "m")
+    monkeypatch.setattr(tc, "complete_json", complete_json)
+    monkeypatch.setattr(tc, "_now", lambda: 1000.0)
+    return seen
+
+
+def test_judge_call_passes_explicit_chain(monkeypatch):
+    muse = "meta/muse-spark-1.3-contributor"
+    monkeypatch.setenv("ACTION_WRITER_MODEL", muse)
+    monkeypatch.setenv("ACTION_WRITER_REASONING", "high")
+    monkeypatch.setenv("ACTION_WRITER_FALLBACKS", "a/b")
+    monkeypatch.delenv("ACTION_WRITER_PROVIDER", raising=False)
+    monkeypatch.setenv("ASK_JUDGE_MODEL", muse)
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "judge/fb1,judge/fb2,judge/fb3")
+    seen = _spy_complete_json(monkeypatch)
+    st.judge_call("p", max_tokens=10, model=muse, deadline=100.0, caller="action_write",
+                  info={})
+    kw = seen[0]
+    assert kw["chain"] == [muse, "a/b"]
+    assert kw["primary_extras"] == {"reasoning": {"effort": "high"}}
+    assert kw["deadline"] == 1100.0
+    # Two entries in the writer's own chain -> the fallback share (not the judge's list).
+    assert kw["attempt_timeout"] == pytest.approx(100.0 * st.FALLBACK_ATTEMPT_SHARE)
+
+    monkeypatch.delenv("ACTION_WRITER_FALLBACKS")
+    st.judge_call("p", max_tokens=10, model=muse, deadline=100.0, caller="action_write",
+                  info={})
+    assert seen[1]["chain"] == [muse] and seen[1]["attempt_timeout"] == 100.0
+
+
+def test_judge_call_without_writer_model_is_unchanged(monkeypatch):
+    monkeypatch.delenv("ACTION_WRITER_MODEL", raising=False)
+    monkeypatch.setenv("ASK_JUDGE_MODEL", WRITER)
+    monkeypatch.delenv("ASK_JUDGE_FALLBACKS", raising=False)
+    seen = _spy_complete_json(monkeypatch)
+    st.judge_call("p", max_tokens=10, model=WRITER, deadline=100.0, caller="c", info={})
+    assert seen[0] == {"model": WRITER, "max_tokens": 10, "deadline": 1100.0, "caller": "c",
+                       "attempt_timeout": 100.0}

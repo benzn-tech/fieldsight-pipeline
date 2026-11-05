@@ -95,6 +95,10 @@ class ChatTurn:
     bad_args: list = field(default_factory=list)
     # complete_json only: the chain entry that answered (`model` is the vendor's id).
     requested_model: str = ""
+    # The vendor's stop cause: OpenRouter's `choices[0].finish_reason` as given, or
+    # Anthropic's `stop_reason` with `max_tokens` mapped to `length`, so one check
+    # `finish_reason == "length"` means "cut off by the token limit" on either route.
+    finish_reason: str = ""
 
 
 def _primary_model():
@@ -112,8 +116,8 @@ def _provider_pin():
 
 
 def _reasoning():
-    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, low, medium or
-    high; anything else (after a warning) and unset mean no key at all.
+    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, minimal, low, medium,
+    high, xhigh or max; anything else (after a warning) and unset mean no key at all.
 
     No model is passed, on purpose: the judge's `off` reaches the wire as
     `{"enabled": false}` whatever the judge model is, as it always has."""
@@ -371,10 +375,12 @@ def _parse_anthropic(data, model, offered_names=()):
                 args = {}
                 bad_args.append(cid)
             tool_calls.append({"id": cid, "name": b.get("name") or "", "arguments": args})
+    stop = data.get("stop_reason")
     turn = ChatTurn(tool_calls=tool_calls, text="".join(texts),
                     usage=_anthropic_usage(data.get("usage")),
-                    model=data.get("model") or model, bad_args=bad_args)
-    stop = data.get("stop_reason")
+                    model=data.get("model") or model, bad_args=bad_args,
+                    finish_reason=("length" if stop == "max_tokens"
+                                   else stop if isinstance(stop, str) else ""))
     if stop == "refusal":
         turn.error = "refusal"
     elif stop == "max_tokens" and not tool_calls and not turn.text.strip():
@@ -425,9 +431,11 @@ def _parse(data, model):
                            "arguments": parsed})
 
     usage = data.get("usage")
+    finish = choice.get("finish_reason")
     return ChatTurn(tool_calls=tool_calls, text=text,
                     usage=usage if isinstance(usage, dict) else {},
-                    model=data.get("model") or model, bad_args=bad_args)
+                    model=data.get("model") or model, bad_args=bad_args,
+                    finish_reason=finish if isinstance(finish, str) else "")
 
 
 def _error_detail(resp):
@@ -565,6 +573,9 @@ def chat(messages, tools, *, model=None, tool_choice="required",
             }
             if idx == 0:
                 payload.update(primary_extras)
+                # xhigh/max think past the default headroom (llm_utils).
+                payload["max_tokens"] = max_tokens + llm_utils.reasoning_headroom(
+                    primary_extras.get("reasoning"))
         attempt_start = _now()
         try:
             resp = http.request("POST", url, body=json.dumps(payload), headers=headers,
@@ -624,7 +635,8 @@ def chat(messages, tools, *, model=None, tool_choice="required",
 
 
 def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
-                  caller="ask_judge", attempt_timeout=None, judge_routing=True) -> ChatTurn:
+                  caller="ask_judge", attempt_timeout=None, judge_routing=True,
+                  chain=None, primary_extras=None) -> ChatTurn:
     """One tool-less JSON answer routed exactly like the Ask judge: `model` (default the
     judge model) then ASK_JUDGE_FALLBACKS (unset = none), the provider pin and reasoning on
     the configured judge model only, a fallback on a 5xx, a 429 or a transport failure,
@@ -638,23 +650,40 @@ def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
     ASK_JUDGE_FALLBACKS and never the judge's provider pin or reasoning -- the verifier
     walks its own chain and checks each answer's family itself.
 
+    `chain` (the action-pack writer, PR-1): the whole chain, in order. `model`,
+    `judge_routing` and every ASK_JUDGE_* setting are then ignored. `primary_extras`
+    (e.g. `provider`, `reasoning`) goes on chain index 0 only, and never on a Claude
+    entry (the Claude API payload is built separately). `turn.finish_reason` is
+    recorded on every route.
+
     A Claude entry goes to api.anthropic.com exactly as in `chat` (ANTHROPIC_API_KEY,
     unset = an error, never OpenRouter), with a JSON-only system instruction in place
     of `response_format`."""
-    env_primary = _primary_model()
-    chain = _model_chain(model or env_primary) if judge_routing else [model or env_primary]
+    explicit = chain is not None
+    if explicit:
+        chain = [m for m in chain if m]
+        if not chain:
+            return ChatTurn(error="no model configured")
+        env_primary = None
+    else:
+        env_primary = _primary_model()
+        chain = (_model_chain(model or env_primary) if judge_routing
+                 else [model or env_primary])
     if not any(is_claude(m) for m in chain) and not corroboration_client.api_key():
         logger.error("llm_tools: API key not set caller=%s", caller)
         return ChatTurn(error="API key not configured")
     if deadline is not None and deadline - _now() < MIN_TIME_LEFT:
         return ChatTurn(error="no time left", timed_out=True)
-    primary_extras = {}
-    if judge_routing and chain[0] == env_primary:
-        pin, reasoning = _provider_pin(), _reasoning()
-        if pin:
-            primary_extras["provider"] = pin
-        if reasoning:
-            primary_extras["reasoning"] = reasoning
+    if explicit:
+        primary_extras = dict(primary_extras or {})
+    else:
+        primary_extras = {}
+        if judge_routing and chain[0] == env_primary:
+            pin, reasoning = _provider_pin(), _reasoning()
+            if pin:
+                primary_extras["provider"] = pin
+            if reasoning:
+                primary_extras["reasoning"] = reasoning
     http = corroboration_client.http_session()
     cap = HTTP_TIMEOUT_CAP if attempt_timeout is None else float(attempt_timeout)
     started = _now()
@@ -693,6 +722,9 @@ def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
                        "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS}
             if idx == 0:
                 payload.update(primary_extras)
+                # xhigh/max think past the default headroom (llm_utils).
+                payload["max_tokens"] = max_tokens + llm_utils.reasoning_headroom(
+                    primary_extras.get("reasoning"))
         attempt_start = _now()
         try:
             resp = http.request("POST", url, body=json.dumps(payload), headers=headers,
