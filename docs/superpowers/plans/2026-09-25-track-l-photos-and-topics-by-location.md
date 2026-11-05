@@ -105,13 +105,15 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_report_generator.py` / wherever `report_sections.build` is called for a day (pass markers; the nightly generator reads S3, so it takes markers from the day's extraction artifact `location_markers`, not Aurora)
 - Test: `tests/unit/test_report_sections_locations.py`
 
-- [ ] **Step 1:** `kind: "entries"` section titled *Locations*: one entry per group — heading = label (or "Before any location was announced"), then the group's topic titles, then its photo keys (same `{name, key}` shape `_photos` builds, so the docx renderer already knows it).
-- [ ] **Step 2:** Section is dropped when there are no markers (the `build` rule: no empty headings).
-- [ ] **Step 3:** Test: a report with markers renders the section between *Safety* and *Photos*; without markers the section list is unchanged (assert on the exact list of titles a fixture produced before this change).
+- [x] **Step 1:** (done, org-api day view; null headings by reason; entries only with a topic title; Photos keeps every photo because no renderer draws `entry.photos` yet — ruling) `kind: "entries"` section titled *Locations*: one entry per group — heading = label (or "Before any location was announced"), then the group's topic titles, then its photo keys (same `{name, key}` shape `_photos` builds, so the docx renderer already knows it).
+- [x] **Step 2:** (done) Section is dropped when there are no markers (the `build` rule: no empty headings).
+- [x] **Step 3:** (done; **nightly generator NOT wired**: it reads only `transcripts/`, has no DB; needs the day's `extractions/` markers merged and passed as `{**report, "location_markers": m}` at `build`) Test: a report with markers renders the section between *Safety* and *Photos*; without markers the section list is unchanged (assert on the exact list of titles a fixture produced before this change).
 
 ---
 
 ### Task 6: The generated (template) report places sections under locations
+
+> **Deferred 2026-11-06.** This regroups a customer's template sections under location headings, which changes their fixed layout, and as written it needs a prompt change plus a real-call A/B on TEST. Placing photos on the line that names their place already ships (owner, 2026-10-01). If it is built later, take each section's place from its `[covers:]` refs in code (`location_grouping`), not from a model-written `[at:]`; that needs no prompt change and no A/B. Revisit after the owner has seen Tasks 4–5 on TEST.
 
 **Files:**
 - Modify: `src/report_template.py` (`_covers_block` offers the topic's place beside each ref), `src/lambda_session_report.py` (`_place_photos` and section assembly honour a `[at: Level 1]` line the same way `[covers: t0]` is honoured)
@@ -131,8 +133,18 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_session_finalize.py` (the confirmation email's topic table gains a *Where* column from `group_day`, blank when unknown)
 - `fieldsight-ui` (separate repo): a "By location" toggle on the day view reading `location_groups`. Out of this repo's scope; note the payload contract in `BACKEND-CONTEXT.md`.
 
-- [ ] **Step 1:** Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
-- [ ] **Step 2:** Write the `location_groups` contract into the UI repo's backend-context doc.
+- [ ] **Step 1:** **Deferred 2026-11-06.** The email table's three-column header (AGENDA ITEM / ASSIGNED / DUE DATE) is literal on BOTH the email and the frontend's Preview & copy (owner, 2026-10-08). A *Where* column must land in both at once, so it waits for the UI line. Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
+- [x] **Step 2:** (contract below, handed to the UI line, which owns fieldsight-ui) Write the `location_groups` contract into the UI repo's backend-context doc.
+
+**`location_groups` contract (org-api `/timeline` rendered day, PR #1228):**
+- Present only when the day has usable location markers AND the caller may see the whole day. A cross-user or site-clipped caller never gets it. Absent ≠ `[]`.
+- `photo_groups` (older key) may be present while `location_groups` is absent; do not infer one from the other.
+- Shape: `[{location: str|null, kind: "level"|"room"|"zone"|"block"|"other"|null, key: str|null, order: int, reason: null|"before_first"|"expired"|"no_time", topic_ids: [int], photos: [filename], unbound_photos: [filename]}]`, in visit order. A return to a place is a new group.
+- `topic_ids` are the same response's `topics[].topic_id` (positions, valid only within that response).
+- `photos` = photos bound to those topics; `unbound_photos` = photos bound to no topic, placed by their own time. Every photo appears once across all groups.
+- Null-group headings the report uses: before_first "Before any location was announced", expired "Location not stated", no_time "Time not recorded".
+- The day report's `sections` also carry a "Locations" `entries` section (title = place, note = topic titles); photos stay in the Photos section.
+- Locations shows only places with topics: a place where only photos were taken does not split it, so it can show fewer groups than the payload's `location_groups`.
 
 ---
 
