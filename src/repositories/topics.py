@@ -1504,7 +1504,9 @@ def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no,
     ledger (migration 0093) LEFT JOINed, or without it (task_no NULL) -- so the two cannot
     drift. DISTINCT ON keeps one row per stable_id, the newest live one (the row
     action_items.get_live_by_stable_id -- and so apply -- acts on); the item filters run
-    AFTER it, so a filter never resurrects an older row of the same stable_id."""
+    AFTER it, so a filter never resurrects an older row of the same stable_id.
+    `raised_on` is not that row's date: it is the earliest report_date of any row of the
+    stable_id, superseded or hidden ones included."""
     where, params = _ask_tools_where(site_ids, author_ids=author_ids, site_id=site_id,
                                      user_id=None, include_agent=True)
     # lower(): the column is free text; validate_request lower-cases the filter values.
@@ -1519,7 +1521,14 @@ def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no,
         "SELECT x.* FROM (SELECT DISTINCT ON (a.stable_id) a.stable_id, "
         + ("n.task_no" if ledger else "NULL::integer") + " AS task_no, "
         "a.text, a.status, a.deadline, a.responsible, a.priority, a.updated_at, "
-        "a.created_at, a.site_id, s.name AS site, a.topic_id, t.report_date, t.source "
+        "a.created_at, a.site_id, s.name AS site, a.topic_id, t.report_date, t.source, "
+        "a.deadline_text, "
+        # raised_on: the item's first raise -- the earliest topic date over EVERY row of the
+        # stable_id, visible or not (a date of the same item, no content); report_date is
+        # the newest live row's (spec 2026-11-05 §6.2). idx_action_items_stable (0073).
+        "(SELECT min(t2.report_date) FROM action_items a2 "
+        "JOIN topics t2 ON t2.id = a2.topic_id "
+        "WHERE a2.stable_id = a.stable_id) AS raised_on "
         "FROM action_items a JOIN topics t ON t.id = a.topic_id "
         "JOIN sites s ON s.id = a.site_id "
         + ("LEFT JOIN action_task_numbers n ON n.stable_id = a.stable_id " if ledger else "")

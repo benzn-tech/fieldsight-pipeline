@@ -355,3 +355,40 @@ def test_zero_deadline_never_reads(w):
     res = lambda_rag_search._search({"mode": "items", "sub": w["pm"]["cognito_sub"],
                                      "deadline_s": 0, "args": {}}, None)
     assert res == {"rows": [], "meta": {"error": "timeout"}}
+
+
+# ---------------------------------------------------------------- dated evidence (PR-2)
+
+def test_items_rows_include_deadline_text(w):
+    db = w["db"]
+    _item(db, w["s1"], w["w1"], "Texted deadline", deadline_text="end of next week")
+    rows = {r["text"]: r for r in _items(w["w1"])["rows"]}
+    assert rows["Texted deadline"]["deadline_text"] == "end of next week"
+    assert rows["W1 task"]["deadline_text"] is None
+
+
+def test_raised_on_is_earliest_row_even_if_superseded(w):
+    """raised_on = the earliest topic date of ANY row of the stable_id (visibility and
+    supersession ignored); report_date stays the newest live row's (DISTINCT ON)."""
+    db = w["db"]
+    rows = []
+    for i, day in enumerate(("2026-10-20", "2026-10-24", "2026-10-28")):
+        t = topics.upsert_topic(db, w["s1"]["id"], day, f"T carried {i}",
+                                user_id=w["w1"]["id"],
+                                source_s3_key=f"extractions/{w['w1']['folder_name']}/{day}/"
+                                              f"{_tag()}.json",
+                                action_items=[{"text": f"Carried task {i}"}])
+        rows.append(db.execute("SELECT id, stable_id, topic_id FROM action_items "
+                               "WHERE topic_id=%s", (t["id"],)).fetchone())
+    sid = rows[0][1]
+    for i, row in enumerate(rows[1:], start=1):
+        db.execute("UPDATE action_items SET stable_id=%s, "
+                   "created_at = created_at + %s * interval '1 minute' WHERE id=%s",
+                   (sid, i, row[0]))
+    # The first raise is superseded and hidden: never shown, still the raise date.
+    db.execute("UPDATE topics SET superseded_at = now() WHERE id=%s", (rows[0][2],))
+    _redact(db, w, rows[0][2], "all")
+    [it] = [r for r in _items(w["w1"])["rows"] if r["stable_id"] == str(sid)]
+    assert it["text"] == "Carried task 2"
+    assert it["report_date"] == "2026-10-28"
+    assert it["raised_on"] == "2026-10-20"

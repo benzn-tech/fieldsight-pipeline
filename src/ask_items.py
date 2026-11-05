@@ -45,7 +45,10 @@ _ARGS = ("site_id", "status", "query", "task_no", "limit")
 # Every item key, always present (None included). Order is the envelope's.
 ITEM_FIELDS = ("stable_id", "task_no", "text", "status", "deadline", "responsible",
                "priority", "updated_at", "created_at", "site_id", "site", "topic_id",
-               "report_date", "source")
+               "report_date", "source", "deadline_text", "raised_on")
+# deadline_text: the free-text deadline (0011) when the date column cannot hold it.
+# raised_on: the item's first raise (earliest row of the stable_id); report_date is the
+# newest live row's. Neither is patchable (action_pack_stages.SNAPSHOT_FIELDS).
 # The items envelope's own budget: up to MAX_LIMIT short rows, which the Ask tools' 12k
 # (about 40 items) would cut. The agent's render (Task 11) budgets what the model reads.
 MAX_RESULT_CHARS = 80_000
