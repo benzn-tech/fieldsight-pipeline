@@ -204,6 +204,18 @@ def test_rows_by_unit_strips_the_unit_cell():
     assert "Unit" in wc.shape_sentence() and "ALL" in wc.shape_sentence() and "General" in wc.shape_sentence()
 
 
+def test_the_model_is_told_every_way_he_says_the_rest_of_a_unit_is_fine():
+    # D3 (TEST smoke 2026-11-06): "Everything else in this one is good" got no
+    # ALL row from either model. Only the text can be pinned here; the real
+    # check is the TEST re-run.
+    s = wc.shape_sentence()
+    assert ("When he says the rest of a unit is fine (\"this one's all good\", \"everything "
+            "else in this one is good\", \"the rest is fine\", \"no other issues in here\"), "
+            "write one row for that unit with Item no ALL and Answer Yes. Evidence is those "
+            "words. Rows for items he did address in that unit stay as their own rows.") in s
+    assert "When he says a unit is all good" not in s
+
+
 TWICE = "\n".join([
     "[10:01:10] Ben Lin (spk_1): Unit one, this one is all good.",
     "[10:05:30] Ben Lin (spk_1): Unit two, the handrail on the stairs is loose.",
