@@ -152,12 +152,12 @@ def measure(database, days):
         n = per_counts[cid]
         report.append(
             "%-4s topic-days %4d | photo-days %4d | marker-days %4d (%s of topic-days, %s of photo-days) "
-            "| markers/day p50 %s p90 %s | topics placed %s | photos %d, placed %s (locate) / %s (place_at), "
-            "disagree %d" % (
+            "| markers/day p50 %s p90 %s | topics placed %s | photos %d (%d on marker-days), placed %s (locate) / %s "
+            "(place_at), disagree %d" % (
                 label[cid], c["topic_days"], c["photo_days"], c["marker_days"],
                 _pct(c["marker_days"], c["topic_days"]), _pct(c["marker_photo_days"], c["photo_days"]),
                 _q(n, .5), _q(n, .9), _pct(c["topics_placed"], c["topics"]),
-                c["photos"], _pct(c["photos_placed_locate"], c["photos"]),
+                c["photos"], c["photos_on_marker_days"], _pct(c["photos_placed_locate"], c["photos"]),
                 _pct(c["photos_placed_place_at"], c["photos"]), c["locators_disagree"]))
     tot = Counter()
     for c in per.values():
@@ -165,11 +165,11 @@ def measure(database, days):
     allm = [x for v in per_counts.values() for x in v]
     report.append(
         "ALL  topic-days %d | photo-days %d | marker-days %d (%s of topic-days, %s of photo-days) "
-        "| markers/day p50 %s p90 %s | topics placed %s | photos %d, placed %s (locate) / %s (place_at), "
-        "disagree %d | marker rows with no live topic that day: %d | distinct raw strings: %d" % (
+        "| markers/day p50 %s p90 %s | topics placed %s | photos %d (%d on marker-days), placed %s (locate) / %s "
+        "(place_at), disagree %d | marker rows with no live topic that day: %d | distinct raw strings: %d" % (
             tot["topic_days"], tot["photo_days"], tot["marker_days"],
             _pct(tot["marker_days"], tot["topic_days"]), _pct(tot["marker_photo_days"], tot["photo_days"]),
-            _q(allm, .5), _q(allm, .9), _pct(tot["topics_placed"], tot["topics"]), tot["photos"],
+            _q(allm, .5), _q(allm, .9), _pct(tot["topics_placed"], tot["topics"]), tot["photos"], tot["photos_on_marker_days"],
             _pct(tot["photos_placed_locate"], tot["photos"]),
             _pct(tot["photos_placed_place_at"], tot["photos"]), tot["locators_disagree"],
             orphan_marker_days, len(raw_strings)))

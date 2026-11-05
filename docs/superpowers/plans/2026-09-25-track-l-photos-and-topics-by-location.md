@@ -157,22 +157,24 @@ Not code in this repo, and the thing that decides whether Tasks 2–7 show anyth
 
 C1 = the platform's own company (internal/owner testing); C2 = a customer company. The label map and the raw strings stay in a local file and are not committed.
 
-| DB | Co. | topic-days | photo-days | marker-days | % of topic-days | % of photo-days | markers/day p50/p90 | topics placed | photos | photos placed |
+| DB | Co. | topic-days | photo-days | marker-days | % of topic-days | % of photo-days | markers/day p50/p90 | topics placed | photos (on marker-days) | photos placed |
 |---|---|---|---|---|---|---|---|---|---|---|
-| prod | C1 internal | 17 | 6 | 7 | 41.2% | 50.0% | 3 / 4 | 23.1% | 46 | 76.1% |
-| prod | C2 customer | 3 | 2 | 0 | **0%** | **0%** | — | 0% | 8 | 0% |
-| prod | all | 20 | 8 | 7 | 35.0% | 37.5% | 3 / 4 | 21.1% | 54 | 64.8% |
-| TEST | C1 internal | 11 | 7 | 6 | 54.5% | 71.4% | 2 / 4 | 30.4% | 88 | 12.5% |
-| TEST | C2 customer | 2 | 2 | 1 | 50.0% | 50.0% | 2 / 2 | 25.0% | 9 | 0% |
+| prod | C1 internal | 17 | 6 | 7 | 41.2% | 50.0% | 3 / 4 | 23.1% | 46 (38) | 76.1% |
+| prod | C2 customer | 3 | 2 | 0 | **0%** | **0%** | — | 0% | 8 (0) | 0% |
+| prod | all | 20 | 8 | 7 | 35.0% | 37.5% | 3 / 4 | 21.1% | 54 (38) | 64.8% |
+| TEST | C1 internal | 11 | 7 | 6 | 54.5% | 71.4% | 2 / 4 | 30.4% | 88 (59) | 12.5% |
+| TEST | C2 customer | 2 | 2 | 1 | 50.0% | 50.0% | 2 / 2 | 25.0% | 9 (6) | 0% |
 
 - `location_markers.locate` (day view) and `photo_binding.place_at` (binding, template report) agreed on every photo (0 disagreements on prod and TEST).
 - No marker row sat on a day without live topics.
 - **The sample is tiny** (20 topic-days on prod in 30 days, 2 companies). The only customer days on prod (3) carry **no marker**. Every marker on prod comes from internal testing.
-- Distinct raw strings: 20 on prod, 12 on TEST. Shapes seen (described, not quoted): levels as words and digits ("level two" / "Level 2"); level + qualifier (atrium, interior, slab, grid line); **level and zone in both orders** ("level N, zone M" and "zone M, level N"); ordinal floors ("second floor", "ground floor", "basement"); stairs/cores/blocks; and non-places (a farm name, "the airport", "inside").
+- Photos on marker-days: prod 35 of 38 placed. TEST only 11 of 65: 49 were taken more than `CARRY_MINUTES` (30) after the last marker, 5 before the first. On TEST he stops re-announcing the place while still photographing; the place expires, as designed.
+- Distinct raw strings: 20 on prod, 12 on TEST. Shapes seen (described, not quoted; customer speech stays local): a level as a word or a digit; a level plus a narrower qualifier (an area, a grid line, a slab); **a level and a zone together, in either order**; ordinal floors, ground and basement; stairs, cores and blocks; and things that are not places in a building (a site or farm name, a city landmark, a bare "inside"-type word).
+- **Multi-unit walk marks are not in `day_location_markers`.** "Now in Unit 2" lands in the extraction's `inspections[].entered` (`lambda_extract_session._clean_entered`, read by `units`/`walk_report`), and only reaches the day's markers if the model also emits a `location_marker` for it. A walk day can therefore be marker-less to Track L while its walk report has per-unit sections. Interface question for the multi-unit walk line (owner of `inspections[].entered`): should each `entered` mark also be written as a day marker, or should Track L read `entered` as a second source? Track L does not write it.
 
 **Read against the 30 % rule (Step 3):** internal testing is above 30 %; the **one real customer is at 0 % (n=3)**. On real use the fix is the habit and the App button (Task 9) first. Tasks 2–7 are still built (owner decides the order), but they show nothing to a customer until markers exist on customer days.
 
-Normaliser implications for Task 2: a compound "level + zone" must key the same whichever is said first; a qualifier after a level is a narrower place; "inside" and site/farm names are `other`, never a level.
+Normaliser implications for Task 2: a level-and-zone compound must key the same whichever is said first; a qualifier after a level is a narrower place; vague words and site names are `other`, never a level.
 
 ## Out of scope
 

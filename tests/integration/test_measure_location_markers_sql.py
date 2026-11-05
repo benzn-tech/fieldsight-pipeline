@@ -64,7 +64,7 @@ def test_the_scripts_own_sql_measures_a_hand_built_day(db, monkeypatch):
     assert "photo-days 1 |" in line
     assert "marker-days 1 (100.0% of topic-days, 100.0% of photo-days)" in line
     assert "topics placed 50.0%" in line                    # 1 of the 2 live topics
-    assert "photos 2, placed 50.0% (locate) / 50.0% (place_at), disagree 0" in line
+    assert "photos 2 (2 on marker-days), placed 50.0% (locate) / 50.0% (place_at), disagree 0" in line
     assert any("Level 1" in p for p in private)
     assert not any("Level 1" in r for r in report)          # raw speech never in the printable part
 
