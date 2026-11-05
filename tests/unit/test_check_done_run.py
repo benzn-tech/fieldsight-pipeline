@@ -972,6 +972,71 @@ def test_a_turn_with_no_end_keeps_the_start_rule():
     assert "cover to steel is checked at fifty" not in w.prompts[0][0]
 
 
+# A kept turn that starts before the window may hold an earlier check's words
+# (two back-to-back checks in one long turn): it is kept only when it starts
+# at most MAX_LEAD_S before, and the prompt then says to find the start.
+
+def test_the_8s_smoke_case_is_kept_and_the_walk_prompt_carries_the_caution():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 52),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 30),
+                "text": "starting in unit one formwork braced"}] + w.turns
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "starting in unit one formwork braced" in prompt
+    assert cd.EARLY_WALK.strip() in prompt
+
+
+def test_a_walk_prompt_has_no_caution_when_every_turn_starts_inside():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.run()
+    assert cd.EARLY_WALK.strip() not in w.prompts[0][0]
+
+
+def test_a_walk_drops_a_turn_that_starts_more_than_120s_before_the_span():
+    assert cd.MAX_LEAD_S == 120
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 0, 59),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 30),
+                "text": "the end of another check"}] + w.turns
+    w.run()
+    assert "the end of another check" not in w.prompts[0][0]
+
+
+def test_a_check_drops_a_turn_that_starts_more_than_120s_before_the_window():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:20",
+                                      "report_date": DATE}]))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 1, 19),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 40),
+                "text": "the end of another check"}]
+    w.run()
+    assert "the end of another check" not in w.prompts[0][0]
+
+
+def test_back_to_back_checks_in_one_long_turn_get_the_find_the_start_caution():
+    # Check B starts at 10:01:50; one turn 10:00:00-10:02:00 holds the end of
+    # check A as well.
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:01:50",
+                                      "report_date": DATE}]))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 0, 0),
+                "abs_end": datetime(2026, 10, 20, 10, 2, 0),
+                "text": "check a done. starting check b. formwork is braced and plumb"}]
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "starting check b" in prompt
+    assert cd.FIND_START in prompt
+    assert "The transcript starts where he started this check." not in prompt
+
+
+def test_a_check_whose_turns_start_inside_the_window_has_no_caution():
+    w = World(db=facts(live_windows=[{"template_id": "t-pp", "start_at": "10:03:00",
+                                      "report_date": DATE}]))
+    w.run()
+    prompt = w.prompts[0][0]
+    assert "The transcript starts where he started this check." in prompt
+    assert cd.FIND_START not in prompt
+
+
 def test_the_final_check_places_two_units_all_goods_in_one_long_turn():
     """D2: the entered marks reach walk_checklist.build, so Unit 2's all-good
     in the same long turn as Unit 1's is placed, not NOT_PLACED."""
