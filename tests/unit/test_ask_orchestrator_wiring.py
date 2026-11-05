@@ -418,7 +418,7 @@ def test_ask_agentic_parameter(tmpl):
         assert tmpl["Parameters"][name]["Type"] == "String"
         assert tmpl["Parameters"][name]["Default"] == ""
     reasoning = tmpl["Parameters"]["AskJudgeReasoning"]
-    assert reasoning["AllowedPattern"] == "^(|off|low|medium|high)$"
+    assert reasoning["AllowedPattern"] == "^(|off|minimal|low|medium|high|xhigh|max)$"
 
 
 def test_judge_env_is_on_the_worker_only(tmpl):
