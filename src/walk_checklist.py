@@ -7,10 +7,12 @@ customer wording and order as an ordinary check. On top of that:
 
   * "this one's all good" (Item no ALL, Answer Yes) fills only that unit's
     unanswered items, each saying so: covered by '<quote>' (HH:MM). It never
-    overwrites a No, and with unit stretches it must have been said inside
-    that unit's stretch; without stretches it must claim a line of its own
-    that no other unit's all-good claimed (R45) -- one quote never covers two
-    units;
+    overwrites a No. When every entered mark's quote is found in the
+    transcript it is placed by WHERE it was said -- it belongs to the unit he
+    last walked into before it, and each place is claimed once; otherwise,
+    with unit stretches it must have been said inside that unit's stretch,
+    and without stretches it must claim a line of its own that no other
+    unit's all-good claimed (R45) -- one quote never covers two units;
   * a finding that names no unit goes to General -- kept, never guessed into
     a unit -- if its evidence is in the transcript;
   * the walk's units are the opening's names, the units he entered and the
@@ -25,6 +27,7 @@ rewrites rows (the on-site overlay) re-renders the same way.
 
 Pure: no database, no network.
 """
+import difflib
 import re
 
 import checklist
@@ -137,7 +140,83 @@ def _is_all(row):
     return checklist._cells(row)[0].upper() == ALL
 
 
-def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dropped):
+class _Text:
+    """The transcript as one run of words, each with the line it is on: a
+    quote is placed by WHERE it was said, not by its line. One speaker's
+    consecutive words are one long line, so one line can hold two units'
+    "all good" (TEST smoke 2026-11-06)."""
+
+    def __init__(self, transcript_text):
+        self.words, self.line_of, self.times = [], [], []
+        for i, line in enumerate((transcript_text or "").splitlines()):
+            m = _TIME_RE.match(line.strip())
+            self.times.append(m.group(1) if m else None)
+            w = checklist.transcript_words(line)
+            self.words.extend(w)
+            self.line_of.extend([i] * len(w))
+
+    def hits(self, quote):
+        """Word index of every place `quote` was said, in text order: word for
+        word, or near enough -- evidence_found's rule -- with each place counted
+        once (a window shifted by a word of the same words is the same place)."""
+        q = checklist._words(quote)
+        n, t = len(q), self.words
+        if n < checklist.MIN_EVIDENCE_WORDS:
+            return []
+        joined_q = " ".join(q)
+        sm = difflib.SequenceMatcher(autojunk=False)
+        sm.set_seq2(joined_q)
+        out, start = [], 0
+        while start <= len(t) - n:
+            window = t[start:start + n]
+            ok = window == q
+            if not ok:
+                sm.set_seq1(" ".join(window))
+                ok = (sm.real_quick_ratio() >= checklist.EVIDENCE_MATCH
+                      and sm.quick_ratio() >= checklist.EVIDENCE_MATCH
+                      and sm.ratio() >= checklist.EVIDENCE_MATCH)
+            if ok:
+                out.append(start)
+                start += n
+            else:
+                start += 1
+        return out
+
+    def time_at(self, word):
+        return self.times[self.line_of[word]]
+
+
+def _mark_places(text, marks):
+    """[(word index, unit)] of each entered mark's quote, in text order, or
+    None when any mark that names a unit cannot be found in the text: then
+    who said what where is not known, and the all-good rules without places
+    apply. Marks are taken in time order and each quote is found after the
+    one before it."""
+    named = [m for m in marks or [] if units_mod._entered_unit(m)]
+    if not named:
+        return None
+    named.sort(key=lambda m: units_mod._hhmmss(m) or "")
+    out, after = [], -1
+    for m in named:
+        place = next((p for p in text.hits(str(m.get("quote") or "")) if p > after), None)
+        if place is None:
+            return None
+        out.append((place, units_mod._entered_unit(m)))
+        after = place
+    return out
+
+
+def _owner(places, word):
+    """The unit whose entered quote was said most recently before `word`."""
+    owner = None
+    for p, unit in places:
+        if p < word:
+            owner = unit
+    return owner
+
+
+def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dropped,
+              text=None, places=None):
     """The first surviving ALL row as (quote, "HH:MM" or None), or None. Each
     ALL row that does not survive is added to `dropped`.
 
@@ -147,7 +226,13 @@ def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dr
     matching line no earlier unit's all-good has claimed (`claimed`, line
     indices, updated here). Without stretches an ALL row with no unclaimed
     line left is dropped (NOT_PLACED, R45): the final check has no stretches,
-    and one "all good" must never silence another unit's questions."""
+    and one "all good" must never silence another unit's questions.
+
+    When every entered mark's quote is found in the text (`places`, from
+    _mark_places), neither rule applies: the quote is placed where it was
+    said, it belongs to the unit he last walked into before it, and each
+    place is claimed once (`claimed`, word indices). One long line can then
+    hold two units' all-goods, and the time shown is that line's time."""
     chosen = None
     for line in model_rows:
         if not _is_all(line):
@@ -159,6 +244,16 @@ def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dr
             why = NOT_YES
         elif not checklist.evidence_found(quote, t_words):
             why = NO_EVIDENCE
+        elif places is not None:
+            # Placed by where it was said: the unit he last walked into
+            # before these words. A place is claimed once (R45).
+            hit = next((p for p in text.hits(quote)
+                        if p not in claimed and _owner(places, p) == unit), None)
+            if hit is None:
+                why = OUTSIDE if stretches is not None else NOT_PLACED
+            elif chosen is None:
+                claimed.add(hit)
+                at = text.time_at(hit)
         else:
             lines = _matching_lines(quote, transcript_text)
             if stretches is not None:
@@ -238,12 +333,14 @@ def _normalized(raw_names):
 
 
 def build(model_text, items, transcript_text, opening, stretches=None, report_date=None,
-          known_units=None):
+          known_units=None, entered=None):
     """The walk's checklists: {"units", "general", "general_dropped", "summary"}.
 
     `opening` is the window's units dict ({"names", "count"}); only names are
     flagged against. `known_units` are the units he entered (each entered
-    mark's unit, in walk order). The walk's units are all three (R44), in walk
+    mark's unit, in walk order). `entered` are those marks themselves
+    ({"unit", "quote", "at" / "at_s"}): their quotes place each all-good by
+    where it was said (_all_good). The walk's units are all three (R44), in walk
     order: the opening's names, then the entered units, then units first seen
     in the rows -- every one a section, all items not checked when no row is
     about it."""
@@ -260,10 +357,13 @@ def build(model_text, items, transcript_text, opening, stretches=None, report_da
     # All-good rows are timed in row order, so an earlier unit claims its
     # line before a later unit that said the same words.
     goods, all_dropped, claimed = {}, {}, set()
-    for u in dict.fromkeys(u for u, row in parsed if u in order and _is_all(row)):
+    alls = list(dict.fromkeys(u for u, row in parsed if u in order and _is_all(row)))
+    text = _Text(transcript_text) if alls and entered else None
+    places = _mark_places(text, entered) if text else None
+    for u in alls:
         all_dropped[u] = []
         goods[u] = _all_good(grouped[u], t_words, transcript_text, u, stretches,
-                             claimed, all_dropped[u])
+                             claimed, all_dropped[u], text, places)
     walk = []
     for u in order:
         sec = _unit_section(u, grouped.get(u, []), items, transcript_text, goods.get(u),

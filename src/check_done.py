@@ -994,7 +994,8 @@ def _walk_result(walk, tpl, items, paragraphs, transcript_text, check, covered_u
     entered = [m.get("unit") for m in walk.get("entered") or [] if isinstance(m, dict)]
     built = walk_checklist.build("\n".join(paragraphs), items, transcript_text,
                                  opening=walk.get("units"), stretches=None,
-                                 report_date=nz_time.nz_today(), known_units=entered)
+                                 report_date=nz_time.nz_today(), known_units=entered,
+                                 entered=walk.get("entered"))
     result = walk_answers_overlay.apply(built, walk.get("answers") or [], items)
     units = []
     for u in result["units"]:

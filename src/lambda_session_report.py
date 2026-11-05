@@ -983,7 +983,8 @@ def _walk_sections(walk, template, prose, futures, items, turns, date, name=None
     # R44: every unit he entered is a section, said anything there or not.
     entered = [m.get("unit") for m in walk.get("entered") or [] if isinstance(m, dict)]
     built = walk_checklist.build(text, items, transcript, walk.get("units"),
-                                 walk.get("stretches"), report_date=date, known_units=entered)
+                                 walk.get("stretches"), report_date=date, known_units=entered,
+                                 entered=walk.get("entered"))
     answers = _walk_answers(walk)
     try:
         laid = walk_answers_overlay.apply(built, answers, items)

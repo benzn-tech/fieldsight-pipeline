@@ -970,3 +970,22 @@ def test_a_turn_with_no_end_keeps_the_start_rule():
                 "text": "cover to steel is checked at fifty"}]
     w.run()
     assert "cover to steel is checked at fifty" not in w.prompts[0][0]
+
+
+def test_the_final_check_places_two_units_all_goods_in_one_long_turn():
+    """D2: the entered marks reach walk_checklist.build, so Unit 2's all-good
+    in the same long turn as Unit 1's is placed, not NOT_PLACED."""
+    facts_ = walk_facts()
+    facts_[WALK]["entered"] = [
+        {"unit": "Unit 1", "at": "10:03", "at_s": "10:03:06", "quote": "starting in unit one"},
+        {"unit": "Unit 2", "at": "10:03", "at_s": "10:03:40", "quote": "walking into unit two now"}]
+    w = WalkWorld(("Unit 1 | ALL | Yes | | | | everything else in this one is good\n"
+                   "Unit 2 | ALL | Yes | | | | everything else in this one is all good\n"),
+                  db=facts(live_windows=[WALK_WINDOW], walk=facts_))
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 3, 5),
+                "abs_end": datetime(2026, 10, 20, 10, 3, 55),
+                "text": ("starting in unit one, formwork is braced. everything else in this "
+                         "one is good. walking into unit two now. everything else in this one "
+                         "is all good.")}]
+    out = w.run()
+    assert [u["not_covered"] for u in out["walk"]["units"]] == [[], []]

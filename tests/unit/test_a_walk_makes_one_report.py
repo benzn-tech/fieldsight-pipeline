@@ -513,3 +513,23 @@ def test_no_walk_key_is_todays_report(run):
     assert len(prompts) == 1 and "Checklist items:\n1. Studs straight and plumb" in prompts[0]
     assert "walk" not in meta and list(meta["checklists"]) == ["Framing Checklist"]
     assert _fingerprint(sections, prompts, meta) == NO_WALK_SNAPSHOT
+
+
+def test_two_units_all_goods_in_one_long_line_both_place_in_the_report(run):
+    """D2 (TEST smoke 2026-11-06): one long turn timed 09:01:10, inside Unit 1's
+    stretch, holds both units' all-goods. The entered marks' quotes place Unit
+    2's by where it was said, so it is not dropped OUTSIDE."""
+    lines = [(9, 1, 10, "now in unit one. everything else in this one is good. now in unit "
+                        "two. everything else in this one is all good.")]
+    walk = dict(WALK, entered=[
+        {"unit": "Unit 1", "at_s": "09:01:05", "quote": "now in unit one"},
+        {"unit": "Unit 2", "at_s": "09:03:05", "quote": "now in unit two"}])
+    answer = "\n".join([
+        "Unit | Item no | Answer | Comment | Responsible | Due | Evidence",
+        "---|---|---|---|---|---|---",
+        "Unit 1 | ALL | Yes | | | | everything else in this one is good",
+        "Unit 2 | ALL | Yes | | | | everything else in this one is all good",
+    ])
+    meta, _, _ = run(walk=walk, lines=lines, walk_answer=answer)
+    assert meta["walk"]["summary"]["rows"] == [["Unit 1", "Yes", "Yes", "Yes"],
+                                               ["Unit 2", "Yes", "Yes", "Yes"]]

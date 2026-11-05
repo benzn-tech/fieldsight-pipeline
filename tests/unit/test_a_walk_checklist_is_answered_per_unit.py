@@ -287,3 +287,118 @@ def test_a_header_with_another_spelling_is_not_a_finding():
     got = wc.build(text, ITEMS, TRANSCRIPT, OPENING)
     assert got["general"] == [] and got["general_dropped"] == []
     assert wc.rows_by_unit(text) == {}
+
+
+# ---- one long line holds several units (TEST smoke 2026-11-06, D2) -------------
+# One speaker's consecutive words are one long turn: the real TEST walk's second
+# turn holds Unit 1's tail, all of Unit 2 and all of Unit 3. An all-good is
+# placed by WHERE it was said -- the unit whose entered quote came last before
+# it -- not by its line.
+
+LONG = "\n".join([
+    "[00:15:02] Morning. Fine day, a bit of wind. With me on site is Ben from RCP. Pre-pour "
+    "inspection today, unit one to unit three. Starting in unit one. Formwork setout checked "
+    "against the drawings, gridlines and levels are right. Formwork is clean, no debris or "
+    "standing water. Release agent is on all the form faces. Props and bracing are in, and "
+    "the supervisor has checked them. Bar sizes and spacing match the reinforcement drawings",
+    "[00:16:01] Bar chairs are in, but the cover at the north edge is only 30 millimetres. It "
+    "needs 50. That's a fail. Plumbing sleeves are in position and taped. Electrical conduits "
+    "are fixed and capped. Everything else in this one is good. Walking into unit two now. "
+    "Edge boards on the east side are about 10 millimetres low. That's a fail. Everything else "
+    "in this one is all good. Into unit three. Formwork setout matches the drawings. Formwork "
+    "is clean. Bar sizes and spacing are right. Laps and starter bars are the right length. "
+    "Cast-in hold-downs on the west wall are not secured yet. Fail. Oh, back to unit one. I "
+    "forgot to say the engineer has not signed off the reinforcement there yet, so that's a "
+    "fail. Unit four, next door, looks the same from here. We will do that one next week. "
+    "That's it for today.",
+])
+LONG_ITEMS = ["Formwork setout", "Bar chairs and cover", "Edge boards", "Hold-downs secured"]
+LONG_OPENING = {"names": ["Unit 1", "Unit 2", "Unit 3"], "count": 3}
+LONG_MARKS = [{"unit": "Unit 1", "at": "00:15", "at_s": "00:15:20", "quote": "Starting in unit one."},
+              {"unit": "Unit 2", "at": "00:16", "at_s": "00:16:31",
+               "quote": "Walking into unit two now."},
+              {"unit": "Unit 3", "at": "00:16", "at_s": "00:16:54", "quote": "Into unit three."}]
+LONG_STRETCHES = [{"unit": None, "from": "00:15:10", "to": "00:15:20"},
+                  {"unit": "Unit 1", "from": "00:15:20", "to": "00:16:31"},
+                  {"unit": "Unit 2", "from": "00:16:31", "to": "00:16:54"},
+                  {"unit": "Unit 3", "from": "00:16:54", "to": None}]
+U1_ALL = "Everything else in this one is good."
+U2_ALL = "Everything else in this one is all good."
+LONG_ROWS = HEADER + "".join([
+    "| Unit 1 | 1 | Yes | | | | Formwork setout checked against the drawings |\n",
+    "| Unit 1 | 2 | No | 30 mm | | | the cover at the north edge is only 30 millimetres |\n",
+    "| Unit 1 | ALL | Yes | | | | %s |\n" % U1_ALL,
+    "| Unit 2 | 3 | No | 10 mm low | | | Edge boards on the east side are about 10 millimetres low |\n",
+    "| Unit 2 | ALL | Yes | | | | %s |\n" % U2_ALL,
+    "| Unit 3 | 1 | Yes | | | | Formwork setout matches the drawings |\n",
+    "| Unit 3 | 4 | No | west wall | | | Cast-in hold-downs on the west wall are not secured yet |\n",
+])
+
+
+def _states(unit):
+    return [(r["answer"], r["state"]) for r in unit["rows"]]
+
+
+def _assert_long_walk(got):
+    u1, u2, u3 = (_unit(got, u) for u in ("Unit 1", "Unit 2", "Unit 3"))
+    assert u1["report"]["all_good"] == {"quote": U1_ALL, "at": "00:16"}
+    assert u2["report"]["all_good"] == {"quote": U2_ALL, "at": "00:16"}
+    assert u1["report"]["dropped"] == [] and u2["report"]["dropped"] == []
+    assert _states(u1) == [("Yes", "answered"), ("No", "answered"),
+                           ("Yes", "answered"), ("Yes", "answered")]
+    assert _states(u2) == [("Yes", "answered"), ("Yes", "answered"),
+                           ("No", "answered"), ("Yes", "answered")]
+    assert _row(u2, 1)["comment"] == "covered by '%s' (00:16)" % U2_ALL
+    # Unit 3 said no all-good: what it did not address is still not checked.
+    assert _states(u3) == [("Yes", "answered"), ("", "not_checked"),
+                           ("", "not_checked"), ("No", "answered")]
+    assert "all_good" not in u3["report"]
+
+
+def test_two_units_all_goods_in_one_long_line_both_place_without_stretches():
+    _assert_long_walk(wc.build(LONG_ROWS, LONG_ITEMS, LONG, LONG_OPENING, entered=LONG_MARKS))
+
+
+def test_two_units_all_goods_in_one_long_line_both_place_with_stretches():
+    # The line's time is 00:16:01, inside Unit 1's stretch: by line, Unit 2's
+    # all-good was dropped OUTSIDE. By place it is Unit 2's.
+    _assert_long_walk(wc.build(LONG_ROWS, LONG_ITEMS, LONG, LONG_OPENING,
+                               stretches=LONG_STRETCHES, entered=LONG_MARKS))
+
+
+def test_without_marks_the_line_rules_still_apply():
+    got = wc.build(LONG_ROWS, LONG_ITEMS, LONG, LONG_OPENING)
+    assert {"item": "ALL", "reason": wc.NOT_PLACED} in _unit(got, "Unit 2")["report"]["dropped"]
+
+
+def test_a_mark_whose_quote_is_not_in_the_text_falls_back_to_the_line_rules():
+    marks = LONG_MARKS[:2] + [dict(LONG_MARKS[2], quote="now standing in unit three")]
+    got = wc.build(LONG_ROWS, LONG_ITEMS, LONG, LONG_OPENING, entered=marks)
+    assert {"item": "ALL", "reason": wc.NOT_PLACED} in _unit(got, "Unit 2")["report"]["dropped"]
+    got = wc.build(LONG_ROWS, LONG_ITEMS, LONG, LONG_OPENING, stretches=LONG_STRETCHES,
+                   entered=marks)
+    assert {"item": "ALL", "reason": wc.OUTSIDE} in _unit(got, "Unit 2")["report"]["dropped"]
+
+
+def test_r45_one_all_good_in_a_long_line_never_fills_two_units():
+    # Said once, in Unit 1; the model tagged it for Unit 2 as well.
+    rows = LONG_ROWS.replace("| Unit 2 | ALL | Yes | | | | %s |" % U2_ALL,
+                             "| Unit 2 | ALL | Yes | | | | %s |" % U1_ALL)
+    for stretches, why in ((None, wc.NOT_PLACED), (LONG_STRETCHES, wc.OUTSIDE)):
+        got = wc.build(rows, LONG_ITEMS, LONG, LONG_OPENING, stretches=stretches,
+                       entered=LONG_MARKS)
+        assert _unit(got, "Unit 1")["report"]["all_good"]["quote"] == U1_ALL
+        u2 = _unit(got, "Unit 2")
+        assert "all_good" not in u2["report"]
+        assert {"item": "ALL", "reason": why} in u2["report"]["dropped"]
+        assert _states(u2) == [("", "not_checked"), ("", "not_checked"),
+                               ("No", "answered"), ("", "not_checked")]
+
+
+def test_an_all_good_said_before_any_unit_was_entered_is_no_units():
+    text = "[00:15:02] Everything else in this one is good. Starting in unit one. Formwork is clean."
+    rows = HEADER + "| Unit 1 | ALL | Yes | | | | %s |\n" % U1_ALL
+    got = wc.build(rows, LONG_ITEMS, text, LONG_OPENING, entered=LONG_MARKS[:1])
+    u1 = _unit(got, "Unit 1")
+    assert "all_good" not in u1["report"]
+    assert {"item": "ALL", "reason": wc.NOT_PLACED} in u1["report"]["dropped"]
