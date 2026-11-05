@@ -184,14 +184,23 @@ per target:
 - with `task_no` for a numbered target;
 - with `query` = the phrase for a text target.
 
-There are at most 4 such calls, inside the existing round-1 batch. Each target then resolves
-in code to one of:
+There are at most 4 such calls, inside the existing round-1 batch. Each call asks for **every
+status**, not only the items tool's default open set. Otherwise an item the user named that is
+already done would resolve to a newer open look-alike, which is C4's failure reproduced in code.
+
+When the phrase query returns nothing, code falls back to a fuzzy match
+(`action_pack_verify.near_duplicate`) of the phrase against the round-1 item list already in
+`run.items`. Each target then resolves in code to one of:
 
 | Result | When |
 |---|---|
-| `resolved(stable_id)` | A `task_no` matches, or exactly one open item matches the phrase. |
-| `ambiguous([stable_id, …])` | Two or more open items match the phrase, or the phrase's best match has a near-duplicate among open items (`action_pack_verify.near_duplicate` = `fuzzy` or `exact` between the candidates' texts). |
-| `none` | Nothing matches. |
+| `resolved(stable_id)` | A `task_no` matches, or exactly one item (any status) matches the phrase. |
+| `ambiguous([stable_id, …])` | Two or more items (any status) match the phrase, or the best match has a near-duplicate among them (`near_duplicate` = `fuzzy` or `exact` between the candidates' texts). |
+| `none` | Nothing matches, the fuzzy fallback included. |
+
+A target that resolves to an item that is already done or closed is shown to the writer as
+such. A close on it is a no-op and is dropped by the existing transition check
+(`legal_change`); it is never redirected to the nearest open item.
 
 The writer's render shows each target with its result, for example
 `t1: AMBIGUOUS — R4, R9: write a note, change neither`.
@@ -220,8 +229,10 @@ rejects is counted in `run_trace.scope_gate` under the codes below.
    - A close or update whose `target_ref` names a target that resolved to a **different**
      `stable_id` is dropped (`drop_named_mismatch`). This is C4's look-alike.
    - A close or update on an `ambiguous` target is **demoted** to a `note`
-     (`demoted_ambiguous`). The note's text is the rationale plus "matches more than one open
+     (`demoted_ambiguous`). The note's text is the rationale plus "matches more than one
      item: R4, R9". Its refs are kept.
+   - A close or update for a named target that resolved `none` is also demoted to a `note`
+     (`demoted_target_none`), never dropped silently. The note says the item was not found.
 3. **Field provenance.** Each proposed field must pass its source's rule. A field that
    fails is removed from `proposed` (`field_unsourced__<field>`). An update left with no
    fields is dropped (`drop_no_sourced_fields`).
@@ -259,6 +270,9 @@ refuses nor picks today+N. Code enforces this through `assumed_default` (rule 3)
 - **Lost recall from over-strict sourcing.** A correct update whose evidence the writer
   cites badly is removed. Mitigation: `scope_gate` counts by code, so the eval can see how
   many removed fields were right. A field-level removal keeps the rest of the action.
+- **Text-named targets that fail to resolve.** If the planner's phrase matches nothing,
+  a correct close becomes a note and that recall is lost. Mitigation: the fuzzy fallback in
+  §3.2.2, the `demoted_target_none` count, and C1–C3 as targeted acceptance cases.
 - **Planner mis-scoping.** A `tidy` instruction read as `named` drops legitimate closes, and
   M2 is the gold case for this. Mitigation: `change_scope` is shown in the reading, and M2 is
   a targeted acceptance case.
@@ -558,6 +572,11 @@ D6 is unchanged: an unverified `web_answer` is still never citable.
 - Change 1's `date_assumed` arrives as a caution too.
 - **"Every check failed"** still fails the pack with reason `verifier`. A pack nobody
   checked is not a pack with cautions.
+- **Deliberate reversal of §4.4.** The 11-01 spec says `unsupported` is "never shown as
+  applicable". Under this mapping, an action the verifier found no evidence for is
+  **individually applicable**, with a visible caution, and still excluded from Apply-all.
+  Only a contradiction stays non-applicable. G3 (a person's click) is the guard.
+  **[owner-level, main agent]** (Q11).
 
 **Cross-element consistency.**
 - One extra verifier call per pack runs **in parallel** with the per-element checks. It reads
@@ -923,6 +942,10 @@ Owner steps carry PR numbers and run links when they are handed over.
 10. **Gold coverage.** v1 warns that the tidy, in-library and not-in-library scenarios are
     below the §8.1 counts (1/3, 2/5, 2/5). Expanding the gold set is a follow-on (gold v3).
     It is not part of this success definition.
+11. **Applicability of caution-flagged actions.** Should an action the verifier could not
+    support be individually applicable with a caution (this design, §7.2), or shown but not
+    applicable until edited? **My call:** applicable with the caution. The person's click
+    is the guard, and hiding correct work is the measured problem.
 
 ---
 
