@@ -2,6 +2,27 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Audit 2026-11-05 — what other lines shipped since this plan was written
+
+Read against `origin/develop` @ `d14c5698`. Columns: what exists, what this plan still has to add, and which steps are now obsolete or change shape.
+
+| Area | Already done (where) | Still missing | Plan step now obsolete / changed |
+|---|---|---|---|
+| Markers captured + stored | `clean_location_markers` + `time_location_markers` give `at_s` to the second (`lambda_extract_session`); per-session merge so a later session no longer wipes the day (`location_markers.replace_for_session`, b14eaf3c); "inspection of <place>" now emits a marker (63472bc8) | — | — |
+| Day view photo grouping | `_photo_groups` (`lambda_org_api.py` ~12978) groups photos by `location_markers.locate`, to the second (#1030, #1032); `None` vs `[]`; cross-user gate | **topics** are not grouped; no `location_groups` key; places are keyed by raw string, so "Level one" and "Level 1" are two groups | Task 4 unchanged in intent, but `_photo_groups` now keys on `locate` (seconds); the replay test must use that, not the 2026-09-25 minute rule |
+| Photo → topic binding by place | `photo_binding._stays/_location_owner`: a photo belongs to the topic under way when its place was announced (owner 2026-10-01). Runs in `photo_rebind` on every day, **not** gated | Stay key is lowercase raw text: "level one" then "Level 1" are two stays | Task 3 Step 2 ("photo follows its topic's place") is now what binding already does; group_day should reuse `photo_binding.place_at`, not a second locator |
+| Inside one place: which item a photo shows | `_first_words_owner` (d8bb5605) | Needs quote `at_s` → only with **EMIT_EVIDENCE=true; OFF on prod**. On prod, inside one stay the photo goes to the topic under way when the place was named | Not this track's to fix (prod flag = owner). Note it; Task 8 counts must say whether TEST had it on |
+| Template (generated) report | `_place_photos(places=…)` places a topic's photos on the line naming their place (`photo_binding.names_place`, owner 2026-10-01); prompt already asks "two floors walked → one line each" (`report_template.py` ~213); markers reach the worker as `reportFacts.locations` (b14eaf3c) | No location **headings**; no `[at:]`; no `sectionsPlacedByLocation` | Task 6 Steps 1–3 shrink: the per-line place match exists. What is left is headings in visit order. Re-decide after Task 1 |
+| Multi-unit walk (other line, spec 2026-11-03) | `units.normalize_unit` ("Unit two"/"U2"/"unit-2" → "Unit 2"; unit/lot/room/house/apt…); `walk_report` gives one section per entered unit (8fab5762) | Levels/floors/zones/Chinese not covered by `units` | Task 2 must **reuse** `units.normalize_unit` for `kind: room/unit`, not write a second unit regex. For a walk check, Task 6 is already done by the walk line; Track L must not re-section a walk report |
+| Number words in places | `photo_binding._place_words` (zero/ground…ten; "ground floor" = level 0) | ordinals ("first floor"), "L1", 一楼/二层, room 1.01 | Task 2 builds on it; `names_place` and `_stays` should switch to `place_key` once it exists (one rule, not three) |
+| Nightly assembled report (`report_sections`) | — | *Locations* section | Task 5 unchanged |
+| Confirmation email | — | *Where* column | Task 7 unchanged |
+| Measurement | — | Task 1 | — |
+
+Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shared locator; Task 4 adds `location_groups` and normalises the key; Task 6 is reduced to headings and is skipped for walk reports.
+
+---
+
 **Goal:** When a site manager walks Level 1, then Level 2, then Room 101, and says so as he goes, the day's report groups his topics **and** their photographs under those places, in the order he visited them. He stops assembling that by hand.
 
 **Architecture:** Nothing new is captured and nothing new is stored. The extractor already emits `location_markers` (`lambda_extract_session.clean_location_markers`, `{at: "HH:MM", location, quote}`), the writer already persists them per day (`day_location_markers`, replaced wholesale on every pass), and org-api already groups a day's photos by them (`_photo_groups`, `shape["photo_groups"]`). What is missing is (1) a normaliser so "Level one", "L1" and "first floor" are one place, (2) the same placement applied to **topics**, not only photos, (3) a *Locations* section in both report renderers, and (4) a measurement of how often he actually says where he is — because if he does not, the product fix is a habit and a button, not code. Everything is computed at read/render time from `markers × time`, so it survives re-extraction and does not wait for Track B.
@@ -28,9 +49,9 @@
 - Create: `scripts/measure_location_markers.py` (RDS Data API, read-only, `--database fieldsight_test|fieldsight`)
 - Output: numbers pasted into this plan's §Findings and into the assessment spec
 
-- [ ] **Step 1:** Over the last 30 days per company: days with any topic; days with ≥1 marker; markers per day (p50/p90); distinct raw location strings and their counts (this is the normaliser's input); photos per day and the share that `locate()` places (non-null) — reuse `location_markers.locate` and `extract_base_time_from_filename` so the number is what the payload would show.
-- [ ] **Step 2:** Print the top 50 raw location strings. Keep this list; Task 2's regexes are written against it, not imagined.
-- [ ] **Step 3:** If fewer than 30 % of inspection days carry a marker, say so at the top of this plan and route the owner to the habit + App button (Task 9) before Tasks 3–7 are built. The code will still be built; the order of value changes.
+- [x] **Step 1:** (done 2026-11-05, see §Findings) Over the last 30 days per company: days with any topic; days with ≥1 marker; markers per day (p50/p90); distinct raw location strings and their counts (this is the normaliser's input); photos per day and the share that `locate()` places (non-null) — reuse `location_markers.locate` and `extract_base_time_from_filename` so the number is what the payload would show.
+- [x] **Step 2:** (done; 20 prod + 12 TEST strings, kept locally, shapes in §Findings) Print the top 50 raw location strings. Keep this list; Task 2's regexes are written against it, not imagined.
+- [x] **Step 3:** (customer days 0 %, internal 41 % → routed to owner 2026-11-05, see §Findings) If fewer than 30 % of inspection days carry a marker, say so at the top of this plan and route the owner to the habit + App button (Task 9) before Tasks 3–7 are built. The code will still be built; the order of value changes.
 
 ---
 
@@ -132,7 +153,28 @@ Not code in this repo, and the thing that decides whether Tasks 2–7 show anyth
 
 ## Findings
 
-_(filled by Task 1 and Task 8)_
+### Task 1 — 2026-11-05, last 30 days, `scripts/measure_location_markers.py` (read-only)
+
+C1 = the platform's own company (internal/owner testing); C2 = a customer company. The label map and the raw strings stay in a local file and are not committed.
+
+| DB | Co. | topic-days | photo-days | marker-days | % of topic-days | % of photo-days | markers/day p50/p90 | topics placed | photos (on marker-days) | photos placed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| prod | C1 internal | 17 | 6 | 7 | 41.2% | 50.0% | 3 / 4 | 23.1% | 46 (38) | 76.1% |
+| prod | C2 customer | 3 | 2 | 0 | **0%** | **0%** | — | 0% | 8 (0) | 0% |
+| prod | all | 20 | 8 | 7 | 35.0% | 37.5% | 3 / 4 | 21.1% | 54 (38) | 64.8% |
+| TEST | C1 internal | 11 | 7 | 6 | 54.5% | 71.4% | 2 / 4 | 30.4% | 88 (59) | 12.5% |
+| TEST | C2 customer | 2 | 2 | 1 | 50.0% | 50.0% | 2 / 2 | 25.0% | 9 (6) | 0% |
+
+- `location_markers.locate` (day view) and `photo_binding.place_at` (binding, template report) agreed on every photo (0 disagreements on prod and TEST).
+- No marker row sat on a day without live topics.
+- **The sample is tiny** (20 topic-days on prod in 30 days, 2 companies). The only customer days on prod (3) carry **no marker**. Every marker on prod comes from internal testing.
+- Photos on marker-days: prod 35 of 38 placed. TEST only 11 of 65: 49 were taken more than `CARRY_MINUTES` (30) after the last marker, 5 before the first. On TEST he stops re-announcing the place while still photographing; the place expires, as designed.
+- Distinct raw strings: 20 on prod, 12 on TEST. Shapes seen (described, not quoted; customer speech stays local): a level as a word or a digit; a level plus a narrower qualifier (an area, a grid line, a slab); **a level and a zone together, in either order**; ordinal floors, ground and basement; stairs, cores and blocks; and things that are not places in a building (a site or farm name, a city landmark, a bare "inside"-type word).
+- **Multi-unit walk marks are not in `day_location_markers`.** "Now in Unit 2" lands in the extraction's `inspections[].entered` (`lambda_extract_session._clean_entered`, read by `units`/`walk_report`), and only reaches the day's markers if the model also emits a `location_marker` for it. A walk day can therefore be marker-less to Track L while its walk report has per-unit sections. Interface question for the multi-unit walk line (owner of `inspections[].entered`): should each `entered` mark also be written as a day marker, or should Track L read `entered` as a second source? Track L does not write it.
+
+**Read against the 30 % rule (Step 3):** internal testing is above 30 %; the **one real customer is at 0 % (n=3)**. On real use the fix is the habit and the App button (Task 9) first. Tasks 2–7 are still built (owner decides the order), but they show nothing to a customer until markers exist on customer days.
+
+Normaliser implications for Task 2: a level-and-zone compound must key the same whichever is said first; a qualifier after a level is a narrower place; vague words and site names are `other`, never a level.
 
 ## Out of scope
 
