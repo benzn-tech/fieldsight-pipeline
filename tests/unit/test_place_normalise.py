@@ -303,3 +303,35 @@ def test_an_elliptical_second_place_is_other(two, one):
 
 def test_a_connector_before_another_part_is_still_one_place():
     _same("level 2 and zone 4", "Level 2 Zone 4")
+
+
+# --- fix round 3 ---------------------------------------------------------------
+
+@pytest.mark.parametrize("measured, place", [
+    ("stair 2.5 m from the wall", "stair 2.5 from the wall"),
+    ("stair 1.5 m", "stair 1.5"),
+    ("basement 1.5 m from the wall", "basement 1.5 from the wall"),
+    ("basement 0.5 m", "basement 0.5"),
+    ("level 2 1.5 m", "level 2 1.5"),
+])
+def test_a_decimal_measurement_is_other(measured, place):
+    assert normalise(measured)["kind"] == "other"
+    assert not same_place(measured, place)
+
+
+@pytest.mark.parametrize("two, one", [
+    ("zone A/B", "zone A"),
+    ("level 2-3", "Level 2"),
+    ("level 2/3", "Level 2"),
+    ("room 101-102", "room 101"),
+])
+def test_a_slash_or_dash_range_is_other(two, one):
+    assert normalise(two)["kind"] == "other"
+    assert not same_place(two, one)
+
+
+@pytest.mark.parametrize("text, label", [("grid C-4", "Grid C"), ("Room 1-01", "Room 1"),
+                                         ("unit-2", "Unit 2"), ("Level -1", "Basement")])
+def test_a_dash_inside_one_code_is_not_a_range(text, label):
+    assert normalise(text)["kind"] != "other"
+    assert normalise(text)["label"].startswith(label)

@@ -39,7 +39,7 @@ wrong place, and nobody sees it.
   is that part's code letter ("Level 2 A" is not "Level 2").
 - A phrase that gives one part two values ("level 2 to level 3", "room 101
   and room 102"), or a part followed by a connector and a second code ("level
-  2 and 3", "zone A to B", "二楼到3"), names two places, so it is kind
+  2 and 3", "zone A to B", "zone A/B", "level 2-3", "二楼到3"), names two places, so it is kind
   "other", not either one. So is any phrase with a measurement in it: what is
   left after removing "2 m" would spell the very place the measurement ruled
   out ("basement 2 m from the wall" is not Basement 2).
@@ -80,6 +80,11 @@ _FILLER = frozenset(("the", "a", "an", "on", "in", "at", "of", "to", "now", "her
                      "is", "we", "re", "are", "i", "m", "just", "so", "um", "uh", "okay",
                      "ok", "and", "near", "by", "next", "beside", "around"))
 _MINUS = re.compile(r"(?<![a-z0-9])-(?=\d)", re.I)            # "Level -1", not "unit-2"
+# "level 2-3", "room 101-102": a dash between two numbers is a range. A dash
+# after a letter ("grid C-4", "unit-2") or before a leading zero ("Room 1-01")
+# is inside one code, and is left alone.
+_RANGE_DASH = re.compile(r"(?<=\d)-(?=[1-9])")
+_DECIMAL = re.compile(r"\d+(?:\.\d+)?")
 _SPLIT = re.compile(r"([a-z]+)(\d[a-z0-9.]*)")              # "l1", "u2", "rm101", "lvl2"
 
 _ONES = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -135,7 +140,9 @@ def _cn_levels(text):
 
 def _tokens(text):
     out = []
-    text = _MINUS.sub(" minus ", _cn_levels(unicodedata.normalize("NFC", text))).replace("&", " and ")
+    text = _cn_levels(unicodedata.normalize("NFC", text))
+    text = _RANGE_DASH.sub(" to ", text).replace("/", " and ").replace("&", " and ")
+    text = _MINUS.sub(" minus ", text)
     for t in _TOKEN.findall(text.casefold()):
         m = _SPLIT.fullmatch(t)
         # A token right after a room prefix is the room's code: "Room L2" is
@@ -182,7 +189,7 @@ def _has_measurement(tok):
     """True when a number is followed by a length ("basement 2 m from the
     wall"). Such a phrase is a distance, and reading a place out of what is
     left of it would spell the very place the measurement ruled out."""
-    return any(w in _MEASURE and i and (tok[i - 1].isdigit() or tok[i - 1] in _ONES
+    return any(w in _MEASURE and i and (_DECIMAL.fullmatch(tok[i - 1]) or tok[i - 1] in _ONES
                                          or tok[i - 1] in _TEENS or tok[i - 1] in _TENS)
                for i, w in enumerate(tok))
 
