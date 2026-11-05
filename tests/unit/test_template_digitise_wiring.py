@@ -214,7 +214,7 @@ def test_the_settings_reach_the_worker_and_default_to_todays_request():
     assert params["TemplateDigitiseReasoning"]["Default"] == ""
     assert params["TemplateDigitiseProvider"]["Default"] == ""
     assert params["TemplateDigitisePdfModel"]["Default"] == ""
-    assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|low|medium|high)$"
+    assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|minimal|low|medium|high|xhigh|max)$"
 
 
 BACKSLASH = chr(92)  # the line continuation after a sam deploy argument
