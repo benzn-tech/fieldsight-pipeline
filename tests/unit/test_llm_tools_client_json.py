@@ -130,3 +130,90 @@ def test_plain_routing_tries_only_the_model_asked_for_and_never_pins(monkeypatch
     turn = tc.complete_json("p", model="google/gemini-3.8-flash", max_tokens=50,
                             deadline=None, caller="v", judge_routing=False)
     assert turn.error is None and turn.requested_model == "google/gemini-3.8-flash"
+
+
+# --- PR-1 Task 1.1: explicit routing (the action writer) and finish_reason ----------
+
+MUSE = "meta/muse-spark-1.3-contributor"
+
+
+def test_explicit_chain_ignores_judge_env(monkeypatch):
+    """`chain` is the whole chain: the judge's pin, reasoning and fallbacks do not apply,
+    even when the chain's model is the judge model."""
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "x")
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "high")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "y")
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {"error": {"message": "x"}}),
+                                          _ok(served="y")))
+    turn = tc.complete_json("p", max_tokens=500, deadline=None, caller="action_write",
+                            chain=["x"], primary_extras={})
+    assert len(pool.calls) == 1
+    body = pool.calls[0]["body"]
+    assert body["model"] == "x"
+    assert "provider" not in body and "reasoning" not in body
+    assert turn.error and turn.requested_model == ""
+
+
+def test_explicit_chain_extras_on_primary_only(monkeypatch):
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {"error": {"message": "x"}}),
+                                          _ok(served="deepseek/x")))
+    turn = tc.complete_json("p", max_tokens=500, deadline=None, caller="action_write",
+                            chain=[MUSE, "deepseek/x"],
+                            primary_extras={"reasoning": {"effort": "high"}})
+    assert [c["body"]["model"] for c in pool.calls] == [MUSE, "deepseek/x"]
+    assert pool.calls[0]["body"]["reasoning"] == {"effort": "high"}
+    assert "reasoning" not in pool.calls[1]["body"]
+    assert "provider" not in pool.calls[1]["body"]
+    assert turn.error is None and turn.requested_model == "deepseek/x"
+
+
+def test_explicit_chain_extras_never_on_a_claude_entry(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak")
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, {
+        "model": "claude-opus-5-5", "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": '{"a": 1}'}]})))
+    turn = tc.complete_json("p", max_tokens=500, deadline=None, caller="action_write",
+                            chain=["claude-opus-5-5"],
+                            primary_extras={"reasoning": {"effort": "high"},
+                                            "provider": {"only": ["x"]}})
+    body = pool.calls[0]["body"]
+    assert "reasoning" not in body and "provider" not in body
+    assert turn.error is None
+
+
+def test_finish_reason_length_recorded(monkeypatch):
+    pool = _install(monkeypatch, FakePool(FakeResponse(200, {
+        "model": JUDGE, "choices": [{"message": {"content": '{"a": 1'},
+                                     "finish_reason": "length"}]})))
+    turn = tc.complete_json("p", model=JUDGE, max_tokens=500, deadline=None, caller="t")
+    assert turn.finish_reason == "length"
+    assert len(pool.calls) == 1
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak")
+    _install(monkeypatch, FakePool(FakeResponse(200, {
+        "model": "claude-opus-5-5", "stop_reason": "max_tokens",
+        "content": [{"type": "text", "text": '{"a": 1'}]})))
+    turn = tc.complete_json("p", max_tokens=500, deadline=None, caller="t",
+                            chain=["claude-opus-5-5"], primary_extras={})
+    assert turn.finish_reason == "length"
+
+
+def test_finish_reason_stop_recorded(monkeypatch):
+    _install(monkeypatch, FakePool(_ok()))
+    turn = tc.complete_json("p", model=JUDGE, max_tokens=500, deadline=None, caller="t")
+    assert turn.finish_reason == "stop"
+
+
+def test_no_chain_is_byte_identical(monkeypatch):
+    """Without `chain`, the judge payload is exactly what it was before PR-1."""
+    pool = _install(monkeypatch, FakePool(_ok()))
+    tc.complete_json("p", model=JUDGE, max_tokens=500, deadline=None, caller="t")
+    assert pool.calls[0]["body"] == {
+        "model": JUDGE,
+        "messages": [{"role": "user", "content": "p"}],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 500 + llm_utils.REASONING_HEADROOM_TOKENS,
+        "provider": llm_utils.parse_provider("coreweave/fp8"),
+        "reasoning": {"enabled": False},
+    }

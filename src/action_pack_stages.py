@@ -197,21 +197,36 @@ class Deps:
 
 
 def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, info):
-    """The writer IS the Ask judge (§4.4): one tool-less JSON answer through
-    llm_tools_client.complete_json -- ASK_JUDGE_PROVIDER pin and ASK_JUDGE_REASONING on the
-    judge model, ASK_JUDGE_FALLBACKS (unset = none). `deadline` is seconds from now (the
-    stage's), converted to the client's clock and also the per-attempt cap. -> (text, err);
-    `info` gets model (the chain entry that answered), served_model and usage."""
+    """One tool-less JSON answer through llm_tools_client.complete_json.
+
+    ACTION_WRITER_MODEL set (spec 2026-11-05 §8.2): the writer's own routing only --
+    agent.writer_routing()'s chain (ACTION_WRITER_FALLBACKS) and its provider/reasoning
+    extras on the first entry; no ASK_JUDGE_* setting applies, even when the writer model
+    equals the judge's. Unset: the writer IS the Ask judge (§4.4), called exactly as
+    before -- ASK_JUDGE_PROVIDER pin and ASK_JUDGE_REASONING on the judge model,
+    ASK_JUDGE_FALLBACKS (unset = none). `deadline` is seconds from now (the stage's),
+    converted to the client's clock and also the per-attempt cap. -> (text, err); `info`
+    gets model (the chain entry that answered), served_model and usage."""
     import llm_tools_client
+    routing = agent.writer_routing()
     # With a fallback configured, one attempt gets FALLBACK_ATTEMPT_SHARE of the window
     # (call_llm's share rule) so a hung primary leaves the fallback the rest; without one
     # the single attempt may use all of it.
-    chain = llm_tools_client._model_chain(model or llm_tools_client._primary_model())
+    if routing.explicit:
+        chain = routing.chain
+    else:
+        chain = llm_tools_client._model_chain(model or llm_tools_client._primary_model())
     attempt = float(deadline) * (FALLBACK_ATTEMPT_SHARE if len(chain) > 1 else 1.0)
-    turn = llm_tools_client.complete_json(
-        prompt, model=model, max_tokens=max_tokens,
-        deadline=llm_tools_client._now() + float(deadline), caller=caller,
-        attempt_timeout=attempt)
+    abs_deadline = llm_tools_client._now() + float(deadline)
+    if routing.explicit:
+        turn = llm_tools_client.complete_json(
+            prompt, model=model, max_tokens=max_tokens, deadline=abs_deadline,
+            caller=caller, attempt_timeout=attempt, chain=list(chain),
+            primary_extras=dict(routing.extras or {}))
+    else:
+        turn = llm_tools_client.complete_json(
+            prompt, model=model, max_tokens=max_tokens, deadline=abs_deadline,
+            caller=caller, attempt_timeout=attempt)
     if turn.error is not None:
         return None, turn.error
     usage = turn.usage if isinstance(turn.usage, dict) else {}
