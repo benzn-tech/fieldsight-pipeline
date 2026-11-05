@@ -1379,6 +1379,13 @@ def test_the_action_packs_switch_reaches_org_api_and_the_agent():
 @pytest.mark.parametrize("parameter,var,shell", [
     ("ActionVerifierModel", "ACTION_VERIFIER_MODEL", "ACTION_VERIFIER_MODEL_PARAM"),
     ("ActionVerifierFallbacks", "ACTION_VERIFIER_FALLBACKS", "ACTION_VERIFIER_FALLBACKS_PARAM"),
+    # PR-1 (spec 2026-11-05 §8.2): the writer's own settings and the hide switch.
+    ("ActionWriterModel", "ACTION_WRITER_MODEL", "ACTION_WRITER_MODEL_PARAM"),
+    ("ActionWriterReasoning", "ACTION_WRITER_REASONING", "ACTION_WRITER_REASONING_PARAM"),
+    ("ActionWriterProvider", "ACTION_WRITER_PROVIDER", "ACTION_WRITER_PROVIDER_PARAM"),
+    ("ActionWriterFallbacks", "ACTION_WRITER_FALLBACKS", "ACTION_WRITER_FALLBACKS_PARAM"),
+    ("ActionVerifierHideUnsupported", "ACTION_VERIFIER_HIDE_UNSUPPORTED",
+     "ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM"),
 ])
 def test_the_action_verifier_is_settable_from_a_repo_variable(parameter, var, shell):
     """Spec 2026-11-01 §14 S6: the verifier must be a different family from the writer. On a
@@ -1391,4 +1398,29 @@ def test_the_action_verifier_is_settable_from_a_repo_variable(parameter, var, sh
         prefix = env.upper()
         assert f'if [ -n "${{{{ vars.{prefix}_{var} }}}}" ]; then' in text, env
         assert f'{shell}="{parameter}=${{{{ vars.{prefix}_{var} }}}}"' in text, env
-        assert f"${shell}" in _raw_override_lines(path), env
+        # One continuation line of its own: two `$X` on one line still pass the check
+        # above, and a lost `\` would end the parameter list early.
+        assert f"${shell} \\" in _raw_override_lines(path).splitlines(), env
+
+
+# ---- GitHub's template limit ---------------------------------------------------------------
+
+# GitHub evaluates a `run:` string that contains `${{ }}` as one expression, capped at 21,000
+# characters. Over it the workflow does not load at all ("workflow file issue", a 0 s failed
+# run on every push), so the deploy silently never starts. PR-1 of the action-pack fixes hit
+# it on deploy.yml at 21,127. The margin leaves room for the next few parameters.
+GITHUB_EXPRESSION_MAX = 21000
+
+
+@pytest.mark.parametrize("env_name", ["prod", "test"])
+def test_every_run_block_fits_githubs_expression_limit(env_name):
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load(open(WORKFLOWS[env_name], encoding="utf-8"))
+    for job_name, job in wf["jobs"].items():
+        for step in job.get("steps") or []:
+            run = step.get("run") or ""
+            if "${{" in run:
+                assert len(run) < GITHUB_EXPRESSION_MAX - 500, (
+                    f"{env_name}:{job_name}:{step.get('name')} run is {len(run)} chars; move "
+                    "comments out of `run:` (YAML comments above it) or the workflow stops "
+                    "loading")

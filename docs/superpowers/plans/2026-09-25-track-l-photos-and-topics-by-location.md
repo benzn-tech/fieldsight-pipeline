@@ -64,9 +64,9 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 **Interfaces:**
 - `normalise(text) -> {"kind": "level"|"room"|"zone"|"block"|"other", "value": str, "label": str, "raw": str}`; `same_place(a, b) -> bool`; `place_key(text) -> str` (what groups are keyed on).
 
-- [ ] **Step 1: Rules, from Task 1's list.** English and Chinese: `level|lvl|l|floor|storey` + ordinal/number (`one`, `1st`, `ground` = 0, `一楼`, `二层`); `room|rm|unit|apt` + code (`101`, `1.01`, `G02`); `zone|area|block|wing|stair|grid` + token; compass words as qualifiers (`east`, `north`). Output a canonical `label` ("Level 1", "Room 101", "Zone B east"). Anything unrecognised is `kind: other` with `value` = casefolded, whitespace-collapsed text (`content_hash.normalize`).
-- [ ] **Step 2: Aliases.** `place_key` consults an optional alias dict (from `name_aliases` rows with `kind='other'` and a `place:` prefix, loaded by the caller) so a company can pin "the new block" → "Block C" without a code change. No new table.
-- [ ] **Step 3: Tests** from real strings: `"Level one"`, `"L1"`, `"first floor"`, `"一楼"` → same key; `"Room 101"` vs `"Room 1.01"` → same; `"Level 1"` vs `"Level 1 east"` → **different** (a qualifier is a narrower place, not a spelling); `"the kitchen"` → `other`; an empty string raises.
+- [x] **Step 1: Rules, from Task 1's list.** (done: `src/place_normalise.py`; reuses `units.normalize_unit`; level+zone in either order = one key; a phrase naming two places, or a measurement, is `other`) English and Chinese: `level|lvl|l|floor|storey` + ordinal/number (`one`, `1st`, `ground` = 0, `一楼`, `二层`); `room|rm|unit|apt` + code (`101`, `1.01`, `G02`); `zone|area|block|wing|stair|grid` + token; compass words as qualifiers (`east`, `north`). Output a canonical `label` ("Level 1", "Room 101", "Zone B east"). Anything unrecognised is `kind: other` with `value` = casefolded, whitespace-collapsed text (`content_hash.normalize`).
+- [x] **Step 2: Aliases.** (done: `place_key(text, aliases=None)`, caller-built dict, one hop) `place_key` consults an optional alias dict (from `name_aliases` rows with `kind='other'` and a `place:` prefix, loaded by the caller) so a company can pin "the new block" → "Block C" without a code change. No new table.
+- [x] **Step 3: Tests** (done: 159 incl. walk units; customer strings replaced by invented examples of the same shapes) from real strings: `"Level one"`, `"L1"`, `"first floor"`, `"一楼"` → same key; `"Room 101"` vs `"Room 1.01"` → same; `"Level 1"` vs `"Level 1 east"` → **different** (a qualifier is a narrower place, not a spelling); `"the kitchen"` → `other`; an empty string raises.
 
 ---
 
@@ -80,10 +80,10 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - `group_day(markers, topics, photos, *, aliases=None) -> list[Group]` where `Group = {"location": label|None, "kind", "order", "topic_ids": [...], "photos": [filename...], "unbound_photos": [...]}`, in first-visit order.
 - `place_of(markers, hhmm) -> label|None` wrapping `location_markers.locate` + `place_normalise`.
 
-- [ ] **Step 1: Topic placement.** A topic's place is `place_of(markers, start_of(time_range))`; a topic that starts before the first marker is `None`. A topic whose window spans two markers stays with the place it **started** in — he was there when he began talking about it; the next marker is a new place, not a split of this topic.
-- [ ] **Step 2: Photo placement.** A photo bound to a topic (`related_photos`) follows its topic's place. A photo bound to no topic is placed by its own time with `place_of`, into the group's `unbound_photos`. A photo bound to two topics goes with the earlier topic and is not listed twice.
-- [ ] **Step 3: Consecutive visits to the same place merge**; a return to a place after another place is a **new** group (Level 1 → Level 2 → Level 1 renders three groups, in that order). Say so in the docstring: the day is a walk, and "back on Level 1" is what he did.
-- [ ] **Step 4: Tests** on a hand-built day: three markers, five topics (one before any marker, one spanning two), eight photos (two unbound, one double-bound). Assert order, membership, and that every photo appears exactly once across all groups.
+- [x] **Step 1: Topic placement.** (done: `src/location_grouping.py`) A topic's place is `place_of(markers, start_of(time_range))`; a topic that starts before the first marker is `None`. A topic whose window spans two markers stays with the place it **started** in — he was there when he began talking about it; the next marker is a new place, not a split of this topic.
+- [x] **Step 2: Photo placement.** (done; bound photo follows its earliest topic) A photo bound to a topic (`related_photos`) follows its topic's place. A photo bound to no topic is placed by its own time with `place_of`, into the group's `unbound_photos`. A photo bound to two topics goes with the earlier topic and is not listed twice.
+- [x] **Step 3: Consecutive visits to the same place merge**; a return to a place after another place is a **new** group (Level 1 → Level 2 → Level 1 renders three groups, in that order). Say so in the docstring: the day is a walk, and "back on Level 1" is what he did.
+- [x] **Step 4: Tests** (done: 18; also `reason` on null groups: before_first / expired / no_time, empty groups never emitted, all-unusable markers → None) on a hand-built day: three markers, five topics (one before any marker, one spanning two), eight photos (two unbound, one double-bound). Assert order, membership, and that every photo appears exactly once across all groups.
 
 ---
 
@@ -93,8 +93,8 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_org_api.py` (`_photo_groups` → delegate to `location_grouping.group_day`; add `shape["location_groups"]`)
 - Test: `tests/unit/test_org_api_location_groups.py`
 
-- [ ] **Step 1:** Keep `photo_groups` shape byte-identical for existing clients (derive it from `group_day`), and add `location_groups` = the full `Group` list with `topic_ids`. Same `None` semantics, same cross-user gate, same never-raise wrapper.
-- [ ] **Step 2:** Test the gate (site-clipped caller: neither key), the no-marker day (neither key), and a marker day (both keys, and `photo_groups` equals what the old code produced on the same fixture — replay, do not re-derive).
+- [x] **Step 1:** (done: `photo_groups` kept on its own code path — ruling — markers read once by `_day_markers`; `location_groups` added, topic ids = `topics[].topic_id`) Keep `photo_groups` shape byte-identical for existing clients (derive it from `group_day`), and add `location_groups` = the full `Group` list with `topic_ids`. Same `None` semantics, same cross-user gate, same never-raise wrapper.
+- [x] **Step 2:** (done: `tests/unit/test_org_api_location_groups.py`, 8 tests) Test the gate (site-clipped caller: neither key), the no-marker day (neither key), and a marker day (both keys, and `photo_groups` equals what the old code produced on the same fixture — replay, do not re-derive).
 
 ---
 
@@ -105,13 +105,15 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_report_generator.py` / wherever `report_sections.build` is called for a day (pass markers; the nightly generator reads S3, so it takes markers from the day's extraction artifact `location_markers`, not Aurora)
 - Test: `tests/unit/test_report_sections_locations.py`
 
-- [ ] **Step 1:** `kind: "entries"` section titled *Locations*: one entry per group — heading = label (or "Before any location was announced"), then the group's topic titles, then its photo keys (same `{name, key}` shape `_photos` builds, so the docx renderer already knows it).
-- [ ] **Step 2:** Section is dropped when there are no markers (the `build` rule: no empty headings).
-- [ ] **Step 3:** Test: a report with markers renders the section between *Safety* and *Photos*; without markers the section list is unchanged (assert on the exact list of titles a fixture produced before this change).
+- [x] **Step 1:** (done, org-api day view; null headings by reason; entries only with a topic title; Photos keeps every photo because no renderer draws `entry.photos` yet — ruling) `kind: "entries"` section titled *Locations*: one entry per group — heading = label (or "Before any location was announced"), then the group's topic titles, then its photo keys (same `{name, key}` shape `_photos` builds, so the docx renderer already knows it).
+- [x] **Step 2:** (done) Section is dropped when there are no markers (the `build` rule: no empty headings).
+- [x] **Step 3:** (done; **nightly generator NOT wired**: it reads only `transcripts/`, has no DB; needs the day's `extractions/` markers merged and passed as `{**report, "location_markers": m}` at `build`) Test: a report with markers renders the section between *Safety* and *Photos*; without markers the section list is unchanged (assert on the exact list of titles a fixture produced before this change).
 
 ---
 
 ### Task 6: The generated (template) report places sections under locations
+
+> **Deferred 2026-11-06.** This regroups a customer's template sections under location headings, which changes their fixed layout, and as written it needs a prompt change plus a real-call A/B on TEST. Placing photos on the line that names their place already ships (owner, 2026-10-01). If it is built later, take each section's place from its `[covers:]` refs in code (`location_grouping`), not from a model-written `[at:]`; that needs no prompt change and no A/B. Revisit after the owner has seen Tasks 4–5 on TEST.
 
 **Files:**
 - Modify: `src/report_template.py` (`_covers_block` offers the topic's place beside each ref), `src/lambda_session_report.py` (`_place_photos` and section assembly honour a `[at: Level 1]` line the same way `[covers: t0]` is honoured)
@@ -131,8 +133,18 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_session_finalize.py` (the confirmation email's topic table gains a *Where* column from `group_day`, blank when unknown)
 - `fieldsight-ui` (separate repo): a "By location" toggle on the day view reading `location_groups`. Out of this repo's scope; note the payload contract in `BACKEND-CONTEXT.md`.
 
-- [ ] **Step 1:** Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
-- [ ] **Step 2:** Write the `location_groups` contract into the UI repo's backend-context doc.
+- [ ] **Step 1:** **Deferred 2026-11-06.** The email table's three-column header (AGENDA ITEM / ASSIGNED / DUE DATE) is literal on BOTH the email and the frontend's Preview & copy (owner, 2026-10-08). A *Where* column must land in both at once, so it waits for the UI line. Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
+- [x] **Step 2:** (contract below, handed to the UI line, which owns fieldsight-ui) Write the `location_groups` contract into the UI repo's backend-context doc.
+
+**`location_groups` contract (org-api `/timeline` rendered day, PR #1228):**
+- Present only when the day has usable location markers AND the caller may see the whole day. A cross-user or site-clipped caller never gets it. Absent ≠ `[]`.
+- `photo_groups` (older key) may be present while `location_groups` is absent; do not infer one from the other.
+- Shape: `[{location: str|null, kind: "level"|"room"|"zone"|"block"|"other"|null, key: str|null, order: int, reason: null|"before_first"|"expired"|"no_time", topic_ids: [int], photos: [filename], unbound_photos: [filename]}]`, in visit order. A return to a place is a new group.
+- `topic_ids` are the same response's `topics[].topic_id` (positions, valid only within that response).
+- `photos` = photos bound to those topics; `unbound_photos` = photos bound to no topic, placed by their own time. Every photo appears once across all groups.
+- Null-group headings the report uses: before_first "Before any location was announced", expired "Location not stated", no_time "Time not recorded".
+- The day report's `sections` also carry a "Locations" `entries` section (title = place, note = topic titles); photos stay in the Photos section.
+- Locations shows only places with topics: a place where only photos were taken does not split it, so it can show fewer groups than the payload's `location_groups`.
 
 ---
 
@@ -152,6 +164,14 @@ Not code in this repo, and the thing that decides whether Tasks 2–7 show anyth
 ---
 
 ## Findings
+
+### TEST verification — 2026-11-06 (deploy run 42026544929, develop 0d8217b7)
+
+Read-only invoke of `fieldsight-test-org-api` `/timeline` as the owner's alias user Ben_Lin_test2:
+- 2026-10-27 (7 markers, 14 photos): 200; `photo_filenames`, `photo_groups` and `location_groups` present; 4 groups in visit order (before_first 9 topics / "Inside" `other` 5 / Level 5 2 / expired 4); all 14 photos appear once; sections `Summary, Actions, Closed today, Open Questions, Decisions, Locations, Photos`, with Locations headed "Before any location was announced / Inside / Level 5 / Location not stated".
+- 2026-10-24 (no markers, 9 photos): 200; only `photo_filenames`; sections unchanged (no Locations).
+
+Task 8 (measure again) is due about 2026-11-20.
 
 ### Task 1 — 2026-11-05, last 30 days, `scripts/measure_location_markers.py` (read-only)
 
