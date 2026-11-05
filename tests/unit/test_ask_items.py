@@ -113,6 +113,19 @@ def test_envelope_items_keep_every_snapshot_field_even_none():
     assert it["deadline"] is None and it["stable_id"] == SID and it["task_no"] == 7
 
 
+def test_item_fields_always_present_new_keys():
+    """deadline_text and raised_on (spec 2026-11-05 §6.2) are always on an envelope item,
+    None included -- a row from before the read change has neither."""
+    env = ask_items.envelope("g1", [_row(), _row(stable_id=str(uuid.uuid4()),
+                                                 deadline_text="end of next week",
+                                                 raised_on="2026-10-20")],
+                             {"truncated": False}, ask_tools.RefAssigner())
+    old, new = env["items"]
+    assert "deadline_text" in ask_items.ITEM_FIELDS and "raised_on" in ask_items.ITEM_FIELDS
+    assert old["deadline_text"] is None and old["raised_on"] is None
+    assert (new["deadline_text"], new["raised_on"]) == ("end of next week", "2026-10-20")
+
+
 def test_envelope_refs_are_shared_with_the_turn_and_deduped():
     refs = ask_tools.RefAssigner()
     assert refs.assign("topic", "t1") == "R1"
