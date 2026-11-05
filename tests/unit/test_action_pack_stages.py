@@ -480,7 +480,7 @@ def test_every_model_call_gets_the_stage_deadline():
 
 
 def test_write_render_drops_web_first_then_documents_and_truncates(monkeypatch):
-    monkeypatch.setattr(st, "WRITE_RENDER_MAX_CHARS", 380)
+    monkeypatch.setattr(st, "WRITE_RENDER_MAX_CHARS", 430)  # dated lines (PR-2): was 380
     rounds = [{"calls": [{"tool": "web_search", "args": {"query_id": "q1"}}], "done": True}]
     model = Model(rounds=rounds)
     payload = st.run(make_ctx(), deps(model=model))
@@ -705,3 +705,64 @@ def test_the_retry_sits_below_the_items_tool_catch():
     env = ask_items.run({"site_id": SITE}, tctx)
     assert [it["stable_id"] for it in env["items"]] == [SID1]
     assert client.n == 2 and trace["rag_retries"] == 1
+
+
+# ---- dated evidence (spec 2026-11-05 §6) ---------------------------------------------------
+
+TOPIC_LINE = {"ref": "R3", "kind": "topic", "date": "2026-10-28", "time": "09:15",
+              "site": "Alpha", "who": "Ann", "title": "Pour | review",
+              "text": "Pour ```next Friday```\nok"}
+
+
+def test_day_renders_date_and_weekday():
+    assert st._day("2026-11-06") == "2026-11-06 (Fri)"
+    assert st._day(dt.date(2026, 11, 1)) == "2026-11-01 (Sun)"
+    assert st._day("2026-11-06T09:00:00+13:00") == "2026-11-06 (Fri)"
+    for bad in (None, "", "next Friday", "2026-13-01", 7):
+        assert st._day(bad) == "-"
+
+
+def test_record_line_has_said_on_weekday():
+    assert st._record_line(TOPIC_LINE) == (
+        "R3 | said_on 2026-10-28 (Wed) 09:15 | Alpha | Ann | Pour / review — "
+        "Pour '''next Friday''' ok")
+    assert st._line(TOPIC_LINE, full=True) == st._record_line(TOPIC_LINE)
+    chunk = {"ref": "R4", "kind": "chunk", "date": None, "text": "x"}
+    assert st._line(chunk, full=True) == "R4 | said_on - | - | - | - — x"
+
+
+def test_item_line_has_deadline_text_and_raised_on():
+    item = {"ref": "R2", "kind": "item", "stable_id": SID1, "task_no": 4, "status": "open",
+            "deadline": None, "responsible": "Ann", "priority": None,
+            "deadline_text": "end of\nnext week | ```x```", "raised_on": "2026-10-20",
+            "report_date": "2026-10-30", "text": "Fix the door"}
+    line = st._line(item, full=True)
+    assert line == (f"R2 | item | stable_id {SID1} | #4 | status open | deadline - | "
+                    "responsible Ann | priority - | deadline_text \"end of next week / "
+                    "'''x'''\" | raised_on 2026-10-20 (Tue) — Fix the door")
+    bare = st._line(dict(item, deadline_text=None, raised_on=None), full=True)
+    assert "deadline_text" not in bare and "| raised_on - —" in bare
+
+
+def test_write_prompt_states_today_with_weekday():
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    header = ("Today (New Zealand): 2026-11-01 (Sun) — today is not the date the "
+              "records were said.")
+    by = {}
+    for c in model.calls:
+        by.setdefault(c["caller"], c["prompt"])
+    for caller in ("action_plan", "action_round", "action_write"):
+        assert header in by[caller], caller
+    write = by["action_write"]
+    assert "said_on" in write and "raised_on" in write and "deadline_text" in write
+    assert "said_on 2026-" in write                    # the evidence lines are dated
+
+
+def test_ask_item_line_unchanged():
+    """Ask shares ask_orchestrator._item_line: the agent's dated render must not touch it."""
+    import ask_orchestrator
+    assert ask_orchestrator._item_line(TOPIC_LINE) == (
+        "R3 | 2026-10-28 09:15 | Alpha | Ann | Pour / review — Pour '''next Friday''' ok")
+    assert ask_orchestrator._item_line({"ref": "R4", "kind": "chunk", "date": None,
+                                        "text": "x"}) == "R4 | - | - | - | - — x"
