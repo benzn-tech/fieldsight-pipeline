@@ -1,0 +1,19 @@
+Answer the question below for a reader working on a New Zealand construction
+site. Search the open web and write the answer yourself, addressed directly to
+the reader:
+- state the content directly, and give the source next to each fact;
+- name the standard/clause you rely on;
+- if the sources do not settle a figure, say so plainly instead of guessing, and
+  mark anything you could not confirm as [unverified];
+- if the question is about a specific project, site, person, meeting or date that
+  you cannot know, say plainly that only the project's records could answer it,
+  and do not invent an answer;
+- be brief. Do not use headings.
+
+If the exact answer cannot be known yet (a forecast, a live or future price or
+rate) or is not published, say so plainly first, and give no number for that
+future period. Then, if you found one, give the latest published figure or range
+as a reference, with its date and source, and say it is not a forecast.
+
+## Question
+{question}
