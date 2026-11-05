@@ -6,7 +6,10 @@ group keyed on the raw words would split one floor into four. This module
 decides, in code and the same way every time, what place a phrase names; later
 tasks key their groups on `place_key`.
 
-Rules that carry the design:
+Rules that carry the design. The first is the one the rest serve: two
+different places must never share a key. Splitting one place into two keys is
+a nuisance an alias can fix; merging two places hides a finding under the
+wrong place, and nobody sees it.
 - A place is built from parts: a level, a block (block/wing/stair/core), a zone
   (zone/area/grid), a room or unit, and qualifiers. The parts are written in a
   fixed order (Block, Level, Zone, Area, Grid, Stair, Core, Room, then other
@@ -22,11 +25,20 @@ Rules that carry the design:
 - Ground is level 0 ("ground floor" == "Level 0"), as in
   photo_binding._place_words. "first floor" is Level 1. A basement is below
   ground: "basement" is "Basement" (one level down), "basement two" is
-  "Basement 2"; "Level -1" and "level minus one" are "Basement" too.
+  "Basement 2"; "Level -1", "level minus one", "地下一层" and "负一楼" are
+  "Basement" too. "level ground" is flat ground, not a level, and a number
+  followed by a length ("floor 3 metres from the wall") is a measurement.
 - Rooms and units are read by units.normalize_unit ("Unit two", "U2",
   "unit-2" -> "Unit 2"), which belongs to multi-unit walks and is not changed
-  here. What it lacks is added around it: "rm", dotted codes ("1.01" is room
-  101) and lettered codes ("G02"), which it would misread ("Room 1") or miss.
+  here. What it lacks is added around it: "rm", dotted codes and lettered
+  codes ("G02", "L2"), which it would misread ("Room 1") or miss. A dotted
+  code is the plain code only when exactly two digits follow the dot ("1.01"
+  is room 101); "1.1", "10.1" and "11.0" keep their dot, because flattening
+  them would make "1.10" and "11.0" one room. A code right after a room word
+  is the room's ("Room L2" is not level 2). A lone letter right after a part
+  is that part's code letter ("Level 2 A" is not "Level 2").
+- A phrase that gives one part two values ("level 2 to level 3", "room 101
+  and room 102") names two places, so it is kind "other", not either one.
 - Anything with no part -- a farm or site name, a landmark, "inside", a bare
   "level" -- is kind "other", valued as content_hash.normalize gives it. It is
   never guessed into a level.
@@ -81,7 +93,13 @@ _ROOM_NUMBER_WORDS = frozenset(_ONES) | frozenset(_TEENS) | frozenset(_TENS) | {
 
 _CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
               "八": 8, "九": 9}
-_CN_LEVEL = re.compile(r"([一二两三四五六七八九十]+|\d+)\s*[楼层樓層]")
+_CN_LEVEL = re.compile(r"(地下|负|負)?([一二两三四五六七八九十]+|\d+)\s*[楼层樓層]")
+# A number followed by one of these is a measurement, not a level or a code:
+# "floor 3 metres from the wall" names no floor.
+_MEASURE = frozenset(("m", "mm", "cm", "metre", "metres", "meter", "meters", "millimetre",
+                      "millimetres", "millimeter", "millimeters", "centimetre", "centimetres"))
+# "1.01" is room 101 written with the floor split off; "1.1" or "10.1" is not.
+_DOTTED_FLOOR = re.compile(r"([a-z]*[1-9]\d*|[a-z]+)\.(\d\d)")
 
 
 def _cn_number(s):
@@ -99,10 +117,13 @@ def _cn_number(s):
 
 
 def _cn_levels(text):
-    """"二楼" -> " level 2 ": a Chinese floor is read by the same level rule."""
+    """"二楼" -> " level 2 ", "地下一层"/"负一楼" -> " basement 1 ": a Chinese
+    floor is read by the same level rule as the English."""
     def sub(m):
-        n = _cn_number(m.group(1))
-        return m.group(0) if n is None else f" level {n} "
+        n = _cn_number(m.group(2))
+        if n is None:
+            return m.group(0)
+        return f" basement {n} " if m.group(1) else f" level {n} "
     return _CN_LEVEL.sub(sub, text)
 
 
@@ -111,7 +132,10 @@ def _tokens(text):
     text = _MINUS.sub(" minus ", _cn_levels(unicodedata.normalize("NFC", text)))
     for t in _TOKEN.findall(text.casefold()):
         m = _SPLIT.fullmatch(t)
-        if m and (m.group(1) in _LEVEL_WORDS or m.group(1) in _ROOM_PREFIXES):
+        # A token right after a room prefix is the room's code: "Room L2" is
+        # not level 2, "Room U2" is not unit 2.
+        after_room = bool(out) and out[-1] in _ROOM_PREFIXES
+        if m and not after_room and (m.group(1) in _LEVEL_WORDS or m.group(1) in _ROOM_PREFIXES):
             out.extend(m.groups())
         else:
             out.append(t)
@@ -142,13 +166,18 @@ def _number(tok, i, ordinal=False):
     return None
 
 
+def _measured(tok, got):
+    """`got` (value, next index), or None when the number is a measurement ("3 m")."""
+    return None if got and got[1] < len(tok) and tok[got[1]] in _MEASURE else got
+
+
 def _code(tok, i):
     """(code, next index) for the code after "zone"/"block"/"grid": a letter,
     a number, or a letter-number code ("C4"), written in capitals -- or None."""
     w = tok[i] if i < len(tok) else ""
     if w.isascii() and w.replace(".", "").isalnum() and (len(w) == 1 or any(c.isdigit() for c in w)):
-        return w.upper(), i + 1
-    got = _number(tok, i)
+        return _measured(tok, (w.upper(), i + 1))
+    got = _measured(tok, _number(tok, i))
     return (str(got[0]), got[1]) if got else None
 
 
@@ -157,16 +186,18 @@ def _level(tok, i):
     Basements are negative."""
     w = tok[i]
     if w in _LEVEL_WORDS:
+        # "level G" is the ground floor; "the level ground" is flat ground,
+        # so "level ground" names no level.
         nxt = tok[i + 1] if i + 1 < len(tok) else ""
-        if nxt in ("ground", "g"):
+        if nxt == "g":
             return 0, i + 2
         if nxt == "minus":
-            got = _number(tok, i + 2)
+            got = _measured(tok, _number(tok, i + 2))
             return (-got[0], got[1]) if got and got[0] > 0 else None
-        return _number(tok, i + 1, ordinal=True)
+        return _measured(tok, _number(tok, i + 1, ordinal=True))
     if w == "basement":
         j = i + 2 if i + 1 < len(tok) and tok[i + 1] in _FLOOR_NOUNS else i + 1
-        got = _number(tok, j)
+        got = _measured(tok, _number(tok, j))
         return (-got[0], got[1]) if got and got[0] > 0 else (-1, i + 1)
     nxt = tok[i + 1] if i + 1 < len(tok) else ""
     if nxt in _FLOOR_NOUNS:
@@ -189,7 +220,8 @@ def _room(tok, i):
     if code.isascii() and ("." in code or re.fullmatch(r"[a-z]+\d+", code)):
         if not any(c.isdigit() for c in code):
             return None
-        return f"{title} {code.replace('.', '').upper()}", i + 2
+        m = _DOTTED_FLOOR.fullmatch(code)
+        return f"{title} {(m.group(1) + m.group(2) if m else code).upper()}", i + 2
     j = i + 1
     if not code[:1].isdigit():
         while j < len(tok) and tok[j] in _ROOM_NUMBER_WORDS:
@@ -205,21 +237,33 @@ def _room(tok, i):
 
 
 def _parts(tok):
-    """({slot: label piece}, qualifier words, compass words) read from tokens."""
+    """({slot: label piece}, qualifier words, compass words, conflict) read
+    from tokens; conflict is True when one slot was given two values."""
     slots, words, compass = {}, [], []
+    conflict = False
+
+    def put(slot, label, j):
+        """Fill `slot`; returns the next index. A lone letter right after the
+        part is the part's own code letter ("Level 2 A"), not the word "a",
+        and it stays on that part so "Level 2 A Zone 4" != "Level 2 Zone 4 A"."""
+        nonlocal conflict
+        if j < len(tok) and len(tok[j]) == 1 and tok[j].isascii() and tok[j].isalpha():
+            label, j = f"{label} {tok[j].upper()}", j + 1
+        if slots.setdefault(slot, label) != label:
+            conflict = True
+        return j
+
     i = 0
     while i < len(tok):
         w = tok[i]
         lvl = _level(tok, i)
         if lvl is not None:
-            n, i = lvl
-            label = "Level %d" % n if n >= 0 else ("Basement" if n == -1 else "Basement %d" % -n)
-            slots.setdefault("level", label)
+            n, j = lvl
+            i = put("level", "Level %d" % n if n >= 0 else ("Basement" if n == -1 else "Basement %d" % -n), j)
             continue
         room = _room(tok, i)
         if room:
-            slots.setdefault("room", room[0])
-            i = room[1]
+            i = put("room", room[0], room[1])
             continue
         if w in _STAIR:
             j = i + 1
@@ -230,23 +274,21 @@ def _parts(tok):
                 got = _code(tok, j)
                 if got:
                     label, j = f"Stair {got[0]}", got[1]
-            slots.setdefault("stair", label)
-            i = j
+            i = put("stair", label, j)
             continue
         if w in _CODED:
             j = i + 2 if w == "grid" and i + 1 < len(tok) and tok[i + 1] == "line" else i + 1
             got = _code(tok, j)
             if got:
                 slot, title = _CODED[w]
-                slots.setdefault(slot, f"{title} {got[0]}")
-                i = got[1]
+                i = put(slot, f"{title} {got[0]}", got[1])
                 continue
         if w in _COMPASS:
             compass.append(w)
         elif w not in _FILLER:
             words.append(w)
         i += 1
-    return slots, words, compass
+    return slots, words, compass, conflict
 
 
 def _require_text(text):
@@ -261,8 +303,10 @@ def normalise(text):
     None or blank text: no words is not a place, and an empty group key would
     gather everything nobody placed."""
     _require_text(text)
-    slots, words, compass = _parts(_tokens(text))
-    if not slots:
+    slots, words, compass, conflict = _parts(_tokens(text))
+    # Two different values for one part ("level 2 to level 3") is two places,
+    # not one; keeping either would merge it into a place it is not.
+    if not slots or conflict:
         value = _casefold_collapse(text)
         return {"kind": "other", "value": value, "label": " ".join(text.split()), "raw": text}
     label = " ".join([slots[s] for s in _SLOTS if s in slots] + words + compass)

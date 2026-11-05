@@ -188,3 +188,79 @@ def test_place_key_is_idempotent_on_labels(text):
     got = normalise(text)
     assert place_key(got["label"]) == place_key(text)
     assert normalise(got["label"])["label"] == got["label"]
+
+
+# --- fix round 1: two different places never share a key ---------------------
+
+@pytest.mark.parametrize("two, one", [
+    ("level 2 to level 3", "Level 2"),
+    ("level two and level three", "Level 2"),
+    ("room 101 and room 102", "room 101"),
+    ("zone A zone B", "zone A"),
+])
+def test_two_values_for_one_part_is_other_not_either(two, one):
+    assert normalise(two)["kind"] == "other"
+    assert not same_place(two, one)
+
+
+def test_the_same_part_said_twice_is_still_that_place():
+    _same("level 2 level 2", "Level 2")
+
+
+@pytest.mark.parametrize("a, b", [
+    ("Room 1.01", "Room 10.1"),
+    ("Room 1.10", "Room 11.0"),
+    ("Room 1.1", "Room 11"),
+    ("Room 1.1", "Room 101"),
+])
+def test_dotted_codes_merge_only_with_two_digits_after_the_dot(a, b):
+    assert not same_place(a, b)
+
+
+def test_dotted_code_with_two_digits_is_the_plain_code():
+    _same("Room 1.10", "Room 110")
+    assert normalise("Room 1.1")["label"] == "Room 1.1"
+
+
+@pytest.mark.parametrize("a, b", [
+    ("Level 2 A", "Level 2"),
+    ("Level 2 I", "Level 2"),
+    ("Room 2 A", "Room 2"),
+    ("Level 2 M", "Level 2"),
+    ("Level 2 A Zone 4", "Level 2 Zone 4 A"),
+])
+def test_a_lone_letter_after_a_part_is_a_code_letter(a, b):
+    assert not same_place(a, b)
+
+
+@pytest.mark.parametrize("text, label", [("Room L2", "Room L2"), ("Room U2", "Room U2"),
+                                         ("rm l2", "Room L2")])
+def test_a_code_after_a_room_word_belongs_to_the_room(text, label):
+    got = normalise(text)
+    assert (got["kind"], got["label"]) == ("room", label)
+    assert not same_place(text, "Level 2")
+    assert not same_place(text, "Unit 2")
+
+
+@pytest.mark.parametrize("text", ["the level ground", "on level ground",
+                                  "floor 3 metres from wall", "floor 3 m from the wall",
+                                  "level 2 mm out"])
+def test_an_adjective_or_a_measurement_is_not_a_level(text):
+    assert normalise(text)["kind"] == "other"
+
+
+def test_level_g_is_still_ground():
+    _same("level G", "Level 0")
+
+
+def test_chinese_basements_are_the_english_basement():
+    _same("地下一层", "负一楼", "basement 1", "Basement")
+    _same("地下二层", "Basement 2")
+    assert not same_place("地下一层", "一楼")
+
+
+@pytest.mark.parametrize("text", ["Room 1.1", "Room 10.1", "Level 2 A", "Room 2 A", "Room L2",
+                                  "Level 2 A Zone 4", "地下一层", "level 2 to level 3"])
+def test_fix_round_1_labels_are_fixed_points(text):
+    got = normalise(text)
+    assert place_key(got["label"]) == place_key(text)
