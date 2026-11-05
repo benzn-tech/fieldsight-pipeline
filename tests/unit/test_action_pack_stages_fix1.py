@@ -22,6 +22,10 @@ def _env(monkeypatch):
 # -- 1. the writer routes like the Ask judge ------------------------------------------------
 
 def test_the_default_model_path_is_the_ask_judge_route(monkeypatch):
+    # ACTION_WRITER_MODEL unset = the Ask judge's routing, called exactly as before PR-1
+    # (spec 2026-11-05 §8.2). Set, it is the writer's own routing: see
+    # test_action_pack_stages.test_judge_call_passes_explicit_chain.
+    monkeypatch.delenv("ACTION_WRITER_MODEL", raising=False)
     import llm_tools_client as tc
     assert st.Deps(execute=1, items_run=1, general_answer=1, fetcher=1, verify=1,
                    docs_on=1).resolve().call_model is st.judge_call

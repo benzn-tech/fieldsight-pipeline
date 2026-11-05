@@ -123,6 +123,7 @@ def test_shape_pack_carries_the_applicable_reason():
 
 def _spy(monkeypatch):
     import llm_tools_client as tc
+    monkeypatch.delenv("ACTION_WRITER_MODEL", raising=False)     # the judge route
     seen = {}
 
     def complete_json(prompt, *, model, max_tokens, deadline, caller, attempt_timeout):
@@ -162,6 +163,7 @@ def test_a_hung_primary_leaves_the_fallback_its_time(monkeypatch):
     from tests.unit.test_llm_tools_client_json import _ok
 
     monkeypatch.setenv("CORROBORATION_API_KEY", "k")
+    monkeypatch.delenv("ACTION_WRITER_MODEL", raising=False)     # the judge route
     monkeypatch.setenv("ASK_JUDGE_MODEL", WRITER)
     monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "openai/gpt-6-luna-pro")
     clock = {"t": 1000.0}
