@@ -183,6 +183,7 @@ def test_action_template_defaults(tpl):
         p = tpl["Parameters"][param]
         assert p["Type"] == "String" and p["Default"] == default, param
     assert tpl["Parameters"]["ActionVerifierHideUnsupported"]["AllowedValues"] == ["on", "off"]
+    assert tpl["Parameters"]["ActionWriterReasoning"]["AllowedPattern"] ==         "^(|off|minimal|low|medium|high|xhigh|max)$"
     import llm_tools_client
     for m in ("claude-opus-5-5", "claude-sonnet-5-5"):
         assert llm_tools_client.is_claude(m) and "/" not in m

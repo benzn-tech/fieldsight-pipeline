@@ -110,6 +110,16 @@ QWEN_ENABLE_THINKING = os.environ.get("QWEN_ENABLE_THINKING", "false").lower() =
 # existed, so an unset value changes no request.
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
 VALID_EFFORTS = ("low", "medium", "high")
+# The PER-FUNCTION settings (ASK_JUDGE_REASONING, TEMPLATE_DIGITISE_REASONING,
+# ACTION_WRITER_REASONING) only ever reach OpenRouter's `reasoning.effort`, so they
+# take OpenRouter's full list. Measured 2026-11-06: a value outside
+# max|xhigh|high|medium|low|minimal|none is an HTTP 400 that lists exactly those, and
+# meta/muse-spark-1.3 honours each level (reasoning tokens on one task: minimal 1.0k,
+# low 2.1k, medium 2.7k, high 3.0k, xhigh 4.1k, max 6.8k). "none" is not offered:
+# `off` already means "no reasoning" and keeps its own wire shape.
+# VALID_EFFORTS above stays narrow ON PURPOSE: LLM_REASONING_EFFORT also becomes
+# Claude 5.x `output_config.effort` (call_claude), whose vocabulary is not this one.
+OPENROUTER_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 # Added to the caller's max_tokens on reasoning endpoints, because reasoning
 # tokens are completion tokens and are emitted BEFORE the answer. Sized from
 # measurement rather than taste: the same prompt used 516 reasoning tokens at
@@ -127,6 +137,21 @@ REASONING_HEADROOM_TOKENS = int(os.environ.get("LLM_REASONING_HEADROOM", "8000")
 # Measured peak on the widest real prod report was 3,386 tokens; this is not
 # sized to be tight, it is sized so the answer is never the thing that stops.
 ANSWER_TOKEN_CEILING = int(os.environ.get("LLM_ANSWER_TOKEN_CEILING", "32000"))
+
+# xhigh and max think well past what the headroom above was sized for: on one small
+# task muse spent 4.1k (xhigh) and 6.8k (max) reasoning tokens against 3.0k at high,
+# i.e. 1.4x and 2.3x. The 8000 default already gives high ~2.7x its small-task spend;
+# these multiples keep roughly that margin (xhigh 16k, max 24k by default -- 24000 is
+# also what extract-session runs with). Every other effort, and no effort, is 1x, so
+# nothing that exists today changes. 32000 + 24000 still clears gemini's 65,536 cap.
+_HEADROOM_SCALE = {"xhigh": 2, "max": 3}
+
+
+def reasoning_headroom(reasoning=None):
+    """Tokens added to an answer budget for reasoning, given the request's OpenRouter
+    `reasoning` dict (or None). REASONING_HEADROOM_TOKENS, scaled up for xhigh/max."""
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    return REASONING_HEADROOM_TOKENS * _HEADROOM_SCALE.get(effort, 1)
 
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -536,7 +561,8 @@ def _is_muse(model):
 
 
 def parse_reasoning(raw, model=None, name="reasoning"):
-    """OpenRouter `reasoning` from a per-function setting: off, low, medium or high.
+    """OpenRouter `reasoning` from a per-function setting: off, or an effort from
+    OPENROUTER_EFFORTS (minimal, low, medium, high, xhigh, max).
     Unset or empty means None (no key at all, the payload as before); anything else
     is warned about, naming `name`, and also None.
 
@@ -556,10 +582,11 @@ def parse_reasoning(raw, model=None, name="reasoning"):
                            "sending no reasoning setting", name, model)
             return None
         return {"enabled": False}
-    if raw in VALID_EFFORTS:
+    if raw in OPENROUTER_EFFORTS:
         return {"effort": raw}
     logger.warning("%s value not recognised "
-                   "(expected off|low|medium|high); sending no reasoning", name)
+                   "(expected off|minimal|low|medium|high|xhigh|max); "
+                   "sending no reasoning", name)
     return None
 
 
@@ -846,7 +873,7 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
             # Only an effort thinks. `{"enabled": false}` spends nothing on reasoning,
             # so the caller's number stays the whole budget -- as on the MiMo path.
             if "effort" in reasoning:
-                payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
+                payload["max_tokens"] = max_tokens + reasoning_headroom(reasoning)
         if i == 0 and provider:
             payload["provider"] = provider
         if force_json:

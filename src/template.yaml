@@ -338,8 +338,10 @@ Parameters:
   ActionWriterReasoning:
     Type: String
     Default: ''
+    AllowedPattern: '^(|off|minimal|low|medium|high|xhigh|max)$'
     Description: >-
-      Action packs writer reasoning: off, low, medium or high; empty = the
+      Action packs writer reasoning: off, minimal, low, medium, high, xhigh or
+      max (xhigh/max get 2x/3x the reasoning headroom); empty = the
       model's default (no reasoning key). 'off' aimed at muse is dropped with a
       warning. Set via TEST_ACTION_WRITER_REASONING / PROD_ACTION_WRITER_REASONING.
 
@@ -424,10 +426,11 @@ Parameters:
   AskJudgeReasoning:
     Type: String
     Default: ''
-    AllowedPattern: '^(|off|low|medium|high)$'
+    AllowedPattern: '^(|off|minimal|low|medium|high|xhigh|max)$'
     Description: >-
       Ask orchestration v2: reasoning control for the primary judge model
-      only. off disables reasoning; low/medium/high set the effort. Empty
+      only. off disables reasoning; minimal/low/medium/high/xhigh/max set the
+      effort (xhigh/max get 2x/3x the reasoning headroom). Empty
       sends no reasoning setting (the provider default).
 
   VoiceWebEnabled:
@@ -1481,12 +1484,12 @@ Parameters:
   TemplateDigitiseReasoning:
     Type: String
     Default: ''
-    AllowedPattern: '^(|off|low|medium|high)$'
+    AllowedPattern: '^(|off|minimal|low|medium|high|xhigh|max)$'
     Description: >-
       Reasoning control for the digitise read. off disables reasoning and adds no
       headroom (dropped with a warning for muse, which cannot disable it);
-      low/medium/high set the effort and add the reasoning headroom to the answer
-      budget. Empty sends no reasoning setting.
+      minimal/low/medium/high/xhigh/max set the effort and add the reasoning
+      headroom to the answer budget (2x for xhigh, 3x for max). Empty sends no reasoning setting.
 
   TemplateDigitiseProvider:
     Type: String

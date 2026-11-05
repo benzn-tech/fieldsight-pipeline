@@ -116,8 +116,8 @@ def _provider_pin():
 
 
 def _reasoning():
-    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, low, medium or
-    high; anything else (after a warning) and unset mean no key at all.
+    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, minimal, low, medium,
+    high, xhigh or max; anything else (after a warning) and unset mean no key at all.
 
     No model is passed, on purpose: the judge's `off` reaches the wire as
     `{"enabled": false}` whatever the judge model is, as it always has."""
@@ -573,6 +573,9 @@ def chat(messages, tools, *, model=None, tool_choice="required",
             }
             if idx == 0:
                 payload.update(primary_extras)
+                # xhigh/max think past the default headroom (llm_utils).
+                payload["max_tokens"] = max_tokens + llm_utils.reasoning_headroom(
+                    primary_extras.get("reasoning"))
         attempt_start = _now()
         try:
             resp = http.request("POST", url, body=json.dumps(payload), headers=headers,
@@ -719,6 +722,9 @@ def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
                        "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS}
             if idx == 0:
                 payload.update(primary_extras)
+                # xhigh/max think past the default headroom (llm_utils).
+                payload["max_tokens"] = max_tokens + llm_utils.reasoning_headroom(
+                    primary_extras.get("reasoning"))
         attempt_start = _now()
         try:
             resp = http.request("POST", url, body=json.dumps(payload), headers=headers,

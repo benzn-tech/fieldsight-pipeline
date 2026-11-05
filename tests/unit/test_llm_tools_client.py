@@ -502,12 +502,28 @@ def test_provider_pin_rides_on_the_primary(monkeypatch):
     ("low", {"effort": "low"}),
     ("medium", {"effort": "medium"}),
     (" high ", {"effort": "high"}),
+    ("minimal", {"effort": "minimal"}),
+    ("xhigh", {"effort": "xhigh"}),
+    ("max", {"effort": "max"}),
 ])
 def test_reasoning_control_on_the_primary(monkeypatch, value, expected):
     monkeypatch.setenv("ASK_JUDGE_REASONING", value)
     pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
     tools_client.chat(MESSAGES, TOOLS)
     assert pool.calls[0]["body"]["reasoning"] == expected
+
+
+@pytest.mark.parametrize("value,scale", [("", 1), ("off", 1), ("high", 1),
+                                         ("xhigh", 2), ("max", 3)])
+def test_xhigh_and_max_buy_more_headroom_on_the_primary_only(monkeypatch, value, scale):
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", value)
+    pool = _install(monkeypatch, FakePool(_http_error(502, "x"), _ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS, max_tokens=500)
+    bodies = [c["body"] for c in pool.calls]
+    assert bodies[0]["max_tokens"] == 500 + scale * llm_utils.REASONING_HEADROOM_TOKENS
+    # The fallback carries no reasoning, so it keeps the plain headroom.
+    assert bodies[1]["max_tokens"] == 500 + llm_utils.REASONING_HEADROOM_TOKENS
 
 
 def test_unknown_reasoning_value_warns_and_sends_nothing(monkeypatch, caplog):

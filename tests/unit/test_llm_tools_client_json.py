@@ -69,6 +69,21 @@ def test_the_judge_model_carries_pin_reasoning_and_json_mode(monkeypatch):
     assert turn.usage == {"prompt_tokens": 100, "completion_tokens": 20}
 
 
+def test_the_writer_chain_at_xhigh_buys_more_headroom_on_its_first_entry(monkeypatch):
+    """The action writer's ACTION_WRITER_REASONING arrives as primary_extras; xhigh/max
+    think past the default headroom, so index 0 gets the scaled budget and a fallback
+    (no reasoning) keeps the plain one."""
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {"error": {"message": "x"}}),
+                                          _ok(served=FB)))
+    tc.complete_json("p", max_tokens=500, deadline=None, caller="action_write",
+                     chain=[JUDGE, FB], primary_extras={"reasoning": {"effort": "xhigh"}})
+    bodies = [c["body"] for c in pool.calls]
+    assert bodies[0]["reasoning"] == {"effort": "xhigh"}
+    assert bodies[0]["max_tokens"] == 500 + 2 * llm_utils.REASONING_HEADROOM_TOKENS
+    assert "reasoning" not in bodies[1]
+    assert bodies[1]["max_tokens"] == 500 + llm_utils.REASONING_HEADROOM_TOKENS
+
+
 def test_falls_back_along_ask_judge_fallbacks_without_the_pin(monkeypatch):
     monkeypatch.setenv("ASK_JUDGE_FALLBACKS", FB)
     pool = _install(monkeypatch, FakePool(FakeResponse(503, {"error": {"message": "x"}}),
