@@ -11482,6 +11482,16 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
             for topic in shape.get("topics") or []:
                 if topic.get("related_photos"):
                     topic["related_photos"] = []
+            # ...and the sections, which render_report_shape built from those
+            # same related_photos BEFORE they were blanked: the Photos section
+            # still carried every {name, key}. Rebuilt from the blanked topics;
+            # if that fails, the old sections minus Photos -- never the leak.
+            try:
+                shape["sections"] = report_sections.build(shape)
+            except Exception:  # noqa: BLE001 - the day must still render
+                logger.exception("clipped sections rebuild failed for %s %s", user, date)
+                shape["sections"] = [s for s in shape.get("sections") or []
+                                     if not (isinstance(s, dict) and s.get("kind") == "photos")]
         else:
             photos = _day_photo_block(conn, caller, user, date)
             if photos is not None:
