@@ -538,7 +538,10 @@ def _locations(topics, report, photos):
             _add(titles, t.get("topic_title") or t.get("title"))
         refs = [by_base[n] for n in (g.get("photos") or []) + (g.get("unbound_photos") or [])
                 if n in by_base]
-        if not titles and not refs:
+        # A heading needs something under it that a reader can see. No
+        # renderer draws `photos` yet, so a group of only photographs would
+        # be an empty heading; its photographs are still in Photos.
+        if not titles:
             continue
         rows.append({
             "title": g.get("location") or _NO_PLACE.get(g.get("reason"),

@@ -123,3 +123,17 @@ def test_org_api_day_without_markers_keeps_its_sections(wired):
     body = json.loads(_render()["body"])
     assert _titles(body["sections"]) == ["Summary", "Actions", "Open Questions", "Decisions",
                                          "Safety", "Photos"]
+
+
+def test_org_api_a_failing_rebuild_keeps_the_first_sections(wired):
+    """The rebuild with markers raises: the sections `render_report_shape`
+    already built are served, and the day still renders."""
+    real = rs.build
+    wired.setattr(org.report_sections, "build",
+                  lambda report: (_ for _ in ()).throw(RuntimeError("boom"))
+                  if report.get("location_markers") else real(report))
+    res = _render()
+    assert res["statusCode"] == 200
+    body = json.loads(res["body"])
+    assert _titles(body["sections"]) == ["Summary", "Actions", "Open Questions",
+                                         "Decisions", "Safety", "Photos"]

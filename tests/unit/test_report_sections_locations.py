@@ -238,3 +238,16 @@ def test_a_grouping_failure_drops_only_the_locations_section(monkeypatch):
 
     monkeypatch.setattr(location_grouping, "group_day", _boom)
     assert _titles(rs.build(_fixture(location_markers=MARKERS))) == BEFORE
+
+
+def test_a_group_with_photos_but_no_titled_topic_gets_no_empty_heading():
+    """Before the first marker, an untitled topic with a photo: no renderer
+    draws `photos`, so that entry would be a heading over nothing."""
+    report = _fixture(location_markers=MARKERS)
+    report["topics"] = report["topics"] + [_topic("", "09:00 - 09:01", [_name(9, 0)])]
+    sections = rs.build(report)
+    entries = _section(sections, "Locations")["items"]
+    assert [e["title"] for e in entries] == ["Level 2", "Level 3"]
+    assert all(e["topics"] for e in entries)
+    # The photograph is still in the report.
+    assert _name(9, 0) in [p["name"] for p in _section(sections, "Photos")["items"]]
