@@ -12864,6 +12864,17 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                                            photos, user, date)
                 if located is not None:
                     shape["location_groups"] = located
+                # The report's Locations section (Track L, Task 5). Rebuilt
+                # HERE, inside this branch, because a place and a minute is a
+                # fact about where the target was: a clipped caller never
+                # reaches this line. The markers ride a shallow copy, so the
+                # served payload gains no raw `location_markers` key.
+                if markers:
+                    try:
+                        shape["sections"] = report_sections.build(
+                            {**shape, "location_markers": markers})
+                    except Exception:  # noqa: BLE001 - keep the sections already built
+                        logger.exception("locations section failed for %s %s", user, date)
                 # `photos` ONLY. The 404's `uploads` also carries sessions and
                 # duration from `range_stats` (site-clipped, author-filtered,
                 # tombstoned); this body already reports those from `day_stats`
