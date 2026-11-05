@@ -4,7 +4,7 @@ Status: design, rev 2 (2026-11-05). Architecture research. Not built, no flag, n
 Rev 2 folds in a Fable builder check (§15): six grounding corrections and seven builder
 questions, answered as my calls where the owner had not ruled.
 Source: owner conversation 2026-11-03..05 after reading 卡兹克's "Agent 自动化系统" article (2026-11-02).
-Diagram (owner-reviewed, Fable-reviewed rev 6): https://claude.ai/artifact/TKCKhHFSduQuU3HWdz4Hif
+Diagram (owner-reviewed): `2026-11-05-site-decision-loop/diagram.html` and `diagram.pdf` in this repo (live copy: https://claude.ai/artifact/TKCKhHFSduQuU3HWdz4Hif). Chinese version: `2026-11-05-site-decision-loop/design-zh.pdf`.
 (tabs: overview / full product flow / dev flow). The product-flow tab is the picture of this document.
 
 ## 1. What and why

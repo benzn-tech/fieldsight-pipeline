@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{margin:0;font-size:14px}[hidden]{display:none!important}img{max-width:100%}</style>
+<title>FieldSight 现场决定闭环</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&family=Roboto+Mono:wght@500&display=swap">
+<style>
+/* Layout: one loop diagram first (six steps + return path), then the example card, then two short rule panels. */
+:root {
+  --bg: #f3f5f8;
+  --paper: #ffffff;
+  --ink: #102a43;
+  --muted: #5a6b7d;
+  --line: #d5dde6;
+  --amber: #ffd966;
+  --amber-ink: #7a5600;
+  --human: #fff4cc;
+  --ok: #15803d;
+  --stop: #b42318;
+  --stop-bg: #fdecea;
+  --ok-bg: #e7f6ec;
+  --hub: #dde6f0;
+  --hub-box: #ffffff;
+  --hub-ink: #102a43;
+  --back: #4f46e5;
+  --sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "Roboto Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0c1622; --paper: #142231; --ink: #e6edf4; --muted: #9db0c3; --line: #263a4f;
+  --amber: #f5c94a; --amber-ink: #f5c94a; --human: #3a2f0f; --ok: #4ade80; --stop: #ff8a80; --stop-bg: #3a1a1a; --ok-bg: #12301f; --hub: #1c3550; --hub-box: #142231; --hub-ink: #e6edf4; --back: #a5b4fc; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0c1622; --paper: #142231; --ink: #e6edf4; --muted: #9db0c3; --line: #263a4f;
+  --amber: #f5c94a; --amber-ink: #f5c94a; --human: #3a2f0f; --ok: #4ade80; --stop: #ff8a80; --stop-bg: #3a1a1a; --ok-bg: #12301f; --hub: #1c3550; --hub-box: #142231; --hub-ink: #e6edf4; --back: #a5b4fc; color-scheme: dark }
+
+body { background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 32px 48px; }
+.wrap { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+h1 { font-weight: 900; font-size: clamp(26px, 4vw, 36px); line-height: 1.2; margin: 0; text-wrap: balance; }
+.lede { margin: 6px 0 0; color: var(--muted); font-size: 16px; max-width: 60ch; }
+h2 { font-size: 20px; font-weight: 700; margin: 0 0 12px; }
+
+/* The loop */
+.loop { background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 24px; display: flex; flex-direction: column; gap: 14px; }
+.steps { display: grid; grid-template-columns: repeat(11, auto); align-items: stretch; gap: 0; }
+.step { min-width: 0; display: flex; flex-direction: column; gap: 6px; padding: 14px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.step.who-me { background: var(--human); border-color: var(--amber); }
+.n { font: 500 12px/1 var(--mono); color: var(--muted); }
+.step b { font-size: 16px; line-height: 1.3; }
+.step span { font-size: 13px; color: var(--muted); line-height: 1.45; }
+.step em { font-style: normal; font-size: 12px; color: var(--ink); background: var(--paper); border: 1px dashed var(--line); border-radius: 6px; padding: 4px 6px; line-height: 1.4; }
+.arr { display: grid; place-items: center; color: var(--muted); font-size: 18px; padding: 0 4px; }
+.back { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--muted); padding: 10px 14px; border: 2px dashed var(--amber); border-radius: 12px; }
+.back b { color: var(--ink); }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--muted); }
+.legend i { display: inline-block; width: 14px; height: 14px; border-radius: 4px; vertical-align: -2px; margin-right: 6px; border: 1px solid var(--line); background: var(--bg); }
+.legend i.me { background: var(--human); border-color: var(--amber); }
+
+/* Example card */
+.row2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.explain { display: flex; flex-direction: column; gap: 10px; }
+.explain p { margin: 0; max-width: 52ch; }
+.card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 8px 24px rgba(16, 42, 67, .08); }
+.card-h { background: #102a43; color: #fff; padding: 10px 14px; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+.card-h b { color: var(--amber); font-weight: 700; }
+.card-b { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.card-t { font-weight: 700; font-size: 16px; }
+.card-why { font-size: 13px; color: var(--muted); }
+.quote { font-size: 13px; border-left: 3px solid var(--amber); padding-left: 10px; color: var(--ink); }
+.opt { border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
+.opt.rec { border-color: var(--amber); background: var(--human); font-weight: 700; }
+.opt small { font-weight: 500; color: var(--amber-ink); font-size: 12px; }
+
+/* Rules */
+.rules { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+.panel { border-radius: 14px; padding: 18px 20px; border: 1px solid var(--line); background: var(--paper); }
+.panel h3 { margin: 0 0 10px; font-size: 17px; display: flex; align-items: center; gap: 8px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.panel ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.p-stop .dot { background: var(--stop); } .p-stop { background: var(--stop-bg); border-color: transparent; }
+.p-ok .dot { background: var(--ok); } .p-ok { background: var(--ok-bg); border-color: transparent; }
+
+.models { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+.m { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.m b { font-size: 15px; } .m span { font-size: 13px; color: var(--muted); }
+.m.key { border-color: var(--amber); }
+footer { font-size: 13px; color: var(--muted); }
+.brake-lede { margin: 0 0 12px; max-width: 70ch; }
+.brakes { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+.bk { background: var(--paper); border: 1px solid var(--line); border-top: 3px solid var(--stop); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.bk-n { font: 500 12px/1 var(--mono); color: var(--muted); }
+.bk b { font-size: 15px; } .bk span { font-size: 13px; color: var(--muted); }
+.brake-note { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+@media (max-width: 900px) { .brakes { grid-template-columns: minmax(0, 1fr); } }
+
+@media (max-width: 900px) {
+  .steps { grid-template-columns: minmax(0, 1fr); }
+  .arr { transform: rotate(90deg); padding: 2px 0; }
+  .row2, .rules { grid-template-columns: minmax(0, 1fr); }
+  .models { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* Tabs */
+.tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.tabs a { text-decoration: none; color: var(--ink); border: 1px solid var(--line); background: var(--paper); border-radius: 99px; padding: 7px 16px; font-size: 14px; font-weight: 500; }
+.tabs a[aria-current="page"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.tabs a:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; }
+.view { display: flex; flex-direction: column; gap: 28px; }
+.view[hidden] { display: none; }
+.lane-b.chips { flex-direction: row; align-items: flex-start; align-content: flex-start; }
+/* Architecture lanes */
+.arch { display: flex; flex-direction: column; gap: 10px; }
+.lane { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 16px; background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+.lane.me { background: var(--human); border-color: var(--amber); }
+.lane.data { background: transparent; border-style: dashed; }
+.lane-h { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.lane-h b { font-size: 17px; }
+.lane-h span { font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+.lane-b { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.chips, .flow, .sub, .side { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.sub, .side { font-size: 13px; color: var(--muted); }
+.flow s { text-decoration: none; color: var(--muted); }
+.fork { display: inline-flex; flex-direction: column; gap: 4px; }
+.nd { font-style: normal; font-size: 13px; line-height: 1.35; padding: 5px 9px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+.nd.sm { font-size: 12px; padding: 3px 7px; }
+.nd.q { border-radius: 99px; }
+.nd.have { border-color: var(--ok); }
+.nd.part { border-color: var(--amber); border-style: dashed; }
+.nd.miss { border-color: var(--stop); border-style: dashed; color: var(--muted); }
+.lane.me .nd { background: var(--paper); }
+.tag { font-size: 12px; background: var(--bg); border-radius: 6px; padding: 2px 7px; color: var(--ink); }
+.hint { font-size: 13px; color: var(--muted); border-left: 3px solid var(--amber); padding-left: 10px; }
+.tally { display: flex; flex-wrap: wrap; gap: 14px; font-size: 14px; color: var(--muted); align-items: center; }
+.tally b { color: var(--ink); font-size: 18px; }
+.tally .k { display: inline-flex; align-items: center; gap: 6px; }
+.tally .sw { width: 22px; height: 14px; border-radius: 4px; border: 2px solid; display: inline-block; }
+.foot-note { margin: 0; font-size: 13px; color: var(--muted); }
+@media (max-width: 760px) { .lane { grid-template-columns: minmax(0, 1fr); gap: 10px; } }
+/* Flow diagram */
+.flow-wrap { overflow-x: auto; background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 12px; }
+.flow-svg { display: block; width: 100%; min-width: 1020px; height: auto; font-family: var(--sans); }
+.flow-svg .band { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.flow-svg .band.hub { fill: var(--hub); stroke: none; }
+.flow-svg .band.me { fill: var(--human); stroke: var(--amber); }
+.flow-svg .band.data { fill: none; stroke: var(--line); stroke-dasharray: 5 4; }
+.flow-svg .band-t { font-size: 15px; font-weight: 700; fill: var(--ink); }
+.flow-svg .band-t.hub { fill: var(--hub-ink); }
+.flow-svg .bx { fill: var(--paper); stroke-width: 1.6; }
+.flow-svg .bx.hub { fill: var(--hub-box); }
+.flow-svg .bx.human { fill: var(--human); }
+.flow-svg .bx.have { stroke: var(--ok); }
+.flow-svg .bx.part { stroke: var(--amber-ink); stroke-dasharray: 5 3; }
+
+.flow-svg .bx.miss { stroke: var(--stop); stroke-dasharray: 3 3; }
+.flow-svg .bt { font-size: 12.5px; fill: var(--ink); }
+.flow-svg .bt.hub { fill: var(--hub-ink); }
+.flow-svg .bt.sm { font-size: 12px; }
+.flow-svg .cy { fill: var(--paper); stroke-width: 1.6; }
+.flow-svg .cy.have { stroke: var(--ok); } .flow-svg .cy.part { stroke: var(--amber-ink); stroke-dasharray: 5 3; } .flow-svg .cy.miss { stroke: var(--stop); stroke-dasharray: 3 3; }
+.flow-svg .strip { fill: var(--paper); stroke: var(--line); }
+.flow-svg .strip.hub { fill: var(--hub-box); stroke: var(--amber); }
+.flow-svg .st { font-size: 12px; fill: var(--muted); } .flow-svg .st.hub { fill: var(--amber-ink); font-weight: 500; }
+.flow-svg .ln { fill: none; stroke-width: 1.6; }
+.flow-svg .ln.main { stroke: var(--ink); } .flow-svg .ln.back { stroke: var(--back); } .flow-svg .ln.human { stroke: var(--amber-ink); stroke-width: 2; } .flow-svg .ln.rec { stroke: var(--muted); stroke-dasharray: 4 4; stroke-width: 1.2; }
+.flow-svg .mk.main { fill: var(--ink); } .flow-svg .mk.back { fill: var(--back); } .flow-svg .mk.human { fill: var(--amber-ink); } .flow-svg .mk.rec { fill: var(--muted); }
+.flow-svg .lt { font-size: 11.5px; fill: var(--ink); paint-order: stroke; stroke: var(--paper); stroke-width: 4px; stroke-linejoin: round; }
+.flow-svg .lt.back, .flow-svg .nt.back { fill: var(--back); } .flow-svg .lt.human { fill: var(--amber-ink); }
+.flow-svg .nt { font-size: 12px; fill: var(--muted); }
+.flow-svg .layer { fill: var(--paper); stroke: var(--back); stroke-width: 1.4; stroke-dasharray: 6 4; }
+.flow-svg .layer-t { font-size: 13px; font-weight: 700; fill: var(--back); }
+.flow-svg .nt.hub { fill: var(--hub-ink); }
+.flow-svg .bx.none { stroke: var(--amber-ink); }
+.flow-svg .bx.stop { fill: var(--stop-bg); }
+.flow-svg .ln.stop { stroke: var(--stop); stroke-width: 1.8; } .flow-svg .mk.stop { fill: var(--stop); } .flow-svg .lt.stop { fill: var(--stop); }
+.flow-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--muted); align-items: center; }
+.flow-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.lg-box { width: 22px; height: 14px; border-radius: 4px; border: 2px solid; display: inline-block; }
+.lg-box.have { border-color: var(--ok); } .lg-box.part { border-color: var(--amber-ink); border-style: dashed; } .lg-box.miss { border-color: var(--stop); border-style: dashed; }
+.lgl { width: 26px; height: 0; border-top: 2px solid; display: inline-block; }
+.lgl-main { border-color: var(--ink); } .lgl-back { border-color: var(--back); } .lgl-human { border-color: var(--amber-ink); } .lgl-rec { border-color: var(--muted); border-top-style: dashed; } .lgl-stop { border-color: var(--stop); }
+</style>
+
+</head><body>
+<div class="wrap">
+  <header style="display:flex;flex-direction:column;gap:14px">
+    <h1>工地上的事，自己跑；只有要拍板的，才递到项目经理面前</h1>
+    <nav class="tabs" aria-label="视图">
+      <a href="#overview" data-tab="overview">一页看懂</a>
+      <a href="#product" data-tab="product">完整架构：产品</a>
+      <a href="#dev" data-tab="dev">完整架构：研发</a>
+    </nav>
+  </header>
+
+  <div class="view" data-view="overview">
+    <p class="lede">借鉴文章里"批奏折"的做法，套到 FieldSight。一共六步，最后一步回到开头，形成闭环。完整的动线和每一块的现状，看后两个标签。</p>
+
+  <section class="loop" aria-label="六步闭环">
+    <div class="steps">
+      <div class="step"><div class="n">1</div><b>现场发生一件事</b><span>系统自动发现，不用人去盯</span><em>录音结束 · 检查漏项 · 待办逾期 · 设备离线</em></div>
+      <div class="arr">→</div>
+      <div class="step"><div class="n">2</div><b>中台分拣</b><span>查规则表：交给谁、重复的合并、同一件事只跑一次</span><em>同一项目同一检查 = 一件事</em></div>
+      <div class="arr">→</div>
+      <div class="step"><div class="n">3</div><b>Agent 去做</b><span>提取、写报告、查记录、出建议</span><em>按任务选模型</em></div>
+      <div class="arr">→</div>
+      <div class="step"><div class="n">4</div><b>另一个模型核对</b><span>说的每件事，录音里真的有吗？最多核 3 轮</span><em>没证据的删掉；对外动作先过人这一关</em></div>
+      <div class="arr">→</div>
+      <div class="step who-me"><div class="n">5</div><b>有权的人点一下</b><span>一张卡片：怎么了、影响、建议选哪个</span><em>能自己办的，根本不会出现在这里</em></div>
+      <div class="arr">→</div>
+      <div class="step"><div class="n">6</div><b>记进决定台账</b><span>带录音原话和日期，同一件事不问第二遍</span><em>"已定"和"定了不做"都记</em></div>
+    </div>
+    <div class="back">↺ <span><b>决定本身也是一件新事件</b>，回到第 2 步：Agent 接着往下做，卡片自动改成结果。</span></div>
+    <div class="legend"><span><i></i>系统自动完成</span><span><i class="me"></i>需要人</span></div>
+  </section>
+
+  <section class="row2">
+    <div class="explain">
+      <h2>第 5 步的卡片长什么样</h2>
+      <p>卡片只用来做三件事：批准一个要先问人的动作、在几个选项里选一个、补一个系统推断不出来的事实。能推断的不问，单纯的通知也不发卡片。</p>
+      <p>项目经理不读整份报告，只看要他决定的那 1 到 3 件事。卡片里给出系统的建议，点一下就行。</p>
+      <p>引用的原话来自第 4 步核对过的录音，点开能听原声，所以他敢直接点。</p>
+      <p>点完以后，系统给 Tom 发一张提醒卡、写进台账，这张卡片变成"已提醒 Tom，今天 15:00"。到截止还没人回复，系统按保守的方式处理：不标通过，并升级给公司管理员。</p>
+    </div>
+    <div class="card" aria-label="示例决定卡片">
+      <div class="card-h"><span><b>FieldSight</b> · 需要你决定</span><span>示例</span></div>
+      <div class="card-b">
+        <div class="card-t">B 栋浇筑前检查：3 项没有覆盖</div>
+        <div class="card-why">影响：明天 7:00 浇筑。钢筋保护层、预埋套管、模板清理没有被提到。</div>
+        <div class="quote">"套管位置等下午再看吧" · Tom，10:42 录音</div>
+        <div class="opt rec">提醒 Tom 今天 15:00 复查，回传照片 <small>推荐</small></div>
+        <div class="opt">接受现状（必须填原因，记入台账）</div>
+        <div class="opt">改派给其他人</div>
+        <div class="card-why">截止：今天 17:00 · 不回复：不标通过，升级给公司管理员</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>什么时候必须问人</h2>
+    <div class="rules">
+      <div class="panel p-stop">
+        <h3><span class="dot"></span>必须先问人</h3>
+        <ul>
+          <li>对外发消息给分包商或业主</li>
+          <li>把检查标为"通过"（第一版先不做：系统还没有"通过"这个状态）</li>
+          <li>改进度计划</li>
+          <li>删除任何数据</li>
+          <li>把录音归到别人名下</li>
+        </ul>
+      </div>
+      <div class="panel p-ok">
+        <h3><span class="dot"></span>Agent 自己做完</h3>
+        <ul>
+          <li>整理录音、写报告</li>
+          <li>合并重复的待办</li>
+          <li>提醒快到期的检查</li>
+          <li>设备掉线后自动重试</li>
+          <li>同一任务最多试 3 次，还失败就停下转人</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>防止烧 token：五道刹车</h2>
+    <p class="brake-lede">"试 3 次"只管重试次数，不等于只调用 3 次模型：一次尝试里 Agent 可能连续调用好几次模型。所以要分层设上限，任何一层碰顶就停，并且只发一条告警。</p>
+    <div class="brakes">
+      <div class="bk"><div class="bk-n">1</div><b>单次尝试</b><span>一次尝试里最多调用模型 8 次，超了立刻停</span></div>
+      <div class="bk"><div class="bk-n">2</div><b>同一任务</b><span>最多试 3 次，间隔越来越长；最坏 3 × 8 = 24 次调用</span></div>
+      <div class="bk"><div class="bk-n">3</div><b>连锁深度</b><span>决定 → 新事件 → 新卡片，这条链最多转 3 圈，防止互相触发</span></div>
+      <div class="bk"><div class="bk-n">4</div><b>每个公司每天的钱包</b><span>用到 80% 提醒，用完暂停不紧急的任务</span></div>
+      <div class="bk"><div class="bk-n">5</div><b>熔断</b><span>同一类错误短时间内大量出现，整条线暂停，只报一次</span></div>
+    </div>
+    <p class="brake-note">数字是建议的起步值，上线前按实际用量调。紧急通道：可能伤人的事直接排最前，不受第 4 道刹车和每人推送上限的限制；其余按 时间 → 影响的后续工序 → 复杂度和牵扯人数 排。</p>
+  </section>
+
+  <section>
+    <h2>模型怎么分工</h2>
+    <div class="models">
+      <div class="m key"><b>拍板层</b><span>写卡片、提取决定。用最强的</span></div>
+      <div class="m"><b>干活层</b><span>报告、摘要、问答。看性价比</span></div>
+      <div class="m"><b>分拣层</b><span>分类、去重。小模型或规则</span></div>
+      <div class="m"><b>专用层</b><span>语音识别、模板识别。按评测选</span></div>
+      <div class="m key"><b>核对层</b><span>必须和写的那个不是同一家</span></div>
+    </div>
+  </section>
+
+  <footer>示例卡片的项目、人名、时间均为虚构。详细设计见 fieldsight-pipeline 仓库 docs/superpowers/specs/2026-11-05-site-decision-loop-design.md。</footer>
+  </div>
+
+  <div class="view" data-view="product" hidden>
+    <p class="lede">按原文的架构图画出 FieldSight 产品的完整动线：从上往下是事件、中台、执行、核对、人的判断，右边是每一步写进去的记录。每个框的边线颜色表示我们现在的状态。</p>
+    <div class="tally" data-tally></div>
+
+        <div class="flow-legend">
+      <span><i class="lgl lgl-main"></i>主流程</span><span><i class="lgl lgl-back"></i>退回 / 重派</span><span><i class="lgl lgl-human"></i>经人的通道</span><span><i class="lgl lgl-stop"></i>阻断 / 回滚</span><span><i class="lgl lgl-rec"></i>写入记录</span>
+    </div>
+    <div class="flow-wrap"><svg class="flow-svg" viewBox="0 0 1240 1206" role="img" aria-label="FieldSight 产品完整架构动线图"><defs><marker id="pm-main" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk main" d="M0,0 L10,5 L0,10 z"/></marker><marker id="pm-back" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk back" d="M0,0 L10,5 L0,10 z"/></marker><marker id="pm-human" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk human" d="M0,0 L10,5 L0,10 z"/></marker><marker id="pm-rec" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk rec" d="M0,0 L10,5 L0,10 z"/></marker><marker id="pm-stop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk stop" d="M0,0 L10,5 L0,10 z"/></marker></defs><rect class="band data" x="1086" y="14" width="140" height="1176" rx="12"/><text class="band-t data" x="1100" y="38">数据沉淀</text><text class="nt " x="1156.0" y="1176" text-anchor="middle">每条记录都带公司 / 项目</text><rect class="band " x="14" y="14" width="1016" height="92" rx="12"/><text class="band-t " x="28" y="38">事件</text><rect class="bx miss " x="130" y="50" width="92" height="36" rx="7"/><text class="bt " x="176.0" y="72.5" text-anchor="middle">定时扫描</text><rect class="bx have " x="230" y="50" width="92" height="36" rx="7"/><text class="bt " x="276.0" y="72.5" text-anchor="middle">录音结束</text><rect class="bx have " x="330" y="50" width="92" height="36" rx="7"/><text class="bt " x="376.0" y="72.5" text-anchor="middle">检查漏项</text><rect class="bx part " x="430" y="50" width="92" height="36" rx="7"/><text class="bt " x="476.0" y="72.5" text-anchor="middle">待办逾期</text><rect class="bx miss " x="530" y="50" width="92" height="36" rx="7"/><text class="bt " x="576.0" y="72.5" text-anchor="middle">检查到期</text><rect class="bx part " x="630" y="50" width="92" height="36" rx="7"/><text class="bt " x="676.0" y="72.5" text-anchor="middle">设备离线</text><rect class="bx part " x="730" y="50" width="92" height="36" rx="7"/><text class="bt " x="776.0" y="65.5" text-anchor="middle">用户反馈</text><text class="bt " x="776.0" y="79.5" text-anchor="middle">/ 纠错</text><rect class="bx part " x="830" y="50" width="92" height="36" rx="7"/><text class="bt " x="876.0" y="72.5" text-anchor="middle">天气 / 进度</text><rect class="bx miss human" x="930" y="50" width="92" height="36" rx="7"/><text class="bt human" x="976.0" y="65.5" text-anchor="middle">卡片上的</text><text class="bt human" x="976.0" y="79.5" text-anchor="middle">决定</text><rect class="band hub" x="14" y="124" width="1016" height="350" rx="12"/><text class="band-t hub" x="28" y="148">现场中台</text><rect class="strip hub" x="130" y="142" width="892" height="24" rx="6"/><text class="st hub" x="140" y="158.5">规则表 · 每条写清：来源 + 类型 · 处理流程 · 用哪个模型 · skill · 并发 · 通知谁 · 紧急度 · 每天上限 · 公司可覆盖</text><path class="ln main" d="M176,86 L176,186" marker-end="url(#pm-main)"/><text class="lt main" x="183" y="122" text-anchor="start">所有事件</text><rect class="bx part hub" x="130" y="186" width="100" height="34" rx="7"/><text class="bt hub" x="180.0" y="200.5" text-anchor="middle">鉴权 + 归属</text><text class="bt hub" x="180.0" y="214.5" text-anchor="middle">公司 / 项目</text><polygon class="bx miss" points="300,180.0 350.0,203 300,226.0 250.0,203"/><text class="bt " x="300" y="207.5" text-anchor="middle">已过期?</text><rect class="bx part hub" x="380" y="186" width="96" height="34" rx="7"/><text class="bt hub" x="428.0" y="200.5" text-anchor="middle">去重</text><text class="bt hub" x="428.0" y="214.5" text-anchor="middle">决定不合并</text><polygon class="bx miss" points="560,180.0 615.0,203 560,226.0 505.0,203"/><text class="bt " x="560" y="207.5" text-anchor="middle">匹配规则?</text><rect class="bx miss hub" x="650" y="186" width="100" height="34" rx="7"/><text class="bt hub" x="700.0" y="207.5" text-anchor="middle">定紧急度</text><rect class="bx part hub" x="790" y="186" width="100" height="34" rx="7"/><text class="bt hub" x="840.0" y="200.5" text-anchor="middle">排队</text><text class="bt hub" x="840.0" y="214.5" text-anchor="middle">紧急的不受限</text><rect class="bx miss hub" x="930" y="186" width="90" height="34" rx="7"/><text class="bt hub" x="975.0" y="207.5" text-anchor="middle">派单</text><path class="ln main" d="M230,203 L250,203" marker-end="url(#pm-main)"/><path class="ln main" d="M350,203 L380,203" marker-end="url(#pm-main)"/><text class="lt main" x="357" y="196" text-anchor="start">否</text><path class="ln main" d="M476,203 L505,203" marker-end="url(#pm-main)"/><path class="ln main" d="M615,203 L650,203" marker-end="url(#pm-main)"/><text class="lt main" x="624" y="196" text-anchor="start">是</text><path class="ln main" d="M750,203 L790,203" marker-end="url(#pm-main)"/><path class="ln main" d="M890,203 L930,203" marker-end="url(#pm-main)"/><path class="ln main" d="M300,226 L300,248" marker-end="url(#pm-main)"/><text class="lt main" x="306" y="241" text-anchor="start">是</text><rect class="bx miss hub" x="250" y="248" width="100" height="28" rx="7"/><text class="bt hub" x="300.0" y="266.5" text-anchor="middle">只作事后记录</text><rect class="bx part hub" x="890" y="290" width="120" height="34" rx="7"/><text class="bt hub" x="950.0" y="304.5" text-anchor="middle">记结论</text><text class="bt hub" x="950.0" y="318.5" text-anchor="middle">成功 / 失败</text><polygon class="bx part" points="790,285.0 840.0,307 790,329.0 740.0,307"/><text class="bt " x="790" y="311.5" text-anchor="middle">失败?</text><polygon class="bx part" points="640,285.0 695.0,307 640,329.0 585.0,307"/><text class="bt " x="640" y="311.5" text-anchor="middle">已试 3 次?</text><rect class="bx none human" x="400" y="290" width="140" height="34" rx="7"/><text class="bt human" x="470.0" y="304.5" text-anchor="middle">转人：故障卡</text><text class="bt human" x="470.0" y="318.5" text-anchor="middle">给管理员 + 运维</text><path class="ln main" d="M890,307 L840,307" marker-end="url(#pm-main)"/><path class="ln back" d="M740,307 L695,307" marker-end="url(#pm-back)"/><text class="lt back" x="712" y="300" text-anchor="start">是</text><path class="ln back" d="M585,307 L540,307" marker-end="url(#pm-back)"/><text class="lt back" x="556" y="300" text-anchor="start">是</text><path class="ln back" d="M640,285 L640,250 L840,250 L840,220" marker-end="url(#pm-back)"/><text class="lt back" x="648" y="244" text-anchor="start">否：退避重派</text><path class="ln main" d="M790,329 L790,340" marker-end="url(#pm-main)"/><text class="lt main" x="797" y="337" text-anchor="start">否：成功</text><rect class="bx have hub" x="745" y="340" width="90" height="28" rx="7"/><text class="bt hub" x="790.0" y="358.5" text-anchor="middle">结案</text><path class="ln human" d="M470,324 L470,352 L115,352 L115,1017 L130,1017" marker-end="url(#pm-human)"/><text class="lt human" x="300" y="348" text-anchor="start">经人的通道</text><path class="ln main" d="M560,226 L560,386" marker-end="url(#pm-main)"/><text class="lt main" x="566" y="244" text-anchor="start">否</text><rect class="bx miss hub" x="500" y="386" width="120" height="34" rx="7"/><text class="bt hub" x="560.0" y="400.5" text-anchor="middle">未处理事件池</text><text class="bt hub" x="560.0" y="414.5" text-anchor="middle">管理员页可见</text><polygon class="bx miss" points="720,381.0 785.0,403 720,425.0 655.0,403"/><text class="bt " x="720" y="407.5" text-anchor="middle">同类反复出现?</text><path class="ln main" d="M620,403 L655,403" marker-end="url(#pm-main)"/><rect class="bx none human" x="830" y="386" width="140" height="34" rx="7"/><text class="bt human" x="900.0" y="400.5" text-anchor="middle">起草新规则</text><text class="bt human" x="900.0" y="414.5" text-anchor="middle">批准后写进规则表</text><path class="ln human" d="M785,403 L830,403" marker-end="url(#pm-human)"/><text class="lt human" x="800" y="396" text-anchor="start">是</text><path class="ln main" d="M720,425 L720,436" marker-end="url(#pm-main)"/><text class="lt main" x="727" y="434" text-anchor="start">否</text><rect class="bx miss hub" x="675" y="436" width="90" height="26" rx="7"/><text class="bt hub" x="720.0" y="453.5" text-anchor="middle">每周汇总</text><rect class="band " x="14" y="492" width="1016" height="230" rx="12"/><text class="band-t " x="28" y="516">Agent 执行</text><rect class="strip " x="130" y="508" width="892" height="24" rx="6"/><text class="st " x="140" y="524.5">skill 库：转写 · 说话人 · 提取待办 / 决定 · 清单核对 · 日报周报 · 行动包 · Ask 问答 · 模板识别 · 照片归档 · 文档索引 · 设备补问</text><path class="ln main" d="M1020,203 L1055,203 L1055,540 L176,540 L176,552" marker-end="url(#pm-main)"/><text class="lt main" x="1048" y="470" text-anchor="end">派给对应的机器和模型</text><rect class="bx part " x="130" y="552" width="96" height="34" rx="7"/><text class="bt " x="178.0" y="573.5" text-anchor="middle">队列取任务</text><rect class="bx have " x="250" y="552" width="110" height="34" rx="7"/><text class="bt " x="305.0" y="566.5" text-anchor="middle">读证据</text><text class="bt " x="305.0" y="580.5" text-anchor="middle">录音/照片/文档</text><rect class="bx have " x="390" y="552" width="80" height="34" rx="7"/><text class="bt " x="430.0" y="573.5" text-anchor="middle">执行</text><rect class="bx part " x="500" y="552" width="140" height="34" rx="7"/><text class="bt " x="570.0" y="566.5" text-anchor="middle">写结果 /</text><text class="bt " x="570.0" y="580.5" text-anchor="middle">写决定草稿</text><path class="ln main" d="M226,569 L250,569" marker-end="url(#pm-main)"/><path class="ln main" d="M360,569 L390,569" marker-end="url(#pm-main)"/><path class="ln main" d="M470,569 L500,569" marker-end="url(#pm-main)"/><path class="ln back" d="M640,575 L1040,575"/><text class="lt back" x="660" y="570" text-anchor="start">失败 / 超时，也交回</text><rect class="layer" x="130" y="610" width="415" height="98" rx="10"/><text class="layer-t" x="142" y="628">模型调用层</text><path class="ln main" d="M430,586 L430,610" marker-end="url(#pm-main)"/><text class="lt main" x="437" y="604" text-anchor="start">每次调模型</text><rect class="bx part " x="142" y="640" width="126" height="28" rx="7"/><text class="bt " x="205.0" y="658.5" text-anchor="middle">注册表：模型+参数</text><rect class="bx have " x="290" y="640" width="92" height="28" rx="7"/><text class="bt " x="336.0" y="658.5" text-anchor="middle">调用模型</text><rect class="bx part " x="408" y="640" width="125" height="28" rx="7"/><text class="bt " x="470.5" y="658.5" text-anchor="middle">记 token / 耗时</text><path class="ln main" d="M268,654 L290,654" marker-end="url(#pm-main)"/><path class="ln main" d="M382,654 L408,654" marker-end="url(#pm-main)"/><path class="ln back" d="M362,640 L362,632 L310,632 L310,640" marker-end="url(#pm-back)"/><text class="nt back" x="142" y="686" text-anchor="start">失败自动换下一个模型（兜底链）</text><text class="nt back" x="142" y="702" text-anchor="start">单次最多调 8 次 · 公司预算用完暂停不紧急的</text><text class="nt " x="680" y="650" text-anchor="start">核对层的复核、判断层的写卡片，调模型也都走这一层</text><rect class="band " x="14" y="740" width="1016" height="200" rx="12"/><text class="band-t " x="28" y="764">核对中台</text><text class="nt " x="130" y="790" text-anchor="start">对外发送（例如给分包商的邮件）</text><text class="nt " x="130" y="808" text-anchor="start">只在人批准后，由新事件触发执行</text><text class="nt " x="130" y="826" text-anchor="start">已发出的内容出错：只追加更正，不删除</text><path class="ln main" d="M570,586 L570,765" marker-end="url(#pm-main)"/><polygon class="bx part" points="570,765.0 625.0,787 570,809.0 515.0,787"/><text class="bt " x="570" y="791.5" text-anchor="middle">有证据?</text><path class="ln main" d="M570,809 L570,830" marker-end="url(#pm-main)"/><text class="lt main" x="576" y="823" text-anchor="start">否</text><rect class="bx miss " x="525" y="830" width="90" height="28" rx="7"/><text class="bt " x="570.0" y="848.5" text-anchor="middle">删掉该条</text><polygon class="bx miss" points="760,764.0 835.0,787 760,810.0 685.0,787"/><text class="bt " x="760" y="791.5" text-anchor="middle">换家复核有问题?</text><path class="ln main" d="M625,787 L685,787" marker-end="url(#pm-main)"/><text class="lt main" x="640" y="780" text-anchor="start">是</text><path class="ln back" d="M760,764 L760,598 L620,598 L620,586" marker-end="url(#pm-back)"/><text class="lt back" x="768" y="740" text-anchor="start">有问题：退回修改（≤3 轮，用尽算失败）</text><polygon class="bx miss" points="905,764.0 965.0,787 905,810.0 845.0,787"/><text class="bt " x="905" y="791.5" text-anchor="middle">只含本项目?</text><path class="ln main" d="M835,787 L845,787" marker-end="url(#pm-main)"/><text class="lt main" x="832" y="778" text-anchor="start">没有</text><rect class="bx miss stop" x="975" y="768" width="50" height="38" rx="7"/><text class="bt stop" x="1000.0" y="784.5" text-anchor="middle">阻断</text><text class="bt stop" x="1000.0" y="798.5" text-anchor="middle">告警</text><path class="ln stop" d="M965,787 L975,787" marker-end="url(#pm-stop)"/><text class="lt stop" x="972" y="764" text-anchor="end">否</text><polygon class="bx miss" points="900,863.0 995.0,890 900,917.0 805.0,890"/><text class="bt " x="900" y="887.5" text-anchor="middle">要人定?</text><text class="bt " x="900" y="901.5" text-anchor="middle">清单 · 选择 · 补信息</text><path class="ln main" d="M905,810 L905,840 L900,840 L900,863" marker-end="url(#pm-main)"/><text class="lt main" x="912" y="832" text-anchor="start">是</text><rect class="bx have " x="640" y="873" width="120" height="34" rx="7"/><text class="bt " x="700.0" y="887.5" text-anchor="middle">发布</text><text class="bt " x="700.0" y="901.5" text-anchor="middle">内部可见</text><path class="ln main" d="M805,890 L760,890" marker-end="url(#pm-main)"/><text class="lt main" x="778" y="883" text-anchor="start">否</text><polygon class="bx miss" points="520,868.0 580.0,890 520,912.0 460.0,890"/><text class="bt " x="520" y="894.5" text-anchor="middle">发布后核实?</text><path class="ln main" d="M640,890 L580,890" marker-end="url(#pm-main)"/><text class="nt " x="400" y="885" text-anchor="end">否：重发一次</text><text class="nt " x="400" y="901" text-anchor="end">再失败算失败</text><path class="ln main" d="M460,890 L408,890"/><path class="ln main" d="M520,912 L520,932 L1040,932 L1040,307 L1010,307" marker-end="url(#pm-main)"/><text class="lt main" x="600" y="926" text-anchor="start">交回结论（成功或失败）</text><path class="ln human" d="M900,917 L900,950 L115,950"/><text class="lt human" x="907" y="945" text-anchor="start">是：挂起，等人</text><rect class="band me" x="14" y="958" width="1016" height="232" rx="12"/><text class="band-t me" x="28" y="982">判断（人）</text><rect class="bx part " x="130" y="1000" width="120" height="34" rx="7"/><text class="bt " x="190.0" y="1014.5" text-anchor="middle">写卡片</text><text class="bt " x="190.0" y="1028.5" text-anchor="middle">截止 + 不答会怎样</text><polygon class="bx miss" points="330,995.0 390.0,1017 330,1039.0 270.0,1017"/><text class="bt " x="330" y="1021.5" text-anchor="middle">定过了?</text><rect class="bx part " x="410" y="1000" width="120" height="34" rx="7"/><text class="bt " x="470.0" y="1014.5" text-anchor="middle">推给有权的人</text><text class="bt " x="470.0" y="1028.5" text-anchor="middle">按紧急度</text><polygon class="bx miss" points="610,995.0 660.0,1017 610,1039.0 560.0,1017"/><text class="bt " x="610" y="1021.5" text-anchor="middle">送达?</text><polygon class="bx miss" points="760,995.0 835.0,1017 760,1039.0 685.0,1017"/><text class="bt " x="760" y="1021.5" text-anchor="middle">截止前有回复?</text><rect class="bx miss " x="865" y="998" width="155" height="38" rx="7"/><text class="bt " x="942.5" y="1014.5" text-anchor="middle">提醒 → 升级给公司管理员</text><text class="bt " x="942.5" y="1028.5" text-anchor="middle">仍无：保守默认 + 记超时</text><path class="ln human" d="M250,1017 L270,1017" marker-end="url(#pm-human)"/><path class="ln human" d="M390,1017 L410,1017" marker-end="url(#pm-human)"/><text class="lt human" x="396" y="1010" text-anchor="start">否</text><path class="ln human" d="M530,1017 L560,1017" marker-end="url(#pm-human)"/><path class="ln human" d="M660,1017 L685,1017" marker-end="url(#pm-human)"/><text class="lt human" x="666" y="1010" text-anchor="start">是</text><path class="ln back" d="M610,995 L610,982 L470,982 L470,1000" marker-end="url(#pm-back)"/><text class="lt back" x="618" y="980" text-anchor="start">否：换渠道再发</text><path class="ln main" d="M835,1017 L865,1017" marker-end="url(#pm-main)"/><text class="lt main" x="842" y="1010" text-anchor="start">否</text><path class="ln main" d="M330,1039 L330,1052 L195,1052 L195,1063" marker-end="url(#pm-main)"/><text class="lt main" x="336" y="1050" text-anchor="start">是</text><rect class="bx have " x="140" y="1063" width="110" height="34" rx="7"/><text class="bt " x="195.0" y="1077.5" text-anchor="middle">照定的做</text><text class="bt " x="195.0" y="1091.5" text-anchor="middle">不再问</text><path class="ln human" d="M760,1039 L760,1058" marker-end="url(#pm-human)"/><text class="lt human" x="767" y="1052" text-anchor="start">是</text><polygon class="bx miss" points="760,1058.0 845.0,1080 760,1102.0 675.0,1080"/><text class="bt " x="760" y="1084.5" text-anchor="middle">有权替项目决定?</text><rect class="bx miss " x="870" y="1063" width="130" height="34" rx="7"/><text class="bt " x="935.0" y="1084.5" text-anchor="middle">不算数，提示他</text><path class="ln main" d="M845,1080 L870,1080" marker-end="url(#pm-main)"/><text class="lt main" x="850" y="1073" text-anchor="start">否</text><rect class="bx part " x="520" y="1063" width="130" height="34" rx="7"/><text class="bt " x="585.0" y="1077.5" text-anchor="middle">写进决定台账</text><text class="bt " x="585.0" y="1091.5" text-anchor="middle">只追加</text><path class="ln human" d="M675,1080 L650,1080" marker-end="url(#pm-human)"/><text class="lt human" x="660" y="1073" text-anchor="start">是</text><rect class="bx miss " x="330" y="1063" width="120" height="34" rx="7"/><text class="bt " x="390.0" y="1077.5" text-anchor="middle">变成新事件</text><text class="bt " x="390.0" y="1091.5" text-anchor="middle">同链最多 3 圈</text><path class="ln human" d="M520,1080 L450,1080" marker-end="url(#pm-human)"/><path class="ln main" d="M250,1080 L330,1080" marker-end="url(#pm-main)"/><path class="ln human" d="M390,1097 L390,1122 L1066,1122 L1066,32 L976,32 L976,50" marker-end="url(#pm-human)"/><text class="lt human" x="1060" y="1138" text-anchor="end">回到事件，Agent 接着做</text><text class="nt me" x="130" y="1152" text-anchor="start">收卡片的人（第一版用现有角色）：项目经理 · 工长 · 公司管理员 · 运维；安全代表、算量员、分包工长和休假委托第三阶段再加</text><text class="nt me" x="130" y="1172" text-anchor="start">紧急度：可能伤人 → 直接最高，不受上限和预算限制；其余按 时间 → 影响的后续工序 → 复杂度和牵扯人数</text><path class="cy miss" d="M1098,57 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="75.0" text-anchor="middle">事件记录</text><path class="cy part" d="M1098,285 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="303.0" text-anchor="middle">运行记录</text><path class="cy miss" d="M1098,645 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="663.0" text-anchor="middle">成本账本</text><path class="cy miss" d="M1098,777 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="795.0" text-anchor="middle">核对记录</text><path class="cy part" d="M1098,1100 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="1118.0" text-anchor="middle">决定台账（含不做）</text><path class="ln rec" d="M1022,67 L1098,67" marker-end="url(#pm-rec)"/><path class="ln rec" d="M1010,295 L1098,295" marker-end="url(#pm-rec)"/><path class="ln rec" d="M545,655 L1098,655" marker-end="url(#pm-rec)"/><path class="ln rec" d="M1026,787 L1098,787" marker-end="url(#pm-rec)"/><path class="ln rec" d="M585,1097 L585,1110 L1098,1110" marker-end="url(#pm-rec)"/></svg></div>
+    <p class="foot-note">"部分"指有其中一块，或只在 TEST、影子模式里，还没有在 prod 对客户开放。</p>
+  </div>
+
+  <div class="view" data-view="dev" hidden>
+    <p class="lede">同一套动线用在我们自己做 FieldSight 的过程上。原文的 CI 中台对应这里的"交付中台"。</p>
+    <div class="tally" data-tally></div>
+
+        <div class="flow-legend">
+      <span><i class="lgl lgl-main"></i>主流程</span><span><i class="lgl lgl-back"></i>退回 / 重派</span><span><i class="lgl lgl-human"></i>经人的通道</span><span><i class="lgl lgl-stop"></i>阻断 / 回滚</span><span><i class="lgl lgl-rec"></i>写入记录</span>
+    </div>
+    <div class="flow-wrap"><svg class="flow-svg" viewBox="0 0 1240 900" role="img" aria-label="FieldSight 研发完整架构动线图"><defs><marker id="dm-main" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk main" d="M0,0 L10,5 L0,10 z"/></marker><marker id="dm-back" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk back" d="M0,0 L10,5 L0,10 z"/></marker><marker id="dm-human" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk human" d="M0,0 L10,5 L0,10 z"/></marker><marker id="dm-rec" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk rec" d="M0,0 L10,5 L0,10 z"/></marker><marker id="dm-stop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="mk stop" d="M0,0 L10,5 L0,10 z"/></marker></defs><rect class="band data" x="1086" y="14" width="140" height="876" rx="12"/><text class="band-t data" x="1100" y="38">数据沉淀</text><rect class="band " x="14" y="14" width="1016" height="92" rx="12"/><text class="band-t " x="28" y="38">事件</text><rect class="bx have " x="130" y="50" width="104" height="36" rx="7"/><text class="bt " x="182.0" y="72.5" text-anchor="middle">你的需求</text><rect class="bx part " x="242" y="50" width="104" height="36" rx="7"/><text class="bt " x="294.0" y="72.5" text-anchor="middle">CloudWatch 告警</text><rect class="bx part " x="354" y="50" width="104" height="36" rx="7"/><text class="bt " x="406.0" y="72.5" text-anchor="middle">CI 失败</text><rect class="bx miss " x="466" y="50" width="104" height="36" rx="7"/><text class="bt " x="518.0" y="72.5" text-anchor="middle">Amplify 失败</text><rect class="bx part " x="578" y="50" width="104" height="36" rx="7"/><text class="bt " x="630.0" y="72.5" text-anchor="middle">客户反馈</text><rect class="bx miss " x="690" y="50" width="104" height="36" rx="7"/><text class="bt " x="742.0" y="72.5" text-anchor="middle">定时巡检</text><rect class="bx miss " x="802" y="50" width="104" height="36" rx="7"/><text class="bt " x="854.0" y="72.5" text-anchor="middle">依赖升级</text><rect class="bx miss " x="914" y="50" width="104" height="36" rx="7"/><text class="bt " x="966.0" y="72.5" text-anchor="middle">上线核实失败</text><rect class="band hub" x="14" y="124" width="1016" height="120" rx="12"/><text class="band-t hub" x="28" y="148">派单</text><path class="ln main" d="M186,86 L186,170" marker-end="url(#dm-main)"/><text class="lt main" x="194" y="122" text-anchor="start">现在：你在对话里转给我</text><rect class="bx part hub" x="130" y="170" width="110" height="34" rx="7"/><text class="bt hub" x="185.0" y="191.5" text-anchor="middle">接收</text><polygon class="bx miss" points="350,164.0 425.0,187 350,210.0 275.0,187"/><text class="bt " x="350" y="191.5" text-anchor="middle">分给哪条线?</text><rect class="bx part hub" x="470" y="170" width="190" height="34" rx="7"/><text class="bt hub" x="565.0" y="184.5" text-anchor="middle">每条线独立工作目录</text><text class="bt hub" x="565.0" y="198.5" text-anchor="middle">放在 Dropbox 外，不共用 stash</text><rect class="bx miss hub" x="690" y="170" width="100" height="34" rx="7"/><text class="bt hub" x="740.0" y="191.5" text-anchor="middle">自动开工</text><path class="ln main" d="M240,187 L275,187" marker-end="url(#dm-main)"/><path class="ln main" d="M425,187 L470,187" marker-end="url(#dm-main)"/><path class="ln main" d="M660,187 L690,187" marker-end="url(#dm-main)"/><rect class="band " x="14" y="262" width="1016" height="140" rx="12"/><text class="band-t " x="28" y="286">Agent 执行</text><rect class="strip " x="130" y="278" width="892" height="24" rx="6"/><text class="st " x="140" y="294.5">各条线会话：后端 · 前端 · 设备 · Ask · 声纹 …   每条线有 skill、记忆文件、子代理</text><path class="ln main" d="M740,204 L740,226 L1055,226 L1055,314 L185,314 L185,330" marker-end="url(#dm-main)"/><rect class="bx have " x="130" y="330" width="110" height="34" rx="7"/><text class="bt " x="185.0" y="351.5" text-anchor="middle">改代码</text><rect class="bx have " x="270" y="330" width="110" height="34" rx="7"/><text class="bt " x="325.0" y="351.5" text-anchor="middle">本地测试</text><polygon class="bx miss" points="490,325.0 565.0,347 490,369.0 415.0,347"/><text class="bt " x="490" y="351.5" text-anchor="middle">评测分不降?</text><rect class="bx have " x="610" y="330" width="100" height="34" rx="7"/><text class="bt " x="660.0" y="351.5" text-anchor="middle">开 PR</text><path class="ln main" d="M240,347 L270,347" marker-end="url(#dm-main)"/><path class="ln main" d="M380,347 L415,347" marker-end="url(#dm-main)"/><path class="ln main" d="M565,347 L610,347" marker-end="url(#dm-main)"/><text class="lt main" x="576" y="340" text-anchor="start">是</text><path class="ln back" d="M490,369 L490,384 L185,384 L185,364" marker-end="url(#dm-back)"/><text class="lt back" x="300" y="380" text-anchor="start">否：回去改</text><text class="nt " x="730" y="374" text-anchor="start">ASR、提示词改动要跑评测：</text><text class="nt " x="730" y="390" text-anchor="start">换家审代码看不出效果变差</text><rect class="band " x="14" y="420" width="1016" height="170" rx="12"/><text class="band-t " x="28" y="444">交付中台</text><path class="ln main" d="M660,364 L660,400 L110,400 L110,477 L130,477" marker-end="url(#dm-main)"/><polygon class="bx part" points="190,455.0 250.0,477 190,499.0 130.0,477"/><text class="bt " x="190" y="481.5" text-anchor="middle">CI 通过?</text><text class="nt " x="190" y="512" text-anchor="middle">前端没有 CI</text><polygon class="bx miss" points="390,454.0 465.0,477 390,500.0 315.0,477"/><text class="bt " x="390" y="481.5" text-anchor="middle">换家审查有问题?</text><path class="ln main" d="M250,477 L315,477" marker-end="url(#dm-main)"/><text class="lt main" x="262" y="470" text-anchor="start">是</text><rect class="bx have " x="520" y="460" width="110" height="34" rx="7"/><text class="bt " x="575.0" y="481.5" text-anchor="middle">合 develop / dev</text><path class="ln main" d="M465,477 L520,477" marker-end="url(#dm-main)"/><text class="lt main" x="475" y="470" text-anchor="start">没有</text><rect class="bx have " x="660" y="460" width="100" height="34" rx="7"/><text class="bt " x="710.0" y="481.5" text-anchor="middle">TEST 部署</text><path class="ln main" d="M630,477 L660,477" marker-end="url(#dm-main)"/><polygon class="bx part" points="850,455.0 915.0,477 850,499.0 785.0,477"/><text class="bt " x="850" y="481.5" text-anchor="middle">TEST 验证过?</text><path class="ln main" d="M760,477 L785,477" marker-end="url(#dm-main)"/><rect class="bx have " x="880" y="530" width="140" height="34" rx="7"/><text class="bt " x="950.0" y="544.5" text-anchor="middle">release PR</text><text class="bt " x="950.0" y="558.5" text-anchor="middle">只挑这次的</text><path class="ln main" d="M915,477 L950,477 L950,530" marker-end="url(#dm-main)"/><text class="lt main" x="925" y="470" text-anchor="start">是</text><path class="ln back" d="M190,499 L190,548 L150,548 L150,364" marker-end="url(#dm-back)"/><text class="lt back" x="196" y="540" text-anchor="start">否</text><path class="ln back" d="M390,500 L390,560 L130,560 L130,364" marker-end="url(#dm-back)"/><text class="lt back" x="398" y="555" text-anchor="start">有：退回（≤3 轮，用尽转人）</text><path class="ln back" d="M850,455 L850,440 L230,440 L230,364" marker-end="url(#dm-back)"/><text class="lt back" x="700" y="436" text-anchor="start">否：回去改</text><rect class="band me" x="14" y="608" width="1016" height="270" rx="12"/><text class="band-t me" x="28" y="632">判断（你）</text><path class="ln human" d="M950,564 L950,598 L60,598 L60,668 L130,668" marker-end="url(#dm-human)"/><rect class="bx part " x="130" y="651" width="130" height="34" rx="7"/><text class="bt " x="195.0" y="665.5" text-anchor="middle">现在：对话里给</text><text class="bt " x="195.0" y="679.5" text-anchor="middle">PR 编号和命令</text><rect class="bx miss " x="290" y="651" width="120" height="34" rx="7"/><text class="bt " x="350.0" y="665.5" text-anchor="middle">决定卡片</text><text class="bt " x="350.0" y="679.5" text-anchor="middle">你本人一键批</text><polygon class="bx have" points="520,646.0 580.0,668 520,690.0 460.0,668"/><text class="bt " x="520" y="672.5" text-anchor="middle">你合 main?</text><rect class="bx have " x="620" y="651" width="100" height="34" rx="7"/><text class="bt " x="670.0" y="672.5" text-anchor="middle">等 15 分钟</text><rect class="bx have " x="750" y="651" width="100" height="34" rx="7"/><text class="bt " x="800.0" y="672.5" text-anchor="middle">prod 部署</text><polygon class="bx part" points="940,646.0 1015.0,668 940,690.0 865.0,668"/><text class="bt " x="940" y="672.5" text-anchor="middle">上线核实?</text><path class="ln human" d="M260,668 L290,668" marker-end="url(#dm-human)"/><path class="ln human" d="M410,668 L460,668" marker-end="url(#dm-human)"/><path class="ln human" d="M580,668 L620,668" marker-end="url(#dm-human)"/><text class="lt human" x="590" y="661" text-anchor="start">是</text><path class="ln main" d="M720,668 L750,668" marker-end="url(#dm-main)"/><path class="ln main" d="M850,668 L865,668" marker-end="url(#dm-main)"/><text class="nt " x="925" y="722" text-anchor="end">读 SERVER_BUILD，不只看 main</text><path class="ln main" d="M520,690 L520,720" marker-end="url(#dm-main)"/><text class="lt main" x="527" y="712" text-anchor="start">否</text><rect class="bx have " x="460" y="720" width="120" height="28" rx="7"/><text class="bt " x="520.0" y="738.5" text-anchor="middle">关闭或排下一次</text><path class="ln stop" d="M940,690 L940,760" marker-end="url(#dm-stop)"/><text class="lt stop" x="947" y="728" text-anchor="start">否</text><rect class="bx miss stop" x="880" y="760" width="120" height="34" rx="7"/><text class="bt stop" x="940.0" y="781.5" text-anchor="middle">回滚 + 告警</text><path class="ln stop" d="M1000,777 L1040,777 L1040,32 L966,32 L966,50" marker-end="url(#dm-stop)"/><text class="lt stop" x="1034" y="630" text-anchor="end">变成&quot;上线核实失败&quot;事件</text><path class="ln main" d="M1015,668 L1022,668"/><text class="nt " x="1026" y="650" text-anchor="end">是：完成</text><text class="nt me" x="130" y="810" text-anchor="start">必须你来的（菱形之前都自动）：合 release 到 main · 数据库迁移 · 功能开关 · prod 数据写 · 密钥和权限 · 产品取舍</text><text class="nt me" x="130" y="830" text-anchor="start">&quot;一键批&quot;必须是你本人经 GitHub 登录点的，Agent 不能替你点</text><path class="cy have" d="M1098,177 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="195.0" text-anchor="middle">会话记录</text><path class="cy have" d="M1098,237 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="255.0" text-anchor="middle">记忆文件</text><path class="cy have" d="M1098,337 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="355.0" text-anchor="middle">PR / git 历史</text><path class="cy miss" d="M1098,397 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="415.0" text-anchor="middle">评测记录</text><path class="cy have" d="M1098,467 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="485.0" text-anchor="middle">CI 日志</text><path class="cy miss" d="M1098,527 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="545.0" text-anchor="middle">审查记录</text><path class="cy miss" d="M1098,657 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="675.0" text-anchor="middle">决定不做清单</text><path class="cy miss" d="M1098,757 v20 a58.0,6 0 0 0 116,0 v-20 a58.0,6 0 0 0 -116,0 a58.0,6 0 0 0 116,0"/><text class="bt sm" x="1156.0" y="775.0" text-anchor="middle">每条线的成本</text><path class="ln rec" d="M1030,187 L1098,187" marker-end="url(#dm-rec)"/><path class="ln rec" d="M1030,247 L1098,247" marker-end="url(#dm-rec)"/><path class="ln rec" d="M710,347 L1098,347" marker-end="url(#dm-rec)"/><path class="ln rec" d="M1030,407 L1098,407" marker-end="url(#dm-rec)"/><path class="ln rec" d="M1030,477 L1098,477" marker-end="url(#dm-rec)"/><path class="ln rec" d="M1030,537 L1098,537" marker-end="url(#dm-rec)"/><path class="ln rec" d="M1030,667 L1098,667" marker-end="url(#dm-rec)"/><path class="ln rec" d="M1030,767 L1098,767" marker-end="url(#dm-rec)"/></svg></div>
+  </div>
+</div>
+<script>
+(function () {
+  var views = document.querySelectorAll('[data-view]');
+  var tabs = document.querySelectorAll('[data-tab]');
+  function show() {
+    var id = location.hash.slice(1);
+    if (!document.querySelector('[data-view="' + id + '"]')) id = 'overview';
+    views.forEach(function (v) { v.hidden = v.getAttribute('data-view') !== id; });
+    tabs.forEach(function (t) { if (t.getAttribute('data-tab') === id) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current'); });
+  }
+  document.querySelectorAll('[data-tally]').forEach(function (el) {
+    var v = el.closest('[data-view]');
+    function n(c) { return v.querySelectorAll('.flow-svg .bx.' + c + ', .flow-svg .cy.' + c).length; }
+    el.innerHTML = '<span class="k"><span class="sw" style="border-color:var(--ok)"></span>已有 <b>' + n('have') + '</b></span>'
+      + '<span class="k"><span class="sw" style="border-color:var(--amber);border-style:dashed"></span>部分 <b>' + n('part') + '</b></span>'
+      + '<span class="k"><span class="sw" style="border-color:var(--stop);border-style:dashed"></span>缺 <b>' + n('miss') + '</b></span>';
+  });
+  window.addEventListener('hashchange', show);
+  show();
+})();
+</script>
+
+</body></html>
