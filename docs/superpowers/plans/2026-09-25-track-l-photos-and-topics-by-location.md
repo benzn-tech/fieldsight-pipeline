@@ -105,9 +105,9 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_report_generator.py` / wherever `report_sections.build` is called for a day (pass markers; the nightly generator reads S3, so it takes markers from the day's extraction artifact `location_markers`, not Aurora)
 - Test: `tests/unit/test_report_sections_locations.py`
 
-- [ ] **Step 1:** `kind: "entries"` section titled *Locations*: one entry per group — heading = label (or "Before any location was announced"), then the group's topic titles, then its photo keys (same `{name, key}` shape `_photos` builds, so the docx renderer already knows it).
-- [ ] **Step 2:** Section is dropped when there are no markers (the `build` rule: no empty headings).
-- [ ] **Step 3:** Test: a report with markers renders the section between *Safety* and *Photos*; without markers the section list is unchanged (assert on the exact list of titles a fixture produced before this change).
+- [x] **Step 1:** (done, org-api day view; null headings by reason; entries only with a topic title; Photos keeps every photo because no renderer draws `entry.photos` yet — ruling) `kind: "entries"` section titled *Locations*: one entry per group — heading = label (or "Before any location was announced"), then the group's topic titles, then its photo keys (same `{name, key}` shape `_photos` builds, so the docx renderer already knows it).
+- [x] **Step 2:** (done) Section is dropped when there are no markers (the `build` rule: no empty headings).
+- [x] **Step 3:** (done; **nightly generator NOT wired**: it reads only `transcripts/`, has no DB; needs the day's `extractions/` markers merged and passed as `{**report, "location_markers": m}` at `build`) Test: a report with markers renders the section between *Safety* and *Photos*; without markers the section list is unchanged (assert on the exact list of titles a fixture produced before this change).
 
 ---
 
