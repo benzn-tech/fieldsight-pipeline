@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -286,6 +287,9 @@ def _lambda():
 
 
 _rag_clients = {}
+# Round 1's target hops run on worker threads, and boto3.client() on the default session is
+# not thread-safe: creation is serialised (a cached client is safe to share).
+_rag_clients_lock = threading.Lock()
 
 
 def rag_lambda_client(timeout):
@@ -293,12 +297,13 @@ def rag_lambda_client(timeout):
     a whole second (cached per value): the hop is bounded by the gather time left, not by
     the org-api client's 120 s. No botocore retries -- S8's single retry is the stages'."""
     secs = max(1, int(-(-float(timeout) // 1)))
-    if secs not in _rag_clients:
-        import boto3
-        from botocore.config import Config
-        _rag_clients[secs] = boto3.client("lambda", config=Config(
-            read_timeout=secs, connect_timeout=min(5, secs), retries={"max_attempts": 0}))
-    return _rag_clients[secs]
+    with _rag_clients_lock:
+        if secs not in _rag_clients:
+            import boto3
+            from botocore.config import Config
+            _rag_clients[secs] = boto3.client("lambda", config=Config(
+                read_timeout=secs, connect_timeout=min(5, secs), retries={"max_attempts": 0}))
+        return _rag_clients[secs]
 
 
 # ---- helpers ------------------------------------------------------------------------------

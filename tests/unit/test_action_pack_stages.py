@@ -938,3 +938,163 @@ def test_plan_prompt_states_the_v2_keys():
     prompt = next(c["prompt"] for c in model.calls if c["caller"] == "action_plan")
     for key in ("change_scope", "targets", "stated_values", "delegations", "sub_tasks"):
         assert f'"{key}"' in prompt, key
+
+
+# ---- PR-3 Task 3.3: target lookups in round 1 (spec 2026-11-05 §3.2.2, §11) --------------
+
+SID_DONE = "44444444-5555-4666-8777-888888888883"
+TARGETS2 = [{"id": "t1", "task_no": 2, "phrase": None},
+            {"id": "t2", "task_no": None, "phrase": "level 3 windows"}]
+
+
+class TargetTools(Tools):
+    """Tools whose target hops (call_id target_*) return one row per target: the done item
+    for the phrase, and a delay to show the hops overlap."""
+
+    def __init__(self, delay=0.0, **kw):
+        super().__init__(**kw)
+        self.delay, self.target_calls, self.threads = delay, [], set()
+
+    def items_run(self, args, tctx, call_id="items"):
+        import threading
+        import time
+        if not call_id.startswith("target_"):
+            return super().items_run(args, tctx, call_id)
+        self.target_calls.append((call_id, args, tctx))
+        self.threads.add(threading.get_ident())
+        if self.delay:
+            time.sleep(self.delay)
+        row = {f: None for f in ask_items.ITEM_FIELDS}
+        if args.get("task_no") == 2:
+            row.update(stable_id=SID2, task_no=2, text="Item 2", status="open")
+        else:
+            row.update(stable_id=SID_DONE, task_no=3, text="Seal the level 3 windows",
+                       status="done")
+        return {"tool": "list_items", "id": call_id, "meta": {}, "items": [
+            {"ref": tctx.refs.assign("item", row["stable_id"], "R"), "kind": "item",
+             "provenance": "records", **row}]}
+
+
+def test_round1_issues_target_calls_all_statuses():
+    tools = TargetTools()
+    model = Model(plan=[plan_obj(targets=TARGETS2)])
+    payload = st.run(make_ctx(), deps(model=model, tools=tools))
+    calls = {cid: args for cid, args, _ in tools.target_calls}
+    assert set(calls) == {"target_t1", "target_t2"}
+    for args in calls.values():
+        assert args["status"] == ["open", "in_progress", "blocked", "done", "closed"]
+        assert args["limit"] == 50 and args["site_id"] == SITE
+    assert calls["target_t1"]["task_no"] == 2 and "query" not in calls["target_t1"]
+    assert calls["target_t2"]["query"] == "level 3 windows" and "task_no" not in calls[
+        "target_t2"]
+    trace = payload["run_trace"]
+    assert trace["target_resolution"] == {"t1": SID2, "t2": SID_DONE}
+    assert trace["target_calls"] == 2
+    # The hops' items entered the registry with refs from the run's shared assigner: SID2
+    # keeps the ref round 1's items call gave it, the done item gets the next one.
+    run_refs = {s["stable_id"]: s["ref"] for s in payload["sources"] if s.get("stable_id")}
+    assert all(r.startswith("R") for r in run_refs.values())
+
+
+def test_target_refs_are_reassigned_on_the_shared_assigner():
+    tools = TargetTools()
+    ctx = make_ctx()
+    run = st.Run(ctx=ctx, deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=TARGETS2), TODAY)
+    st.gather_stage(run)
+    by_sid = {e["item"]["stable_id"]: ref for ref, e in run.registry.items()
+              if e["kind"] == "item"}
+    assert by_sid[SID2] == run.refs.assign("item", SID2, "R")          # same as items1
+    assert by_sid[SID_DONE] == run.refs.assign("item", SID_DONE, "R")
+    assert len(set(run.registry)) == len(run.registry)
+    # each hop had a private assigner and its own deadline
+    for _, _, tctx in tools.target_calls:
+        assert tctx.refs is not run.refs
+        assert tctx.deadline == pytest.approx(ctx.clock() + ask_items.MAX_DEADLINE_S)
+    assert run.resolution["t2"].stable_id == SID_DONE
+
+
+def test_target_calls_run_concurrently():
+    import time
+    tools = TargetTools(delay=0.2)
+    targets = [{"id": f"t{i}", "task_no": None, "phrase": f"windows {i}"}
+               for i in range(1, 5)]
+    run = st.Run(ctx=make_ctx(), deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=targets), TODAY)
+    t0 = time.perf_counter()
+    st.gather_stage(run)
+    assert time.perf_counter() - t0 < 0.5
+    assert len(tools.target_calls) == 4 and len(tools.threads) == 4
+
+
+def test_at_most_four_target_lookups():
+    tools = TargetTools()
+    targets = [{"id": f"t{i}", "task_no": i, "phrase": None} for i in range(1, 7)]
+    run = st.Run(ctx=make_ctx(), deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=targets), TODAY)
+    st.gather_stage(run)
+    assert len(tools.target_calls) == 4
+    assert run.trace["target_lookups_capped"] == 2
+    # t5/t6 still resolve over what the run read (task_no 1 and 2 are round 1's items).
+    assert set(run.trace["target_resolution"]) == {f"t{i}" for i in range(1, 7)}
+
+
+def test_target_hop_skipped_without_time():
+    clock = Clock()
+    ctx = make_ctx(clock=clock)
+    tools = TargetTools()
+    run = st.Run(ctx=ctx, deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=TARGETS2), TODAY)
+    # 4 s of hop budget left: under MIN_TARGET_HOP_S.
+    clock.t = ctx.deadline_for("gather") - st.ROUND_FLOOR_S - 4.0
+    st.gather_stage(run)
+    assert tools.target_calls == []
+    assert run.trace["target_resolve_time"] == 2
+    # t1 (task_no 2) is among round 1's open items, but a skipped lookup is `none`.
+    assert run.trace["target_resolution"] == {"t1": "none", "t2": "none"}
+
+
+def test_target_hop_budget_is_capped_by_gather_time():
+    clock = Clock()
+    ctx = make_ctx(clock=clock)
+    tools = TargetTools()
+    run = st.Run(ctx=ctx, deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=TARGETS2[:1]), TODAY)
+    clock.t = ctx.deadline_for("gather") - st.ROUND_FLOOR_S - 12.0
+    st.gather_stage(run)
+    [(_, _, tctx)] = tools.target_calls
+    assert tctx.deadline == pytest.approx(clock.t + 12.0)
+
+
+def test_no_targets_no_hops_and_an_empty_resolution():
+    tools = TargetTools()
+    payload = st.run(make_ctx(), deps(tools=tools))
+    assert tools.target_calls == []
+    assert payload["run_trace"]["target_resolution"] == {}
+    assert payload["run_trace"]["plan_scope"] == "named"
+
+
+def test_target_resolution_in_trace_is_counts_shaped():
+    tools = TargetTools()
+    targets = TARGETS2 + [{"id": "t3", "task_no": 404, "phrase": None},
+                          {"id": "t4", "task_no": None, "phrase": "item"}]
+    model = Model(plan=[plan_obj(targets=targets)])
+    payload = st.run(make_ctx(), deps(model=model, tools=tools))
+    trace = payload["run_trace"]
+    assert trace["target_resolution"]["t3"] == "none"
+    assert action_pack_view.fail_trace_error(trace) is None
+    assert action_pack_view.fail_trace_error(
+        {"target_resolution": trace["target_resolution"]}) is None
+
+
+def test_a_failing_target_hop_does_not_fail_round_1():
+    class Boom(TargetTools):
+        def items_run(self, args, tctx, call_id="items"):
+            if call_id.startswith("target_"):
+                raise RuntimeError("boom")
+            return super().items_run(args, tctx, call_id)
+    payload = st.run(make_ctx(), deps(model=Model(plan=[plan_obj(targets=TARGETS2)]),
+                                      tools=Boom()))
+    trace = payload["run_trace"]
+    assert trace["tool_errors"] >= 2
+    assert trace["target_resolution"]["t1"] == SID2       # round 1's own items

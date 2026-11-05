@@ -35,15 +35,18 @@ Logs: ids, counts and codes only -- never the instruction, a reading, a query or
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import action_pack_targets
 import action_pack_view
 import action_pack_web
 import ask_items
@@ -64,6 +67,12 @@ QUERY_MAX_CHARS = 200
 TITLE_MAX_CHARS = 120
 READING_MAX_CHARS = 1500
 ROUND1_ITEMS_LIMIT = 100
+# Named-target lookups in round 1 (spec 2026-11-05 §3.2.2, §11): at most this many items
+# hops, every status, each with its own budget; under MIN_TARGET_HOP_S none is made.
+MAX_TARGET_LOOKUPS = 4
+TARGET_ITEMS_LIMIT = 50
+TARGET_STATUSES = ("open", "in_progress", "blocked", "done", "closed")
+MIN_TARGET_HOP_S = 5.0
 # A model call is not started with less than this left in its stage; a model round is not
 # started with less than ROUND_FLOOR_S of gather left (the call plus one 20 s tool hop).
 MIN_MODEL_CALL_S = 10.0
@@ -287,6 +296,7 @@ class RetryOnceLambda:
     def __init__(self, client, *, deadline, clock, trace, client_factory=None):
         self._client, self._deadline, self._clock, self._trace = client, deadline, clock, trace
         self._factory = client_factory
+        self._lock = threading.Lock()       # round 1's target hops share this wrapper
 
     def _attempt(self, kwargs):
         left = self._deadline - self._clock()
@@ -313,7 +323,8 @@ class RetryOnceLambda:
         except Exception as exc:                            # noqa: BLE001
             if not retryable(exc) or self._deadline - self._clock() < MIN_RETRY_S:
                 raise
-            self._trace["rag_retries"] = self._trace.get("rag_retries", 0) + 1
+            with self._lock:
+                self._trace["rag_retries"] = self._trace.get("rag_retries", 0) + 1
             logger.info("action agent rag-search retry (%s)", type(exc).__name__)
             return self._attempt(kwargs)
 
@@ -454,6 +465,8 @@ class Run:
     web_trace: dict = field(default_factory=dict)
     last_served: Optional[str] = None
     stage: str = "start"
+    # Plan target id -> action_pack_targets.Resolution (round 1; spec 2026-11-05 §3.2.2).
+    resolution: dict = field(default_factory=dict)
 
     def failure_trace(self):
         """Counts only (action_pack_view.fail_trace_error's shape): what was spent and how
@@ -899,18 +912,95 @@ def _web(run, query_id, rnd):
     run.add(rnd, env)
 
 
+def _target_hop(run, target, budget):
+    """One items lookup for a planner target, run on a worker thread: EVERY status (a named
+    item that is already done must be found as itself, not as an open look-alike), its own
+    deadline, and a private RefAssigner -- the shared one is not thread-safe, so the refs are
+    re-assigned on the main thread (`_add_target_envelope`). Touches nothing on `run`."""
+    tctx = dataclasses.replace(run.tool_ctx, refs=ask_tools.RefAssigner(),
+                               deadline=run.ctx.clock() + budget)
+    args = {"status": list(TARGET_STATUSES), "limit": TARGET_ITEMS_LIMIT,
+            "site_id": run.ctx.site_id}
+    if target.get("task_no") is not None:
+        args["task_no"] = target["task_no"]
+    else:
+        args["query"] = target["phrase"]
+    return run.deps.items_run(args, tctx, call_id=f"target_{target['id']}")
+
+
+def _add_target_envelope(run, env):
+    """Main thread: the hop's items take their refs from the run's shared assigner (an item's
+    ref is keyed on its stable_id, so an item round 1 already read keeps its ref), then enter
+    the registry as round-1 evidence."""
+    if isinstance(env, dict):
+        for it in env.get("items") or []:
+            if isinstance(it, dict) and it.get("stable_id"):
+                it["ref"] = run.refs.assign("item", str(it["stable_id"]), "R")
+    _bump(run.trace, "tool_calls")
+    _bump(run.trace, "items_calls")
+    _bump(run.trace, "target_calls")
+    run.add(1, env)
+
+
+def resolve_targets(run, unlooked=()) -> dict:
+    """Plan target id -> Resolution over every item the run has read (each hop's results
+    plus round 1's items: run.items is their union). A target whose lookup was skipped for
+    time (`unlooked`) is `none` -- the open-only items cannot tell a done named item from an
+    open look-alike. Trace: ids and codes only."""
+    out = {}
+    for t in run.plan.targets if run.plan else []:
+        out[t["id"]] = (action_pack_targets.Resolution(action_pack_targets.NONE)
+                        if t["id"] in unlooked
+                        else action_pack_targets.resolve(t, run.items))
+    run.resolution = out
+    run.trace["target_resolution"] = {
+        tid: (r.stable_id.lower() if r.kind == action_pack_targets.RESOLVED else r.kind)
+        for tid, r in out.items()}
+    return out
+
+
 def round1(run):
     plan, ctx = run.plan, run.ctx
     site = ctx.site_id
-    days = [{"name": "day_overview",
-             "args": {"date_from": a.isoformat(), "date_to": b.isoformat(), "site": site}}
-            for a, b in day_windows(plan.date_from, plan.date_to)]
-    _execute(run, days, 1)
-    _items(run, {"limit": ROUND1_ITEMS_LIMIT}, 1, "items1")
-    if plan.document_queries and run.deps.docs_on():
-        _execute(run, [{"name": ask_tools.DOC_TOOL, "args": {"query": q, "site": site}}
-                       for q in plan.document_queries], 1)
+    # Named targets (spec 2026-11-05 §3.2.2, §11): up to MAX_TARGET_LOOKUPS items hops,
+    # concurrent with each other and with round 1's own calls (wall cost: one hop). Each
+    # gets min(MAX_DEADLINE_S, gather left - ROUND_FLOOR_S); under MIN_TARGET_HOP_S none
+    # runs and those targets are `none`.
+    hop_targets = list(plan.targets[:MAX_TARGET_LOOKUPS])
+    if len(plan.targets) > len(hop_targets):
+        run.trace["target_lookups_capped"] = len(plan.targets) - len(hop_targets)
+    unlooked = set()
+    budget = min(float(ask_items.MAX_DEADLINE_S), ctx.left("gather") - ROUND_FLOOR_S)
+    if hop_targets and budget < MIN_TARGET_HOP_S:
+        unlooked = {t["id"] for t in hop_targets}
+        _bump(run.trace, "target_resolve_time", len(hop_targets))
+        hop_targets = []
+    futures = []
+    pool = ThreadPoolExecutor(max_workers=len(hop_targets)) if hop_targets else None
+    try:
+        futures = [pool.submit(_target_hop, run, t, budget) for t in hop_targets]
+        days = [{"name": "day_overview",
+                 "args": {"date_from": a.isoformat(), "date_to": b.isoformat(), "site": site}}
+                for a, b in day_windows(plan.date_from, plan.date_to)]
+        _execute(run, days, 1)
+        _items(run, {"limit": ROUND1_ITEMS_LIMIT}, 1, "items1")
+        if plan.document_queries and run.deps.docs_on():
+            _execute(run, [{"name": ask_tools.DOC_TOOL, "args": {"query": q, "site": site}}
+                           for q in plan.document_queries], 1)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+    # Whether round 1 failed is judged on its own calls, as before the target hops.
     envs = [env for rnd, env in run.envelopes if rnd == 1]
+    for t, fut in zip(hop_targets, futures):
+        try:
+            env = fut.result()
+        except Exception as exc:                            # noqa: BLE001 -- a fake/bug
+            logger.warning("action agent target hop failed: %s", type(exc).__name__)
+            env = {"tool": ask_items.TOOL_NAME, "id": f"target_{t['id']}", "items": [],
+                   "meta": {"error": "upstream"}}
+        _add_target_envelope(run, env)
+    resolve_targets(run, unlooked)
     if envs and all((env.get("meta") or {}).get("error") for env in envs):
         raise agent.ToolsFailure("every round-1 tool failed")
 
