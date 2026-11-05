@@ -1,0 +1,303 @@
+"""Which place an inspector named, written one way (Track L, Task 2).
+
+Track L groups a day's topics and photos under the places he says out loud.
+The same floor comes back as "Level one", "L1", "first floor" or "一楼", and a
+group keyed on the raw words would split one floor into four. This module
+decides, in code and the same way every time, what place a phrase names; later
+tasks key their groups on `place_key`.
+
+Rules that carry the design:
+- A place is built from parts: a level, a block (block/wing/stair/core), a zone
+  (zone/area/grid), a room or unit, and qualifiers. The parts are written in a
+  fixed order (Block, Level, Zone, Area, Grid, Stair, Core, Room, then other
+  words, then compass words), so "level two, zone four" and "zone four, level
+  two" are one place: "Level 2 Zone 4".
+- A qualifier is a narrower place, not a spelling. "Level 1 east", "Level 2
+  slab" and "Level 2 corridor" are each their own group, apart from "Level 1".
+  So every word left over after the parts are read is kept, in the order he
+  said it, except a short list of filler words ("the", "on", "now"). That can
+  split one place over a stray word; the opposite choice -- dropping unknown
+  words -- would silently merge "Level 2 kitchen" into "Level 2", and a merge
+  nobody sees is worse than a split somebody can alias away.
+- Ground is level 0 ("ground floor" == "Level 0"), as in
+  photo_binding._place_words. "first floor" is Level 1. A basement is below
+  ground: "basement" is "Basement" (one level down), "basement two" is
+  "Basement 2"; "Level -1" and "level minus one" are "Basement" too.
+- Rooms and units are read by units.normalize_unit ("Unit two", "U2",
+  "unit-2" -> "Unit 2"), which belongs to multi-unit walks and is not changed
+  here. What it lacks is added around it: "rm", dotted codes ("1.01" is room
+  101) and lettered codes ("G02"), which it would misread ("Room 1") or miss.
+- Anything with no part -- a farm or site name, a landmark, "inside", a bare
+  "level" -- is kind "other", valued as content_hash.normalize gives it. It is
+  never guessed into a level.
+
+`kind` of a multi-part place is its most specific part: room, then zone, then
+block, then level. `value` of a structured place is its label casefolded; the
+key is "kind:value", so an "other" can never collide with a structured place.
+
+Pure: no database, no network.
+"""
+import re
+import unicodedata
+
+from content_hash import normalize as _casefold_collapse
+from units import PREFIXES, normalize_unit
+
+_TOKEN = re.compile(r"[一-鿿]+|[a-z0-9]+(?:\.[a-z0-9]+)*")
+
+_LEVEL_WORDS = ("level", "lvl", "l", "floor", "storey", "story")
+_FLOOR_NOUNS = ("floor", "level", "storey", "story")        # "first floor", "ground level"
+_ROOM_PREFIXES = PREFIXES + ("rm",)          # normalize_unit's prefixes, plus "rm"
+_ROOM_TITLE = {"u": "Unit", "rm": "Room"}
+# word -> (slot, title). Zone-like and block-like parts take a code after them.
+_CODED = {"zone": ("zone", "Zone"), "area": ("area", "Area"), "grid": ("grid", "Grid"),
+          "gridline": ("grid", "Grid"), "block": ("block", "Block"), "wing": ("wing", "Wing"),
+          "core": ("core", "Core")}
+_STAIR = ("stair", "stairs", "stairwell", "staircase")
+_SLOTS = ("block", "wing", "level", "zone", "area", "grid", "stair", "core", "room")
+_KIND_BY_SLOT = (("room", "room"), ("zone", "zone"), ("area", "zone"), ("grid", "zone"),
+                 ("block", "block"), ("wing", "block"), ("stair", "block"), ("core", "block"),
+                 ("level", "level"))
+_COMPASS = ("north", "south", "east", "west", "northeast", "northwest", "southeast",
+            "southwest")
+_FILLER = frozenset(("the", "a", "an", "on", "in", "at", "of", "to", "now", "here", "this",
+                     "is", "we", "re", "are", "i", "m", "just", "so", "um", "uh", "okay",
+                     "ok", "and", "near", "by", "next", "beside", "around"))
+_MINUS = re.compile(r"(?<![a-z0-9])-(?=\d)", re.I)            # "Level -1", not "unit-2"
+_SPLIT = re.compile(r"([a-z]+)(\d[a-z0-9.]*)")              # "l1", "u2", "rm101", "lvl2"
+
+_ONES = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+         "seven": 7, "eight": 8, "nine": 9}
+_TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+          "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50}
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+             "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
+             "twelfth": 12}
+_ORDINAL_DIGITS = re.compile(r"(\d+)(?:st|nd|rd|th)")
+# Words normalize_unit reads as part of a room number ("room one oh two").
+_ROOM_NUMBER_WORDS = frozenset(_ONES) | frozenset(_TEENS) | frozenset(_TENS) | {
+    "sixty", "seventy", "eighty", "ninety", "hundred", "oh", "o"}
+
+_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
+              "八": 8, "九": 9}
+_CN_LEVEL = re.compile(r"([一二两三四五六七八九十]+|\d+)\s*[楼层樓層]")
+
+
+def _cn_number(s):
+    """一..九十九 as an int ("十一" = 11, "二十" = 20), or None."""
+    if s.isdigit():
+        return int(s)
+    if "十" not in s:
+        return _CN_DIGITS.get(s) if len(s) == 1 else None
+    tens, _, ones = s.partition("十")
+    if len(tens) > 1 or len(ones) > 1:
+        return None
+    t = _CN_DIGITS.get(tens, 1 if not tens else None)
+    o = _CN_DIGITS.get(ones, 0 if not ones else None)
+    return None if t is None or o is None else t * 10 + o
+
+
+def _cn_levels(text):
+    """"二楼" -> " level 2 ": a Chinese floor is read by the same level rule."""
+    def sub(m):
+        n = _cn_number(m.group(1))
+        return m.group(0) if n is None else f" level {n} "
+    return _CN_LEVEL.sub(sub, text)
+
+
+def _tokens(text):
+    out = []
+    text = _MINUS.sub(" minus ", _cn_levels(unicodedata.normalize("NFC", text)))
+    for t in _TOKEN.findall(text.casefold()):
+        m = _SPLIT.fullmatch(t)
+        if m and (m.group(1) in _LEVEL_WORDS or m.group(1) in _ROOM_PREFIXES):
+            out.extend(m.groups())
+        else:
+            out.append(t)
+    return out
+
+
+def _number(tok, i, ordinal=False):
+    """(n, next index) for the number at tok[i] -- digits, or words up to
+    fifty-nine; with `ordinal`, "first"/"2nd" too -- or None."""
+    w = tok[i] if i < len(tok) else ""
+    if w.isdigit():
+        return int(w), i + 1
+    if ordinal:
+        m = _ORDINAL_DIGITS.fullmatch(w)
+        if m:
+            return int(m.group(1)), i + 1
+        if w in _ORDINALS:
+            return _ORDINALS[w], i + 1
+    if w in _ONES:
+        return _ONES[w], i + 1
+    if w in _TEENS:
+        return _TEENS[w], i + 1
+    if w in _TENS:
+        nxt = tok[i + 1] if i + 1 < len(tok) else ""
+        if nxt in _ONES and _ONES[nxt]:
+            return _TENS[w] + _ONES[nxt], i + 2
+        return _TENS[w], i + 1
+    return None
+
+
+def _code(tok, i):
+    """(code, next index) for the code after "zone"/"block"/"grid": a letter,
+    a number, or a letter-number code ("C4"), written in capitals -- or None."""
+    w = tok[i] if i < len(tok) else ""
+    if w.isascii() and w.replace(".", "").isalnum() and (len(w) == 1 or any(c.isdigit() for c in w)):
+        return w.upper(), i + 1
+    got = _number(tok, i)
+    return (str(got[0]), got[1]) if got else None
+
+
+def _level(tok, i):
+    """(level number, next index) for a level starting at tok[i], or None.
+    Basements are negative."""
+    w = tok[i]
+    if w in _LEVEL_WORDS:
+        nxt = tok[i + 1] if i + 1 < len(tok) else ""
+        if nxt in ("ground", "g"):
+            return 0, i + 2
+        if nxt == "minus":
+            got = _number(tok, i + 2)
+            return (-got[0], got[1]) if got and got[0] > 0 else None
+        return _number(tok, i + 1, ordinal=True)
+    if w == "basement":
+        j = i + 2 if i + 1 < len(tok) and tok[i + 1] in _FLOOR_NOUNS else i + 1
+        got = _number(tok, j)
+        return (-got[0], got[1]) if got and got[0] > 0 else (-1, i + 1)
+    nxt = tok[i + 1] if i + 1 < len(tok) else ""
+    if nxt in _FLOOR_NOUNS:
+        if w == "ground":
+            return 0, i + 2
+        got = _number(tok, i, ordinal=True)
+        if got and got[1] == i + 1:
+            return got[0], i + 2
+    return None
+
+
+def _room(tok, i):
+    """(label, next index) for a room/unit at tok[i], or None. Dotted and
+    lettered codes are read here; plain numbers go to normalize_unit."""
+    p = tok[i]
+    if p not in _ROOM_PREFIXES or i + 1 >= len(tok):
+        return None
+    code = tok[i + 1]
+    title = _ROOM_TITLE.get(p, p.title())
+    if code.isascii() and ("." in code or re.fullmatch(r"[a-z]+\d+", code)):
+        if not any(c.isdigit() for c in code):
+            return None
+        return f"{title} {code.replace('.', '').upper()}", i + 2
+    j = i + 1
+    if not code[:1].isdigit():
+        while j < len(tok) and tok[j] in _ROOM_NUMBER_WORDS:
+            j += 1
+        if j < len(tok) and tok[j - 1] == "hundred" and tok[j] == "and":
+            j += 1
+            while j < len(tok) and tok[j] in _ROOM_NUMBER_WORDS:
+                j += 1
+    else:
+        j += 1
+    label = normalize_unit(" ".join(["room" if p == "rm" else p] + tok[i + 1:j]))
+    return (label, j) if label else None
+
+
+def _parts(tok):
+    """({slot: label piece}, qualifier words, compass words) read from tokens."""
+    slots, words, compass = {}, [], []
+    i = 0
+    while i < len(tok):
+        w = tok[i]
+        lvl = _level(tok, i)
+        if lvl is not None:
+            n, i = lvl
+            label = "Level %d" % n if n >= 0 else ("Basement" if n == -1 else "Basement %d" % -n)
+            slots.setdefault("level", label)
+            continue
+        room = _room(tok, i)
+        if room:
+            slots.setdefault("room", room[0])
+            i = room[1]
+            continue
+        if w in _STAIR:
+            j = i + 1
+            label = "Stair"
+            if j < len(tok) and tok[j] == "core":
+                label, j = "Stair core", j + 1
+            else:
+                got = _code(tok, j)
+                if got:
+                    label, j = f"Stair {got[0]}", got[1]
+            slots.setdefault("stair", label)
+            i = j
+            continue
+        if w in _CODED:
+            j = i + 2 if w == "grid" and i + 1 < len(tok) and tok[i + 1] == "line" else i + 1
+            got = _code(tok, j)
+            if got:
+                slot, title = _CODED[w]
+                slots.setdefault(slot, f"{title} {got[0]}")
+                i = got[1]
+                continue
+        if w in _COMPASS:
+            compass.append(w)
+        elif w not in _FILLER:
+            words.append(w)
+        i += 1
+    return slots, words, compass
+
+
+def _require_text(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("a place needs some text")
+
+
+def normalise(text):
+    """{"kind", "value", "label", "raw"} for one spoken place.
+
+    kind is "level" | "room" | "zone" | "block" | "other". Raises ValueError on
+    None or blank text: no words is not a place, and an empty group key would
+    gather everything nobody placed."""
+    _require_text(text)
+    slots, words, compass = _parts(_tokens(text))
+    if not slots:
+        value = _casefold_collapse(text)
+        return {"kind": "other", "value": value, "label": " ".join(text.split()), "raw": text}
+    label = " ".join([slots[s] for s in _SLOTS if s in slots] + words + compass)
+    kind = next(k for s, k in _KIND_BY_SLOT if s in slots)
+    return {"kind": kind, "value": label.casefold(), "label": label, "raw": text}
+
+
+def _strip_prefix(s):
+    s = s.strip()
+    return s[len("place:"):] if s.casefold().startswith("place:") else s
+
+
+def _resolve(text, aliases):
+    """The place text an alias pins `text` to, or `text` itself. One hop: an
+    alias's right-hand side is not looked up again, so a loop cannot form."""
+    _require_text(text)
+    if not aliases:
+        return text
+    table = {_casefold_collapse(_strip_prefix(k)): _strip_prefix(v)
+             for k, v in aliases.items() if isinstance(k, str) and isinstance(v, str)}
+    return table.get(_casefold_collapse(_strip_prefix(text))) or text
+
+
+def place_key(text, aliases=None):
+    """The key groups are keyed on: "kind:value".
+
+    `aliases` is a plain dict the caller builds from name_aliases rows with
+    kind='other' whose wrong_term/right_term carry a "place:" prefix, e.g.
+    {"the new block": "Block C"} (a "place:" prefix on either side is
+    tolerated). Keys are matched casefolded and whitespace-collapsed; the
+    right-hand side is then normalised like any spoken place."""
+    got = normalise(_resolve(text, aliases))
+    return f"{got['kind']}:{got['value']}"
+
+
+def same_place(a, b, aliases=None):
+    """True when two spoken places are one group."""
+    return place_key(a, aliases) == place_key(b, aliases)
