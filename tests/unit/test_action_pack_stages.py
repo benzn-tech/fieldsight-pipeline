@@ -1098,3 +1098,59 @@ def test_a_failing_target_hop_does_not_fail_round_1():
     trace = payload["run_trace"]
     assert trace["tool_errors"] >= 2
     assert trace["target_resolution"]["t1"] == SID2       # round 1's own items
+
+
+# ---- PR-3 Task 3.4: the named targets in the write render --------------------------------
+
+def _write_prompt(model):
+    return next(c["prompt"] for c in model.calls if c["caller"] == "action_write")
+
+
+def test_write_prompt_lists_named_targets():
+    class Pool(Tools):
+        """Round 1's items plus a done item and two scaffold look-alikes."""
+
+        def items_run(self, args, tctx, call_id="items"):
+            env = super().items_run(args, tctx, call_id)
+            extra = [("44444444-5555-4666-8777-88888888888a", 7, "Seal the level 3 windows",
+                      "done"),
+                     ("44444444-5555-4666-8777-88888888888b", 8, "Check north scaffold",
+                      "open"),
+                     ("44444444-5555-4666-8777-88888888888c", 9,
+                      "Fix north scaffold tie", "blocked")]
+            for sid, no, text, status in extra:
+                row = {f: None for f in ask_items.ITEM_FIELDS}
+                row.update(stable_id=sid, task_no=no, text=text, status=status)
+                env["items"].append({"ref": tctx.refs.assign("item", sid, "R"),
+                                     "kind": "item", "provenance": "records", **row})
+            return env
+
+    targets = [{"id": "t1", "task_no": 2, "phrase": None},
+               {"id": "t2", "task_no": None, "phrase": "north scaffold"},
+               {"id": "t3", "task_no": None, "phrase": "seal level 3 windows"},
+               {"id": "t4", "task_no": 404, "phrase": None}]
+    model = Model(plan=[plan_obj(targets=targets)])
+    ctx = make_ctx()
+    st.run(ctx, deps(model=model, tools=Pool()))
+    prompt = _write_prompt(model)
+    refs = {}
+    for line in prompt.splitlines():
+        if " | item | stable_id " in line:
+            ref, _, sid = line.split(" | ")[:3]
+            refs[sid.split()[-1]] = ref
+    block = ("Named targets (the items the instruction names, matched in code):\n"
+             f"t1: {refs[SID2]} (open)\n"
+             f"t2: AMBIGUOUS — {refs['44444444-5555-4666-8777-88888888888b']}, "
+             f"{refs['44444444-5555-4666-8777-88888888888c']}: write a note, change neither\n"
+             f"t3: {refs['44444444-5555-4666-8777-88888888888a']} (done) — already done\n"
+             "t4: NOT FOUND — write a note\n")
+    assert block in prompt
+    assert "north scaffold" not in prompt.split("Named targets")[1].split("Instruction")[0]
+
+
+def test_write_prompt_without_targets_is_unchanged():
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    prompt = _write_prompt(model)
+    assert "Named targets" not in prompt
+    assert "Write in this language: en\n\nInstruction from the user" in prompt
