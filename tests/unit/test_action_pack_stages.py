@@ -203,6 +203,7 @@ def deps(model=None, tools=None, web=None, fetcher=None, verify=None, docs=True,
 def _env(monkeypatch):
     monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
     monkeypatch.delenv("ACTION_TOKEN_CAP", raising=False)
+    monkeypatch.delenv("ACTION_MAX_ROUNDS", raising=False)
 
 
 # ---- happy path / payload ------------------------------------------------------------
@@ -1154,3 +1155,20 @@ def test_write_prompt_without_targets_is_unchanged():
     prompt = _write_prompt(model)
     assert "Named targets" not in prompt
     assert "Write in this language: en\n\nInstruction from the user" in prompt
+
+
+# ---- PR-3 Task 3.5: ACTION_MAX_ROUNDS --------------------------------------------------
+
+@pytest.mark.parametrize("knob,model_rounds", [("2", 1), ("1", 0), ("4", 3), ("99", 7)])
+def test_model_rounds_honours_knob(monkeypatch, knob, model_rounds):
+    monkeypatch.setenv("ACTION_MAX_ROUNDS", knob)
+    # Every round asks for a fresh call and is never done, so only the cap stops it.
+    rounds = [{"calls": [{"tool": "search_records", "args": {"query": f"q{i}"}}],
+               "done": False} for i in range(20)]
+    model = Model(rounds=rounds)
+    payload = st.run(make_ctx(), deps(model=model))
+    made = [c for c in model.calls if c["caller"] == "action_round"]
+    assert len(made) == model_rounds
+    assert payload["run_trace"]["rounds"] == model_rounds + 1
+    for i, call in enumerate(made):                 # the prompt counts down to the knob
+        assert f"{model_rounds - i - 1} rounds remain after this one" in call["prompt"]

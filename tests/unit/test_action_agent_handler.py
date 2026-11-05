@@ -544,7 +544,8 @@ def test_an_unbuilt_verifier_fails_internal(env, monkeypatch):
 
 def test_model_settings_fall_back_to_the_existing_ask_settings(monkeypatch):
     for k in ("ACTION_WRITER_MODEL", "ACTION_VERIFIER_MODEL", "ACTION_VERIFIER_FALLBACKS",
-              "ACTION_TOKEN_CAP", "ASK_JUDGE_MODEL", "CORROBORATION_CHEAP_MODEL"):
+              "ACTION_TOKEN_CAP", "ACTION_MAX_ROUNDS", "ASK_JUDGE_MODEL",
+              "CORROBORATION_CHEAP_MODEL"):
         monkeypatch.delenv(k, raising=False)
     import llm_tools_client
     import web_answer
@@ -552,6 +553,7 @@ def test_model_settings_fall_back_to_the_existing_ask_settings(monkeypatch):
     assert agent.verifier_model() == web_answer.CHEAP_MODEL
     assert agent.verifier_fallbacks() == []
     assert agent.token_cap() == agent.DEFAULT_TOKEN_CAP
+    assert agent.max_rounds() == agent.DEFAULT_MAX_ROUNDS
     monkeypatch.setenv("ASK_JUDGE_MODEL", "judge/x")
     assert agent.writer_model() == "judge/x"
     monkeypatch.setenv("ACTION_WRITER_MODEL", "w/x")
@@ -662,3 +664,17 @@ def test_verifier_hide_default_on(monkeypatch):
     for raw in ("off", " OFF ", "Off"):
         monkeypatch.setenv("ACTION_VERIFIER_HIDE_UNSUPPORTED", raw)
         assert agent.verifier_hide_unsupported() is False
+
+
+# ---- PR-3 Task 3.5: ACTION_MAX_ROUNDS --------------------------------------------------
+
+@pytest.mark.parametrize("raw,want", [(None, 8), ("", 8), ("8", 8), ("3", 3), ("1", 1),
+                                      ("0", 1), ("-2", 1), ("99", 8), ("x", 8),
+                                      (" 5 ", 5), ("2.5", 8)])
+def test_max_rounds_clamps(monkeypatch, raw, want):
+    if raw is None:
+        monkeypatch.delenv("ACTION_MAX_ROUNDS", raising=False)
+    else:
+        monkeypatch.setenv("ACTION_MAX_ROUNDS", raw)
+    assert agent.max_rounds() == want
+    assert agent.DEFAULT_MAX_ROUNDS == 8

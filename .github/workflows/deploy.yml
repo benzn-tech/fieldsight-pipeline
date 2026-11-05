@@ -225,6 +225,10 @@ jobs:
           if [ -n "${{ vars.TEST_ACTION_VERIFIER_HIDE_UNSUPPORTED }}" ]; then
             ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM="ActionVerifierHideUnsupported=${{ vars.TEST_ACTION_VERIFIER_HIDE_UNSUPPORTED }}"
           fi
+          ACTION_MAX_ROUNDS_PARAM=""
+          if [ -n "${{ vars.TEST_ACTION_MAX_ROUNDS }}" ]; then
+            ACTION_MAX_ROUNDS_PARAM="ActionMaxRounds=${{ vars.TEST_ACTION_MAX_ROUNDS }}"
+          fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
@@ -358,6 +362,7 @@ jobs:
               $ACTION_WRITER_PROVIDER_PARAM \
               $ACTION_WRITER_FALLBACKS_PARAM \
               $ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM \
+              $ACTION_MAX_ROUNDS_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

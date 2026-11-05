@@ -188,6 +188,20 @@ def token_cap() -> int:
     return value if value > 0 else DEFAULT_TOKEN_CAP
 
 
+# Gather rounds per run, round 1 included (spec 2026-11-05 §11: the latency knob). The
+# stages' MAX_ROUNDS (8) stays the ceiling; ACTION_MAX_ROUNDS can only lower it.
+DEFAULT_MAX_ROUNDS = 8
+
+
+def max_rounds() -> int:
+    """ACTION_MAX_ROUNDS clamped to 1..DEFAULT_MAX_ROUNDS; unset or not an int -> 8."""
+    try:
+        value = int((os.environ.get("ACTION_MAX_ROUNDS") or "").strip())
+    except ValueError:
+        return DEFAULT_MAX_ROUNDS
+    return max(1, min(DEFAULT_MAX_ROUNDS, value))
+
+
 # ---- the run context ----------------------------------------------------------------------
 
 @dataclass

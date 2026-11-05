@@ -23,6 +23,7 @@ from tests.unit.test_action_pack_stages import (SITE, TODAY, WRITER, Model, Tool
 def _env(monkeypatch):
     monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
     monkeypatch.delenv("ACTION_TOKEN_CAP", raising=False)
+    monkeypatch.delenv("ACTION_MAX_ROUNDS", raising=False)
 
 
 class ValidatingTools(Tools):

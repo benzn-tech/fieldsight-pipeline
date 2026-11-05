@@ -165,6 +165,8 @@ ACTION_MODEL_PARAMS = {
     "ActionVerifierFallbacks": ("ACTION_VERIFIER_FALLBACKS",
                                 "claude-sonnet-5-5,google/gemini-3.8-flash"),
     "ActionVerifierHideUnsupported": ("ACTION_VERIFIER_HIDE_UNSUPPORTED", "on"),
+    # PR-3 (spec 2026-11-05 §11): gather rounds, the latency knob.
+    "ActionMaxRounds": ("ACTION_MAX_ROUNDS", "8"),
 }
 
 
@@ -183,6 +185,7 @@ def test_action_template_defaults(tpl):
         p = tpl["Parameters"][param]
         assert p["Type"] == "String" and p["Default"] == default, param
     assert tpl["Parameters"]["ActionVerifierHideUnsupported"]["AllowedValues"] == ["on", "off"]
+    assert tpl["Parameters"]["ActionMaxRounds"]["AllowedPattern"] == "^[1-8]$"
     import llm_tools_client
     for m in ("claude-opus-5-5", "claude-sonnet-5-5"):
         assert llm_tools_client.is_claude(m) and "/" not in m

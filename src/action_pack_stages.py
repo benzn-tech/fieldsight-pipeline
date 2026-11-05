@@ -1220,7 +1220,8 @@ def validate_round(obj, run):
 def model_rounds(run):
     ctx, plan = run.ctx, run.plan
     made, rnd = [], 1
-    while rnd < MAX_ROUNDS:
+    limit = min(MAX_ROUNDS, agent.max_rounds())     # ACTION_MAX_ROUNDS; MAX_ROUNDS = ceiling
+    while rnd < limit:
         if run.over_cap():
             run.truncate("tokens")
             break
@@ -1235,7 +1236,7 @@ def model_rounds(run):
             document_queries=json.dumps(plan.document_queries, ensure_ascii=False),
             instruction=str((ctx.pack or {}).get("instruction") or "").replace("```", "'''"),
             catalog=_tool_catalog(run), max_calls=MAX_CALLS_PER_ROUND,
-            rounds_left=MAX_ROUNDS - rnd - 1, web=WEB_TOOL,
+            rounds_left=limit - rnd - 1, web=WEB_TOOL,
             made="\n".join(made) or "(only the first round's overview, items and documents)",
             evidence=gather_render(run))
         try:
