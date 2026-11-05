@@ -1,8 +1,10 @@
 # Site decision loop: site events run themselves, only decisions reach a person
 
-Status: design, rev 2 (2026-11-05). Architecture research. Not built, no flag, no migration yet.
+Status: design, rev 3 (2026-11-05). Architecture research. Not built, no flag, no migration yet.
 Rev 2 folds in a Fable builder check (§15): six grounding corrections and seven builder
 questions, answered as my calls where the owner had not ruled.
+Rev 3 compares the design with the author's open-sourced code (§16,
+github.com/KKKKhazix/agent-autoloop, MIT) and adopts what fits a multi-tenant product.
 Source: owner conversation 2026-11-03..05 after reading 卡兹克's "Agent 自动化系统" article (2026-11-02).
 Diagram (owner-reviewed): `2026-11-05-site-decision-loop/diagram.html` and `diagram.pdf` in this repo (live copy: https://claude.ai/artifact/TKCKhHFSduQuU3HWdz4Hif). Chinese version: `2026-11-05-site-decision-loop/design-zh.pdf`.
 (tabs: overview / full product flow / dev flow). The product-flow tab is the picture of this document.
@@ -96,6 +98,12 @@ Every source writes the same short record (the article's "very short message"):
 | `link` | back to the source screen |
 | `chain_id`, `chain_depth` | a decision event inherits the chain of the card that caused it (§4.7) |
 
+**Events carry data, never instructions** (borrowed, §16). Unknown fields are rejected at the
+hub. `summary` and any free text (transcript quotes, feedback) never enter a model prompt as
+instructions; prompts get only validated fields (`type`, ids, links) and evidence spans
+fenced as quoted data. Transcripts are outside text, so this matters more for us than for
+the author.
+
 **Scheduled scans are a source.** "Overdue to-do", "inspection due", "device silent for N
 hours" do not happen by themselves; a timer scan emits them (the article's 定时 source).
 
@@ -128,9 +136,15 @@ hours" do not happen by themselves; a timer scan emits them (the article's 定�
      category (§6.2) skips the pool and goes straight to a person.
 5. **Urgency** (§7). 6. **Queue** (urgent work bypasses per-day caps and budget pauses).
 7. **Dispatch** to the handler.
-8. **Results.** Every handler returns success or failure (including timeout). Failure:
-   back off and redispatch; on the 3rd failure, fault card to company admin + ops. Success
-   without a person needed: close.
+8. **Results.** Every handler returns one of: success, nothing to do, failure, or (lease
+   expired without an answer) unknown. Failure and unknown: back off and redispatch, waiting
+   5 min doubling to a 1 h cap (the author's numbers). Two separate thresholds (my call):
+   **notify** (fault card to company admin + ops) on the 3rd failure, **stop retrying** on the
+   5th. The author stops at 10; we stop earlier because each attempt can spend model calls
+   (§8). While a run waits to retry, **new events for the same subject are merged into it**
+   instead of starting another run (borrowed: this is what stops a re-extracted checklist
+   gap from producing a second card). Success without a person needed, or nothing to do:
+   close.
 
 ### 4.3 Handlers and the model-call layer
 
@@ -157,8 +171,14 @@ In order:
    of bad output while hiding 15 % of good; pick per handler from measurement, not by name.
 3. **Project isolation:** the output references only this company's and this project's
    records. Failure **blocks**, alerts ops, no retry, no publish.
-4. **Gate: does a person need to decide?** Yes when the next step is in the ask-first list
-   (§6.2), or the handler needs a choice or a fact it cannot infer (§6.1). Yes → card. No →
+4. **Gate: does a person need to decide?** Two sources, combined:
+   - the **handler declares** it in its result (a choice or a fact it cannot infer, §6.1);
+   - the **hub re-checks** every proposed next step against the ask-first list (§6.2), in
+     code, whatever the handler said.
+
+   Yes from either → card. In the shadow phase the two are counted separately. This gate is
+   our addition: the author's kernel has none and relies on the ask-first list written into
+   the agent's prompt (§16), and a prompt instruction is not proof of compliance. No →
 5. **Publish internally** (report, to-do, timeline). Outward sends never happen here.
 6. **Verify after publish:** the item is actually there / the email actually left. One
    resend, then failure.
@@ -170,12 +190,19 @@ In order:
    do not re-send.
 3. **Route** to people who have authority for this project and this kind of decision
    (§6.4), by urgency, through their channels (app, email, Teams, device voice).
-4. **Delivery check;** undelivered → next channel.
+4. **Delivery check;** undelivered → retry at 0/1/3/7/15/25/35/45/55 min (the author's
+   schedule), then the next channel; the card stays open throughout. Each delivered message
+   carries the card's version, so an update edits the original message instead of sending a
+   new one. The idempotency key for a send is the card id + version.
 5. **Deadline:** before it, one reminder, then escalate to the delegate. At the deadline with
    no answer → the card kind's conservative default (§6.2), and a ledger row "timed out".
-6. **Authority check on the answer:** "has authority to decide for this project?" (owner
-   ruling: not "is it the PM"; delegation while on leave must work). No → not counted, the
-   person is told.
+6. **Answer checks**, all required:
+   - the answer refers to the message actually delivered (card id + version);
+   - **only the first valid answer counts**; later answers are told it is already decided;
+   - the person is signed in (no answer-by-link; the author's open link form suits one
+     user, not a company);
+   - "has authority to decide for this project?" (owner ruling: not "is it the PM";
+     delegation while on leave must work). No → not counted, and the person is told.
 7. **Ledger write** (append-only, §5.3) → a `decision.made` event → hub.
 
 ### 4.6 Records
@@ -185,8 +212,11 @@ outcome), cost ledger, check log, decision ledger.
 
 ### 4.7 Chain depth
 
-A decision event inherits `chain_id` and increments `chain_depth`. At depth 3 the hub records
-the event and stops asking, so two handlers cannot keep triggering each other.
+Events emitted by a handler inherit `chain_id` and increment `chain_depth`. At depth 3 the
+hub records the event and stops asking, so two handlers cannot keep triggering each other.
+**Open:** whether a person's answer adds a level. The author's answers do not (only
+agent-emitted events do; cap 8) and timer scans start at 0. Under that rule our cap of 3
+counts agent hops only.
 
 ### 4.8 Run identity (my call)
 
@@ -210,18 +240,26 @@ needs a `sub`, `patch_action_item` checks the caller's ACL, action packs run as
 ### 5.1 `site_events`
 `event_id`, `company_id`, `site_id`, `source`, `type`, `subject_ref`, `occurred_at`,
 `received_at`, `summary`, `link`, `chain_id`, `chain_depth`, `dedupe_key` (unique),
-`status` (`late`, `unmatched`, `queued`, `running`, `done`, `failed`, `blocked`), `rule_id`.
+`status` (`late`, `unmatched`, `queued`, `running`, `done`, `nothing`, `failed`, `blocked`), `rule_id`.
+`dedupe_key` is built from (company_id, source, source key); events the hub itself emits get
+a suffix so they can never collide with a source's own keys (borrowed).
 
 ### 5.2 `event_runs`
-`run_id`, `event_id`, `attempt`, `handler`, `started_at`, `ended_at`, `outcome`, `error`,
+`run_id`, `event_id`, `attempt`, `handler`, `claim_id`, `lease_until`, `started_at`, `ended_at`,
+`outcome` (`done`, `nothing`, `failed`, `unknown`, `cancelled`), `result_hash`, `error`,
 `tokens_in`, `tokens_out`, `cost_usd`, `model_calls`, `models` (per-call model names; action
-packs already record planner/writer/verifier ids, reuse that shape).
+packs already record planner/writer/verifier ids, reuse that shape). A result reported twice
+with the same `result_hash` gets the same acknowledgement; a different result for the same
+claim is rejected (borrowed: makes retries and lost responses safe).
 
 ### 5.3 `decision_cards` and `decision_ledger`
 - `decision_cards`: `card_id`, `event_id`, `company_id`, `site_id`, `kind`
   (`approve`, `choose`, `fact`, `fault`, `rule`), `question`, `consequence`, `options` (jsonb,
   one marked recommended), `evidence` (jsonb spans), `urgency`, `deadline_at`,
-  `timeout_default`, `recipients`, `status` (`open`, `answered`, `timed_out`, `superseded`).
+  `timeout_default`, `recipients`, `version`, `delivered_refs`,
+  `status` (`open`, `answered` → `done` once the follow-up action has run, `timed_out`,
+  `superseded`). Card key = (company_id, site_id, rule, subject_ref, purpose); dedupe applies
+  only while a card with that key is open.
 - `decision_ledger`: **append-only**, enforced by a trigger that rejects UPDATE and DELETE
   (the stack has a single DB role, see 0092/0093/0095 "No GRANT", so a grant cannot do it).
   `entry_id`, `company_id`, `site_id`, `card_id` (nullable: meeting decisions confirmed
@@ -306,7 +344,8 @@ shadow phase.
 
 Any brake that trips stops the work and sends one alert.
 1. Model calls per attempt: 8.
-2. Attempts per task: 3, with growing back-off (worst case 24 calls).
+2. Attempts per task: notify at 3, stop at 5, back-off 5 min doubling to 1 h (worst case 40
+   calls).
 3. Chain depth: 3.
 4. Per-company daily budget: warn at 80 %, pause non-urgent work at 100 %.
 5. Circuit breaker: a burst of the same error type pauses that handler, one alert.
@@ -340,7 +379,7 @@ only when the device is online.
 
 | Phase | What | Gate to move on |
 |---|---|---|
-| P0 shadow | hub + rules + ledger tables; two deterministic rules (checklist gap, overdue to-do), no model calls; cards written, **not sent**; owner reviews them on a shadow-review page | ≥50 shadow cards labelled by the owner: needs-a-person precision ≥80 %, fabricated evidence 0, cards/person/day ≤3 |
+| P0 shadow | hub + rules + ledger tables; two deterministic rules (checklist gap, overdue to-do), no model calls; cards written, **not sent**; owner reviews them on a shadow-review page | ≥50 shadow cards labelled by the owner: needs-a-person precision ≥80 % (handler-declared and hub-checked counted separately), fabricated evidence 0, cards/person/day ≤3. Engineering gate (borrowed): an independent replay judge over the event log, invariant checks (no card without an event, no answer counted twice, no cross-company row), and mutation testing where every planted fault is caught, run nightly |
 | P1 internal | cards sent to FieldSight staff on Test Project, via a **web card inbox + email** (no push or Teams yet) | same metrics hold for 2 weeks; timeout defaults and pm → admin escalation fire correctly |
 | P2 one customer | one pilot company, PM + foreman | PM-rated useful ≥70 %; no outward action without approval (audited) |
 | P3 | more rules (device, inspection due, weather), more roles | per rule |
@@ -373,6 +412,7 @@ is merged by the owner, so they gate P0's review and P1.
 - Action packs keep their own entry point in v1.
 
 **Open:**
+- Whether a person's answer adds a chain level (§4.7).
 - Channel order per role.
 - Quiet hours.
 
@@ -413,3 +453,61 @@ On question 5: the 2026-11-04 verifier figures come from the action-pack eval ru
 in the gitignored `action_pack_eval_runs/` and in the action-pack line's notes, not in the
 repo. A handler's verifier choice must be re-measured on that handler's own labelled set, not
 taken from those figures.
+
+## 16. Comparison with the author's code (rev 3, 2026-11-05)
+
+The article's system was open-sourced as github.com/KKKKhazix/agent-autoloop (MIT; commit
+ee74f43). It was read only, never run. It is single-user and single-machine (Node, SQLite),
+and its kernel never calls a model: it takes events, routes them, hands out work and keeps
+an append-only log.
+
+**Confirmed:**
+- The default ask-first list (`protocol/rules.ts`).
+- Dedupe by source + id.
+- Long-poll claiming.
+- Backoff and redispatch, with a notification on the 3rd failure.
+- An answer becomes a new event that resumes the same thread.
+- The append-only log is the only authority.
+- Separate tables for events, runs, cards and deliveries.
+
+**Where the article misled us:**
+
+| What we inferred | What the code does |
+|---|---|
+| A "needs a person?" gate in the hub | None. The agent decides, and the ask-first list is only text in its prompt (`worker/contract.ts`) |
+| 3 failures → hand to a person | Notify at 3, stop at 10 (`kernel/decide.ts` `MAX_ATTEMPTS`) |
+| Chain depth 3 | Cap 8, answers add no level (`MAX_HOPS`) |
+| Code review ≤3 rounds | One review per head commit |
+| Full checks in a fresh VM | Waits for the project's own CI |
+| Auto-merge | Disables GitHub auto-merge and merges itself after checking that head and main are unchanged |
+| "Decided / declined" files are a mechanism | A skill convention (`docs/decisions.md`, `docs/declined.md`); the kernel only passes the last 20 decided cards as context |
+| Unmatched events draft rules | Only the last 20 unmatched events are listed |
+
+**Adopted in rev 3:**
+- Merging same-subject events into a waiting retry (§4.2.8).
+- Run states `nothing` and `unknown`; `result_hash` idempotency (§5.2).
+- Hub-emitted key suffixes (§5.1).
+- Card version, delivered refs, open-only card keys and the delivery retry schedule (§4.5.4, §5.3).
+- The answer must match the delivered message, and only the first answer counts (§4.5.6).
+- Data-only events (§4.1).
+- Replay judge, invariants and mutation testing as the P0 engineering gate (§12).
+- Backoff numbers (§4.2.8).
+
+**Not adopted:**
+- Answer-by-link without sign-in, and per-channel answerer lists (a company needs per-project authority).
+- Spend shown but never enforced (we brake, §8; we borrow only its accounting of unreported runs).
+
+**Ours alone, so we must validate it ourselves:**
+- multi-tenancy;
+- the late-event check;
+- urgency with the injury override;
+- the hub's ask-first gate before publishing;
+- the deadline → remind → escalate → conservative-default path;
+- the authority test;
+- the trigger-enforced append-only ledger;
+- the five brakes;
+- the cross-vendor reviewer;
+- rule drafting from the unmatched pool;
+- the model-call layer;
+- the three card purposes;
+- infer-don't-ask.
