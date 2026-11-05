@@ -113,6 +113,8 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 
 ### Task 6: The generated (template) report places sections under locations
 
+> **Deferred 2026-11-06.** This regroups a customer's template sections under location headings, which changes their fixed layout, and as written it needs a prompt change plus a real-call A/B on TEST. Placing photos on the line that names their place already ships (owner, 2026-10-01). If it is built later, take each section's place from its `[covers:]` refs in code (`location_grouping`), not from a model-written `[at:]`; that needs no prompt change and no A/B. Revisit after the owner has seen Tasks 4–5 on TEST.
+
 **Files:**
 - Modify: `src/report_template.py` (`_covers_block` offers the topic's place beside each ref), `src/lambda_session_report.py` (`_place_photos` and section assembly honour a `[at: Level 1]` line the same way `[covers: t0]` is honoured)
 - Test: extend `tests/unit/test_session_report_covers*.py` (whatever #925 named them) with the location variant
