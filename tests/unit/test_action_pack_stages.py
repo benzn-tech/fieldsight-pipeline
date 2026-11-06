@@ -579,7 +579,7 @@ def test_write_schema_violations_are_dropped_and_counted():
     assert dropped == {
         "conclusion__downgraded": 1, "conclusion__confidence": 1, "conclusion__refs": 1,
         "close_item__targets": 2, "close_item__proposed": 1,
-        "extra_key__update_item": 1, "update_item__proposed": 2, "unknown__type": 1,
+        "update_item__proposed": 2, "unknown__type": 1,
         "create_item__no_refs": 2, "create_item__refs": 1, "draft_email__proposed": 1,
         "note__refs": 1}
     assert action_pack_view.payload_shape_error(payload) is None
@@ -1538,9 +1538,26 @@ def test_write_dropped_counts_shaped():
                                     {"type": "x" * 300, "refs": ["R1"]}]}
     st.validate_draft(obj, run, {"R1"})
     wd = run.trace["write_dropped"]
+    assert wd["note__text_too_long"] == 1 and wd["unknown__type"] == 1
+    assert sum(wd[f"{t}__no_refs"] for t in st.ACTION_TYPES) == len(st.ACTION_TYPES)
     assert all(k.split("__")[0] in st.ACTION_TYPES + ("unknown", "conclusion", "extra_key")
                for k in wd)
     assert action_pack_view.fail_trace_error({"write_dropped": wd}) is None
+
+
+def test_removed_keys_count_only_on_kept_actions_and_foreign_fields_apart():
+    run = _vrun()
+    obj = {"conclusion": [{"text": "c", "refs": "R1", "confidence": "uncertain"}],
+           "actions": [
+        {"type": "update_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"text": "reword", "deadline": "2026-11-20", "junk": 1},
+         "rationale": "r", "refs": ["R1"]},
+        {**_note("n", stray=1, refs=["R9"])}]}           # dropped: its stray key is not counted
+    draft = st.validate_draft(obj, run, {"R1"})
+    assert [a["proposed"] for a in draft["actions"]] == [{"deadline": "2026-11-20"}]
+    assert run.trace["write_dropped"] == {
+        "conclusion__schema": 1, "update_item__foreign_field": 1,
+        "extra_key__update_item": 1, "note__refs": 1, "note__no_refs": 1}
 
 
 def test_write_prompt_has_standards_note_rule():

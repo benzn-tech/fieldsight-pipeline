@@ -1451,13 +1451,19 @@ def _draft_cap(field):
     return BODY_MAX_CHARS                      # a draft's body, a note's text (spec §5.2)
 
 
-def _proposed(atype, raw, counts):
+_ALL_FIELDS = (set().union(*action_pack_view.APPLY_EDIT_FIELDS.values())
+               | {f for req, opt in _DRAFT_FIELDS.values() for f in req + opt})
+
+
+def _proposed(atype, raw, counts, removed):
     """(the validated `proposed` of one action, None) or (None, the drop reason). Apply
     types follow action_pack_view (APPLY_EDIT_FIELDS, CLOSE_STATUSES,
     CREATE_TEXT_MAX_CHARS): a value apply would refuse is dropped here instead of stored
     dead. A key this type does not carry is removed and counted `extra_key__<type>`, never
     sent on (apply would 409 it) and never the reason the action is lost (spec 2026-11-05
-    §5.2). A priority outside ACTION_PRIORITIES (after lower-casing) drops just that field,
+    §5.2); a field of another type removed is `<type>__foreign_field`, since the
+    action then does less than the writer meant. Both go to `removed`, which the caller
+    counts only when the action is kept. A priority outside ACTION_PRIORITIES (after lower-casing) drops just that field,
     counted `<type>__priority`. Draft text fields (a note's text, a draft's body) take up to
     BODY_MAX_CHARS; longer is the reason `<field>_too_long`."""
     if raw is None:
@@ -1465,9 +1471,10 @@ def _proposed(atype, raw, counts):
     if not isinstance(raw, dict):
         return None, "proposed"
     known = _known_fields(atype)
-    extra = [k for k in raw if k not in known]
-    if extra:
-        _bump(counts, f"extra_key__{atype}", len(extra))
+    for k in raw:
+        if k not in known:
+            _bump(removed, f"{atype}__foreign_field" if k in _ALL_FIELDS
+                  else f"extra_key__{atype}")
     raw = {k: v for k, v in raw.items() if v is not None and k in known}
     if atype in action_pack_view.APPLY_EDIT_FIELDS:
         out = {}
@@ -1579,8 +1586,9 @@ def validate_draft(obj, run, citable):
     # when the type is not an ACTION_TYPES one), `conclusion__<reason>` for a finding, and
     # `extra_key__<type>` for a key removed from an action that is kept. Reasons: cap,
     # schema, type, refs (one ref removed), no_refs, rationale, proposed, <field>_too_long,
-    # priority, targets, transitions, target_ref; a finding's text, refs, confidence, cap,
-    # and downgraded (kept, as uncertain).
+    # foreign_field (another type's field removed from a kept action), priority, targets,
+    # transitions, target_ref; a finding's text, refs (one ref removed), schema (refs not
+    # a list), confidence, cap, and downgraded (kept, as uncertain).
     counts = {}
     conclusion = []
     for c in obj["conclusion"]:
@@ -1593,7 +1601,7 @@ def validate_draft(obj, run, citable):
             continue
         refs = _clean_refs(c.get("refs", []), citable, counts, "conclusion")
         if refs is None:
-            _bump(counts, "conclusion__refs")
+            _bump(counts, "conclusion__schema")
             continue
         conf = c.get("confidence")
         if conf not in CONFIDENCE:
@@ -1617,9 +1625,10 @@ def validate_draft(obj, run, citable):
         if atype not in ACTION_TYPES:
             _bump(counts, "unknown__type")
             continue
+        removed = {}                                  # counted only if the action is kept
         extra = set(a) - _ACTION_KEYS
         if extra:
-            _bump(counts, f"extra_key__{atype}", len(extra))
+            _bump(removed, f"extra_key__{atype}", len(extra))
         refs = _clean_refs(a.get("refs"), citable, counts, atype)
         if not refs:
             _bump(counts, f"{atype}__no_refs")
@@ -1628,7 +1637,7 @@ def validate_draft(obj, run, citable):
         if rationale is None:
             _bump(counts, f"{atype}__rationale")
             continue
-        proposed, reason = _proposed(atype, a.get("proposed"), counts)
+        proposed, reason = _proposed(atype, a.get("proposed"), counts, removed)
         if proposed is None:
             _bump(counts, f"{atype}__{reason}")
             continue
@@ -1664,6 +1673,8 @@ def validate_draft(obj, run, citable):
             sources = _field_sources(a.get("field_sources"), proposed, citable=citable)
             el.update(target_ref=ref, field_sources=sources)
         actions.append(el)
+        for k, n in removed.items():
+            _bump(counts, k, n)
     if counts:
         run.trace["write_dropped"] = counts
     added = 0
