@@ -44,7 +44,8 @@ def test_the_writer_lower_cases_priority_and_drops_one_apply_would_refuse():
     assert proposed == [{"priority": "high"}, {"deadline": "2026-11-10"},
                         {"text": "Book the pump"}]
     dropped = payload["run_trace"]["write_dropped"]
-    assert dropped["priority"] == 3 and dropped["actions"] == 1
+    assert dropped == {"update_item__priority": 2, "create_item__priority": 1,
+                       "update_item__proposed": 1}
 
 
 def test_the_writer_prompt_names_the_priority_values():

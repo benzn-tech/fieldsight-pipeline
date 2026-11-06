@@ -575,8 +575,13 @@ def test_write_schema_violations_are_dropped_and_counted():
     assert draft["actions"][0]["proposed"] == {"status": "done"}        # close defaults done
     assert draft["actions"][1]["refs"] == ["D1"]
     dropped = payload["run_trace"]["write_dropped"]
-    assert dropped["targets"] == 2 and dropped["actions"] == 7
-    assert dropped["conclusion"] == 1 and dropped["conclusion_downgraded"] == 1
+    # Typed keys (spec 2026-11-05 §5.2): <type>__<reason>, conclusion__<reason>.
+    assert dropped == {
+        "conclusion__downgraded": 1, "conclusion__confidence": 1, "conclusion__refs": 1,
+        "close_item__targets": 2, "close_item__proposed": 1,
+        "extra_key__update_item": 1, "update_item__proposed": 2, "unknown__type": 1,
+        "create_item__no_refs": 2, "create_item__refs": 1, "draft_email__proposed": 1,
+        "note__refs": 1}
     assert action_pack_view.payload_shape_error(payload) is None
     assert [a["seq"] for a in payload["actions"]] == [1, 2, 3]
 
@@ -1311,7 +1316,7 @@ def test_validate_draft_leaves_a_closed_target_to_the_gate():
     draft = st.validate_draft(obj, run, {"R1"})
     assert [(a["type"], a["target_stable_id"]) for a in draft["actions"]] == [
         ("close_item", SID1)]
-    assert run.trace["write_dropped"] == {"transitions": 1}
+    assert run.trace["write_dropped"] == {"update_item__transitions": 1}
 
 
 def test_r3_delegated_deadline_is_the_raised_on_date():
@@ -1412,7 +1417,7 @@ def test_a_non_string_target_ref_is_absent_and_counted():
         for bad in (["t1"], {"id": "t1"}, 1)]}
     draft = st.validate_draft(obj, run, {"R1"})
     assert [a["target_ref"] for a in draft["actions"]] == [None, None, None]
-    assert run.trace["write_dropped"] == {"target_ref": 3}
+    assert run.trace["write_dropped"] == {"close_item__target_ref": 3}
 
 
 def test_write_prompt_shows_stated_values():
@@ -1439,3 +1444,112 @@ def test_named_close_with_user_source_and_no_stated_value_is_kept():
     assert [(a["type"], a["target_stable_id"]) for a in payload["actions"]] == [
         ("close_item", SID1)]
     assert payload["run_trace"]["scope_gate"] == {"user_value_unstated__status": 1}
+
+
+# ---- PR-6: notes survive the schema; typed write_dropped (spec 2026-11-05 §5.2) ----------
+
+def _note(text, **extra):
+    return {"type": "note", "proposed": {"text": text}, "rationale": "r", "refs": ["D1"],
+            **extra}
+
+
+def test_long_note_kept():
+    text = "Clause 4.2 requires " + "x" * 2980
+    write = {"conclusion": [], "actions": [_note(text)]}
+    verify = Verify()
+    payload = st.run(make_ctx(), deps(model=Model(write=[write]), verify=verify))
+    [note] = verify.calls[0]["draft"]["actions"]
+    assert note["type"] == "note" and note["proposed"] == {"text": text}
+    assert action_pack_view.payload_shape_error(payload) is None
+    assert "write_dropped" not in payload["run_trace"]
+
+
+def test_stray_key_removed_and_counted():
+    run = _vrun()
+    long = "y" * 3000
+    obj = {"conclusion": [], "actions": [
+        {"type": "note", "proposed": {"text": long, "clause": "4.2"}, "rationale": "r",
+         "refs": ["R1"], "confidence": "supported"},
+        {"type": "update_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"deadline": "2026-11-10", "note": "per R1"}, "rationale": "r",
+         "refs": ["R1"]}]}
+    draft = st.validate_draft(obj, run, {"R1"})
+    note, update = draft["actions"]
+    assert note["proposed"] == {"text": long} and "confidence" not in note
+    assert update["proposed"] == {"deadline": "2026-11-10"}
+    assert run.trace["write_dropped"] == {"extra_key__note": 2, "extra_key__update_item": 1}
+
+
+def test_note_over_4000_dropped():
+    run = _vrun()
+    obj = {"conclusion": [], "actions": [
+        {**_note("z" * (st.BODY_MAX_CHARS + 1)), "refs": ["R1"]},
+        {**_note("z" * st.BODY_MAX_CHARS), "refs": ["R1"]}]}
+    draft = st.validate_draft(obj, run, {"R1"})
+    assert [len(a["proposed"]["text"]) for a in draft["actions"]] == [st.BODY_MAX_CHARS]
+    assert run.trace["write_dropped"] == {"note__text_too_long": 1}
+
+
+def test_create_item_text_keeps_the_apply_cap():
+    # A create is applied, so its text keeps action_pack_view's cap; only notes grow.
+    run = _vrun()
+    obj = {"conclusion": [], "actions": [
+        {"type": "create_item", "proposed": {"text": "t" * 2001}, "rationale": "r",
+         "refs": ["R1"]}]}
+    assert st.validate_draft(obj, run, {"R1"})["actions"] == []
+    assert run.trace["write_dropped"] == {"create_item__text_too_long": 1}
+
+
+def test_write_dropped_keys_carry_type():
+    run = _vrun()
+    obj = {"conclusion": [{"text": "", "refs": [], "confidence": "supported"}],
+           "actions": [
+        "not an object",
+        {"type": "merge_items", "proposed": {}, "rationale": "r", "refs": ["R1"]},
+        {"type": "note", "proposed": {"text": "n"}, "rationale": "", "refs": ["R1"]},
+        {"type": "draft_rfi", "proposed": {"subject": "s"}, "rationale": "r",
+         "refs": ["R1"]},
+        {"type": "close_item", "target_stable_id": None, "proposed": {},
+         "rationale": "r", "refs": ["R1"]},
+        {"type": "draft_email", "proposed": {"subject": "s", "body": "b"},
+         "rationale": "r", "refs": ["R9"]}]}
+    st.validate_draft(obj, run, {"R1"})
+    assert run.trace["write_dropped"] == {
+        "conclusion__text": 1, "unknown__schema": 1, "unknown__type": 1,
+        "note__rationale": 1, "draft_rfi__proposed": 1, "close_item__targets": 1,
+        "draft_email__refs": 1, "draft_email__no_refs": 1}
+
+
+def test_write_dropped_cap_is_typed():
+    run = _vrun()
+    obj = {"conclusion": [{"text": "c", "refs": ["R1"], "confidence": "supported"}]
+           * (st.MAX_CONCLUSION + 1),
+           "actions": [_note("n", refs=["R1"])] * (st.MAX_ACTIONS + 2)}
+    st.validate_draft(obj, run, {"R1"})
+    assert run.trace["write_dropped"] == {"conclusion__cap": 1, "note__cap": 2}
+
+
+def test_write_dropped_counts_shaped():
+    run = _vrun()
+    every_type = [{"type": t, "proposed": {"bogus": 1}, "rationale": "r", "refs": ["R9"],
+                   "stray": True} for t in st.ACTION_TYPES]
+    obj = {"conclusion": [{"text": "c", "refs": ["R9"], "confidence": "supported"}],
+           "actions": every_type + [{**_note("w" * 5000), "refs": ["R1"]},
+                                    {"type": "x" * 300, "refs": ["R1"]}]}
+    st.validate_draft(obj, run, {"R1"})
+    wd = run.trace["write_dropped"]
+    assert all(k.split("__")[0] in st.ACTION_TYPES + ("unknown", "conclusion", "extra_key")
+               for k in wd)
+    assert action_pack_view.fail_trace_error({"write_dropped": wd}) is None
+
+
+def test_write_prompt_has_standards_note_rule():
+    p = st.WRITE_PROMPT
+    assert "the answer is a note action" in p
+    assert ("Use create_item for it only when the instruction asks for a task or the "
+            "evidence shows work still to do") in p
+    assert ("use draft_rfi only when the instruction asks for an RFI or the answer needs a "
+            "party outside the team") in p
+    # It is general wording, and the prompt still formats.
+    st.WRITE_PROMPT.format(site="s", today="t", as_of="a", reading="r", language="en",
+                           targets="", instruction="i", evidence="e")

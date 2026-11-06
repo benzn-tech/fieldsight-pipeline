@@ -62,6 +62,16 @@ def test_fabrication_passes_at_threshold():
     assert metrics.score_fabrication(run, labels)["verdict"] == metrics.PASS   # 1/20 = 5%
 
 
+
+def test_writer_schema_drops_skip_removed_keys():
+    # extra_key__<type> counts a key removed from a kept action (spec 2026-11-05 §5.2).
+    trace = {"write_dropped": {"note__text_too_long": 1, "update_item__targets": 2,
+                               "extra_key__note": 3}}
+    run = {"packs": [{"gold_id": "G", "pack": {"id": "p", "state": "ready",
+                                               "conclusion": [], "actions": [],
+                                               "sources": [], "run_trace": trace}}]}
+    assert metrics.score_fabrication(run, [])["dropped_by_writer_schema"] == 3
+
 def test_wrong_target(ex):
     gold, run, labels = ex
     out = metrics.score_wrong_target(gold, run, labels)
