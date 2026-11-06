@@ -335,3 +335,51 @@ def test_create_optional_fields_follow_the_rules():
     # The text keeps its refs rule; an assumed deadline needs an item's raised_on.
     assert out["actions"][0]["proposed"] == {"text": "Book the pump", "responsible": "Sam"}
     assert counts == {"field_unsourced__priority": 1, "field_unsourced__deadline": 1}
+
+
+
+# ---- Task 4.4: rule 4, deadline sanity ----------------------------------------------------
+
+def test_said_on_mismatch_removes_deadline():
+    def deadline(said_on, refs=("R1",)):
+        return upd(SID_A, {"deadline": "2026-11-06", "status": "in_progress"}, ref="t1",
+                   sources={"deadline": ev(*refs, said_on=said_on), "status": ev("R1")})
+    out, counts = gate([deadline(TOPIC_DAY)])                 # R1 was said on TOPIC_DAY
+    assert out["actions"][0]["proposed"]["deadline"] == "2026-11-06" and counts == {}
+    for said_on, refs in (("2026-10-27", ("R1",)), (None, ("R1",)),
+                          ("2026-10-20", ("R1", "R2"))):      # a document has no date
+        out, counts = gate([deadline(said_on, refs)])
+        assert out["actions"][0]["proposed"] == {"status": "in_progress"}, said_on
+        assert counts == {"field_said_on_mismatch": 1}
+    # The own item ref's date is its raised_on (a deadline from its deadline_text).
+    items = make_items()
+    items[SID_A]["deadline_text"] = "in two weeks"
+    a = upd(SID_A, {"deadline": "2026-11-03"}, ref="t1", refs=("R4",),
+            sources={"deadline": ev("R4", "R1", said_on=TOPIC_DAY)})
+    out, counts = gate([a], items=items)
+    assert out["actions"][0]["proposed"] == {"deadline": "2026-11-03"} and counts == {}
+    a["field_sources"]["deadline"] = ev("R4", said_on="2026-10-21")
+    out, counts = gate([a], items=items)
+    assert out["actions"] == [] and counts["field_said_on_mismatch"] == 1
+
+
+def test_deadline_before_source_removed():
+    a = upd(SID_A, {"deadline": "2026-10-27", "priority": "high"}, ref="t1",
+            sources={"deadline": ev("R1", said_on=TOPIC_DAY), "priority": ev("R1")})
+    out, counts = gate([a])
+    assert out["actions"][0]["proposed"] == {"priority": "high"}
+    assert counts == {"field_deadline_before_source": 1}
+    # The same day is not before it.
+    a["proposed"]["deadline"] = TOPIC_DAY
+    out, counts = gate([a])
+    assert out["actions"][0]["proposed"]["deadline"] == TOPIC_DAY and counts == {}
+
+
+def test_create_deadline_follows_rule_4():
+    create = {"type": "create_item", "target_stable_id": None, "target_ref": None,
+              "proposed": {"text": "Book the pump", "deadline": "2026-11-02"},
+              "field_sources": {"deadline": ev("R1", said_on="2026-10-01")},
+              "rationale": "r", "refs": ["R1"]}
+    out, counts = gate([create])
+    assert out["actions"][0]["proposed"] == {"text": "Book the pump"}
+    assert counts == {"field_said_on_mismatch": 1}

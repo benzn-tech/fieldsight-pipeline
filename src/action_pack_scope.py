@@ -34,6 +34,12 @@ removed (`field_unsourced__<field>`); a close/update left with nothing is droppe
                      action is marked `assumed = ["deadline"]` (`date_assumed`).
 A stated status still has to be a legal change for the type (`drop_illegal_after_gate`).
 
+Rule 4 -- deadline sanity. An `evidence` deadline carries `said_on` equal to the date of
+one of its source refs (a topic's or chunk's date; the target's own item row's raised_on)
+or is removed (`field_said_on_mismatch`); a deadline before that day is removed
+(`field_deadline_before_source`). Code checks the anchor only; the spoken date itself is
+the model's (no date parsing here).
+
 The action's planner target is its `target_ref`; with none, the target whose resolved
 item (or one of whose ambiguous candidates) is the action's item.
 
@@ -140,6 +146,28 @@ def _norm(fld, value):
     return v.lower() if fld in ("status", "priority") else v.casefold()
 
 
+def _ref_day(entry, own_ref):
+    """The date a ref shows: a topic's or chunk's `date`; the target's own item row's
+    `raised_on`. None for anything else (a document, a web ref, another item)."""
+    it = entry.get("item") or {}
+    if entry.get("kind") in ("topic", "chunk"):
+        return _day_iso(it.get("date"))
+    if entry.get("kind") == "item" and entry.get("ref") == own_ref:
+        return _day_iso(it.get("raised_on"))
+    return None
+
+
+def _deadline_sane(value, fs, *, registry, own_ref):
+    """Rule 4 for an evidence deadline: None when it holds, else the removal code."""
+    said_on = fs.get("said_on")
+    days = {_ref_day(registry[r], own_ref) for r in fs.get("refs") or [] if r in registry}
+    if said_on is None or said_on not in days:
+        return "field_said_on_mismatch"
+    if _norm("deadline", value) < said_on:
+        return "field_deadline_before_source"
+    return None
+
+
 def _stated(plan, tid, fld):
     """The planner's stated value for (target, field): the target's own entry first, then
     a global one (target null). None when the user stated nothing for it."""
@@ -175,7 +203,13 @@ def _field(fld, value, fs, *, tid, plan, item, registry, counts):
         ok = any(registry[r].get("kind") in EVIDENCE_KINDS for r in refs) or (
             fld == "deadline" and item is not None and bool(item.get("deadline_text"))
             and own in refs)
-        return (value, None) if ok else (None, unsourced)
+        if not ok:
+            return None, unsourced
+        if fld == "deadline":
+            code = _deadline_sane(value, fs, registry=registry, own_ref=own)
+            if code is not None:
+                return None, code
+        return value, None
     if src == "assumed_default":
         raised = _day_iso((item or {}).get("raised_on"))
         if (fld != "deadline" or item is None or raised is None
