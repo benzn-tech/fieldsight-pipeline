@@ -59,7 +59,7 @@ _SEP = r"[\s/|,]"
 _COMBINED = re.compile(rf"^(?:{_WORDS})(?:{_SEP}+(?:{_WORDS}))*$")
 _COMBINED_WORD = re.compile(rf"(?:^|(?<={_SEP}))({_WORDS})(?={_SEP}|$)")
 # What a ticked box holds once _BOXES glyphs are gone; anything longer is a written answer.
-_TICK = re.compile(r"^(x|y|n|yes|no|n/?a)?$", re.IGNORECASE)
+_TICK = re.compile(r"^(x|y|n|yes|no|n/?a|pass|passed|fail|failed|ok)?$", re.IGNORECASE)
 _NUMBER = re.compile(r"^[\d.()]*$")
 # Column labels that name no section ("Item | Yes | No"): the heading above names it.
 _GENERIC = {"", "#", "no", "no.", "item", "items", "description", "activity", "check",

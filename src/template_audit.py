@@ -154,11 +154,21 @@ def _n(entry, count):
     return n if type(n) is int and 1 <= n <= count else None
 
 
+# Lines a Word rendering always holds that are never checklist rows: column headings and
+# sign-off fields. A "missing" claim naming one is found in the source text, so the text
+# check alone would let it through as a false alarm (final review, 2026-11-06).
+NOT_ITEMS = {"item", "items", "no.", "#", "comment", "comments", "yes", "no", "n/a", "na",
+             "pass", "fail", "yes no n/a", "pass fail n/a", "signature", "signed", "date",
+             "time", "name", "inspector", "inspected by", "officer", "notes", "address"}
+
+
 def check(answer, result, source_text):
     """The A4 guards and the final verdict. `source_text` is the Word rendering, or None
     for a PDF / photos. No I/O."""
     items = _items(result)
     drafted = {normalise(t) for t in items}
+    titles = {normalise(s.get("title")) for s in (result.get("sections") or [])
+              if isinstance(s, dict)}
     source = None if source_text is None else normalise(source_text)
     count = answer.get("source_items")
     count = count if type(count) is int and count >= 0 else None
@@ -178,6 +188,10 @@ def check(answer, result, source_text):
             drop("missing", claim, "no text")
         elif text in drafted:
             drop("missing", claim, "already a draft item")
+        elif text in titles:
+            drop("missing", claim, "a draft section title")
+        elif text.rstrip(":") in NOT_ITEMS:
+            drop("missing", claim, "a column heading or sign-off field")
         elif text in seen:
             drop("missing", claim, "duplicate")
         elif source is not None:

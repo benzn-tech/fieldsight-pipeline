@@ -253,6 +253,27 @@ def test_separate_pass_fail_columns():
         {"title": "", "items": ["Nogs fitted", "Bracing installed"]}]
 
 
+def test_filled_pass_fail_answers_keep_their_rows():
+    # A filled-in form: rows answered "Pass" / "Fail" / "OK" are still items. Before
+    # _TICK knew these words, those rows were dropped and the read looked complete.
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Item", "Pass / Fail / N/A", "Comments")
+    _row(t, "Check A", "Pass", "")
+    _row(t, "Check B", "", "")
+    _row(t, "Check C", "Fail", "")
+    _row(t, "Check D", "OK", "")
+    assert template_docx.read(_save(d)) == [
+        {"title": "", "items": ["Check A", "Check B", "Check C", "Check D"]}]
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "Item", "Pass", "Fail", "N/A")
+    _row(t, "Nogs fitted", "Pass", "", "")
+    _row(t, "Bracing installed", "", "Failed", "")
+    assert template_docx.read(_save(d)) == [
+        {"title": "", "items": ["Nogs fitted", "Bracing installed"]}]
+
+
 def test_ok_alone_is_not_an_answer_header():
     d = docx.Document()
     t = d.add_table(rows=0, cols=3)

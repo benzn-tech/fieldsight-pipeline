@@ -59,6 +59,15 @@ def test_missing_claim_matches_whole_words_only():
     assert out["verdict"] == "ok" and out["missing"] == []
 
 
+@pytest.mark.parametrize("text", ["Comment", "Signed:", "Date", "Wall Framing"])
+def test_missing_claim_naming_a_heading_or_sign_off_is_dropped(text):
+    # Each is in the source text, so only this guard stops the false alarm.
+    out = audit.check(_answer("problems", 3, missing=[{"section": "", "text": text}]),
+                      DRAFT, SOURCE_TEXT)
+    assert out["verdict"] == "ok" and out["missing"] == []
+    assert out["dropped_claims"][0]["kind"] == "missing"
+
+
 def test_missing_claim_already_in_draft_is_dropped():
     out = audit.check(_answer("problems", 3, missing=[
         {"section": "Wall Framing", "text": "studs at 600 centres"}]), DRAFT, SOURCE_TEXT)
