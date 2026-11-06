@@ -75,20 +75,29 @@ def write_obj(**over):
                            "confidence": "supported"}],
            "actions": [{"type": "close_item", "target_stable_id": SID1,
                         "proposed": {"status": "done"}, "rationale": "Records say done.",
-                        "refs": ["R1", "R2"]}]}
+                        "refs": ["R1", "R2"], "field_sources": {"status": src("R1")}}]}
     obj.update(over)
     return obj
+
+
+def src(*refs, said_on=None, source="evidence"):
+    """A field_sources entry (spec 2026-11-05 §3.2.3). R1 is the run's topic line."""
+    return {"source": source, "refs": list(refs), "said_on": said_on}
 
 
 class Model:
     """call_model fake: answers by caller; records every call (prompt, deadline, caller)."""
 
-    def __init__(self, plan=None, rounds=None, write=None, used=None, usage=None):
-        self.answers = {"action_plan": list(plan or [plan_obj()]),
+    def __init__(self, plan=None, rounds=None, write=None, used=None, usage=None,
+                 finish=None):
+        # The default plan tidies (spec 2026-11-05 §3.2.4): the scope gate then lets the
+        # default close on SID1 through without a named target and its round-1 hop.
+        self.answers = {"action_plan": list(plan or [plan_obj(change_scope="tidy")]),
                         "action_round": list(rounds or []),
                         "action_write": list(write or [write_obj()])}
         self.used = used or {}
         self.usage = usage
+        self.finish = {k: list(v) for k, v in (finish or {}).items()}   # caller -> reasons
         self.calls = []
 
     def __call__(self, prompt, *, max_tokens, force_json, model, deadline, caller, info):
@@ -98,6 +107,8 @@ class Model:
         ans = queue.pop(0) if len(queue) > 1 else (queue[0] if queue
                                                      else {"calls": [], "done": True})
         info["model"] = self.used.get(caller, model)
+        if self.finish.get(caller):
+            info["finish_reason"] = self.finish[caller].pop(0)
         if self.usage is not None:
             info["usage"] = {"prompt_tokens": self.usage, "completion_tokens": 0}
         if isinstance(ans, tuple):          # (None, error)
@@ -526,7 +537,7 @@ def test_write_schema_violations_are_dropped_and_counted():
         {"text": "made-up ref", "refs": ["R99"], "confidence": "uncertain"}],
         "actions": [
         {"type": "close_item", "target_stable_id": SID1, "proposed": {}, "rationale": "r",
-         "refs": ["R1"]},
+         "refs": ["R1"], "field_sources": {"status": src("R1")}},
         {"type": "close_item", "target_stable_id": "77777777-0000-4000-8000-000000000000",
          "proposed": {"status": "done"}, "rationale": "r", "refs": ["R1"]},
         {"type": "close_item", "target_stable_id": "the pour item",
@@ -549,7 +560,9 @@ def test_write_schema_violations_are_dropped_and_counted():
          "refs": ["D1", "R77"]},
         {"type": "update_item", "target_stable_id": SID2,
          "proposed": {"deadline": "2026-11-10", "status": "in_progress"},
-         "rationale": "r", "refs": ["R1"]}]}
+         "rationale": "r", "refs": ["R1"],
+         "field_sources": {"deadline": src("R1", said_on="2026-10-10"),
+                           "status": src("R1")}}]}
     verify = Verify()
     payload = st.run(make_ctx(), deps(model=Model(write=[write]), verify=verify))
     draft = verify.calls[0]["draft"]
@@ -930,6 +943,8 @@ def test_plan_v2_trace_is_counts_shaped():
     assert trace["plan_scope"] == "named"
     assert trace["plan_key_defaulted"] == ["delegations"]
     assert trace["plan_targets"] == 2 and trace["plan_sub_tasks"] == 2
+    # Counts only, so Task 4.6 can tell a planner miss from a writer or gate miss (R3).
+    assert trace["plan_stated_values"] == 2 and trace["plan_delegations"] == 0
     assert action_pack_view.fail_trace_error(trace) is None
 
 
@@ -1069,7 +1084,7 @@ def test_target_hop_budget_is_capped_by_gather_time():
 
 def test_no_targets_no_hops_and_an_empty_resolution():
     tools = TargetTools()
-    payload = st.run(make_ctx(), deps(tools=tools))
+    payload = st.run(make_ctx(), deps(model=Model(plan=[plan_obj()]), tools=tools))
     assert tools.target_calls == []
     assert payload["run_trace"]["target_resolution"] == {}
     assert payload["run_trace"]["plan_scope"] == "named"
@@ -1172,3 +1187,255 @@ def test_model_rounds_honours_knob(monkeypatch, knob, model_rounds):
     assert payload["run_trace"]["rounds"] == model_rounds + 1
     for i, call in enumerate(made):                 # the prompt counts down to the knob
         assert f"{model_rounds - i - 1} rounds remain after this one" in call["prompt"]
+
+
+# ---- PR-4 Task 4.1: writer keys target_ref and field_sources (spec 2026-11-05 §3.2.3) ----
+
+def _vrun(items=None, targets=None):
+    run = st.Run(ctx=make_ctx(), deps=deps())
+    run.items = items or {SID1: {"stable_id": SID1, "status": "open"}}
+    run.plan, _ = st.validate_plan(
+        plan_obj(targets=targets or [{"id": "t1", "task_no": 1}]), TODAY)
+    return run
+
+
+def test_validate_draft_keeps_field_sources():
+    run = _vrun()
+    obj = {"conclusion": [], "actions": [
+        {"type": "update_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"deadline": "2026-11-10", "priority": "high"},
+         "field_sources": {
+             "deadline": {"source": "evidence", "refs": ["R2", "R99"],
+                          "said_on": "2026-11-01"},
+             "priority": {"source": "user", "refs": []},
+             "status": {"source": "user", "refs": []}},          # not proposed: ignored
+         "rationale": "r", "refs": ["R1"]},
+        {"type": "create_item", "target_ref": "t9",              # unknown target id
+         "proposed": {"text": "Book the pump"}, "rationale": "r", "refs": ["R1"]}]}
+    draft = st.validate_draft(obj, run, {"R1", "R2"})
+    upd, create = draft["actions"]
+    assert upd["target_ref"] == "t1"
+    assert upd["field_sources"] == {
+        "deadline": {"source": "evidence", "refs": ["R2"], "said_on": "2026-11-01"},
+        "priority": {"source": "user", "refs": [], "said_on": None}}
+    assert upd["refs"] == ["R1"]          # a field's refs join only if it passes the gate
+    assert create["target_ref"] is None and create["field_sources"] is None
+
+
+def test_field_sources_bad_source_is_none():
+    proposed = {"deadline": "2026-11-10", "priority": "high", "responsible": "Sam",
+                "status": "blocked"}
+    raw = {"deadline": {"source": "guess", "refs": ["R1"], "said_on": None},
+           "priority": "high",
+           "responsible": {"source": "evidence", "refs": "R1"},
+           "status": {"source": "evidence", "refs": ["R1"], "said_on": "yesterday"}}
+    out = st._field_sources(raw, proposed, citable={"R1"})
+    none = {"source": None, "refs": [], "said_on": None}
+    assert out["deadline"] == none and out["priority"] == none
+    assert out["responsible"] == none
+    assert out["status"] == {"source": "evidence", "refs": ["R1"], "said_on": None}
+    assert st._field_sources(None, proposed, citable={"R1"}) is None
+    assert st._field_sources("x", proposed, citable={"R1"}) is None
+
+
+def test_open_statuses_match_the_verifier():
+    import action_pack_verify
+    assert st.OPEN_STATUSES == action_pack_verify.OPEN_STATUSES
+
+
+
+# ---- PR-4 Task 4.5: the scope gate in the run; the write budget (spec 2026-11-05 §3.2.4, §11)
+
+class NamedTools(Tools):
+    """Round 1's items (SID1 #1, SID2 #2) with per-item field overrides, on every read
+    (round 1 and the target hops alike)."""
+
+    def __init__(self, over=None, **kw):
+        super().__init__(**kw)
+        self.over = over or {}
+
+    def items_run(self, args, tctx, call_id="items"):
+        env = super().items_run(args, tctx, call_id)
+        for it in env["items"]:
+            it.update(self.over.get(it["stable_id"], {}))
+        return env
+
+
+NAMED_T1 = [{"id": "t1", "task_no": 1, "phrase": None}]
+
+
+def test_write_stage_applies_scope_gate():
+    write = write_obj(actions=[
+        dict(write_obj()["actions"][0], target_ref="t1"),                # named: kept
+        {"type": "update_item", "target_stable_id": SID2, "proposed": {"priority": "high"},
+         "field_sources": {"priority": src("R1")}, "rationale": "r", "refs": ["R1"]}])
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=NAMED_T1)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=verify))
+    trace = payload["run_trace"]
+    assert trace["target_resolution"] == {"t1": SID1}
+    assert [(a["type"], a["target_stable_id"]) for a in verify.calls[0]["draft"]["actions"]] \
+        == [("close_item", SID1)]
+    assert trace["scope_gate"] == {"drop_unasked_target": 1}
+    assert [a["target_stable_id"] for a in payload["actions"]] == [SID1]
+
+
+def test_a_closed_item_named_by_number_becomes_an_already_done_note():
+    # Review Focus 5, end to end: "#1" is already done. The writer's close must reach the
+    # gate (validate_draft no longer drops it as a transition) and become a note.
+    write = write_obj(actions=[dict(write_obj()["actions"][0], target_ref="t1",
+                                    proposed={"status": "closed"})])
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=NAMED_T1)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=verify,
+                                      tools=NamedTools({SID1: {"status": "done"}})))
+    [note] = verify.calls[0]["draft"]["actions"]
+    assert note["type"] == "note" and note["target_stable_id"] is None
+    assert note["proposed"] == {"text": "Records say done. (already done)"}
+    assert note["refs"] == ["R1", "R2"]
+    assert payload["run_trace"]["scope_gate"] == {"demoted_target_closed": 1}
+    assert "write_dropped" not in payload["run_trace"]
+    assert payload["actions"][0]["type"] == "note"
+
+
+def test_validate_draft_leaves_a_closed_target_to_the_gate():
+    # Review Focus 5: a close on a done item must reach the scope gate (which makes the
+    # named one an "already done" note); legal_change would drop it here first.
+    run = _vrun(items={SID1: {"stable_id": SID1, "status": "done"},
+                       SID2: {"stable_id": SID2, "status": "open"}})
+    obj = {"conclusion": [], "actions": [
+        {"type": "close_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"status": "closed"}, "rationale": "r", "refs": ["R1"]},
+        {"type": "update_item", "target_stable_id": SID2, "proposed": {"status": "open"},
+         "rationale": "r", "refs": ["R1"]}]}
+    draft = st.validate_draft(obj, run, {"R1"})
+    assert [(a["type"], a["target_stable_id"]) for a in draft["actions"]] == [
+        ("close_item", SID1)]
+    assert run.trace["write_dropped"] == {"transitions": 1}
+
+
+def test_r3_delegated_deadline_is_the_raised_on_date():
+    # R3: "Nobody's said when #1 is due. Just pick a date." -> the item's raised_on,
+    # whatever the writer proposed, marked assumed.
+    plan = plan_obj(targets=NAMED_T1, delegations=[{"target": "t1", "field": "deadline"}])
+    write = write_obj(actions=[
+        {"type": "update_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"deadline": "2026-11-08"},
+         "field_sources": {"deadline": src(source="assumed_default")},
+         "rationale": "No due date was set; the user asked for one.", "refs": ["R2"]}])
+    verify = Verify()
+    model = Model(plan=[plan], write=[write])
+    tools = NamedTools({SID1: {"deadline": None, "raised_on": "2026-10-09"}})
+    payload = st.run(make_ctx(), deps(model=model, verify=verify, tools=tools))
+    [a] = verify.calls[0]["draft"]["actions"]
+    assert a["proposed"] == {"deadline": "2026-10-09"} and a["assumed"] == ["deadline"]
+    assert payload["actions"][0]["proposed"] == {"deadline": "2026-10-09"}
+    assert payload["run_trace"]["scope_gate"] == {"date_assumed": 1}
+    prompt = _write_prompt(model)
+    assert ("Delegated missing values (only for an item with neither a deadline nor a "
+            "deadline_text; source assumed_default):\nt1: deadline") in prompt
+
+
+def test_write_prompt_states_scope_and_field_sources():
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    prompt = _write_prompt(model)
+    assert ("- Change only items the instruction names, unless it asks you to tidy open "
+            "items. For anything else worth changing, write a note.") in prompt
+    for key in ('"target_ref"', '"field_sources"', '"assumed_default"', '"said_on"'):
+        assert key in prompt, key
+    assert "Delegated missing values" not in prompt
+
+
+def test_write_length_stop_counted_and_repaired():
+    # Review Focus 3: the larger answer stops on the token limit -> counted, repaired, built.
+    model = Model(write=['{"conclusion": [{"text": "The pour was', write_obj()],
+                  finish={"action_write": ["length", "stop"]})
+    payload = st.run(make_ctx(), deps(model=model))
+    trace = payload["run_trace"]
+    assert trace["write_finish_length"] == 1 and trace["write_repairs"] == 1
+    assert [a["type"] for a in payload["actions"]] == ["close_item"]
+    assert st.WRITE_MAX_TOKENS == 12000
+
+
+def test_a_length_stop_outside_the_writer_is_not_counted():
+    model = Model(finish={"action_plan": ["length"], "action_round": ["length"]})
+    payload = st.run(make_ctx(), deps(model=model))
+    assert "write_finish_length" not in payload["run_trace"]
+
+
+def test_judge_call_reports_the_finish_reason(monkeypatch):
+    import llm_tools_client as tc
+    monkeypatch.setattr(tc, "complete_json", lambda prompt, **kw: tc.ChatTurn(
+        text="{", model="m", requested_model="m", finish_reason="length"))
+    monkeypatch.setattr(tc, "_now", lambda: 1000.0)
+    info = {}
+    st.judge_call("p", max_tokens=10, model=WRITER, deadline=100.0, caller="action_write",
+                  info=info)
+    assert info["finish_reason"] == "length"
+
+
+def test_scope_gate_trace_counts_shaped():
+    stated = [{"target": "t1", "field": "deadline", "value": "2026-11-14"}]
+    plan = plan_obj(targets=NAMED_T1 + [{"id": "t2", "task_no": 404, "phrase": None}],
+                    stated_values=stated)
+    write = write_obj(actions=[
+        {"type": "update_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"deadline": "2026-11-13", "priority": "high"},
+         "field_sources": {"deadline": src(source="user"), "priority": src("R2")},
+         "rationale": "r", "refs": ["R1"]},
+        {"type": "update_item", "target_stable_id": SID2, "target_ref": "t2",
+         "proposed": {"status": "blocked"}, "field_sources": {"status": src("R1")},
+         "rationale": "r", "refs": ["R1"]}])
+    verify = Verify()
+    payload = st.run(make_ctx(), deps(model=Model(plan=[plan], write=[write]),
+                                      verify=verify))
+    trace = payload["run_trace"]
+    assert trace["scope_gate"] == {"user_value_overridden__deadline": 1,
+                                   "field_unsourced__priority": 1,
+                                   "demoted_target_none": 1}
+    assert action_pack_view.fail_trace_error({"scope_gate": trace["scope_gate"]}) is None
+    assert action_pack_view.fail_trace_error(trace) is None
+    assert [a["proposed"] for a in verify.calls[0]["draft"]["actions"]] == [
+        {"deadline": "2026-11-14"}, {"text": "r (named item not found)"}]
+    # A run the gate leaves alone still records it, empty.
+    assert st.run(make_ctx(), deps())["run_trace"]["scope_gate"] == {}
+
+
+# ---- PR-4 review fixes --------------------------------------------------------------------
+
+def test_a_non_string_target_ref_is_absent_and_counted():
+    run = _vrun()
+    obj = {"conclusion": [], "actions": [
+        {"type": "close_item", "target_stable_id": SID1, "target_ref": bad,
+         "proposed": {"status": "done"}, "rationale": "r", "refs": ["R1"]}
+        for bad in (["t1"], {"id": "t1"}, 1)]}
+    draft = st.validate_draft(obj, run, {"R1"})
+    assert [a["target_ref"] for a in draft["actions"]] == [None, None, None]
+    assert run.trace["write_dropped"] == {"target_ref": 3}
+
+
+def test_write_prompt_shows_stated_values():
+    stated = [{"target": "t1", "field": "status", "value": "done"},
+              {"target": None, "field": "priority", "value": "high"}]
+    model = Model(plan=[plan_obj(targets=NAMED_T1, stated_values=stated)])
+    st.run(make_ctx(), deps(model=model))
+    prompt = _write_prompt(model)
+    assert ("Values the user stated (source user; the code applies these values):\n"
+            "t1: status = done\nany item you change: priority = high") in prompt
+
+
+def test_named_close_with_user_source_and_no_stated_value_is_kept():
+    # "Close #1": the planner recorded no stated status; the writer says source user and
+    # cites the record that says it is finished. The close must still be shown.
+    write = write_obj(actions=[
+        {"type": "close_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"status": "done"},
+         "field_sources": {"status": src(source="user")},
+         "rationale": "The record says it is finished.", "refs": ["R1", "R2"]}])
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=NAMED_T1)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=verify))
+    assert [(a["type"], a["target_stable_id"]) for a in payload["actions"]] == [
+        ("close_item", SID1)]
+    assert payload["run_trace"]["scope_gate"] == {"user_value_unstated__status": 1}
