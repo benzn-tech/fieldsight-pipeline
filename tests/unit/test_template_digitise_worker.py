@@ -419,3 +419,264 @@ def test_the_fallback_read_gets_the_workers_deadline(s3, monkeypatch):
     worker.lambda_handler(_event(), _Context(900_000))
     assert _result(s3)["status"] == "done"
     assert 900 - worker.WRITE_RESERVE_SECONDS - 5 < seen[0] <= 900 - worker.WRITE_RESERVE_SECONDS
+
+
+# ---- the upload audit (spec 2026-11-06 A1, A5) ------------------------------------------
+
+AUDIT_KEY = f"template_digitise_audits/{COMPANY}/{RID}.json"
+
+
+class _SNS:
+    def __init__(self, fail=False):
+        self.published, self.fail = [], fail
+
+    def publish(self, **kw):
+        if self.fail:
+            raise AssertionError("published with no topic configured")
+        self.published.append(kw)
+        return {"MessageId": "m"}
+
+
+@pytest.fixture
+def sns(monkeypatch):
+    fake = _SNS()
+    monkeypatch.setattr(worker, "sns", lambda: fake)
+    return fake
+
+
+@pytest.fixture
+def audit_on(monkeypatch):
+    monkeypatch.setenv("TEMPLATE_DIGITISE_AUDIT", "true")
+    monkeypatch.setenv("ALERT_TOPIC_ARN", "arn:aws:sns:ap-southeast-2:1:alerts")
+    monkeypatch.setenv("STAGE", "test")
+    for name in ("TEMPLATE_DIGITISE_MODEL", "TEMPLATE_DIGITISE_AUDIT_MODEL",
+                 "TEMPLATE_DIGITISE_AUDIT_ALT_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _audit_answer(verdict="ok", source_items=1, **lists):
+    out = {"verdict": verdict, "source_items": source_items, "missing": [], "extra": [],
+           "reworded": [], "split_or_merged": [], "summary": "checked"}
+    out.update(lists)
+    return _ok(json.dumps(out))
+
+
+def _audit(s3):
+    return json.loads(s3.puts[AUDIT_KEY])
+
+
+def _rule_read_docx():
+    # The rule reads "Gate locked"; "Fence intact" holds a written answer, so it is not an
+    # item -- but it IS in the source text, so a model naming it as missing is checkable.
+    return _docx_of(("No.", "Item", "Yes / No / N/A", "Comment"), ("1", "Gate locked", "", ""),
+                    ("2", "Fence intact", "Checked by J. Smith on site, all good", ""))
+
+
+def test_audit_off_writes_nothing(s3, sns, monkeypatch):
+    monkeypatch.delenv("TEMPLATE_DIGITISE_AUDIT", raising=False)
+    _docx_source(s3, _rule_read_docx())
+    sent = _http(monkeypatch, [])
+    assert worker.lambda_handler(_event(), None) == {"ok": True}
+    assert _result(s3)["status"] == "done"
+    assert not any(k.startswith("template_digitise_audits/") for k in s3.puts)
+    assert sent == [] and sns.published == []
+
+
+def test_audit_ok_stored_not_published(s3, sns, audit_on, monkeypatch):
+    _docx_source(s3, _rule_read_docx())
+    sent = _http(monkeypatch, [_audit_answer("ok", 1)])
+    worker.lambda_handler(_event(), None)
+    rec = _audit(s3)
+    assert rec["verdict"] == "ok" and rec["model"] == "google/gemini-3.8-flash"
+    assert (rec["id"], rec["companyId"], rec["name"], rec["userId"]) == (
+        RID, COMPANY, "Site inspection", "u-1")
+    assert rec["sourceKeys"] == _result(s3)["sourceKeys"]
+    assert (rec["route"], rec["status"], rec["counts"]) == ("docx", "done", {"sections": 1, "items": 1})
+    assert isinstance(rec["elapsed_s"], float) and rec["dropped_claims"] == []
+    assert sns.published == []
+    # one call, the audit's: a rule read sends the Word file's rendering, then the draft
+    assert len(sent) == 1 and sent[0]["model"] == "google/gemini-3.8-flash"
+    content = sent[0]["messages"][0]["content"]
+    assert content[0]["text"] == worker.template_audit.PROMPT
+    assert "1 | Gate locked" in content[1]["text"] and "Fence intact" in content[1]["text"]
+    assert '"Gate locked"' in content[2]["text"]
+    lines = [json.loads(v) for k, v in s3.puts.items() if k.startswith("lake_manifest/")]
+    assert any(l["key"] == AUDIT_KEY and l["hint"].get("company_id") == COMPANY for l in lines)
+
+
+def test_audit_problems_published_to_topic(s3, sns, audit_on, monkeypatch):
+    _docx_source(s3, _rule_read_docx())
+    _http(monkeypatch, [_audit_answer("problems", 2, missing=[
+        {"section": "", "text": "Fence intact"}, {"section": "", "text": "Roof flashing"}])])
+    worker.lambda_handler(_event(), None)
+    rec = _audit(s3)
+    assert rec["verdict"] == "problems"
+    assert rec["missing"] == [{"section": "", "text": "Fence intact"}]
+    assert [d["claim"]["text"] for d in rec["dropped_claims"]] == ["Roof flashing"]
+    assert len(sns.published) == 1
+    msg = sns.published[0]
+    assert msg["TopicArn"] == "arn:aws:sns:ap-southeast-2:1:alerts"
+    assert msg["Subject"].startswith("[FieldSight test] Template upload problems: Site inspection")
+    assert len(msg["Subject"]) <= 100
+    body = msg["Message"]
+    assert "Site inspection" in body and "problems" in body and "Fence intact" in body
+    assert COMPANY in body and AUDIT_KEY in body
+    assert "Roof flashing" not in body, "a claim the code dropped never reaches the email"
+
+
+def test_alert_subject_is_ascii_and_at_most_100_chars(s3, sns, audit_on, monkeypatch):
+    _docx_source(s3, _rule_read_docx())
+    _request(s3, [f"template_sources/{COMPANY}/{'d' * 32}.docx"],
+             name="Inspección — 検査 " * 20 + "\nsecond line")
+    _http(monkeypatch, [_audit_answer("problems", 2, missing=[{"section": "", "text": "Fence intact"}])])
+    worker.lambda_handler(_event(), None)
+    subject = sns.published[0]["Subject"]
+    assert len(subject) <= 100 and subject.isascii() and "\n" not in subject
+    assert subject.startswith("[FieldSight test] Template upload problems: Inspeccion")
+
+
+def test_audit_problems_without_topic_logs_and_stores(s3, audit_on, monkeypatch, caplog):
+    import logging
+    monkeypatch.delenv("ALERT_TOPIC_ARN", raising=False)
+    monkeypatch.setattr(worker, "sns", lambda: _SNS(fail=True))
+    _docx_source(s3, _rule_read_docx())
+    _http(monkeypatch, [_audit_answer("problems", 2, missing=[{"section": "", "text": "Fence intact"}])])
+    with caplog.at_level(logging.INFO):
+        assert worker.lambda_handler(_event(), None) == {"ok": True}
+    assert _audit(s3)["verdict"] == "problems"
+    assert any("no topic" in r.getMessage() for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_a_publish_failure_is_logged_and_the_record_kept(s3, audit_on, monkeypatch, caplog):
+    class _Down:
+        def publish(self, **kw):
+            raise RuntimeError("sns down")
+    monkeypatch.setattr(worker, "sns", lambda: _Down())
+    _docx_source(s3, _rule_read_docx())
+    _http(monkeypatch, [_audit_answer("problems", 2, missing=[{"section": "", "text": "Fence intact"}])])
+    assert worker.lambda_handler(_event(), None) == {"ok": True}
+    assert _audit(s3)["verdict"] == "problems"
+    assert any("could not publish" in r.getMessage() for r in caplog.records)
+
+
+def test_audit_exception_leaves_result_and_returns_ok(s3, sns, audit_on, monkeypatch, caplog):
+    from datetime import datetime as real_datetime, timezone
+
+    class _Now:
+        @staticmethod
+        def now(tz=None):
+            return real_datetime(2026, 11, 6, tzinfo=timezone.utc)
+    monkeypatch.setattr(worker, "datetime", _Now)
+    _docx_source(s3, _rule_read_docx())
+    monkeypatch.delenv("TEMPLATE_DIGITISE_AUDIT")
+    worker.lambda_handler(_event(), None)
+    baseline = s3.puts[RES_KEY]
+
+    monkeypatch.setenv("TEMPLATE_DIGITISE_AUDIT", "true")
+    s3.puts.clear()
+
+    def boom(source, result, deadline=None):
+        result["sections"].clear()      # even a run that mangles what it was handed
+        raise RuntimeError("audit blew up")
+    monkeypatch.setattr(worker.template_audit, "run", boom)
+    assert worker.lambda_handler(_event(), None) == {"ok": True}
+    assert s3.puts[RES_KEY] == baseline
+    assert AUDIT_KEY not in s3.puts and sns.published == []
+    assert any(r.getMessage() == f"template audit {RID} failed" for r in caplog.records)
+
+
+def test_unread_source_writes_skipped(s3, sns, audit_on, monkeypatch, caplog):
+    import logging
+    import template_types
+    key = f"template_sources/{COMPANY}/{'e' * 32}.pdf"
+    s3.store[key] = b"x"
+    s3.sizes[key] = template_types.MAX_BYTES + 1
+    _request(s3, [key])
+    sent = _http(monkeypatch, [])
+    with caplog.at_level(logging.INFO):
+        worker.lambda_handler(_event(), None)
+    rec = _audit(s3)
+    assert rec["verdict"] == "skipped" and rec["reason"] == "too_large"
+    assert rec["status"] == "error" and rec["sourceKeys"] == [key]
+    assert sent == [] and sns.published == []
+    assert any(r.getMessage() == f"template audit {RID}: skipped (too_large)" for r in caplog.records)
+
+
+def test_a_word_text_over_the_cap_is_skipped_not_sent(s3, sns, audit_on, monkeypatch):
+    _docx_source(s3, _docx_no_answer_column())
+    monkeypatch.setattr(template_docx, "render_text",
+                        lambda source: "x" * (worker.template_vision.MAX_TEXT_CHARS + 1))
+    sent = _http(monkeypatch, [])
+    worker.lambda_handler(_event(), None)
+    assert _audit(s3)["verdict"] == "skipped" and _audit(s3)["reason"] == "too_long"
+    assert sent == []
+
+
+def test_audit_skipped_when_under_60s_left(s3, sns, audit_on, monkeypatch, caplog):
+    import logging
+    _docx_source(s3, _rule_read_docx())
+    sent = _http(monkeypatch, [])
+    with caplog.at_level(logging.INFO):
+        assert worker.lambda_handler(_event(), _Context(70_000)) == {"ok": True}
+    assert _result(s3)["status"] == "done"
+    assert sent == []
+    assert any("audit skipped: no time" in r.getMessage() for r in caplog.records)
+    assert _audit(s3)["verdict"] == "skipped" and _audit(s3)["reason"] == "no_time"
+
+
+def test_the_audit_gets_what_is_left_minus_the_reserve(s3, sns, audit_on, monkeypatch):
+    _docx_source(s3, _rule_read_docx())
+    seen = []
+
+    def spy(source, result, deadline=None):
+        seen.append(deadline)
+        return dict(worker.template_audit._unsure("x"), model="m", elapsed_s=0.0)
+    monkeypatch.setattr(worker.template_audit, "run", spy)
+    worker.lambda_handler(_event(), _Context(900_000))
+    assert 900 - worker.WRITE_RESERVE_SECONDS - 5 < seen[0] <= 900 - worker.WRITE_RESERVE_SECONDS
+    assert _audit(s3)["verdict"] == "unsure" and sns.published == []
+
+
+def test_audit_log_line_shape(s3, sns, audit_on, monkeypatch, caplog):
+    import logging
+    _docx_source(s3, _rule_read_docx())
+    _http(monkeypatch, [_audit_answer("ok", 1)])
+    with caplog.at_level(logging.INFO):
+        worker.lambda_handler(_event(), None)
+    assert (f"template audit {RID}: ok route=docx items=1 source_items=1 "
+            "missing=0 extra=0 reworded=0") in [r.getMessage() for r in caplog.records]
+
+
+def test_a_photo_read_is_audited_by_the_other_model(s3, sns, audit_on, monkeypatch):
+    keys = [f"template_sources/{COMPANY}/{'b' * 32}.jpg"]
+    s3.store[keys[0]] = b"\xff\xd8 not really a jpeg"
+    _request(s3, keys)
+    sent = _http(monkeypatch, [
+        _ok(json.dumps({"sections": [{"title": "General", "items": ["Gate locked"]}]})),
+        _audit_answer("ok", 1)])
+    worker.lambda_handler(_event(), None)
+    assert _result(s3)["model"] == "google/gemini-3.8-flash"
+    # gemini read it, so gemini may not audit it: the ALT model, reasoning low
+    assert sent[1]["model"] == "meta/muse-spark-1.3-contributor"
+    assert sent[1]["reasoning"] == {"effort": "low"}
+    content = sent[1]["messages"][0]["content"]
+    assert [p["type"] for p in content] == ["text", "image_url", "text"]
+    rec = _audit(s3)
+    assert rec["verdict"] == "ok" and rec["model"] == "meta/muse-spark-1.3-contributor"
+    assert rec["route"] == "vision"
+
+
+def test_a_refused_docx_with_a_checklist_is_missed(s3, sns, audit_on, monkeypatch):
+    # The reader model also found nothing; the audit names a row that is in the file.
+    monkeypatch.setenv("TEMPLATE_DIGITISE_MODEL", "meta/muse-spark-1.3-contributor")
+    _docx_source(s3, _docx_no_answer_column())
+    sent = _http(monkeypatch, [_ok('{"sections": []}'), _audit_answer("missed", 2, missing=[
+        {"section": "Wall Framing", "text": "Studs at 600 centres"}])])
+    worker.lambda_handler(_event(), None)
+    assert _result(s3)["status"] == "unreadable"
+    assert sent[1]["model"] == "google/gemini-3.8-flash"
+    rec = _audit(s3)
+    assert rec["verdict"] == "missed" and rec["route"] == "docx_model"
+    assert len(sns.published) == 1
+    assert "Template upload missed" in sns.published[0]["Subject"]
