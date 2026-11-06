@@ -34,6 +34,12 @@ _LIVE_KEYS_SQL = ("SELECT DISTINCT c.source_s3_key FROM report_chunks c "
                   "WHERE c.source_s3_key = ANY(%(keys)s) AND "
                   + search_sql._visibility_predicate("c", "TRUE"))
 
+# The action pack re-check's chunk rule (live_chunk_ids): the same imported predicate, by
+# chunk id -- a pack source stores its chunk id, not the chunk's source key.
+_LIVE_CHUNKS_SQL = ("SELECT c.id::text AS id FROM report_chunks c "
+                    "WHERE c.id = ANY(%(ids)s::uuid[]) AND "
+                    + search_sql._visibility_predicate("c", "TRUE"))
+
 # Rule 1: the keys a recording tombstone covers (prefix match). The same predicate
 # the chunk arm carries, over the manifest's keys, so a tombstone withholds even
 # while a stale chunk row is still there.
@@ -72,6 +78,22 @@ def _manifest(t):
 
 def _rows(conn, sql, params):
     return conn.cursor(row_factory=dict_row).execute(sql, params).fetchall()
+
+
+def live_chunk_ids(conn, ids, site_ids, author_ids) -> set:
+    """The lower-cased ids among `ids` (uuid strings) of report_chunks rows that still exist
+    and pass search's own visibility rule for this reader -- the rule that let the action
+    agent read them. Used by the action pack source re-check for a chunk with no topic (an
+    unassigned transcript window, which search keeps visible: see
+    deleted_predicates.visible_chunks_predicate). A re-ingested chunk gets a new id, so its
+    old id is no longer live and the source is hidden: fail closed."""
+    ids = [str(i) for i in ids or () if _UUID.match(str(i))]
+    if not ids or not site_ids:
+        return set()
+    return {r["id"].lower() for r in _rows(conn, _LIVE_CHUNKS_SQL, {
+        "ids": ids, "site_ids": list(site_ids),
+        "author_ids": None if author_ids is None else list(author_ids),
+        "source_family": None})}
 
 
 def live_document_ids(conn, ids, site_ids) -> set:

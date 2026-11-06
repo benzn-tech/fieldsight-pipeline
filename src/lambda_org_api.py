@@ -874,8 +874,11 @@ class _ReaderVisibility:
     sources and for its actions' live targets alike.
 
     records   -> topics.get_topic_visible on the topic_id; an `item` source with no topic_id
-                 goes through its live row (get_live_by_stable_id). A records source with
-                 neither is removed (fail closed: nothing to re-check).
+                 goes through its live row (get_live_by_stable_id); a `chunk` source with no
+                 topic_id (an unassigned transcript window -- most of them have no topic)
+                 goes through its chunk row with search's own visibility rule
+                 (ask_thread_check.live_chunk_ids). A records source with none of these is
+                 removed (fail closed: nothing to re-check).
     documents -> ask_thread_check.live_document_ids: exists, undeleted, on a site the reader
                  sees.
     web       -> never removed (no record behind it; the snapshot is the pack's own copy).
@@ -919,11 +922,17 @@ class _ReaderVisibility:
         srcs = pack.get("sources") or []
         try:
             with self.conn.transaction():
-                site_ids, _ = self._site_author_ids()
+                site_ids, author_ids = self._site_author_ids()
                 live_docs = ask_thread_check.live_document_ids(
                     self.conn, sorted({str(s["document_id"]) for s in srcs
                                        if s.get("provenance") == "documents"
                                        and s.get("document_id")}), site_ids)
+                live_chunks = ask_thread_check.live_chunk_ids(
+                    self.conn, sorted({str(s["chunk_id"]) for s in srcs
+                                       if s.get("provenance") == "records"
+                                       and s.get("kind") == "chunk"
+                                       and not s.get("topic_id") and s.get("chunk_id")}),
+                    site_ids, author_ids)
                 removed = set()
                 for s in srcs:
                     prov = s.get("provenance")
@@ -937,6 +946,8 @@ class _ReaderVisibility:
                     elif s.get("stable_id"):
                         item = action_items.get_live_by_stable_id(self.conn, s["stable_id"])
                         live = item is not None and self._topic(item["topic_id"])
+                    elif s.get("kind") == "chunk" and s.get("chunk_id"):
+                        live = str(s["chunk_id"]).lower() in live_chunks
                     else:
                         live = False
                     if not live:
