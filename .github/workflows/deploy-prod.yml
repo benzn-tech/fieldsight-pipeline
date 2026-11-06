@@ -254,6 +254,14 @@ jobs:
           if [ -n "$TD_PDF_MODEL" ]; then
             TEMPLATE_DIGITISE_PDF_MODEL_PARAM="TemplateDigitisePdfModel=$TD_PDF_MODEL"
           fi
+          # Upload audit models (spec 2026-11-06 A6), normalised like TD_MODEL and never empty:
+          # a blank variable falls back to the template default.
+          TDA_MODEL="$(printf '%s' "${{ vars.PROD_TEMPLATE_DIGITISE_AUDIT_MODEL || 'google/gemini-3.8-flash' }}" | tr -d '[:space:]')"
+          TDA_MODEL="${TDA_MODEL:-google/gemini-3.8-flash}"
+          TDA_ALT_MODEL="$(printf '%s' "${{ vars.PROD_TEMPLATE_DIGITISE_AUDIT_ALT_MODEL || 'meta/muse-spark-1.3-contributor' }}" | tr -d '[:space:]')"
+          TDA_ALT_MODEL="${TDA_ALT_MODEL:-meta/muse-spark-1.3-contributor}"
+          TEMPLATE_DIGITISE_AUDIT_MODEL_PARAM="TemplateDigitiseAuditModel=$TDA_MODEL"
+          TEMPLATE_DIGITISE_AUDIT_ALT_MODEL_PARAM="TemplateDigitiseAuditAltModel=$TDA_ALT_MODEL"
           # Gemini provider order (spec 2026-10-23). Unset keeps the template
           # default (AI Studio first); 'off' is the rollback.
           PROVIDER_ORDER_PARAM=""
@@ -363,6 +371,9 @@ jobs:
               ${TEMPLATE_DIGITISE_REASONING_PARAM:+"$TEMPLATE_DIGITISE_REASONING_PARAM"} \
               ${TEMPLATE_DIGITISE_PROVIDER_PARAM:+"$TEMPLATE_DIGITISE_PROVIDER_PARAM"} \
               ${TEMPLATE_DIGITISE_PDF_MODEL_PARAM:+"$TEMPLATE_DIGITISE_PDF_MODEL_PARAM"} \
+              "TemplateDigitiseAudit=${{ vars.PROD_TEMPLATE_DIGITISE_AUDIT || 'false' }}" \
+              "$TEMPLATE_DIGITISE_AUDIT_MODEL_PARAM" \
+              "$TEMPLATE_DIGITISE_AUDIT_ALT_MODEL_PARAM" \
               "CheckDoneGaps=${{ vars.PROD_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.PROD_PROJECT_DOCUMENTS || 'false' }}" \
               $PDF_LAYER_PARAM \
