@@ -328,6 +328,48 @@ def test_s13_removed_sources_hide_their_claims_and_actions(db, env):
     assert status == 200 and next(s for s in mine["sources"] if s["ref"] == "R4")["removed"]
 
 
+def test_s13_topicless_transcript_chunks_use_search_visibility(db, env):
+    # Most transcript windows belong to no topic (report_chunks.topic_id NULL) and search
+    # keeps them visible, so the agent may cite only those. The re-check must not hide
+    # them wholesale (an action backed only by them vanished on GET), but must still hide
+    # one search would hide: another site, another author under SELF reach, a deleted
+    # recording, a row that no longer exists.
+    from repositories import chunks
+    co, site, other_site, creator = _world(db)
+    pm = _user(db, co, "pm")
+    memberships.ensure_membership(db, pm["id"], site["id"], "pm")
+    vec = "[" + ",".join(["0.01"] * 1024) + "]"
+
+    def chunk(site_id, user_id, key=None):
+        key = key or f"extractions/F_{_tag()}/{DAY}/sid{_tag()}.json"
+        return str(chunks.insert_chunk(db, site_id, DAY, "transcript_window", "talk", vec,
+                                       user_id=user_id, source_s3_key=key)["id"])
+
+    mine = chunk(site["id"], creator["id"])
+    pms = chunk(site["id"], pm["id"])
+    elsewhere = chunk(other_site["id"], pm["id"])
+    gone_prefix = f"extractions/F_{_tag()}/{DAY}/sid{_tag()}"
+    gone = chunk(site["id"], creator["id"], key=gone_prefix + ".json")
+    redactions.create_recording_tombstone(db, co["id"], gone_prefix, "test", None, "admin")
+    src = lambda ref, cid: {"ref": ref, "kind": "chunk", "provenance": "records",  # noqa: E731
+                            "chunk_id": cid, "excerpt": f"text-{ref}"}
+    sources = [src("R1", mine), src("R2", pms), src("R3", elsewhere), src("R4", gone),
+               src("R5", str(uuid.uuid4()))]
+    actions = [{"seq": i, "type": "note", "refs": [f"R{i}"], "verifier": "supported"}
+               for i in range(1, 6)]
+    pid = _ready_pack(db, site, creator, sources, actions)
+
+    status, body = _call(db, pm, "GET", f"/action-packs/{pid}")
+    assert status == 200
+    assert {s["ref"] for s in body["sources"] if s["removed"]} == {"R3", "R4", "R5"}
+    assert [a["seq"] for a in body["actions"]] == [1, 2]
+    # The creator (worker, SELF reach) does not see the pm's own recording either.
+    status, body = _call(db, creator, "GET", f"/action-packs/{pid}")
+    assert status == 200
+    assert {s["ref"] for s in body["sources"] if s["removed"]} == {"R2", "R3", "R4", "R5"}
+    assert [a["seq"] for a in body["actions"]] == [1]
+
+
 def test_s15_applicable_and_target_task_numbers(db, env):
     co, site, _, creator = _world(db)
     pm = _user(db, co, "pm")
