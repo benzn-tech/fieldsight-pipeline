@@ -238,7 +238,10 @@ def check(answer, result, source_text):
             reworded.append({"n": n, "source_text": _ws(claim.get("source_text")),
                              "draft_text": items[n - 1]})
 
-    # Reported, never decisive: nothing in the source can confirm "these two were one row".
+    # Nothing in the source text can confirm "these two were one row", so a split/merge
+    # decides the verdict only when it names a real draft item AND the model itself calls
+    # the read "problems". TEST 2026-11-06: muse joined two council rows into item 29 on
+    # all 3 reads, gemini named it 3/3, and the verdict still said "ok".
     split = []
     for claim in _entries(answer, "split_or_merged"):
         n = _n(claim, len(items)) if isinstance(claim, dict) else None
@@ -249,7 +252,8 @@ def check(answer, result, source_text):
 
     said, error = answer.get("verdict"), None
     if items:
-        verdict = "problems" if (missing or extra or reworded) else "ok"
+        decisive_split = split and said == "problems"
+        verdict = "problems" if (missing or extra or reworded or decisive_split) else "ok"
     elif missing and said in ("missed", "problems"):
         verdict = "missed"
     elif not missing and said == "not_a_checklist":
