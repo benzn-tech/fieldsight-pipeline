@@ -10,7 +10,7 @@ import action_pack_stages as st
 import lambda_action_agent as agent
 from tests.unit.test_action_pack_stages import (CO, PACK, SID1, SID2, VERIFIER, WRITER, ClientError,
                                      Clock, Fetcher, FlakyLambda, Model, Tools, Verify, Web,
-                                     deps, make_ctx, plan_obj, write_obj)
+                                     deps, make_ctx, plan_obj, src, write_obj)
 
 
 @pytest.fixture(autouse=True)
@@ -46,7 +46,8 @@ def test_the_default_model_path_is_the_ask_judge_route(monkeypatch):
                     "timeout": 42.0}
     assert info == {"model": "openai/gpt-6-luna-pro",
                     "served_model": "openai/gpt-6-luna-pro-2026",
-                    "usage": {"prompt_tokens": 7, "completion_tokens": 3}}
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+                    "finish_reason": ""}
     monkeypatch.setattr(tc, "complete_json", lambda *a, **k: tc.ChatTurn(error="HTTP 503"))
     assert st.judge_call("p", max_tokens=10, model=WRITER, deadline=42.0,
                          caller="x", info={}) == (None, "HTTP 503")
@@ -78,7 +79,8 @@ class ItemsWithStatus(Tools):
 
 
 def test_update_and_close_must_be_legal_from_the_current_status():
-    write = {"conclusion": [], "actions": [
+    fs = {f: src("R1", said_on="2026-10-10") for f in ("status", "deadline")}
+    write = {"conclusion": [], "actions": [dict(a, field_sources=fs) for a in [
         {"type": "update_item", "target_stable_id": SID1, "proposed": {"status": "open"},
          "rationale": "r", "refs": ["R1"]},                       # reopen: never
         {"type": "close_item", "target_stable_id": SID2, "proposed": {"status": "closed"},
@@ -89,7 +91,7 @@ def test_update_and_close_must_be_legal_from_the_current_status():
          "proposed": {"status": "blocked", "deadline": "2026-11-10"}, "rationale": "r",
          "refs": ["R1"]},                                         # in_progress -> blocked ok
         {"type": "close_item", "target_stable_id": SID1, "proposed": {}, "rationale": "r",
-         "refs": ["R1"]}]}                                        # in_progress -> done ok
+         "refs": ["R1"]}]]}                                       # in_progress -> done ok
     tools = ItemsWithStatus({SID1: "in_progress", SID2: "done"})
     verify = Verify()
     payload = st.run(make_ctx(), deps(model=Model(write=[write]), tools=tools, verify=verify))
@@ -97,14 +99,17 @@ def test_update_and_close_must_be_legal_from_the_current_status():
             for a in verify.calls[0]["draft"]["actions"]]
     assert kept == [("update_item", SID1, {"status": "blocked", "deadline": "2026-11-10"}),
                     ("close_item", SID1, {"status": "done"})]
-    assert payload["run_trace"]["write_dropped"]["transitions"] == 3
+    # The reopen is the writer schema's; the two on the done item are the scope gate's
+    # (rule 1: a target must be open -- spec 2026-11-05 §3.2.4).
+    assert payload["run_trace"]["write_dropped"]["transitions"] == 1
+    assert payload["run_trace"]["scope_gate"] == {"drop_target_closed": 2}
 
 
 def test_an_unchanged_status_is_dropped_from_an_update_not_the_whole_update():
     write = {"conclusion": [], "actions": [
         {"type": "update_item", "target_stable_id": SID1,
          "proposed": {"status": "open", "deadline": "2026-11-10"}, "rationale": "r",
-         "refs": ["R1"]},
+         "refs": ["R1"], "field_sources": {"deadline": src("R1", said_on="2026-10-10")}},
         {"type": "update_item", "target_stable_id": SID2, "proposed": {"status": "open"},
          "rationale": "r", "refs": ["R1"]}]}
     verify = Verify()

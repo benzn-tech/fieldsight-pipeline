@@ -98,7 +98,7 @@ GATHER_HEADER_MAX_CHARS = GATHER_RENDER_MAX_CHARS // 4
 WRITE_RENDER_MAX_CHARS = 30000 * 4
 PLAN_MAX_TOKENS = 1500
 ROUND_MAX_TOKENS = 1000
-WRITE_MAX_TOKENS = 8000
+WRITE_MAX_TOKENS = 12000          # spec 2026-11-05 §11: field_sources and sub_tasks
 # Write output caps (extras are dropped and counted).
 MAX_CONCLUSION = 20
 MAX_ACTIONS = 30
@@ -237,7 +237,8 @@ def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, 
     before -- ASK_JUDGE_PROVIDER pin and ASK_JUDGE_REASONING on the judge model,
     ASK_JUDGE_FALLBACKS (unset = none). `deadline` is seconds from now (the stage's),
     converted to the client's clock and also the per-attempt cap. -> (text, err); `info`
-    gets model (the chain entry that answered), served_model and usage."""
+    gets model (the chain entry that answered), served_model, usage and finish_reason
+    ("length" = stopped on the token limit)."""
     import llm_tools_client
     routing = agent.writer_routing()
     # With a fallback configured, one attempt gets FALLBACK_ATTEMPT_SHARE of the window
@@ -263,7 +264,8 @@ def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, 
     usage = turn.usage if isinstance(turn.usage, dict) else {}
     info.update(model=turn.requested_model or model, served_model=turn.model or None,
                 usage={"prompt_tokens": usage.get("prompt_tokens"),
-                       "completion_tokens": usage.get("completion_tokens")})
+                       "completion_tokens": usage.get("completion_tokens")},
+                finish_reason=getattr(turn, "finish_reason", "") or "")
     return turn.text, None
 
 
@@ -512,6 +514,8 @@ class Run:
         if not counted:
             counted = (len(prompt) + len(text or "")) // 4      # estimate: chars / 4
         self.tokens += counted
+        if caller == "action_write" and info.get("finish_reason") == "length":
+            _bump(self.trace, "write_finish_length")        # spec §11: a truncated answer
         self.last_served = info.get("served_model") if err is None else None
         return text, err, (info.get("model") or wanted)
 
@@ -1352,12 +1356,23 @@ Return ONLY a JSON object:
 """
 
 
+def delegations_render(run) -> str:
+    """The planner's delegated missing values (spec 2026-11-05 §3.2.4 `assumed_default`):
+    target ids and field names only. "" with none, so WRITE_PROMPT is unchanged."""
+    delegations = run.plan.delegations if run.plan else []
+    if not delegations:
+        return ""
+    lines = [f"{d['target'] or 'any item you change'}: {d['field']}" for d in delegations]
+    return ("\nDelegated missing values (only for an item with neither a deadline nor a "
+            "deadline_text; source assumed_default):\n" + "\n".join(lines))
+
+
 def targets_render(run) -> str:
     """The planner's named targets as resolved in round 1 (spec 2026-11-05 §3.2.2), one line
-    each -- ids, refs and statuses only, never the phrase. "" with no targets, so a plan
-    without targets leaves WRITE_PROMPT unchanged."""
+    each -- ids, refs and statuses only, never the phrase -- then the delegated values. ""
+    with neither, so such a plan leaves WRITE_PROMPT unchanged."""
     if not run.resolution:
-        return ""
+        return delegations_render(run)
 
     def ref(sid):
         return str((run.items.get(sid) or {}).get("ref") or "?")
@@ -1374,7 +1389,7 @@ def targets_render(run) -> str:
         else:
             lines.append(f"{tid}: NOT FOUND — write a note")
     return ("\nNamed targets (the items the instruction names, matched in code):\n"
-            + "\n".join(lines))
+            + "\n".join(lines) + delegations_render(run))
 
 
 def write_render(run):
@@ -1567,10 +1582,15 @@ def validate_draft(obj, run, citable):
             if target is None or target not in run.items:
                 _bump(counts, "targets")
                 continue
-            proposed = legal_change(atype, proposed, run.items[target].get("status"))
-            if proposed is None:
-                _bump(counts, "transitions")
-                continue
+            current = run.items[target].get("status")
+            # A target that is no longer open is the scope gate's (rule 1): a named one
+            # becomes an "already done" note, any other is dropped there. legal_change
+            # would drop a close on it here, before the gate could say so.
+            if (current or "open") in OPEN_STATUSES:
+                proposed = legal_change(atype, proposed, current)
+                if proposed is None:
+                    _bump(counts, "transitions")
+                    continue
         el = {"type": atype, "target_stable_id": target, "proposed": proposed,
               "rationale": rationale, "refs": refs}
         if atype in TARGETED or atype == "create_item":
@@ -1641,6 +1661,13 @@ def write_stage(run):
             run.models["writer"] = used
             if run.last_served:
                 run.models["writer_served"] = run.last_served
+            # The scope gate (spec 2026-11-05 §3.2.4): which items the draft may change
+            # and which proposed fields have a source. Counts only in the trace.
+            import action_pack_scope
+            draft, counts = action_pack_scope.gate(
+                draft, plan=plan, resolution=run.resolution, items=run.items,
+                registry=run.registry)
+            run.trace["scope_gate"] = counts
             return draft
     raise agent.ModelFailure("write schema")
 
