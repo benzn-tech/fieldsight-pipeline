@@ -1,8 +1,10 @@
 # Site decision loop: site events run themselves, only decisions reach a person
 
-Status: design, rev 3 (2026-11-05). Architecture research. Not built, no flag, no migration yet.
+Status: design, rev 4 (2026-11-06). Architecture research. Not built, no flag, no migration yet.
 Rev 2 folds in a Fable builder check (§15): six grounding corrections and seven builder
 questions, answered as my calls where the owner had not ruled.
+Rev 4 records the owner's 2026-11-06 rulings: all my calls approved, the spoken location
+onboarding (§9), answers do not add a chain level (§4.7), quiet hours (§6.6).
 Rev 3 compares the design with the author's open-sourced code (§16,
 github.com/KKKKhazix/agent-autoloop, MIT) and adopts what fits a multi-tenant product.
 Source: owner conversation 2026-11-03..05 after reading 卡兹克's "Agent 自动化系统" article (2026-11-02).
@@ -214,9 +216,11 @@ outcome), cost ledger, check log, decision ledger.
 
 Events emitted by a handler inherit `chain_id` and increment `chain_depth`. At depth 3 the
 hub records the event and stops asking, so two handlers cannot keep triggering each other.
-**Open:** whether a person's answer adds a level. The author's answers do not (only
-agent-emitted events do; cap 8) and timer scans start at 0. Under that rule our cap of 3
-counts agent hops only.
+**A person's answer does not add a level** (owner, 2026-11-06, same as the author's code).
+Only events a handler emits count, and timer scans start at 0. A chain that passes through a
+person (PM decides → foreman reminded → foreman confirms) is never cut short. The cap of 3
+stops agents triggering each other with no person in between, which is where a runaway
+loop comes from.
 
 ### 4.8 Run identity (my call)
 
@@ -329,6 +333,11 @@ migration and membership UI.
 - Conflict: "Monday said C30, Wednesday said C35, which stands?"
 - Not a card: "Is next Wednesday 12 Nov?" (inferred).
 
+### 6.6 Quiet hours (owner, 2026-11-06)
+Default 21:00-06:00 NZ time, plus all of Sunday. Cards raised in that window wait until
+06:00. Saturday is a working day (NZ sites often work Saturday mornings); the owner may
+change this. Possible injury ignores quiet hours (§7). Each company can change the window.
+
 ## 7. Urgency
 
 Owner, 2026-11-04:
@@ -355,10 +364,28 @@ Numbers are starting values, to be set from shadow-phase measurements.
 
 ## 9. Project location list
 
-Needed to resolve "the north wall" and by multi-unit walks. Proposed (owner has not ruled):
-extract buildings / units / levels from uploaded drawings and documents (#1145), the PM
-confirms once with a single card, and new names heard in recordings are added as candidates
-until confirmed or matched to a drawing. Manual entry optional, never required.
+Needed to resolve "the north wall" and by multi-unit walks.
+
+**Spoken onboarding (owner, 2026-11-06).** Drawings are not a reliable source yet: drawing
+reading is not accurate enough. PM data entry is not one either: people under site pressure
+do not fill forms. So:
+1. **When.** A project with no location list prompts once, wherever someone first meets it:
+   - a microphone button when the project is created on the web;
+   - if that was skipped, a short voice prompt on the device at the first recording on the
+     project.
+
+   Skippable; if skipped, one reminder a few days later. Once confirmed, never asked again.
+2. **How.** A short spoken description, no typing (the no-manual-typing rule), for example:
+   - "four storey, three zones: north, south and detached";
+   - "20 houses: 6 at 115 X Street, 4 at 117 X Street, 10 at 120 X Street".
+3. **Confirm card.** The system turns it into a structure and sends one card: "Is this your
+   project?" with the parsed list, and the options *correct* / *say it again* / *later*.
+4. **Free shape.** No fixed schema. A project can be address → unit, or building → level →
+   zone, and can span several addresses. Store it as a tree of named nodes with a kind
+   (address, building, unit, level, zone).
+5. **Later additions are candidates.** Names heard in recordings that are not on the list,
+   and anything read from drawings once that is reliable, become candidates. They are asked
+   about only when it matters (a defect would attach to a place not on the list).
 
 ## 10. Tenancy, privacy, retention
 
@@ -390,20 +417,21 @@ is merged by the owner, so they gate P0's review and P1.
 
 ## 13. Decided, my calls, open
 
-**Owner decided (2026-11-03..05):**
+**Owner decided (2026-11-03..06):**
 - The three card purposes.
 - Ask as little as possible.
 - The authority test (not "is it the PM").
 - The urgency factors, with injury as an override.
 - Retention is deferred.
 - Claude models go only through the Claude API.
+- 2026-11-06: every "my call" below was approved ("你定的没问题"). Also: the spoken location
+  onboarding (§9); a person's answer does not add a chain level (§4.7); quiet hours (§6.6).
 
-**My calls (owner has seen the diagram but not ruled on these):**
+**My calls (approved by the owner 2026-11-06):**
 - The recipient roles in §6.4, and mapping v1 onto existing roles with delegation deferred to P3.
 - The conservative timeout defaults in §6.2.
 - The unmatched threshold of 5 in 7 days.
 - The brake numbers in §8.
-- The location-list approach in §9.
 - Run identity: a system principal per company and site, evidence re-filtered per recipient,
   writes performed as the answering person (§4.8).
 - P0 emitters (§4.1). P0 is deterministic, and the model-call layer is deferred (§4.3).
@@ -412,9 +440,12 @@ is merged by the owner, so they gate P0's review and P1.
 - Action packs keep their own entry point in v1.
 
 **Open:**
-- Whether a person's answer adds a chain level (§4.7).
-- Channel order per role.
-- Quiet hours.
+- Channel order per role. Not needed until push or Teams exist. Starting point:
+  - PM: web inbox plus a daily email digest, with an immediate email when urgent;
+  - foreman: push, plus device voice when urgent;
+  - company admin: email;
+  - ops: internal alert.
+- Saturday as a working day (§6.6).
 
 ## 14. Left to the builder
 - Event transport: SQS FIFO (dedupe id = `dedupe_key`) or table-polling; EventBridge for

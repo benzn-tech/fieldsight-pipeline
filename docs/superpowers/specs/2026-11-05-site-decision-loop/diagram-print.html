@@ -293,7 +293,7 @@ footer { font-size: 13px; color: var(--muted); }
     <div class="brakes">
       <div class="bk"><div class="bk-n">1</div><b>单次尝试</b><span>一次尝试里最多调用模型 8 次，超了立刻停</span></div>
       <div class="bk"><div class="bk-n">2</div><b>同一任务</b><span>第 3 次失败通知管理员，第 5 次停；间隔 5 分钟起翻倍、最长 1 小时；最坏 5 × 8 = 40 次调用</span></div>
-      <div class="bk"><div class="bk-n">3</div><b>连锁深度</b><span>Agent 发出的新事件最多连 3 层，防止互相触发（人的回答算不算一层待定）</span></div>
+      <div class="bk"><div class="bk-n">3</div><b>连锁深度</b><span>Agent 发出的新事件最多连 3 层，防止互相触发；人的回答不算一层</span></div>
       <div class="bk"><div class="bk-n">4</div><b>每个公司每天的钱包</b><span>用到 80% 提醒，用完暂停不紧急的任务</span></div>
       <div class="bk"><div class="bk-n">5</div><b>熔断</b><span>同一类错误短时间内大量出现，整条线暂停，只报一次</span></div>
     </div>
@@ -311,7 +311,7 @@ footer { font-size: 13px; color: var(--muted); }
     </div>
   </section>
 
-  <footer>示例卡片的项目、人名、时间均为虚构。详细设计见 fieldsight-pipeline 仓库 docs/superpowers/specs/2026-11-05-site-decision-loop-design.md（第 3 版，已对照作者开源代码 KKKKhazix/agent-autoloop）。</footer>
+  <footer>示例卡片的项目、人名、时间均为虚构。详细设计见 fieldsight-pipeline 仓库 docs/superpowers/specs/2026-11-05-site-decision-loop-design.md（第 4 版，已对照作者开源代码 KKKKhazix/agent-autoloop）。</footer>
   </div>
 
   <div class="view" data-view="product" hidden>
