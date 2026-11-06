@@ -26,7 +26,9 @@ def test_org_api_uses_the_shared_priority_set():
 
 def _update(proposed):
     return {"type": "update_item", "target_stable_id": SID2, "proposed": proposed,
-            "rationale": "r", "refs": ["R1"]}
+            "rationale": "r", "refs": ["R1"],
+            "field_sources": {f: {"source": "evidence", "refs": ["R1"],
+                                  "said_on": "2026-10-10"} for f in proposed}}
 
 
 def test_the_writer_lower_cases_priority_and_drops_one_apply_would_refuse():
@@ -35,7 +37,7 @@ def test_the_writer_lower_cases_priority_and_drops_one_apply_would_refuse():
         _update({"priority": "urgent", "deadline": "2026-11-10"}),
         _update({"priority": "P1"}),                       # nothing else left: dropped
         {"type": "create_item", "proposed": {"text": "Book the pump", "priority": "ASAP"},
-         "rationale": "r", "refs": ["R1"]}])
+         "rationale": "r", "refs": ["R1"], "field_sources": {}}])
     verify = Verify()
     payload = st.run(make_ctx(), deps(model=Model(write=[write]), verify=verify))
     proposed = [a["proposed"] for a in verify.calls[0]["draft"]["actions"]]

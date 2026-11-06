@@ -98,7 +98,7 @@ GATHER_HEADER_MAX_CHARS = GATHER_RENDER_MAX_CHARS // 4
 WRITE_RENDER_MAX_CHARS = 30000 * 4
 PLAN_MAX_TOKENS = 1500
 ROUND_MAX_TOKENS = 1000
-WRITE_MAX_TOKENS = 8000
+WRITE_MAX_TOKENS = 12000          # spec 2026-11-05 §11: field_sources and sub_tasks
 # Write output caps (extras are dropped and counted).
 MAX_CONCLUSION = 20
 MAX_ACTIONS = 30
@@ -123,6 +123,8 @@ TARGETED = ("close_item", "update_item")
 CONFIDENCE = ("supported", "uncertain")
 VERIFIER_LABELS = ("supported", "weak", "unsupported")
 ITEM_STATUSES = tuple(action_pack_view.STATUS_TRANSITIONS)
+# action_pack_verify.OPEN_STATUSES (verify imports this module, so not imported here).
+OPEN_STATUSES = ("open", "in_progress", "blocked")
 SNAPSHOT_FIELDS = ("status", "deadline", "responsible", "priority", "text", "updated_at")
 # Proposed fields per draft-only type (the apply types use action_pack_view's table).
 _DRAFT_FIELDS = {"draft_rfi": (("subject", "body"), ()),
@@ -235,7 +237,8 @@ def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, 
     before -- ASK_JUDGE_PROVIDER pin and ASK_JUDGE_REASONING on the judge model,
     ASK_JUDGE_FALLBACKS (unset = none). `deadline` is seconds from now (the stage's),
     converted to the client's clock and also the per-attempt cap. -> (text, err); `info`
-    gets model (the chain entry that answered), served_model and usage."""
+    gets model (the chain entry that answered), served_model, usage and finish_reason
+    ("length" = stopped on the token limit)."""
     import llm_tools_client
     routing = agent.writer_routing()
     # With a fallback configured, one attempt gets FALLBACK_ATTEMPT_SHARE of the window
@@ -261,7 +264,8 @@ def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, 
     usage = turn.usage if isinstance(turn.usage, dict) else {}
     info.update(model=turn.requested_model or model, served_model=turn.model or None,
                 usage={"prompt_tokens": usage.get("prompt_tokens"),
-                       "completion_tokens": usage.get("completion_tokens")})
+                       "completion_tokens": usage.get("completion_tokens")},
+                finish_reason=getattr(turn, "finish_reason", "") or "")
     return turn.text, None
 
 
@@ -510,6 +514,8 @@ class Run:
         if not counted:
             counted = (len(prompt) + len(text or "")) // 4      # estimate: chars / 4
         self.tokens += counted
+        if caller == "action_write" and info.get("finish_reason") == "length":
+            _bump(self.trace, "write_finish_length")        # spec §11: a truncated answer
         self.last_served = info.get("served_model") if err is None else None
         return text, err, (info.get("model") or wanted)
 
@@ -863,6 +869,8 @@ def plan_stage(run: Run) -> Plan:
             run.trace["plan_scope"] = plan.change_scope
             run.trace["plan_key_defaulted"] = list(plan.defaulted)
             run.trace["plan_targets"] = len(plan.targets)
+            run.trace["plan_stated_values"] = len(plan.stated_values)
+            run.trace["plan_delegations"] = len(plan.delegations)
             run.trace["plan_sub_tasks"] = len(plan.sub_tasks)
             return plan
         logger.info("action agent plan rejected pack=%s code=%s", ctx.pack_id, code)
@@ -1328,6 +1336,12 @@ Rules:
 - Never ask the user questions.
 - Never reopen an item, and only change an item whose current status allows it.
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
+- Change only items the instruction names, unless it asks you to tidy open items. For anything else worth changing, write a note.
+- target_ref: on close_item / update_item, the id (t1, t2 ...) of the named target it acts on, from the named targets list; null when the item is not a named target.
+- field_sources: on close_item, update_item and create_item, one entry for every proposed field except a create's text (close_item's field is "status"): {{"source": "user" | "evidence" | "assumed_default", "refs": [...], "said_on": "YYYY-MM-DD" or null}}.
+  "user": the user gave this value in the instruction. "evidence": a record (R topic/chunk) or a project document (D) states it -- cite those refs; an item's own line never justifies changing that item, except a deadline worked out from its own deadline_text; web refs (W) never set a field. "assumed_default": only for a deadline the user told you to set when the item has neither a deadline nor a deadline_text; propose the item's raised_on as YYYY-MM-DD.
+  said_on: for an "evidence" deadline, the said_on of the record it was resolved from (an item's raised_on when it comes from its deadline_text); otherwise null.
+  A field without a valid source is removed before anyone sees it.
 - Action types and their "proposed" fields:
   close_item   {{"status": "done" | "closed"}}
   update_item  any of {{"status": "in_progress"|"blocked"|"done"|"closed", "deadline": "YYYY-MM-DD", "responsible": "a name", "priority": "low"|"medium"|"high"}}
@@ -1338,18 +1352,40 @@ Rules:
 
 Return ONLY a JSON object:
 {{"conclusion": [{{"text": "...", "refs": ["R1"], "confidence": "supported"}}],
-  "actions": [{{"type": "close_item", "target_stable_id": "<stable_id or null>", "proposed": {{...}}, "rationale": "why, in one or two sentences", "refs": ["R2"]}}]}}
+  "actions": [{{"type": "close_item", "target_stable_id": "<stable_id or null>", "target_ref": "<t1 or null>", "proposed": {{...}}, "field_sources": {{"status": {{"source": "evidence", "refs": ["R2"], "said_on": null}}}}, "rationale": "why, in one or two sentences", "refs": ["R2"]}}]}}
 
 {evidence}
 """
 
 
+def delegations_render(run) -> str:
+    """The planner's stated values and delegated missing values (spec 2026-11-05 §3.2.4
+    `user`, `assumed_default`): target ids, field names and the stated values
+    (sanitised data: the code copies them, never follows them). "" with neither, so
+    WRITE_PROMPT is unchanged."""
+    plan = run.plan
+    out = ""
+    stated = plan.stated_values if plan else []
+    if stated:
+        lines = [f"{v['target'] or 'any item you change'}: {v['field']} = "
+                 f"{sanitize(v['value'])}" for v in stated]
+        out += ("\nValues the user stated (source user; the code applies these values):\n"
+                + "\n".join(lines))
+    delegations = plan.delegations if plan else []
+    if delegations:
+        lines = [f"{d['target'] or 'any item you change'}: {d['field']}"
+                 for d in delegations]
+        out += ("\nDelegated missing values (only for an item with neither a deadline nor "
+                "a deadline_text; source assumed_default):\n" + "\n".join(lines))
+    return out
+
+
 def targets_render(run) -> str:
     """The planner's named targets as resolved in round 1 (spec 2026-11-05 §3.2.2), one line
-    each -- ids, refs and statuses only, never the phrase. "" with no targets, so a plan
-    without targets leaves WRITE_PROMPT unchanged."""
+    each -- ids, refs and statuses only, never the phrase -- then the delegated values. ""
+    with neither, so such a plan leaves WRITE_PROMPT unchanged."""
     if not run.resolution:
-        return ""
+        return delegations_render(run)
 
     def ref(sid):
         return str((run.items.get(sid) or {}).get("ref") or "?")
@@ -1366,7 +1402,7 @@ def targets_render(run) -> str:
         else:
             lines.append(f"{tid}: NOT FOUND — write a note")
     return ("\nNamed targets (the items the instruction names, matched in code):\n"
-            + "\n".join(lines))
+            + "\n".join(lines) + delegations_render(run))
 
 
 def write_render(run):
@@ -1473,6 +1509,38 @@ def legal_change(atype, proposed, current):
     return proposed or None
 
 
+FIELD_SOURCES = ("user", "evidence", "assumed_default")
+_NO_SOURCE = {"source": None, "refs": [], "said_on": None}
+
+
+def _field_sources(raw, proposed, *, citable=()):
+    """The writer's `field_sources` for the fields it proposes (spec 2026-11-05 §3.2.3):
+    {field: {"source": user|evidence|assumed_default, "refs": [citable refs],
+    "said_on": "YYYY-MM-DD" or None}}. None when `raw` is not an object. A field with a
+    missing or malformed entry (unknown source, refs not a list) gets source None -- the
+    scope gate then removes it; a said_on that is not an ISO date is None. An entry for a
+    field not proposed, and a create's `text` (it keeps its refs rule), are ignored."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for fld in proposed:
+        if fld == "text":
+            continue
+        e = raw.get(fld)
+        if (not isinstance(e, dict) or e.get("source") not in FIELD_SOURCES
+                or not isinstance(e.get("refs", []), list)):
+            out[fld] = dict(_NO_SOURCE)
+            continue
+        refs = []
+        for r in e.get("refs") or []:
+            if isinstance(r, str) and r.strip() in citable and r.strip() not in refs:
+                refs.append(r.strip())
+        said = _iso_date(e.get("said_on"))
+        out[fld] = {"source": e["source"], "refs": refs,
+                    "said_on": said.isoformat() if said else None}
+    return out
+
+
 def validate_draft(obj, run, citable):
     """{"conclusion": [...], "actions": [...]} from the writer's object, every element that
     breaks the schema dropped and counted in run.trace["write_dropped"]. None when the
@@ -1496,13 +1564,15 @@ def validate_draft(obj, run, citable):
             conf = "uncertain"                       # G2: not citable -> uncertain
             _bump(counts, "conclusion_downgraded")
         conclusion.append({"text": text, "refs": refs, "confidence": conf})
+    plan_targets = {t["id"] for t in (run.plan.targets if run.plan else [])}
     actions = []
     for a in obj["actions"]:
         if len(actions) >= MAX_ACTIONS:
             _bump(counts, "actions")
             continue
         if not isinstance(a, dict) or set(a) - {"type", "target_stable_id", "proposed",
-                                                "rationale", "refs"}:
+                                                "rationale", "refs", "target_ref",
+                                                "field_sources"}:
             _bump(counts, "actions")
             continue
         atype = a.get("type")
@@ -1525,12 +1595,31 @@ def validate_draft(obj, run, citable):
             if target is None or target not in run.items:
                 _bump(counts, "targets")
                 continue
-            proposed = legal_change(atype, proposed, run.items[target].get("status"))
-            if proposed is None:
-                _bump(counts, "transitions")
-                continue
-        actions.append({"type": atype, "target_stable_id": target, "proposed": proposed,
-                        "rationale": rationale, "refs": refs})
+            current = run.items[target].get("status")
+            # A target that is no longer open is the scope gate's (rule 1): a named one
+            # becomes an "already done" note, any other is dropped there. legal_change
+            # would drop a close on it here, before the gate could say so.
+            if (current or "open") in OPEN_STATUSES:
+                proposed = legal_change(atype, proposed, current)
+                if proposed is None:
+                    _bump(counts, "transitions")
+                    continue
+        el = {"type": atype, "target_stable_id": target, "proposed": proposed,
+              "rationale": rationale, "refs": refs}
+        if atype in TARGETED or atype == "create_item":
+            # Spec 2026-11-05 §3.2.3: the writer names the planner target it acts on and
+            # where each proposed field comes from; the scope gate (action_pack_scope)
+            # judges both. A target_ref that is not one of the plan's target ids (or not
+            # a string at all) is null and counted. A field's refs join the action's refs
+            # in the gate, only when the field survives it.
+            ref = a.get("target_ref")
+            if ref is not None and (atype not in TARGETED or not isinstance(ref, str)
+                                    or ref not in plan_targets):
+                _bump(counts, "target_ref")
+                ref = None
+            sources = _field_sources(a.get("field_sources"), proposed, citable=citable)
+            el.update(target_ref=ref, field_sources=sources)
+        actions.append(el)
     if counts:
         run.trace["write_dropped"] = counts
     added = 0
@@ -1584,6 +1673,13 @@ def write_stage(run):
             run.models["writer"] = used
             if run.last_served:
                 run.models["writer_served"] = run.last_served
+            # The scope gate (spec 2026-11-05 §3.2.4): which items the draft may change
+            # and which proposed fields have a source. Counts only in the trace.
+            import action_pack_scope
+            draft, counts = action_pack_scope.gate(
+                draft, plan=plan, resolution=run.resolution, items=run.items,
+                registry=run.registry)
+            run.trace["scope_gate"] = counts
             return draft
     raise agent.ModelFailure("write schema")
 
