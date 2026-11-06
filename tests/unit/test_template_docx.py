@@ -209,3 +209,94 @@ def test_a_yes_no_table_that_is_not_a_checklist_has_no_items():
     _row(t, "Attendee", "Yes", "No")
     _row(t, "", "", "")
     assert template_docx.read(_save(d)) == []
+
+
+# ---- combined answer column, Pass/Fail words, legacy checkboxes (spec 2026-11-06 R1-R3) --
+# A hand-made form on 2026-11-06 read as zero items: one answer column headed
+# "Yes / No / N/A", every answer cell blank. Council forms say Pass / Fail / N/A.
+
+def _combined_like(answer_header="Yes / No / N/A", items=("Bottom plates fixed to slab",
+                                                          "Studs at 600 centres",
+                                                          "Lintels sized to drawings")):
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "No.", "Item", answer_header, "Comment")
+    _row(t, "Wall Framing", merge=True)
+    for n, it in enumerate(items, start=1):
+        _row(t, str(n), it, "", "")
+    return d, t
+
+
+def test_combined_answer_column_reads_items():
+    d, _ = _combined_like()
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Bottom plates fixed to slab", "Studs at 600 centres",
+                                            "Lintels sized to drawings"]},
+    ]
+
+
+@pytest.mark.parametrize("header", ["Y/N/NA", "Yes/No", "Pass / Fail / N/A",
+                                    "Complies / Does not comply / N/A", "YES | NO | N/A"])
+def test_combined_column_variants(header):
+    d, _ = _combined_like(header, items=("Gate locked", "Signage up"))
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Gate locked", "Signage up"]}]
+
+
+def test_separate_pass_fail_columns():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=5)
+    _row(t, "Item", "Pass", "N/A", "Fail", "Comment")
+    _row(t, "Nogs fitted", "", "", "", "")
+    _row(t, "Bracing installed", "", "", "", "")
+    assert template_docx.read(_save(d)) == [
+        {"title": "", "items": ["Nogs fitted", "Bracing installed"]}]
+
+
+def test_ok_alone_is_not_an_answer_header():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Item", "OK", "Comment")
+    _row(t, "Nogs fitted", "", "")
+    assert template_docx.read(_save(d)) == []
+
+
+def test_pass_in_item_text_is_not_an_answer():
+    d, _ = _combined_like(items=("Pass-through sealed OK", "Studs at 600 centres"))
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Pass-through sealed OK", "Studs at 600 centres"]}]
+
+
+def test_written_answer_row_is_not_an_item():
+    d, t = _combined_like(items=("Gate locked",))
+    _row(t, "2", "Final walk-round", "Checked by J. Smith on site, all good", "")
+    assert template_docx.read(_save(d)) == [{"title": "Wall Framing", "items": ["Gate locked"]}]
+
+
+def test_legacy_form_checkbox_is_answer_cell():
+    from docx.oxml import parse_xml
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=2)
+    _row(t, "Gate locked", "")
+    # A legacy FORMCHECKBOX field: w:ffData with a w:checkBox child, no answer text.
+    t.rows[0].cells[1]._tc.append(parse_xml(
+        '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Check1"/><w:enabled/>'
+        '<w:checkBox><w:sizeAuto/><w:default w:val="0"/></w:checkBox></w:ffData></w:fldChar></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> FORMCHECKBOX </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'))
+    assert template_docx.read(_save(d)) == [{"title": "", "items": ["Gate locked"]}]
+
+
+def test_bicl_and_penina_layouts_unchanged():
+    assert template_docx.read(_bicl_like()) == [
+        {"title": "Site Boundaries",
+         "items": ["Site secured", "Hoardings established where appropriate"]},
+        {"title": "Emergency Procedures", "items": ["Evacuation plan displayed"]},
+    ]
+    assert template_docx.read(_penina_like()) == [
+        {"title": "General", "items": ["Site Hazard Identification Board display",
+                                       "Is the H&S Policy displayed?"]},
+        {"title": "Site Amenities",
+         "items": ["Is the toilet facility in a clean and sanitary state?"]},
+    ]
