@@ -122,12 +122,24 @@ def test_reworded_with_no_difference_or_source_text_not_in_docx_is_dropped():
     assert len(out["dropped_claims"]) == 2
 
 
-def test_split_or_merged_is_reported_but_never_decides_the_verdict():
+def test_split_or_merged_decides_only_when_the_model_says_problems():
     out = audit.check(_answer("problems", 2, split_or_merged=[
         {"n": 1, "note": "two rows joined"}, {"n": 9, "note": "no such item"}]), DRAFT, SOURCE_TEXT)
-    assert out["verdict"] == "ok"
+    assert out["verdict"] == "problems"
     assert out["split_or_merged"] == [{"n": 1, "note": "two rows joined"}]
     assert out["dropped_claims"][0]["kind"] == "split_or_merged"
+
+
+def test_split_or_merged_with_model_ok_stays_ok():
+    out = audit.check(_answer("ok", 2, split_or_merged=[{"n": 1, "note": "maybe joined"}]),
+                      DRAFT, SOURCE_TEXT)
+    assert out["verdict"] == "ok" and out["split_or_merged"] == [{"n": 1, "note": "maybe joined"}]
+
+
+def test_split_or_merged_naming_no_item_is_not_decisive():
+    out = audit.check(_answer("problems", 2, split_or_merged=[{"n": 9, "note": "x"}]),
+                      DRAFT, SOURCE_TEXT)
+    assert out["verdict"] == "ok"
 
 
 def test_model_ok_with_checked_findings_is_problems():
