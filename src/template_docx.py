@@ -173,6 +173,39 @@ def _headings(document):
     return out
 
 
+_EMPTY_BOX = re.compile("[☐□]")
+_TICKED_BOX = re.compile("[☑☒✓✔■]")
+
+
+def _plain(text):
+    """Whitespace collapsed, checkbox glyphs written as [ ] / [x] for a text reader."""
+    return " ".join(_TICKED_BOX.sub(" [x] ", _EMPTY_BOX.sub(" [ ] ", text)).split())
+
+
+def render_text(source):
+    """The Word file as plain text in document order, for the model reader when no rule
+    above finds a row (spec 2026-11-06 R4): each non-empty paragraph a line; each table
+    "[table N]" then one line per non-blank row, its cells (merged ones once) joined
+    by " | "."""
+    document = docx.Document(source)
+    tables = iter(document.tables)  # the body's own tables, in the order iterchildren meets them
+    lines, n = [], 0
+    for el in document.element.body.iterchildren():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            text = _plain("".join(t.text or "" for t in el.iter() if t.tag.endswith("}t")))
+            if text:
+                lines.append(text)
+        elif tag == "tbl":
+            n += 1
+            lines.append(f"[table {n}]")
+            for row in next(tables).rows:
+                cells = [_plain(c.text) for c in _unique_cells(row)]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
 def read(source):
     """[{title, items: [str]}] in document order; [] when no checklist table is found."""
     document = docx.Document(source)

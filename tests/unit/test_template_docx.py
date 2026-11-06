@@ -300,3 +300,30 @@ def test_bicl_and_penina_layouts_unchanged():
         {"title": "Site Amenities",
          "items": ["Is the toilet facility in a clean and sanitary state?"]},
     ]
+
+
+# ---- the plain-text rendering the model fallback reads (spec 2026-11-06 R4) -----------
+
+def test_render_text_tables_and_paragraphs():
+    d = docx.Document()
+    d.add_paragraph("Wall Framing Checklist")
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Item", "Done", "Comment")
+    _row(t, "Section A", merge=True)
+    _row(t, "Gate locked", "☐", "")
+    _row(t, "Signage  up", "☑ Yes", "fine")
+    d.add_paragraph("")
+    d.add_paragraph("Signed: ____")
+    t2 = d.add_table(rows=0, cols=2)
+    _row(t2, "Project", "Penina")
+    assert template_docx.render_text(_save(d)) == "\n".join([
+        "Wall Framing Checklist",
+        "[table 1]",
+        "Item | Done | Comment",
+        "Section A",
+        "Gate locked | [ ] | ",
+        "Signage up | [x] Yes | fine",
+        "Signed: ____",
+        "[table 2]",
+        "Project | Penina",
+    ])

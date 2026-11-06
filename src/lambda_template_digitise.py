@@ -3,13 +3,15 @@
 Non-VPC (it calls OpenRouter; org-api is in-VPC with no outbound, BUG-36). Triggered by
 org-api writing template_digitise_requests/{company_id}/{id}.json (wired by
 scripts/wire-s3-events.sh, BUG-33). Reads the sources under template_sources/{company_id}/,
-routes a Word file to python-docx and a PDF or photos to one vision call, validates in
-code (template_draft), and writes template_digitise_results/{company_id}/{id}.json for the
-poll. Writes a result for EVERY request it accepts, including failures: an async invoke
-that raises is retried twice by Lambda, which would spend two more model calls on a form
-that already failed.
+routes a Word file to python-docx (or, when no rule finds a row, its text to the model
+reader) and a PDF or photos to one vision call, validates in code (template_draft), and
+writes template_digitise_results/{company_id}/{id}.json for the poll. Writes a result for
+EVERY request it accepts, including failures, so the poll never stays pending: async
+retries are off (EventInvokeConfig MaximumRetryAttempts 0), so a raise would only lose the
+answer, never re-run the read.
 
-Design: docs/superpowers/specs/2026-10-16-template-digitise-design.md section 3.
+Design: docs/superpowers/specs/2026-10-16-template-digitise-design.md section 3, and
+2026-11-06-digitise-reader-and-audit-design.md R4 for the Word fallback.
 """
 import json
 import logging
@@ -112,11 +114,23 @@ def digitise(request, deadline=None):
             body = _read_source(keys[0])
         except _TooLarge:
             return _empty("error", route="docx", error=MSG_TOO_LARGE)
-        raw = template_docx.read(BytesIO(body))
+        draft = template_draft.clean(template_docx.read(BytesIO(body)))
+        if draft["counts"]["items"]:
+            return {"status": "done", **draft, "route": "docx", "model": None, "pages": None}
+        # No rule found a row: the same model reader as a PDF, on the file as text
+        # (spec 2026-11-06 R4). Only on zero items -- a partial rule read is the audit's.
+        text = template_docx.render_text(BytesIO(body))
+        if len(text) > template_vision.MAX_TEXT_CHARS:
+            return _empty("unreadable", route="docx", reason=MSG_WORD_NO_TABLE)
+        used = template_vision.model()
+        left = None if deadline is None else max(1.0, deadline - (time.monotonic() - started))
+        raw, err = template_vision.read_text(text, deadline=left)
+        if err:
+            return _empty("error", route="docx_model", model=used, error=err)
         draft = template_draft.clean(raw)
         if draft["counts"]["items"] == 0:
-            return _empty("unreadable", route="docx", reason=MSG_WORD_NO_TABLE)
-        return {"status": "done", **draft, "route": "docx", "model": None, "pages": None}
+            return _empty("unreadable", route="docx_model", model=used, reason=MSG_NO_ROWS)
+        return {"status": "done", **draft, "route": "docx_model", "model": used, "pages": None}
 
     try:
         pages = [{"body": _read_source(k), "content_type": template_types.EXT_TYPES[e],

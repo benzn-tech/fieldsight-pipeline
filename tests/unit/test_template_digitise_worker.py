@@ -143,15 +143,18 @@ def test_without_the_docx_layer_a_word_file_is_an_error_not_an_importerror(s3, m
     assert res["status"] == "error" and res["error"] == worker.MSG_WORD_DISABLED
 
 
-def test_a_word_file_with_no_checklist_table_is_unreadable(s3):
+def test_a_word_file_with_no_checklist_table_is_unreadable(s3, monkeypatch):
+    # Since spec 2026-11-06 R4 it goes to the model reader first; the model finds nothing.
     d = docx.Document(); d.add_paragraph("Just prose")
     buf = BytesIO(); d.save(buf)
     key = f"template_sources/{COMPANY}/{'d' * 32}.docx"
     s3.store[key] = buf.getvalue()
     _request(s3, [key])
+    sent = _http(monkeypatch, [_ok('{"sections": []}')])
     worker.lambda_handler(_event(), None)
     res = _result(s3)
-    assert res["status"] == "unreadable" and res["reason"] == worker.MSG_WORD_NO_TABLE
+    assert res["status"] == "unreadable" and res["reason"] == worker.MSG_NO_ROWS
+    assert len(sent) == 1
 
 
 def test_zero_items_from_the_model_is_unreadable(s3, monkeypatch):
@@ -321,3 +324,98 @@ def test_a_pdf_read_by_the_pdf_model_is_labelled_with_that_model(s3, monkeypatch
 
     assert sent[0]["model"] == "meta/muse-spark-1.3-contributor"
     assert _result(s3)["model"] == "meta/muse-spark-1.3-contributor"
+
+
+# ---- the model fallback for a Word file no rule reads (spec 2026-11-06 R4) ------------
+
+def _docx_of(*rows, heading=None):
+    d = docx.Document()
+    if heading:
+        d.add_paragraph(heading)
+    t = d.add_table(rows=0, cols=len(rows[0]))
+    for cells in rows:
+        r = t.add_row()
+        for i, c in enumerate(cells):
+            r.cells[i].text = c
+    buf = BytesIO(); d.save(buf)
+    return buf.getvalue()
+
+
+def _docx_no_answer_column():
+    return _docx_of(("No.", "Item", "Checked by"), ("1", "Studs at 600 centres", ""),
+                    ("2", "Lintels sized to drawings", ""), heading="Wall Framing")
+
+
+def _docx_source(s3, body):
+    key = f"template_sources/{COMPANY}/{'d' * 32}.docx"
+    s3.store[key] = body
+    _request(s3, [key])
+
+
+def test_docx_with_no_rule_rows_falls_back_to_model(s3, monkeypatch):
+    monkeypatch.delenv("TEMPLATE_DIGITISE_MODEL", raising=False)
+    _docx_source(s3, _docx_no_answer_column())
+    sent = _http(monkeypatch, [_ok(json.dumps({"sections": [
+        {"title": "Wall Framing", "items": ["Studs at 600 centres", "Lintels sized to drawings"]}]}))])
+    worker.lambda_handler(_event(), None)
+    res = _result(s3)
+    assert res["status"] == "done"
+    assert res["route"] == "docx_model" and res["model"] == "google/gemini-3.8-flash"
+    assert res["counts"] == {"sections": 1, "items": 2}
+    content = sent[0]["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": worker.template_vision.TEXT_PROMPT}
+    assert "1 | Studs at 600 centres | " in content[1]["text"]
+
+
+def test_docx_fallback_finds_nothing_is_unreadable_no_rows(s3, monkeypatch):
+    _docx_source(s3, _docx_no_answer_column())
+    _http(monkeypatch, [_ok('{"sections": [{"title": "Wall Framing", "items": []}]}')])
+    worker.lambda_handler(_event(), None)
+    res = _result(s3)
+    assert res["status"] == "unreadable" and res["reason"] == worker.MSG_NO_ROWS
+    assert res["route"] == "docx_model"
+
+
+def test_docx_fallback_model_error_is_mapped_as_the_vision_branch_does(s3, monkeypatch):
+    _docx_source(s3, _docx_no_answer_column())
+    _http(monkeypatch, [_R(503, {"error": {"message": "down"}})] * lu.MAX_ATTEMPTS)
+    worker.lambda_handler(_event(), None)
+    res = _result(s3)
+    assert res["status"] == "error" and res["route"] == "docx_model"
+    assert res["error"] == worker.template_vision.MSG_UNAVAILABLE
+
+
+def test_docx_too_long_for_fallback_keeps_old_refusal(s3, monkeypatch):
+    _docx_source(s3, _docx_no_answer_column())
+    monkeypatch.setattr(template_docx, "render_text",
+                        lambda source: "x" * (worker.template_vision.MAX_TEXT_CHARS + 1))
+    sent = _http(monkeypatch, [])
+    worker.lambda_handler(_event(), None)
+    res = _result(s3)
+    assert res["status"] == "unreadable" and res["reason"] == worker.MSG_WORD_NO_TABLE
+    assert sent == []
+
+
+def test_docx_rule_read_never_calls_model(s3, monkeypatch):
+    _docx_source(s3, _docx_of(("No.", "Item", "Yes / No / N/A", "Comment"),
+                              ("1", "Gate locked", "", "")))
+    sent = _http(monkeypatch, [])
+    worker.lambda_handler(_event(), None)
+    res = _result(s3)
+    assert res["status"] == "done" and res["route"] == "docx" and res["model"] is None
+    assert res["sections"][0]["items"] == [{"text": "Gate locked", "flags": []}]
+    assert sent == []
+
+
+def test_the_fallback_read_gets_the_workers_deadline(s3, monkeypatch):
+    _docx_source(s3, _docx_no_answer_column())
+    seen = []
+
+    def spy(text, deadline=None):
+        seen.append(deadline)
+        return [{"title": "T", "items": ["i"]}], None
+
+    monkeypatch.setattr(worker.template_vision, "read_text", spy)
+    worker.lambda_handler(_event(), _Context(900_000))
+    assert _result(s3)["status"] == "done"
+    assert 900 - worker.WRITE_RESERVE_SECONDS - 5 < seen[0] <= 900 - worker.WRITE_RESERVE_SECONDS
