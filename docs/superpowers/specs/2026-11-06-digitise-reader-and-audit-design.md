@@ -322,6 +322,15 @@ listing script therefore sees at most 90 days. Offboarding and export treat it
 as they treat results today: the prefix is not in `lake_keys`, and not in the
 company export. Running the lifecycle script against prod is the owner's
 step.
+
+Beside each record the worker also writes a stats line,
+`template_digitise_audit_stats/{YYYY-MM}/{company_id}/{id}.json`. It holds only counts
+and labels: verdict, skip reason, status, route, reader and audit models, file
+extensions, and the item, section and claim counts. It never holds the template name,
+claim text, summary or error, so no expiry rule reaches it. That keeps the read rate
+visible over the long run while the reader and models keep changing.
+`scripts/template-audit-stats.sh` tallies it by month (owner, 2026-11-06: full records
+90 days, stats kept).
 - The R4 fallback has no flag of its own. It replaces a refusal, and its draft
   still needs a person's Save.
 
