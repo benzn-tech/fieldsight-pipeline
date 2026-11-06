@@ -18,6 +18,22 @@ is dropped (`drop_named_mismatch`: C4's look-alike). An action on an `ambiguous`
 dropped silently. Rule 2 runs before rule 1's scope check, so a demotion is never lost
 to `drop_unasked_target`.
 
+Rule 3 -- field provenance. Every proposed field of a close, an update and a create's
+optional fields (its text keeps its refs rule) must pass its declared source, or it is
+removed (`field_unsourced__<field>`); a close/update left with nothing is dropped
+(`drop_no_sourced_fields`).
+    user             a stated value for (this target or none, field) must exist; the
+                     value BECOMES the stated one (`user_value_overridden__<field>` when
+                     the writer's differed, normalised);
+    evidence         a ref of kind topic, chunk or document -- an item row never
+                     justifies a change, except the target's own row for a deadline it
+                     carries as deadline_text; web refs never set a field;
+    assumed_default  a deadline only, under a delegation covering the target, on an item
+                     with neither deadline nor deadline_text: the value BECOMES the
+                     item's raised_on (owner rule: the raised date, never today+N), and the
+                     action is marked `assumed = ["deadline"]` (`date_assumed`).
+A stated status still has to be a legal change for the type (`drop_illegal_after_gate`).
+
 The action's planner target is its `target_ref`; with none, the target whose resolved
 item (or one of whose ambiguous candidates) is the action's item.
 
@@ -26,11 +42,16 @@ counts.
 """
 from __future__ import annotations
 
+import datetime as dt
+
 import action_pack_stages as st
+import action_pack_view
 import action_pack_targets as targets
 from action_pack_verify import OPEN_STATUSES
 
 TARGETED = ("close_item", "update_item")
+SOURCED = TARGETED + ("create_item",)
+EVIDENCE_KINDS = ("topic", "chunk", "document")
 
 NOTE_SUFFIX = {
     "en": {"ambiguous": "matches more than one item: {refs}",
@@ -100,6 +121,106 @@ def _scope(a, *, plan, resolution, items, named_sids, lang, counts):
     return a
 
 
+def _day_iso(value):
+    """'YYYY-MM-DD' for a date, a datetime or an ISO date/timestamp string, else None."""
+    if isinstance(value, dt.datetime):
+        value = value.date()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    d = st._iso_date(str(value or "")[:10])
+    return d.isoformat() if d else None
+
+
+def _norm(fld, value):
+    """The comparison form of a field value: ISO for dates, lower-case for status and
+    priority, casefold for responsible."""
+    v = str(value if value is not None else "").strip()
+    if fld == "deadline":
+        return _day_iso(v) or v
+    return v.lower() if fld in ("status", "priority") else v.casefold()
+
+
+def _stated(plan, tid, fld):
+    """The planner's stated value for (target, field): the target's own entry first, then
+    a global one (target null). None when the user stated nothing for it."""
+    stated = [e for e in getattr(plan, "stated_values", None) or [] if e["field"] == fld]
+    for e in stated:
+        if tid is not None and e["target"] == tid:
+            return e["value"]
+    for e in stated:
+        if e["target"] is None:
+            return e["value"]
+    return None
+
+
+def _delegated(plan, tid, fld):
+    return any(e["field"] == fld and (e["target"] is None or e["target"] == tid)
+               for e in getattr(plan, "delegations", None) or [])
+
+
+def _field(fld, value, fs, *, tid, plan, item, registry, counts):
+    """(value to keep, None) or (None, removal code) for one proposed field."""
+    src = fs.get("source") if isinstance(fs, dict) else None
+    unsourced = f"field_unsourced__{fld}"
+    if src == "user":
+        stated = _stated(plan, tid, fld)
+        if stated is None:
+            return None, unsourced
+        if _norm(fld, value) != _norm(fld, stated):
+            _bump(counts, f"user_value_overridden__{fld}")
+        return stated, None
+    if src == "evidence":
+        refs = [r for r in fs.get("refs") or [] if r in registry]
+        own = (item or {}).get("ref")
+        ok = any(registry[r].get("kind") in EVIDENCE_KINDS for r in refs) or (
+            fld == "deadline" and item is not None and bool(item.get("deadline_text"))
+            and own in refs)
+        return (value, None) if ok else (None, unsourced)
+    if src == "assumed_default":
+        raised = _day_iso((item or {}).get("raised_on"))
+        if (fld != "deadline" or item is None or raised is None
+                or item.get("deadline") or item.get("deadline_text")
+                or not _delegated(plan, tid, fld)):
+            return None, unsourced
+        return raised, None
+    return None, unsourced
+
+
+def _provenance(a, *, tid, plan, items, registry, counts):
+    """Rule 3 for one close/update/create -> the action with only its sourced fields, or
+    None (dropped)."""
+    atype, sid = a.get("type"), a.get("target_stable_id")
+    item = items.get(sid) if atype in TARGETED else None
+    sources = a.get("field_sources") or {}
+    proposed, assumed = dict(a.get("proposed") or {}), []
+    for fld in [f for f in proposed if f != "text"]:
+        value, code = _field(fld, proposed[fld], sources.get(fld), tid=tid, plan=plan,
+                             item=item, registry=registry, counts=counts)
+        if code is not None:
+            proposed.pop(fld)
+            _bump(counts, code)
+            continue
+        proposed[fld] = value
+        if (sources.get(fld) or {}).get("source") == "assumed_default":
+            assumed.append(fld)
+            _bump(counts, "date_assumed")
+    if atype in TARGETED:
+        if not proposed:
+            _bump(counts, "drop_no_sourced_fields")
+            return None
+        status = proposed.get("status")
+        legal = st.legal_change(atype, proposed, (item or {}).get("status"))
+        if legal is None or (atype == "close_item"
+                             and status not in action_pack_view.CLOSE_STATUSES):
+            _bump(counts, "drop_illegal_after_gate")
+            return None
+        proposed = legal
+    out = dict(a, proposed=proposed)
+    if assumed:
+        out["assumed"] = assumed
+    return out
+
+
 def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
     """-> (the gated draft, counts). `resolution` is {target id: Resolution} (round 1),
     `items` the run's items by stable_id, `registry` its refs. The conclusion and the
@@ -112,6 +233,10 @@ def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
         if a.get("type") in TARGETED:
             a = _scope(a, plan=plan, resolution=resolution, items=items,
                        named_sids=named_sids, lang=lang, counts=counts)
+        if a is not None and a.get("type") in SOURCED:
+            tid = _named_target(a, resolution) if a["type"] in TARGETED else None
+            a = _provenance(a, tid=tid, plan=plan, items=items, registry=registry,
+                            counts=counts)
         if a is not None:
             out.append(a)
     return dict(draft, actions=out), counts

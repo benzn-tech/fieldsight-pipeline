@@ -171,3 +171,167 @@ def test_conclusion_and_untargeted_actions_pass_untouched():
     out, counts = scope.gate(copy.deepcopy(draft), plan=make_plan(), resolution={},
                              items=items, registry=make_registry(items))
     assert out == draft and counts == {}
+
+
+
+# ---- Task 4.3: rule 3, field provenance ---------------------------------------------------
+
+def user():
+    return {"source": "user", "refs": [], "said_on": None}
+
+
+def assumed():
+    return {"source": "assumed_default", "refs": [], "said_on": None}
+
+
+def test_priority_without_source_removed():
+    a = upd(SID_A, {"status": "in_progress", "priority": "high"}, ref="t1",
+            sources={"status": ev("R1"), "priority": {"source": None, "refs": [],
+                                                      "said_on": None}})
+    b = upd(SID_A, {"priority": "high"}, ref="t1")
+    b["field_sources"] = None                          # the writer gave no field_sources
+    out, counts = gate([a])
+    assert out["actions"][0]["proposed"] == {"status": "in_progress"}
+    assert counts == {"field_unsourced__priority": 1}
+    out, counts = gate([b])
+    assert out["actions"] == []
+    assert counts == {"field_unsourced__priority": 1, "drop_no_sourced_fields": 1}
+
+
+def test_item_own_ref_not_evidence():
+    # The target's own row (R4) and another item's row (R5) never justify a change.
+    a = upd(SID_A, {"priority": "high", "responsible": "Sam"}, ref="t1",
+            sources={"priority": ev("R4"), "responsible": ev("R5")}, refs=("R4", "R5"))
+    out, counts = gate([a])
+    assert out["actions"] == []
+    assert counts == {"field_unsourced__priority": 1, "field_unsourced__responsible": 1,
+                      "drop_no_sourced_fields": 1}
+
+
+def test_deadline_text_own_ref_is_evidence():
+    items = make_items()
+    items[SID_A]["deadline_text"] = "end of next week"
+    a = upd(SID_A, {"deadline": "2026-10-31"}, ref="t1",
+            sources={"deadline": ev("R4", said_on="2026-10-20")}, refs=("R4",))
+    out, counts = gate([a], items=items)
+    assert out["actions"][0]["proposed"] == {"deadline": "2026-10-31"}
+    assert counts == {}
+    # Without a deadline_text the item's own row is not evidence for its deadline.
+    out, counts = gate([a])
+    assert out["actions"] == []
+    assert counts["field_unsourced__deadline"] == 1
+
+
+def test_user_value_overrides_writer():
+    stated = [{"target": "t1", "field": "deadline", "value": "2026-11-14"},
+              {"target": None, "field": "responsible", "value": "Sam Lee"},
+              {"target": "t2", "field": "priority", "value": "low"}]
+    a = upd(SID_A, {"deadline": "2026-11-13", "responsible": "sam lee", "priority": "high"},
+            ref="t1", sources={"deadline": user(), "responsible": user(),
+                               "priority": user()})
+    out, counts = gate([a], plan=make_plan(stated=stated, targets=("t1", "t2")),
+                       resolution={"t1": Resolution(RESOLVED, SID_A),
+                                   "t2": Resolution(RESOLVED, SID_B)})
+    # The stated value wins; a casefold-equal name is not an override; t2's priority
+    # does not cover t1.
+    assert out["actions"][0]["proposed"] == {"deadline": "2026-11-14",
+                                             "responsible": "Sam Lee"}
+    assert counts == {"user_value_overridden__deadline": 1,
+                      "field_unsourced__priority": 1}
+
+
+def test_user_without_stated_value_removed():
+    a = upd(SID_A, {"priority": "high", "status": "blocked"}, ref="t1",
+            sources={"priority": user(), "status": ev("R1")})
+    out, counts = gate([a], plan=make_plan(
+        stated=[{"target": "t1", "field": "deadline", "value": "2026-11-14"}]))
+    assert out["actions"][0]["proposed"] == {"status": "blocked"}
+    assert counts == {"field_unsourced__priority": 1}
+
+
+def test_user_status_still_has_to_be_legal():
+    # A stated status replaces the writer's; it must still be a legal change for the type.
+    stated = [{"target": "t1", "field": "status", "value": "in_progress"}]
+    a = upd(SID_A, {"status": "done"}, ref="t1", atype="close_item",
+            sources={"status": user()})
+    out, counts = gate([a], plan=make_plan(stated=stated))
+    assert out["actions"] == []
+    assert counts == {"user_value_overridden__status": 1, "drop_illegal_after_gate": 1}
+
+
+def test_r3_assumed_default_uses_raised_on():
+    # R3: "Nobody has said when Sam's invoice (#4) is due. Just pick a date."
+    a = upd(SID_A, {"deadline": "2026-11-21"}, ref="t1", sources={"deadline": assumed()},
+            refs=("R4",))
+    for deleg in ({"target": "t1", "field": "deadline"},
+                  {"target": None, "field": "deadline"}):
+        out, counts = gate([a], plan=make_plan(delegations=[deleg]))
+        [got] = out["actions"]
+        assert got["proposed"] == {"deadline": "2026-10-20"}         # the item's raised_on
+        assert got["assumed"] == ["deadline"]
+        assert counts == {"date_assumed": 1}
+
+
+def test_assumed_default_same_day_is_today():
+    import datetime as dt
+    items = make_items()
+    items[SID_A]["raised_on"] = dt.date(2026, 11, 7)                  # raised today
+    a = upd(SID_A, {"deadline": "2026-11-14"}, ref="t1", sources={"deadline": assumed()},
+            refs=("R4",))
+    out, counts = gate([a], items=items,
+                       plan=make_plan(delegations=[{"target": "t1", "field": "deadline"}]))
+    [got] = out["actions"]
+    assert got["proposed"] == {"deadline": "2026-11-07"} and got["assumed"] == ["deadline"]
+
+
+def test_assumed_default_refused_when_deadline_text_present():
+    deleg = [{"target": "t1", "field": "deadline"}]
+    a = upd(SID_A, {"deadline": "2026-11-14"}, ref="t1", sources={"deadline": assumed()},
+            refs=("R4",))
+    for key, value in (("deadline_text", "end of the month"), ("deadline", "2026-11-30"),
+                       ("raised_on", None)):
+        items = make_items()
+        items[SID_A][key] = value
+        out, counts = gate([a], items=items, plan=make_plan(delegations=deleg))
+        assert out["actions"] == [], key
+        assert counts == {"field_unsourced__deadline": 1, "drop_no_sourced_fields": 1}
+    # No delegation for this target, or for this field: refused too.
+    for d in ([], [{"target": "t2", "field": "deadline"}]):
+        out, _ = gate([a], plan=make_plan(delegations=d, targets=("t1", "t2")))
+        assert out["actions"] == []
+    # Only the deadline may be assumed.
+    b = upd(SID_A, {"priority": "low"}, ref="t1", sources={"priority": assumed()})
+    out, counts = gate([b], plan=make_plan(delegations=deleg))
+    assert counts["field_unsourced__priority"] == 1
+
+
+def test_web_ref_cannot_source_field():
+    a = upd(SID_A, {"priority": "high", "status": "blocked"}, ref="t1",
+            sources={"priority": ev("R3"), "status": ev("R2")}, refs=("R2", "R3"))
+    out, counts = gate([a])
+    assert out["actions"][0]["proposed"] == {"status": "blocked"}        # a document: ok
+    assert counts == {"field_unsourced__priority": 1}
+
+
+def test_close_needs_source():
+    close = upd(SID_A, {"status": "done"}, ref="t1", atype="close_item", sources={})
+    out, counts = gate([close])
+    assert out["actions"] == []
+    assert counts == {"field_unsourced__status": 1, "drop_no_sourced_fields": 1}
+    close["field_sources"] = {"status": ev("R1")}
+    out, counts = gate([close])
+    assert out["actions"][0]["proposed"] == {"status": "done"} and counts == {}
+
+
+def test_create_optional_fields_follow_the_rules():
+    create = {"type": "create_item", "target_stable_id": None, "target_ref": None,
+              "proposed": {"text": "Book the pump", "priority": "high",
+                           "responsible": "Sam", "deadline": "2026-11-20"},
+              "field_sources": {"priority": ev("R4"), "responsible": ev("R1"),
+                                "deadline": assumed()},
+              "rationale": "r", "refs": ["R1"]}
+    out, counts = gate([create],
+                       plan=make_plan(delegations=[{"target": None, "field": "deadline"}]))
+    # The text keeps its refs rule; an assumed deadline needs an item's raised_on.
+    assert out["actions"][0]["proposed"] == {"text": "Book the pump", "responsible": "Sam"}
+    assert counts == {"field_unsourced__priority": 1, "field_unsourced__deadline": 1}
