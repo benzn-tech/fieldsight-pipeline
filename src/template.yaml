@@ -1515,6 +1515,33 @@ Parameters:
       The model PDF uploads go to, for when the image model takes no file input. Empty
       means PDFs go to TemplateDigitiseModel, as before.
 
+  # Upload audit (spec 2026-11-06 A6): a second model checks every read against its source
+  # and emails misreads to AlertTopic. Driven by TEST_/PROD_TEMPLATE_DIGITISE_AUDIT* repo
+  # variables with the defaults in the workflows' ||; pinned by
+  # tests/unit/test_template_digitise_wiring.py.
+  TemplateDigitiseAudit:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, TemplateDigitiseFunction audits each read after writing it, stores the
+      verdict under template_digitise_audits/ and emails problems / missed to AlertTopic.
+      False (default) audits nothing.
+
+  TemplateDigitiseAuditModel:
+    Type: String
+    Default: google/gemini-3.8-flash
+    Description: >-
+      The model that audits a read (TEMPLATE_DIGITISE_AUDIT_MODEL). Never the model that
+      made the draft: then TemplateDigitiseAuditAltModel audits instead.
+
+  TemplateDigitiseAuditAltModel:
+    Type: String
+    Default: meta/muse-spark-1.3-contributor
+    Description: >-
+      The audit model used when the draft came from TemplateDigitiseAuditModel
+      (TEMPLATE_DIGITISE_AUDIT_ALT_MODEL), run with reasoning low.
+
   # Project documents (spec 2026-10-16). Wired in pieces, pinned by
   # tests/unit/test_project_documents_wiring.py: this Parameter -> PROJECT_DOCUMENTS on
   # OrgApiFunction (routes), RagSearchFunction (documents mode), AskAgentFunction (the
@@ -2956,7 +2983,8 @@ Resources:
   # a PDF or photos with one vision call. Non-VPC: it calls OpenRouter, and org-api
   # (in-VPC, no outbound) hands it the work through template_digitise_requests/
   # (BUG-36). NO Events: wired by scripts/wire-s3-events.sh (fs-template-digitise,
-  # BUG-33). Its output prefix template_digitise_results/ matches no trigger.
+  # BUG-33). Its output prefixes template_digitise_results/ and template_digitise_audits/
+  # match no trigger.
   # ----------------------------------------------------------
   TemplateDigitiseFunction:
     Type: AWS::Serverless::Function
@@ -2995,6 +3023,16 @@ Resources:
           TEMPLATE_DIGITISE_PROVIDER: !Ref TemplateDigitiseProvider
           TEMPLATE_DIGITISE_PDF_MODEL: !Ref TemplateDigitisePdfModel
           TEMPLATE_DIGITISE_FALLBACK_MODELS: ''
+          # The upload audit (spec 2026-11-06 A5/A6). Its chain is empty for the reader's
+          # reason; STAGE names the stack in the email subject.
+          TEMPLATE_DIGITISE_AUDIT: !Ref TemplateDigitiseAudit
+          TEMPLATE_DIGITISE_AUDIT_MODEL: !Ref TemplateDigitiseAuditModel
+          TEMPLATE_DIGITISE_AUDIT_ALT_MODEL: !Ref TemplateDigitiseAuditAltModel
+          TEMPLATE_DIGITISE_AUDIT_FALLBACK_MODELS: ''
+          STAGE: !Ref Stage
+          # Where problems / missed go. Absent when the stack creates no alert topic; the
+          # worker then stores and logs the verdict and publishes nothing.
+          ALERT_TOPIC_ARN: !If [ShouldCreateAlerts, !Ref AlertTopic, !Ref "AWS::NoValue"]
       Policies:
         # lake_put: the result write also appends one manifest line in the bucket it wrote to.
         - Version: '2012-10-17'
@@ -3013,7 +3051,15 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/template_sources/*
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_audits/*
+        # The audit's email: Publish on AlertTopic only, conditional like the topic itself.
+        - !If
+          - ShouldCreateAlerts
+          - SNSPublishMessagePolicy:
+              TopicName: !GetAtt AlertTopic.TopicName
+          - !Ref "AWS::NoValue"
 
   # ----------------------------------------------------------
   # Project documents worker (spec 2026-10-16-project-documents-design). Reads one uploaded
