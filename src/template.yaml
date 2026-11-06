@@ -2771,8 +2771,8 @@ Resources:
   # a PDF or photos with one vision call. Non-VPC: it calls OpenRouter, and org-api
   # (in-VPC, no outbound) hands it the work through template_digitise_requests/
   # (BUG-36). NO Events: wired by scripts/wire-s3-events.sh (fs-template-digitise,
-  # BUG-33). Its output prefixes template_digitise_results/ and template_digitise_audits/
-  # match no trigger.
+  # BUG-33). Its output prefixes template_digitise_results/, template_digitise_audits/
+  # and template_digitise_audit_stats/ match no trigger.
   # ----------------------------------------------------------
   TemplateDigitiseFunction:
     Type: AWS::Serverless::Function
@@ -2842,6 +2842,7 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_audits/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_audit_stats/*
         # The audit's email: Publish on AlertTopic only, conditional like the topic itself.
         - !If
           - ShouldCreateAlerts
