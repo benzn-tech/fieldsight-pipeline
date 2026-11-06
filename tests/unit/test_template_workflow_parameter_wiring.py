@@ -1386,6 +1386,8 @@ def test_the_action_packs_switch_reaches_org_api_and_the_agent():
     ("ActionWriterFallbacks", "ACTION_WRITER_FALLBACKS", "ACTION_WRITER_FALLBACKS_PARAM"),
     ("ActionVerifierHideUnsupported", "ACTION_VERIFIER_HIDE_UNSUPPORTED",
      "ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM"),
+    # PR-3 (spec 2026-11-05 §11): the gather-round latency knob.
+    ("ActionMaxRounds", "ACTION_MAX_ROUNDS", "ACTION_MAX_ROUNDS_PARAM"),
 ])
 def test_the_action_verifier_is_settable_from_a_repo_variable(parameter, var, shell):
     """Spec 2026-11-01 §14 S6: the verifier must be a different family from the writer. On a

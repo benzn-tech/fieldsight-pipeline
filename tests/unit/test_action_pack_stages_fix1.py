@@ -17,6 +17,7 @@ from tests.unit.test_action_pack_stages import (CO, PACK, SID1, SID2, VERIFIER, 
 def _env(monkeypatch):
     monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
     monkeypatch.delenv("ACTION_TOKEN_CAP", raising=False)
+    monkeypatch.delenv("ACTION_MAX_ROUNDS", raising=False)
 
 
 # -- 1. the writer routes like the Ask judge ------------------------------------------------

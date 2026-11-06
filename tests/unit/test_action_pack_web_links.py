@@ -42,6 +42,7 @@ def robots_grounding():
 def _env(monkeypatch):
     monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
     monkeypatch.delenv("ACTION_TOKEN_CAP", raising=False)
+    monkeypatch.delenv("ACTION_MAX_ROUNDS", raising=False)
     monkeypatch.setenv("ACTION_VERIFIER_MODEL", "google/gemini-3.8-flash")
     monkeypatch.delenv("ACTION_VERIFIER_FALLBACKS", raising=False)
 
