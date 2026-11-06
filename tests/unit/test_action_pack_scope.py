@@ -32,6 +32,7 @@ def make_items():
 
 def make_registry(items):
     reg = {"R1": {"ref": "R1", "kind": "topic", "item": {"date": TOPIC_DAY}},
+           "R9": {"ref": "R9", "kind": "chunk", "item": {"date": TOPIC_DAY}},
            "R2": {"ref": "R2", "kind": "document", "item": {}},
            "R3": {"ref": "R3", "kind": "web_answer", "item": {}}}
     for it in items.values():
@@ -246,7 +247,7 @@ def test_user_value_overrides_writer():
               {"target": "t2", "field": "priority", "value": "low"}]
     a = upd(SID_A, {"deadline": "2026-11-13", "responsible": "sam lee", "priority": "high"},
             ref="t1", sources={"deadline": user(), "responsible": user(),
-                               "priority": user()})
+                               "priority": user()}, refs=("R4",))
     out, counts = gate([a], plan=make_plan(stated=stated, targets=("t1", "t2")),
                        resolution={"t1": Resolution(RESOLVED, SID_A),
                                    "t2": Resolution(RESOLVED, SID_B)})
@@ -259,8 +260,9 @@ def test_user_value_overrides_writer():
 
 
 def test_user_without_stated_value_removed():
+    # Nothing stated and no record or document among its refs (only the item's own row).
     a = upd(SID_A, {"priority": "high", "status": "blocked"}, ref="t1",
-            sources={"priority": user(), "status": ev("R1")})
+            sources={"priority": user(), "status": ev("R1")}, refs=("R4",))
     out, counts = gate([a], plan=make_plan(
         stated=[{"target": "t1", "field": "deadline", "value": "2026-11-14"}]))
     assert out["actions"][0]["proposed"] == {"status": "blocked"}
@@ -401,3 +403,53 @@ def test_create_deadline_follows_rule_4():
     out, counts = gate([create])
     assert out["actions"][0]["proposed"] == {"text": "Book the pump"}
     assert counts == {"field_said_on_mismatch": 1}
+
+
+# ---- review fixes ------------------------------------------------------------------------
+
+def test_user_without_stated_value_falls_back_to_evidence():
+    # "Close #4": the planner recorded no stated status, but the action cites a chunk
+    # that says the work is finished -- a stated value OR evidence (spec §3.2.4).
+    close = upd(SID_A, {"status": "done"}, ref="t1", atype="close_item",
+                sources={"status": user()}, refs=("R4", "R9"))
+    out, counts = gate([close])
+    assert out["actions"][0]["proposed"] == {"status": "done"}
+    assert counts == {"user_value_unstated__status": 1}
+    # Only the item's own row: still unsourced.
+    close["refs"] = ["R4"]
+    out, counts = gate([close])
+    assert out["actions"] == []
+    assert counts == {"field_unsourced__status": 1, "drop_no_sourced_fields": 1}
+    # A deadline falling back meets rule 4 too: no said_on -> removed.
+    a = upd(SID_A, {"deadline": "2026-11-14"}, ref="t1", sources={"deadline": user()},
+            refs=("R9",))
+    out, counts = gate([a])
+    assert out["actions"] == [] and counts["field_said_on_mismatch"] == 1
+
+
+def test_wrong_target_ref_is_corrected_to_the_target_that_resolved_there():
+    res = {"t1": Resolution(RESOLVED, SID_A), "t2": Resolution(NONE)}
+    close = upd(SID_A, {"status": "done"}, ref="t2", atype="close_item")
+    out, counts = gate([close], plan=make_plan(targets=("t1", "t2")), resolution=res)
+    assert [(a["type"], a["target_stable_id"]) for a in out["actions"]] == [
+        ("close_item", SID_A)]
+    assert counts == {"target_ref_corrected": 1}
+    # The stated value is the corrected target's.
+    stated = [{"target": "t1", "field": "status", "value": "closed"}]
+    close["field_sources"] = {"status": user()}
+    out, counts = gate([close], plan=make_plan(targets=("t1", "t2"), stated=stated),
+                       resolution=res)
+    assert out["actions"][0]["proposed"] == {"status": "closed"}
+    # C4's look-alike (no other target resolved to it) is still a mismatch.
+    out, counts = gate([upd(SID_B, {"status": "done"}, ref="t1", atype="close_item")],
+                       plan=make_plan(targets=("t1", "t2")), resolution=res)
+    assert counts == {"drop_named_mismatch": 1}
+
+
+def test_field_refs_join_the_action_only_when_the_field_survives():
+    a = upd(SID_A, {"status": "blocked", "priority": "high"}, ref="t1", refs=("R1",),
+            sources={"status": ev("R2"), "priority": ev("R4", "R5")})
+    out, counts = gate([a])
+    assert out["actions"][0]["proposed"] == {"status": "blocked"}
+    assert out["actions"][0]["refs"] == ["R1", "R2"]
+    assert counts == {"field_unsourced__priority": 1}

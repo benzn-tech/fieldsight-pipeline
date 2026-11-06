@@ -1359,14 +1359,25 @@ Return ONLY a JSON object:
 
 
 def delegations_render(run) -> str:
-    """The planner's delegated missing values (spec 2026-11-05 §3.2.4 `assumed_default`):
-    target ids and field names only. "" with none, so WRITE_PROMPT is unchanged."""
-    delegations = run.plan.delegations if run.plan else []
-    if not delegations:
-        return ""
-    lines = [f"{d['target'] or 'any item you change'}: {d['field']}" for d in delegations]
-    return ("\nDelegated missing values (only for an item with neither a deadline nor a "
-            "deadline_text; source assumed_default):\n" + "\n".join(lines))
+    """The planner's stated values and delegated missing values (spec 2026-11-05 §3.2.4
+    `user`, `assumed_default`): target ids, field names and the stated values
+    (sanitised data: the code copies them, never follows them). "" with neither, so
+    WRITE_PROMPT is unchanged."""
+    plan = run.plan
+    out = ""
+    stated = plan.stated_values if plan else []
+    if stated:
+        lines = [f"{v['target'] or 'any item you change'}: {v['field']} = "
+                 f"{sanitize(v['value'])}" for v in stated]
+        out += ("\nValues the user stated (source user; the code applies these values):\n"
+                + "\n".join(lines))
+    delegations = plan.delegations if plan else []
+    if delegations:
+        lines = [f"{d['target'] or 'any item you change'}: {d['field']}"
+                 for d in delegations]
+        out += ("\nDelegated missing values (only for an item with neither a deadline nor "
+                "a deadline_text; source assumed_default):\n" + "\n".join(lines))
+    return out
 
 
 def targets_render(run) -> str:
@@ -1598,16 +1609,15 @@ def validate_draft(obj, run, citable):
         if atype in TARGETED or atype == "create_item":
             # Spec 2026-11-05 §3.2.3: the writer names the planner target it acts on and
             # where each proposed field comes from; the scope gate (action_pack_scope)
-            # judges both. An unknown target id is null; a field's refs are the action's.
+            # judges both. A target_ref that is not one of the plan's target ids (or not
+            # a string at all) is null and counted. A field's refs join the action's refs
+            # in the gate, only when the field survives it.
             ref = a.get("target_ref")
-            if ref is not None and (atype not in TARGETED or ref not in plan_targets):
+            if ref is not None and (atype not in TARGETED or not isinstance(ref, str)
+                                    or ref not in plan_targets):
                 _bump(counts, "target_ref")
                 ref = None
             sources = _field_sources(a.get("field_sources"), proposed, citable=citable)
-            for fs in (sources or {}).values():
-                for r in fs["refs"]:
-                    if r not in el["refs"]:
-                        el["refs"].append(r)
             el.update(target_ref=ref, field_sources=sources)
         actions.append(el)
     if counts:

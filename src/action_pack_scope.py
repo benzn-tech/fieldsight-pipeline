@@ -21,10 +21,12 @@ to `drop_unasked_target`.
 Rule 3 -- field provenance. Every proposed field of a close, an update and a create's
 optional fields (its text keeps its refs rule) must pass its declared source, or it is
 removed (`field_unsourced__<field>`); a close/update left with nothing is dropped
-(`drop_no_sourced_fields`).
+(`drop_no_sourced_fields`). Only a kept field's refs join the action's refs.
     user             a stated value for (this target or none, field) must exist; the
                      value BECOMES the stated one (`user_value_overridden__<field>` when
-                     the writer's differed, normalised);
+                     the writer's differed, normalised); with nothing stated, the
+                     field falls back to the evidence rule over its own and the
+                     action's refs (`user_value_unstated__<field>` when it holds);
     evidence         a ref of kind topic, chunk or document -- an item row never
                      justifies a change, except the target's own row for a deadline it
                      carries as deadline_text; web refs never set a field;
@@ -76,16 +78,25 @@ def _bump(d, key, n=1):
     d[key] = d.get(key, 0) + n
 
 
-def _named_target(a, resolution, *, ambiguous=True):
+def _named_target(a, resolution, *, ambiguous=True, counts=None):
     """The planner target id this action acts on, or None (unnamed). `ambiguous`: also
-    infer it from an ambiguous target's candidates (not under `tidy`)."""
+    infer it from an ambiguous target's candidates (not under `tidy`). A target_ref that
+    did not resolve to the action's item while ANOTHER target did is corrected to that
+    target (counted `target_ref_corrected` when `counts` is given): the item the user
+    named wins over the writer's label."""
     ref = a.get("target_ref")
-    if ref in resolution:
-        return ref
     sid = a.get("target_stable_id")
-    for tid, r in resolution.items():
-        if r.kind == targets.RESOLVED and r.stable_id == sid:
-            return tid
+    resolved_here = [tid for tid, r in resolution.items()
+                     if r.kind == targets.RESOLVED and r.stable_id == sid]
+    if isinstance(ref, str) and ref in resolution:
+        r = resolution[ref]
+        if (r.kind == targets.RESOLVED and r.stable_id == sid) or not resolved_here:
+            return ref
+        if counts is not None:
+            _bump(counts, "target_ref_corrected")
+        return resolved_here[0]
+    if resolved_here:
+        return resolved_here[0]
     for tid, r in resolution.items():
         if ambiguous and r.kind == targets.AMBIGUOUS and sid in r.candidates:
             return tid
@@ -105,7 +116,8 @@ def _note(a, lang, suffix_key, items, candidates=()):
 def _scope(a, *, plan, resolution, items, named_sids, lang, counts):
     """Rules 1-2 for one close/update -> the action, a note, or None (dropped)."""
     sid = a.get("target_stable_id")
-    tid = _named_target(a, resolution, ambiguous=plan.change_scope != "tidy")
+    tid = _named_target(a, resolution, ambiguous=plan.change_scope != "tidy",
+                        counts=counts)
     r = resolution.get(tid) if tid is not None else None
     if r is not None:
         if r.kind == targets.AMBIGUOUS:
@@ -189,14 +201,23 @@ def _delegated(plan, tid, fld):
                for e in getattr(plan, "delegations", None) or [])
 
 
-def _field(fld, value, fs, *, tid, plan, item, registry, counts):
+def _field(fld, value, fs, *, tid, plan, item, registry, counts, action_refs=()):
     """(value to keep, None) or (None, removal code) for one proposed field."""
     src = fs.get("source") if isinstance(fs, dict) else None
     unsourced = f"field_unsourced__{fld}"
     if src == "user":
         stated = _stated(plan, tid, fld)
         if stated is None:
-            return None, unsourced
+            # A stated value OR evidence (spec §3.2.4): the planner may not have recorded
+            # what the user said, so the field may still stand on a record or document
+            # among its own and the action's refs, under the evidence rule.
+            refs = list(dict.fromkeys(list(fs.get("refs") or []) + list(action_refs)))
+            value, code = _field(fld, value, dict(fs, source="evidence", refs=refs),
+                                 tid=tid, plan=plan, item=item, registry=registry,
+                                 counts=counts)
+            if code is None:
+                _bump(counts, f"user_value_unstated__{fld}")
+            return value, code
         if _norm(fld, value) != _norm(fld, stated):
             _bump(counts, f"user_value_overridden__{fld}")
         return stated, None
@@ -230,14 +251,19 @@ def _provenance(a, *, tid, plan, items, registry, counts):
     item = items.get(sid) if atype in TARGETED else None
     sources = a.get("field_sources") or {}
     proposed, assumed = dict(a.get("proposed") or {}), []
+    refs = list(a.get("refs") or [])
     for fld in [f for f in proposed if f != "text"]:
         value, code = _field(fld, proposed[fld], sources.get(fld), tid=tid, plan=plan,
-                             item=item, registry=registry, counts=counts)
+                             item=item, registry=registry, counts=counts,
+                             action_refs=a.get("refs") or [])
         if code is not None:
             proposed.pop(fld)
             _bump(counts, code)
             continue
         proposed[fld] = value
+        for r in (sources.get(fld) or {}).get("refs") or []:     # a kept field's refs
+            if r in registry and r not in refs:
+                refs.append(r)
         if (sources.get(fld) or {}).get("source") == "assumed_default":
             assumed.append(fld)
             _bump(counts, "date_assumed")
@@ -252,7 +278,7 @@ def _provenance(a, *, tid, plan, items, registry, counts):
             _bump(counts, "drop_illegal_after_gate")
             return None
         proposed = legal
-    out = dict(a, proposed=proposed)
+    out = dict(a, proposed=proposed, refs=st.with_web_sources(refs, registry)[0])
     if assumed:
         out["assumed"] = assumed
     return out

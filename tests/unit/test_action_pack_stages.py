@@ -1218,7 +1218,7 @@ def test_validate_draft_keeps_field_sources():
     assert upd["field_sources"] == {
         "deadline": {"source": "evidence", "refs": ["R2"], "said_on": "2026-11-01"},
         "priority": {"source": "user", "refs": [], "said_on": None}}
-    assert upd["refs"] == ["R1", "R2"]               # a field's ref is cited by the action
+    assert upd["refs"] == ["R1"]          # a field's refs join only if it passes the gate
     assert create["target_ref"] is None and create["field_sources"] is None
 
 
@@ -1400,3 +1400,42 @@ def test_scope_gate_trace_counts_shaped():
         {"deadline": "2026-11-14"}, {"text": "r (named item not found)"}]
     # A run the gate leaves alone still records it, empty.
     assert st.run(make_ctx(), deps())["run_trace"]["scope_gate"] == {}
+
+
+# ---- PR-4 review fixes --------------------------------------------------------------------
+
+def test_a_non_string_target_ref_is_absent_and_counted():
+    run = _vrun()
+    obj = {"conclusion": [], "actions": [
+        {"type": "close_item", "target_stable_id": SID1, "target_ref": bad,
+         "proposed": {"status": "done"}, "rationale": "r", "refs": ["R1"]}
+        for bad in (["t1"], {"id": "t1"}, 1)]}
+    draft = st.validate_draft(obj, run, {"R1"})
+    assert [a["target_ref"] for a in draft["actions"]] == [None, None, None]
+    assert run.trace["write_dropped"] == {"target_ref": 3}
+
+
+def test_write_prompt_shows_stated_values():
+    stated = [{"target": "t1", "field": "status", "value": "done"},
+              {"target": None, "field": "priority", "value": "high"}]
+    model = Model(plan=[plan_obj(targets=NAMED_T1, stated_values=stated)])
+    st.run(make_ctx(), deps(model=model))
+    prompt = _write_prompt(model)
+    assert ("Values the user stated (source user; the code applies these values):\n"
+            "t1: status = done\nany item you change: priority = high") in prompt
+
+
+def test_named_close_with_user_source_and_no_stated_value_is_kept():
+    # "Close #1": the planner recorded no stated status; the writer says source user and
+    # cites the record that says it is finished. The close must still be shown.
+    write = write_obj(actions=[
+        {"type": "close_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"status": "done"},
+         "field_sources": {"status": src(source="user")},
+         "rationale": "The record says it is finished.", "refs": ["R1", "R2"]}])
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=NAMED_T1)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=verify))
+    assert [(a["type"], a["target_stable_id"]) for a in payload["actions"]] == [
+        ("close_item", SID1)]
+    assert payload["run_trace"]["scope_gate"] == {"user_value_unstated__status": 1}
