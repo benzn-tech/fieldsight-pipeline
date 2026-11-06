@@ -97,6 +97,7 @@ def test_the_worker_may_read_its_inputs_and_write_only_its_result():
     assert ("s3:PutObject", "template_digitise_results/*") in g
     # the upload audit (spec 2026-11-06 A5) stores its verdict beside the result
     assert ("s3:PutObject", "template_digitise_audits/*") in g
+    assert ("s3:PutObject", "template_digitise_audit_stats/*") in g
     assert ("s3:PutObject", "lake_manifest/*") in g
     assert ("s3:PutObject", "template_sources/*") not in g
     assert ("s3:PutObject", "template_digitise_requests/*") not in g
@@ -125,8 +126,8 @@ def test_no_rule_fires_on_the_workers_own_output_or_the_uploads():
     # checked rather than a stale literal.
     import lake_put
     assert lake_put.MANIFEST_PREFIX == "lake_manifest/"
-    for out in ("template_digitise_results/", "template_digitise_audits/", "template_sources/",
-                lake_put.MANIFEST_PREFIX):
+    for out in ("template_digitise_results/", "template_digitise_audits/",
+                "template_digitise_audit_stats/", "template_sources/", lake_put.MANIFEST_PREFIX):
         assert not any(out.startswith(p) or p.startswith(out) for p in prefixes), out
 
 
@@ -146,6 +147,10 @@ def test_the_four_prefixes_expire_after_ninety_days_and_the_script_still_reruns(
         assert rule["Expiration"]["Days"] == 90
         # the script refuses to run over rules it does not manage; its own must be listed
         assert "ID!=`%s`" % rid in script, f"{rid} missing from the exclusion query"
+    # the stats line holds no customer text and is the long-term record: no rule reaches it
+    for rule in rules.values():
+        prefix = (rule.get("Filter") or {}).get("Prefix", "")
+        assert not "template_digitise_audit_stats/".startswith(prefix), rule["ID"]
 
 
 def test_a_failed_run_is_not_retried_into_a_second_paid_model_call():

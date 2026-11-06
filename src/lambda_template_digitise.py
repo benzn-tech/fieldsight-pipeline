@@ -14,7 +14,10 @@ Then, with TEMPLATE_DIGITISE_AUDIT=true, a second model audits the read against 
 source this invocation already holds (template_audit), the verdict is stored under
 template_digitise_audits/{company_id}/{id}.json, and a `problems` / `missed` verdict is
 published to the alert topic for the owner. The audit runs after the result is written
-and its failure is only logged: it never changes what the person polls.
+and its failure is only logged: it never changes what the person polls. Beside each
+record goes a stats line under template_digitise_audit_stats/{YYYY-MM}/{company_id}/{id}.json:
+counts and labels only, no customer text, so it is kept when the record expires (90
+days) and the read rate can be followed for as long as the reader keeps changing.
 
 Design: docs/superpowers/specs/2026-10-16-template-digitise-design.md section 3, and
 2026-11-06-digitise-reader-and-audit-design.md R4 for the Word fallback, A1-A5 for the
@@ -94,6 +97,39 @@ def result_key(company_id, request_id):
 
 def audit_key(company_id, request_id):
     return f"template_digitise_audits/{company_id}/{request_id}.json"
+
+
+def stats_key(company_id, request_id, audited_at):
+    return f"template_digitise_audit_stats/{audited_at[:7]}/{company_id}/{request_id}.json"
+
+
+def _ext(key):
+    tail = key.rsplit("/", 1)[-1]
+    return tail.rsplit(".", 1)[-1].lower() if "." in tail else ""
+
+
+def audit_stats(record):
+    """The kept part of an audit record: counts and labels, never a string the customer
+    wrote. No name, no claim text, no summary, no error (it can quote the answer), and
+    the file types from the stored keys, whose names are ours, not the upload's."""
+    counts = record.get("counts") or {}
+
+    def n(field):
+        value = record.get(field)
+        return len(value) if isinstance(value, list) else 0
+
+    return {"v": 1, "id": record.get("id"), "companyId": record.get("companyId"),
+            "auditedAt": record.get("auditedAt"), "verdict": record.get("verdict"),
+            "reason": record.get("reason"), "status": record.get("status"),
+            "route": record.get("route"), "readModel": record.get("readModel"),
+            "auditModel": record.get("model"),
+            "fileTypes": sorted({_ext(k) for k in record.get("sourceKeys") or []}),
+            "files": len(record.get("sourceKeys") or []),
+            "sections": counts.get("sections"), "items": counts.get("items"),
+            "sourceItems": record.get("source_items"), "missing": n("missing"),
+            "extra": n("extra"), "reworded": n("reworded"),
+            "splitOrMerged": n("split_or_merged"), "droppedClaims": n("dropped_claims"),
+            "elapsedS": record.get("elapsed_s")}
 
 
 def _empty(status, **extra):
@@ -287,6 +323,12 @@ def _store(company, request_id, record):
     key = audit_key(company, request_id)
     lake_put(S3_BUCKET, key, json.dumps(record, ensure_ascii=False),
              owner_hint={"company_id": company}, client=s3(), ContentType="application/json")
+    try:
+        lake_put(S3_BUCKET, stats_key(company, request_id, record["auditedAt"]),
+                 json.dumps(audit_stats(record)), owner_hint={"company_id": company},
+                 client=s3(), ContentType="application/json")
+    except Exception:  # noqa: BLE001 - the record is stored; the stats line only counts
+        logger.exception("template audit %s: could not store the stats line", request_id)
     return key
 
 
