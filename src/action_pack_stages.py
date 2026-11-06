@@ -123,6 +123,8 @@ TARGETED = ("close_item", "update_item")
 CONFIDENCE = ("supported", "uncertain")
 VERIFIER_LABELS = ("supported", "weak", "unsupported")
 ITEM_STATUSES = tuple(action_pack_view.STATUS_TRANSITIONS)
+# action_pack_verify.OPEN_STATUSES (verify imports this module, so not imported here).
+OPEN_STATUSES = ("open", "in_progress", "blocked")
 SNAPSHOT_FIELDS = ("status", "deadline", "responsible", "priority", "text", "updated_at")
 # Proposed fields per draft-only type (the apply types use action_pack_view's table).
 _DRAFT_FIELDS = {"draft_rfi": (("subject", "body"), ()),

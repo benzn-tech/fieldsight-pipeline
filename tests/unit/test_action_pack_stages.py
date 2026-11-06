@@ -1221,3 +1221,8 @@ def test_field_sources_bad_source_is_none():
     assert out["status"] == {"source": "evidence", "refs": ["R1"], "said_on": None}
     assert st._field_sources(None, proposed, citable={"R1"}) is None
     assert st._field_sources("x", proposed, citable={"R1"}) is None
+
+
+def test_open_statuses_match_the_verifier():
+    import action_pack_verify
+    assert st.OPEN_STATUSES == action_pack_verify.OPEN_STATUSES
