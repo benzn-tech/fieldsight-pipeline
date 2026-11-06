@@ -38,11 +38,12 @@ done
 
 DIR="$(mktemp -d)"
 trap 'rm -rf "$DIR"' EXIT
-# Git Bash on Windows: a native python misreads /tmp/... paths, so hand it the Windows path.
+# Git Bash on Windows: native aws and python misread /tmp/... (aws writes under C:\tmp),
+# so hand both the Windows path.
 PYDIR="$DIR"
 command -v cygpath >/dev/null 2>&1 && PYDIR="$(cygpath -w "$DIR")"
 # A denied or expired credential fails here (set -e) instead of reading as "no uploads".
-aws s3 sync "s3://$BUCKET/$PREFIX" "$DIR" --profile "$PROFILE" --region "$REGION" \
+aws s3 sync "s3://$BUCKET/$PREFIX" "$PYDIR" --profile "$PROFILE" --region "$REGION" \
   --only-show-errors
 
 "$PY" - "$PYDIR" "$MONTHS" <<'EOF'
