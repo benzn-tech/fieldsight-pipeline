@@ -327,3 +327,52 @@ def test_render_text_tables_and_paragraphs():
         "[table 2]",
         "Project | Penina",
     ])
+
+
+# ---- checkbox cells are answers, not answer-column headers (fix after Tasks 1-2) -------
+# "☐ Pass ☐ Fail" reads "pass fail" once glyphs go, so an outcome / signature table looked
+# like a combined-column header with Inspector / Signature / Date as its items.
+
+def _add_outcome_table(d):
+    t = d.add_table(rows=0, cols=2)
+    _row(t, "Inspection Result", "☐ Pass ☐ Fail")
+    _row(t, "Reinspection required?", "☐ Yes ☐ No")
+    _row(t, "Inspector name", "")
+    _row(t, "Signature", "")
+    _row(t, "Date", "")
+
+
+def test_an_outcome_and_signature_table_alone_reads_nothing():
+    d = docx.Document()
+    d.add_paragraph("Council inspection")
+    _add_outcome_table(d)
+    assert template_docx.read(_save(d)) == []
+
+
+def test_an_outcome_table_after_a_checklist_adds_no_items():
+    d, _ = _combined_like(items=("Gate locked", "Signage up"))
+    _add_outcome_table(d)
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Gate locked", "Signage up"]}]
+
+
+def test_a_combined_header_with_a_checkbox_element_is_not_a_header():
+    from docx.oxml import parse_xml
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=2)
+    _row(t, "Inspection Result", "Pass / Fail")
+    _row(t, "Signature", "")
+    t.rows[0].cells[1]._tc.append(parse_xml(
+        '<w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">'
+        '<w:sdtPr><w14:checkbox/></w:sdtPr><w:sdtContent><w:p/></w:sdtContent></w:sdt>'))
+    # The w14 checkbox makes row 1 an item row by the cell rule ("Inspection Result"), as
+    # before; what matters is that "Signature" never becomes an item under it.
+    flat = [i for s in template_docx.read(_save(d)) for i in s["items"]]
+    assert "Signature" not in flat
+
+
+def test_a_space_joined_combined_header_is_a_header_not_an_item():
+    d, _ = _combined_like("Yes No N/A", items=("Gate locked", "Signage up"))
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Gate locked", "Signage up"]}]

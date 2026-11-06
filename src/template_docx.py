@@ -15,9 +15,14 @@ Free, exact and deterministic. The rule (the spike's truth reader, generalised -
     is not just a number. Its section is the header row's own label when that label names
     something ("Scaffolding | Y | N | NA"), else the paragraph just above the table (the
     usual heading), else untitled; merged single-cell rows inside it are sections as above.
-  * a COMBINED answer column (spec 2026-11-06 R1) is read the same way: one header cell
-    that is only answer words joined by / | , or spaces ("Yes / No / N/A", "Y/N/NA",
-    "Pass / Fail / N/A"), naming at least a yes-word and a no-word, is the answer column.
+  * a COMBINED answer column (spec 2026-11-06 R1) is read the same way: one header cell,
+    a header label with no checkbox glyphs, that is only answer words joined by / | , or
+    spaces ("Yes / No / N/A", "Y/N/NA", "Pass / Fail / N/A"), naming at least a yes-word
+    and a no-word, is the answer column. A cell WITH boxes ("[] Pass [] Fail") is itself
+    being answered -- an outcome line, never a column label.
+  * a table whose every item row (by the cell rule) starts with a column label ("No.",
+    "#", "Item") is a header row reading "Yes No N/A", not items: the column reader
+    takes it.
   * Pass / Fail words (R2) count as yes / no words in header cells only; the reader still
     outputs item text alone. "OK" is a yes-word only when the header row also has a no-word.
   * a legacy Word form checkbox (w:ffData with a w:checkBox child, R3) marks an answer
@@ -77,12 +82,15 @@ def _text(cell):
     return " ".join(_BOXES.sub(" ", cell.text).split())
 
 
-def _is_answer_cell(cell):
-    if _ANSWER.match(_text(cell)):
-        return True
+def _has_checkbox(cell):
+    """A w14 checkbox content control, or a legacy form checkbox (w:ffData/w:checkBox)."""
     return any(el.tag == _W14_CHECKBOX
                or (el.tag == _W + "checkBox" and el.getparent().tag == _W + "ffData")
                for el in cell._tc.iter())
+
+
+def _is_answer_cell(cell):
+    return bool(_ANSWER.match(_text(cell))) or _has_checkbox(cell)
 
 
 def _kind(cells):
@@ -121,7 +129,8 @@ def _answer_columns(cells):
     if "yes" in found and "no" in found:
         return sorted(found.values())
     for i, label in enumerate(labels):
-        if _is_combined(label):
+        # Boxes mean the cell is itself answered (an outcome line), not a column label.
+        if _is_combined(label) and not _BOXES.search(cells[i].text) and not _has_checkbox(cells[i]):
             return [i]
     return None
 
@@ -214,7 +223,8 @@ def read(source):
     for t, table in enumerate(document.tables):
         cells = [_unique_cells(r) for r in table.rows]
         rows = [_kind(c) for c in cells]
-        if not any(kind == "item" for kind, _ in rows):
+        items = [text for kind, text in rows if kind == "item"]
+        if not items or all(_label(text) in _GENERIC for text in items):
             by_columns = _read_by_columns(cells, headings[t] if t < len(headings) else "")
             if not by_columns or not any(kind == "item" for kind, _ in by_columns[1]):
                 continue
