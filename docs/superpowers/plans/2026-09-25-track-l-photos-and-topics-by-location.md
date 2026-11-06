@@ -159,7 +159,9 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 Not code in this repo, and the thing that decides whether Tasks 2–7 show anything:
 
 - [ ] **Working rule for site managers:** say the place when you enter it — "Level two", "Room one-oh-one" — before the first observation there. One sentence; the extractor already listens for it.
-- [ ] **GrandTime App:** a *Current location* quick button that records a marker (`{at, location}`) without speech — same shape, same table, arrives with the session. Spec it in the App repo referencing `day_location_markers`; the backend needs no change if the App writes it through the session's existing metadata channel.
+- [ ] ~~**GrandTime App:** a *Current location* quick button that records a marker (`{at, location}`) without speech~~ — **not built (owner, 2026-11-06: habit first).** A button that writes a place without speech needs typed text or GPS, and both break owner rules (no typing in capture; place comes only from speech). If the habit alone does not move the Task 8 re-measure (~2026-11-20), the fallback is a *reminder-only* button: press → the device prompts "say where you are" → the inspector speaks → the existing extractor records the marker. No backend change either way.
+
+**Ruling 2026-11-06 (made under the owner's standing "pick the long-term option" rule; owner may overturn) on `_assemble_session_report` / `_assemble_day_report` `topics[].related_photos`:** no change. Rows are already site-clipped, `related_photos` are filenames of photos bound to topics the caller may see, and an exported report is meant to carry its photos. The only cross-site case is a mis-bound photo — that is the photo-binding defect, not this path.
 
 ---
 
