@@ -1328,6 +1328,12 @@ Rules:
 - Never ask the user questions.
 - Never reopen an item, and only change an item whose current status allows it.
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
+- Change only items the instruction names, unless it asks you to tidy open items. For anything else worth changing, write a note.
+- target_ref: on close_item / update_item, the id (t1, t2 ...) of the named target it acts on, from the named targets list; null when the item is not a named target.
+- field_sources: on close_item, update_item and create_item, one entry for every proposed field except a create's text (close_item's field is "status"): {{"source": "user" | "evidence" | "assumed_default", "refs": [...], "said_on": "YYYY-MM-DD" or null}}.
+  "user": the user gave this value in the instruction. "evidence": a record (R topic/chunk) or a project document (D) states it -- cite those refs; an item's own line never justifies changing that item, except a deadline worked out from its own deadline_text; web refs (W) never set a field. "assumed_default": only for a deadline the user told you to set when the item has neither a deadline nor a deadline_text; propose the item's raised_on.
+  said_on: for an "evidence" deadline, the said_on of the record it was resolved from (an item's raised_on when it comes from its deadline_text); otherwise null.
+  A field without a valid source is removed before anyone sees it.
 - Action types and their "proposed" fields:
   close_item   {{"status": "done" | "closed"}}
   update_item  any of {{"status": "in_progress"|"blocked"|"done"|"closed", "deadline": "YYYY-MM-DD", "responsible": "a name", "priority": "low"|"medium"|"high"}}
@@ -1338,7 +1344,7 @@ Rules:
 
 Return ONLY a JSON object:
 {{"conclusion": [{{"text": "...", "refs": ["R1"], "confidence": "supported"}}],
-  "actions": [{{"type": "close_item", "target_stable_id": "<stable_id or null>", "proposed": {{...}}, "rationale": "why, in one or two sentences", "refs": ["R2"]}}]}}
+  "actions": [{{"type": "close_item", "target_stable_id": "<stable_id or null>", "target_ref": "<t1 or null>", "proposed": {{...}}, "field_sources": {{"status": {{"source": "evidence", "refs": ["R2"], "said_on": null}}}}, "rationale": "why, in one or two sentences", "refs": ["R2"]}}]}}
 
 {evidence}
 """
@@ -1473,6 +1479,38 @@ def legal_change(atype, proposed, current):
     return proposed or None
 
 
+FIELD_SOURCES = ("user", "evidence", "assumed_default")
+_NO_SOURCE = {"source": None, "refs": [], "said_on": None}
+
+
+def _field_sources(raw, proposed, *, citable=()):
+    """The writer's `field_sources` for the fields it proposes (spec 2026-11-05 §3.2.3):
+    {field: {"source": user|evidence|assumed_default, "refs": [citable refs],
+    "said_on": "YYYY-MM-DD" or None}}. None when `raw` is not an object. A field with a
+    missing or malformed entry (unknown source, refs not a list) gets source None -- the
+    scope gate then removes it; a said_on that is not an ISO date is None. An entry for a
+    field not proposed, and a create's `text` (it keeps its refs rule), are ignored."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for fld in proposed:
+        if fld == "text":
+            continue
+        e = raw.get(fld)
+        if (not isinstance(e, dict) or e.get("source") not in FIELD_SOURCES
+                or not isinstance(e.get("refs", []), list)):
+            out[fld] = dict(_NO_SOURCE)
+            continue
+        refs = []
+        for r in e.get("refs") or []:
+            if isinstance(r, str) and r.strip() in citable and r.strip() not in refs:
+                refs.append(r.strip())
+        said = _iso_date(e.get("said_on"))
+        out[fld] = {"source": e["source"], "refs": refs,
+                    "said_on": said.isoformat() if said else None}
+    return out
+
+
 def validate_draft(obj, run, citable):
     """{"conclusion": [...], "actions": [...]} from the writer's object, every element that
     breaks the schema dropped and counted in run.trace["write_dropped"]. None when the
@@ -1496,13 +1534,15 @@ def validate_draft(obj, run, citable):
             conf = "uncertain"                       # G2: not citable -> uncertain
             _bump(counts, "conclusion_downgraded")
         conclusion.append({"text": text, "refs": refs, "confidence": conf})
+    plan_targets = {t["id"] for t in (run.plan.targets if run.plan else [])}
     actions = []
     for a in obj["actions"]:
         if len(actions) >= MAX_ACTIONS:
             _bump(counts, "actions")
             continue
         if not isinstance(a, dict) or set(a) - {"type", "target_stable_id", "proposed",
-                                                "rationale", "refs"}:
+                                                "rationale", "refs", "target_ref",
+                                                "field_sources"}:
             _bump(counts, "actions")
             continue
         atype = a.get("type")
@@ -1529,8 +1569,23 @@ def validate_draft(obj, run, citable):
             if proposed is None:
                 _bump(counts, "transitions")
                 continue
-        actions.append({"type": atype, "target_stable_id": target, "proposed": proposed,
-                        "rationale": rationale, "refs": refs})
+        el = {"type": atype, "target_stable_id": target, "proposed": proposed,
+              "rationale": rationale, "refs": refs}
+        if atype in TARGETED or atype == "create_item":
+            # Spec 2026-11-05 §3.2.3: the writer names the planner target it acts on and
+            # where each proposed field comes from; the scope gate (action_pack_scope)
+            # judges both. An unknown target id is null; a field's refs are the action's.
+            ref = a.get("target_ref")
+            if ref is not None and (atype not in TARGETED or ref not in plan_targets):
+                _bump(counts, "target_ref")
+                ref = None
+            sources = _field_sources(a.get("field_sources"), proposed, citable=citable)
+            for fs in (sources or {}).values():
+                for r in fs["refs"]:
+                    if r not in el["refs"]:
+                        el["refs"].append(r)
+            el.update(target_ref=ref, field_sources=sources)
+        actions.append(el)
     if counts:
         run.trace["write_dropped"] = counts
     added = 0

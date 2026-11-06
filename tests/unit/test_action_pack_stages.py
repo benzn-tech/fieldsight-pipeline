@@ -1172,3 +1172,52 @@ def test_model_rounds_honours_knob(monkeypatch, knob, model_rounds):
     assert payload["run_trace"]["rounds"] == model_rounds + 1
     for i, call in enumerate(made):                 # the prompt counts down to the knob
         assert f"{model_rounds - i - 1} rounds remain after this one" in call["prompt"]
+
+
+# ---- PR-4 Task 4.1: writer keys target_ref and field_sources (spec 2026-11-05 §3.2.3) ----
+
+def _vrun(items=None, targets=None):
+    run = st.Run(ctx=make_ctx(), deps=deps())
+    run.items = items or {SID1: {"stable_id": SID1, "status": "open"}}
+    run.plan, _ = st.validate_plan(
+        plan_obj(targets=targets or [{"id": "t1", "task_no": 1}]), TODAY)
+    return run
+
+
+def test_validate_draft_keeps_field_sources():
+    run = _vrun()
+    obj = {"conclusion": [], "actions": [
+        {"type": "update_item", "target_stable_id": SID1, "target_ref": "t1",
+         "proposed": {"deadline": "2026-11-10", "priority": "high"},
+         "field_sources": {
+             "deadline": {"source": "evidence", "refs": ["R2", "R99"],
+                          "said_on": "2026-11-01"},
+             "priority": {"source": "user", "refs": []},
+             "status": {"source": "user", "refs": []}},          # not proposed: ignored
+         "rationale": "r", "refs": ["R1"]},
+        {"type": "create_item", "target_ref": "t9",              # unknown target id
+         "proposed": {"text": "Book the pump"}, "rationale": "r", "refs": ["R1"]}]}
+    draft = st.validate_draft(obj, run, {"R1", "R2"})
+    upd, create = draft["actions"]
+    assert upd["target_ref"] == "t1"
+    assert upd["field_sources"] == {
+        "deadline": {"source": "evidence", "refs": ["R2"], "said_on": "2026-11-01"},
+        "priority": {"source": "user", "refs": [], "said_on": None}}
+    assert upd["refs"] == ["R1", "R2"]               # a field's ref is cited by the action
+    assert create["target_ref"] is None and create["field_sources"] is None
+
+
+def test_field_sources_bad_source_is_none():
+    proposed = {"deadline": "2026-11-10", "priority": "high", "responsible": "Sam",
+                "status": "blocked"}
+    raw = {"deadline": {"source": "guess", "refs": ["R1"], "said_on": None},
+           "priority": "high",
+           "responsible": {"source": "evidence", "refs": "R1"},
+           "status": {"source": "evidence", "refs": ["R1"], "said_on": "yesterday"}}
+    out = st._field_sources(raw, proposed, citable={"R1"})
+    none = {"source": None, "refs": [], "said_on": None}
+    assert out["deadline"] == none and out["priority"] == none
+    assert out["responsible"] == none
+    assert out["status"] == {"source": "evidence", "refs": ["R1"], "said_on": None}
+    assert st._field_sources(None, proposed, citable={"R1"}) is None
+    assert st._field_sources("x", proposed, citable={"R1"}) is None
