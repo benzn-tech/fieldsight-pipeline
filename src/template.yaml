@@ -391,6 +391,15 @@ Parameters:
       TEST_ACTION_VERIFIER_HIDE_UNSUPPORTED /
       PROD_ACTION_VERIFIER_HIDE_UNSUPPORTED (literally on or off).
 
+  ActionMaxRounds:
+    Type: String
+    Default: '8'
+    AllowedPattern: '^[1-8]$'
+    Description: >-
+      Action packs gather rounds per run, round 1 included (spec 2026-11-05
+      §11: the latency knob). 1-8; the code clamps to the same range and 8 is
+      the ceiling. Set via TEST_ACTION_MAX_ROUNDS / PROD_ACTION_MAX_ROUNDS.
+
   CompanyStatusEnforce:
     Type: String
     Default: 'off'
@@ -2811,6 +2820,8 @@ Resources:
           # Per-run token cap (§4.2 cost guard): over it the run stores what is verified
           # as a partial pack (run_trace.truncated).
           ACTION_TOKEN_CAP: '400000'
+          # Gather rounds per run (1-8, round 1 included): the latency knob.
+          ACTION_MAX_ROUNDS: !Ref ActionMaxRounds
           # A backstop only. llm_utils measures this from the start of EACH call's
           # fallback chain, not from the Lambda's start, so it bounds a single call that
           # was given no deadline (780 < 900 Timeout - 60 store reserve) and says nothing

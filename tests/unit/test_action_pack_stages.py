@@ -203,6 +203,7 @@ def deps(model=None, tools=None, web=None, fetcher=None, verify=None, docs=True,
 def _env(monkeypatch):
     monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
     monkeypatch.delenv("ACTION_TOKEN_CAP", raising=False)
+    monkeypatch.delenv("ACTION_MAX_ROUNDS", raising=False)
 
 
 # ---- happy path / payload ------------------------------------------------------------
@@ -229,7 +230,9 @@ def test_payload_passes_the_store_checks_and_cites_only_what_survives():
     assert ctx.cps[0]["reading"] == "Review the 10-10 pour." and ctx.cps[0]["title"]
     trace = payload["run_trace"]
     assert trace["truncated"] is False and trace["rounds"] >= 1
-    assert all(isinstance(v, (int, bool, dict, list)) for v in trace.values())
+    # Counts and codes only (plan_scope is a code since PR-3).
+    assert all(isinstance(v, (int, bool, dict, list, str)) for v in trace.values())
+    assert action_pack_view.fail_trace_error(trace) is None
 
 
 def test_round_one_is_deterministic_and_pinned_to_the_site():
@@ -815,3 +818,357 @@ def test_judge_call_without_writer_model_is_unchanged(monkeypatch):
     st.judge_call("p", max_tokens=10, model=WRITER, deadline=100.0, caller="c", info={})
     assert seen[0] == {"model": WRITER, "max_tokens": 10, "deadline": 1100.0, "caller": "c",
                        "attempt_timeout": 100.0}
+
+
+# ---- PR-3 Task 3.1: plan v2 keys, tolerant (spec 2026-11-05 §3.2.1, §4.2) ----------------
+
+V2 = {"change_scope": "named",
+      "targets": [{"id": "t1", "task_no": 4, "phrase": None},
+                  {"id": "t2", "task_no": None, "phrase": "door hardware"}],
+      "stated_values": [{"target": "t1", "field": "deadline", "value": "2026-11-13"},
+                        {"target": None, "field": "priority", "value": "high"}],
+      "delegations": [{"target": "t2", "field": "deadline"}],
+      "sub_tasks": [{"id": "s1", "ask": "close #4", "kind": "close", "targets": ["t1"]},
+                    {"id": "s2", "ask": "set a due date", "kind": "update",
+                     "targets": ["t2"]}]}
+V2_UNNAMED = dict(
+    V2, stated_values=[{"target": None, "field": "priority", "value": "high"}],
+    delegations=[{"target": None, "field": "deadline"}],
+    sub_tasks=[{"id": "s1", "ask": "tidy up", "kind": "other", "targets": []}])
+
+
+def test_plan_v1_answer_still_valid():
+    plan, err = st.validate_plan(plan_obj(), TODAY)
+    assert err is None
+    assert plan.change_scope == "named" and plan.defaulted == []
+    assert (plan.targets, plan.stated_values, plan.delegations, plan.sub_tasks) == (
+        [], [], [], [])
+
+
+def test_plan_v2_answer_is_kept():
+    plan, err = st.validate_plan(plan_obj(**dict(V2, change_scope="tidy")), TODAY)
+    assert err is None and plan.defaulted == []
+    assert plan.change_scope == "tidy"
+    assert plan.targets == V2["targets"]
+    assert plan.stated_values == V2["stated_values"]
+    assert plan.delegations == V2["delegations"]
+    assert plan.sub_tasks == V2["sub_tasks"]
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("targets", "t1"),
+    ("targets", [{"id": "t1", "task_no": None, "phrase": None}]),       # names nothing
+    ("targets", [{"id": "t 1", "task_no": 3, "phrase": None}]),         # id not a code
+    ("targets", [{"id": "t1", "task_no": 3, "phrase": None}] * 2),      # duplicate id
+    ("targets", [{"id": "t1", "task_no": True, "phrase": None}]),
+    ("targets", [{"id": "t1", "task_no": None, "phrase": "x" * 201}]),
+    ("targets", [{"id": "t1", "task_no": 3, "phrase": None, "extra": 1}]),
+    ("stated_values", [{"target": None, "field": "deadline", "value": "next Friday"}]),
+    ("stated_values", [{"target": None, "field": "colour", "value": "red"}]),
+    ("stated_values", [{"target": None, "field": "priority", "value": "urgent"}]),
+    ("stated_values", [{"target": None, "field": "status", "value": "reopened"}]),
+    ("stated_values", [{"target": "t9", "field": "priority", "value": "high"}]),
+    ("delegations", [{"target": None, "field": "priority"}]),
+    ("sub_tasks", [{"id": "s1", "ask": "x", "kind": "dance", "targets": []}]),
+    ("sub_tasks", [{"id": "s1", "ask": "", "kind": "close", "targets": []}]),
+    ("sub_tasks", [{"id": "s1", "ask": "x", "kind": "close", "targets": ["t9"]}]),
+])
+def test_plan_v2_malformed_key_defaulted(key, bad):
+    # A bad `targets` would also default every key naming t1/t2 (pinned below): here the
+    # others name no target, so each case shows a bad key costing only itself.
+    base = V2 if key != "targets" else V2_UNNAMED
+    plan, err = st.validate_plan(plan_obj(**dict(base, **{key: bad})), TODAY)
+    assert err is None
+    assert getattr(plan, key) == [] and plan.defaulted == [key]
+    for other in ("targets", "stated_values", "delegations", "sub_tasks"):
+        if other != key:
+            assert getattr(plan, other) == base[other], other
+
+
+def test_plan_v2_target_refs_follow_a_defaulted_targets_key():
+    """stated_values / delegations / sub_tasks naming a target that is no longer there are
+    defaulted too: a reference to a dropped target is a reference to nothing."""
+    plan, err = st.validate_plan(plan_obj(**dict(V2, targets="t1")), TODAY)
+    assert err is None
+    assert plan.defaulted == ["targets", "stated_values", "delegations", "sub_tasks"]
+
+
+@pytest.mark.parametrize("scope", [None, "", "everything", 3])
+def test_plan_invalid_scope_is_named(scope):
+    plan, err = st.validate_plan(plan_obj(**dict(V2, change_scope=scope)), TODAY)
+    assert err is None and plan.change_scope == "named"
+    assert plan.defaulted == ["change_scope"]
+
+
+def test_plan_v2_caps():
+    many = [{"id": f"t{i}", "task_no": i, "phrase": None} for i in range(1, 12)]
+    plan, err = st.validate_plan(plan_obj(targets=many), TODAY)
+    assert err is None and plan.targets == [] and plan.defaulted == ["targets"]
+    ten = many[:10]
+    plan, _ = st.validate_plan(plan_obj(targets=ten), TODAY)
+    assert len(plan.targets) == 10 and plan.defaulted == []
+    subs = [{"id": f"s{i}", "ask": "x", "kind": "other", "targets": []} for i in range(9)]
+    plan, _ = st.validate_plan(plan_obj(sub_tasks=subs), TODAY)
+    assert plan.sub_tasks == [] and plan.defaulted == ["sub_tasks"]
+    sv = [{"target": None, "field": "priority", "value": "high"}] * 11
+    plan, _ = st.validate_plan(plan_obj(stated_values=sv), TODAY)
+    assert plan.stated_values == [] and plan.defaulted == ["stated_values"]
+
+
+def test_plan_unknown_extra_key_rejected():
+    plan, err = st.validate_plan(plan_obj(**V2, extra=1), TODAY)
+    assert plan is None and err == "keys"
+    core = plan_obj(**V2)
+    del core["reading"]
+    assert st.validate_plan(core, TODAY) == (None, "keys")
+
+
+def test_plan_v2_trace_is_counts_shaped():
+    model = Model(plan=[plan_obj(**dict(V2, delegations="bad"))])
+    payload = st.run(make_ctx(), deps(model=model))
+    trace = payload["run_trace"]
+    assert trace["plan_scope"] == "named"
+    assert trace["plan_key_defaulted"] == ["delegations"]
+    assert trace["plan_targets"] == 2 and trace["plan_sub_tasks"] == 2
+    assert action_pack_view.fail_trace_error(trace) is None
+
+
+def test_plan_prompt_states_the_v2_keys():
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    prompt = next(c["prompt"] for c in model.calls if c["caller"] == "action_plan")
+    for key in ("change_scope", "targets", "stated_values", "delegations", "sub_tasks"):
+        assert f'"{key}"' in prompt, key
+
+
+# ---- PR-3 Task 3.3: target lookups in round 1 (spec 2026-11-05 §3.2.2, §11) --------------
+
+SID_DONE = "44444444-5555-4666-8777-888888888883"
+TARGETS2 = [{"id": "t1", "task_no": 2, "phrase": None},
+            {"id": "t2", "task_no": None, "phrase": "level 3 windows"}]
+
+
+class TargetTools(Tools):
+    """Tools whose target hops (call_id target_*) return one row per target: the done item
+    for the phrase, and a delay to show the hops overlap."""
+
+    def __init__(self, delay=0.0, **kw):
+        super().__init__(**kw)
+        self.delay, self.target_calls, self.threads = delay, [], set()
+
+    def items_run(self, args, tctx, call_id="items"):
+        import threading
+        import time
+        if not call_id.startswith("target_"):
+            return super().items_run(args, tctx, call_id)
+        self.target_calls.append((call_id, args, tctx))
+        self.threads.add(threading.get_ident())
+        if self.delay:
+            time.sleep(self.delay)
+        row = {f: None for f in ask_items.ITEM_FIELDS}
+        if args.get("task_no") == 2:
+            row.update(stable_id=SID2, task_no=2, text="Item 2", status="open")
+        else:
+            row.update(stable_id=SID_DONE, task_no=3, text="Seal the level 3 windows",
+                       status="done")
+        return {"tool": "list_items", "id": call_id, "meta": {}, "items": [
+            {"ref": tctx.refs.assign("item", row["stable_id"], "R"), "kind": "item",
+             "provenance": "records", **row}]}
+
+
+def test_round1_issues_target_calls_all_statuses():
+    tools = TargetTools()
+    model = Model(plan=[plan_obj(targets=TARGETS2)])
+    payload = st.run(make_ctx(), deps(model=model, tools=tools))
+    calls = {cid: args for cid, args, _ in tools.target_calls}
+    assert set(calls) == {"target_t1", "target_t2"}
+    for args in calls.values():
+        assert args["status"] == ["open", "in_progress", "blocked", "done", "closed"]
+        assert args["limit"] == 50 and args["site_id"] == SITE
+    assert calls["target_t1"]["task_no"] == 2 and "query" not in calls["target_t1"]
+    assert calls["target_t2"]["query"] == "level 3 windows" and "task_no" not in calls[
+        "target_t2"]
+    trace = payload["run_trace"]
+    assert trace["target_resolution"] == {"t1": SID2, "t2": SID_DONE}
+    assert trace["target_calls"] == 2
+    # The hops' items entered the registry with refs from the run's shared assigner: SID2
+    # keeps the ref round 1's items call gave it, the done item gets the next one.
+    run_refs = {s["stable_id"]: s["ref"] for s in payload["sources"] if s.get("stable_id")}
+    assert all(r.startswith("R") for r in run_refs.values())
+
+
+def test_target_refs_are_reassigned_on_the_shared_assigner():
+    tools = TargetTools()
+    ctx = make_ctx()
+    run = st.Run(ctx=ctx, deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=TARGETS2), TODAY)
+    st.gather_stage(run)
+    by_sid = {e["item"]["stable_id"]: ref for ref, e in run.registry.items()
+              if e["kind"] == "item"}
+    assert by_sid[SID2] == run.refs.assign("item", SID2, "R")          # same as items1
+    assert by_sid[SID_DONE] == run.refs.assign("item", SID_DONE, "R")
+    assert len(set(run.registry)) == len(run.registry)
+    # each hop had a private assigner and its own deadline
+    for _, _, tctx in tools.target_calls:
+        assert tctx.refs is not run.refs
+        assert tctx.deadline == pytest.approx(ctx.clock() + ask_items.MAX_DEADLINE_S)
+    assert run.resolution["t2"].stable_id == SID_DONE
+
+
+def test_target_calls_run_concurrently():
+    import time
+    tools = TargetTools(delay=0.2)
+    targets = [{"id": f"t{i}", "task_no": None, "phrase": f"windows {i}"}
+               for i in range(1, 5)]
+    run = st.Run(ctx=make_ctx(), deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=targets), TODAY)
+    t0 = time.perf_counter()
+    st.gather_stage(run)
+    assert time.perf_counter() - t0 < 0.5
+    assert len(tools.target_calls) == 4 and len(tools.threads) == 4
+
+
+def test_at_most_four_target_lookups():
+    tools = TargetTools()
+    targets = [{"id": f"t{i}", "task_no": i, "phrase": None} for i in range(1, 7)]
+    run = st.Run(ctx=make_ctx(), deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=targets), TODAY)
+    st.gather_stage(run)
+    assert len(tools.target_calls) == 4
+    assert run.trace["target_lookups_capped"] == 2
+    # t5/t6 still resolve over what the run read (task_no 1 and 2 are round 1's items).
+    assert set(run.trace["target_resolution"]) == {f"t{i}" for i in range(1, 7)}
+
+
+def test_target_hop_skipped_without_time():
+    clock = Clock()
+    ctx = make_ctx(clock=clock)
+    tools = TargetTools()
+    run = st.Run(ctx=ctx, deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=TARGETS2), TODAY)
+    # 4 s of hop budget left: under MIN_TARGET_HOP_S.
+    clock.t = ctx.deadline_for("gather") - st.ROUND_FLOOR_S - 4.0
+    st.gather_stage(run)
+    assert tools.target_calls == []
+    assert run.trace["target_resolve_time"] == 2
+    # t1 (task_no 2) is among round 1's open items, but a skipped lookup is `none`.
+    assert run.trace["target_resolution"] == {"t1": "none", "t2": "none"}
+
+
+def test_target_hop_budget_is_capped_by_gather_time():
+    clock = Clock()
+    ctx = make_ctx(clock=clock)
+    tools = TargetTools()
+    run = st.Run(ctx=ctx, deps=deps(model=Model(), tools=tools))
+    run.plan, _ = st.validate_plan(plan_obj(targets=TARGETS2[:1]), TODAY)
+    clock.t = ctx.deadline_for("gather") - st.ROUND_FLOOR_S - 12.0
+    st.gather_stage(run)
+    [(_, _, tctx)] = tools.target_calls
+    assert tctx.deadline == pytest.approx(clock.t + 12.0)
+
+
+def test_no_targets_no_hops_and_an_empty_resolution():
+    tools = TargetTools()
+    payload = st.run(make_ctx(), deps(tools=tools))
+    assert tools.target_calls == []
+    assert payload["run_trace"]["target_resolution"] == {}
+    assert payload["run_trace"]["plan_scope"] == "named"
+
+
+def test_target_resolution_in_trace_is_counts_shaped():
+    tools = TargetTools()
+    targets = TARGETS2 + [{"id": "t3", "task_no": 404, "phrase": None},
+                          {"id": "t4", "task_no": None, "phrase": "item"}]
+    model = Model(plan=[plan_obj(targets=targets)])
+    payload = st.run(make_ctx(), deps(model=model, tools=tools))
+    trace = payload["run_trace"]
+    assert trace["target_resolution"]["t3"] == "none"
+    assert action_pack_view.fail_trace_error(trace) is None
+    assert action_pack_view.fail_trace_error(
+        {"target_resolution": trace["target_resolution"]}) is None
+
+
+def test_a_failing_target_hop_does_not_fail_round_1():
+    class Boom(TargetTools):
+        def items_run(self, args, tctx, call_id="items"):
+            if call_id.startswith("target_"):
+                raise RuntimeError("boom")
+            return super().items_run(args, tctx, call_id)
+    payload = st.run(make_ctx(), deps(model=Model(plan=[plan_obj(targets=TARGETS2)]),
+                                      tools=Boom()))
+    trace = payload["run_trace"]
+    assert trace["tool_errors"] >= 2
+    assert trace["target_resolution"]["t1"] == SID2       # round 1's own items
+
+
+# ---- PR-3 Task 3.4: the named targets in the write render --------------------------------
+
+def _write_prompt(model):
+    return next(c["prompt"] for c in model.calls if c["caller"] == "action_write")
+
+
+def test_write_prompt_lists_named_targets():
+    class Pool(Tools):
+        """Round 1's items plus a done item and two scaffold look-alikes."""
+
+        def items_run(self, args, tctx, call_id="items"):
+            env = super().items_run(args, tctx, call_id)
+            extra = [("44444444-5555-4666-8777-88888888888a", 7, "Seal the level 3 windows",
+                      "done"),
+                     ("44444444-5555-4666-8777-88888888888b", 8, "Check north scaffold",
+                      "open"),
+                     ("44444444-5555-4666-8777-88888888888c", 9,
+                      "Fix north scaffold tie", "blocked")]
+            for sid, no, text, status in extra:
+                row = {f: None for f in ask_items.ITEM_FIELDS}
+                row.update(stable_id=sid, task_no=no, text=text, status=status)
+                env["items"].append({"ref": tctx.refs.assign("item", sid, "R"),
+                                     "kind": "item", "provenance": "records", **row})
+            return env
+
+    targets = [{"id": "t1", "task_no": 2, "phrase": None},
+               {"id": "t2", "task_no": None, "phrase": "north scaffold"},
+               {"id": "t3", "task_no": None, "phrase": "seal level 3 windows"},
+               {"id": "t4", "task_no": 404, "phrase": None}]
+    model = Model(plan=[plan_obj(targets=targets)])
+    ctx = make_ctx()
+    st.run(ctx, deps(model=model, tools=Pool()))
+    prompt = _write_prompt(model)
+    refs = {}
+    for line in prompt.splitlines():
+        if " | item | stable_id " in line:
+            ref, _, sid = line.split(" | ")[:3]
+            refs[sid.split()[-1]] = ref
+    block = ("Named targets (the items the instruction names, matched in code):\n"
+             f"t1: {refs[SID2]} (open)\n"
+             f"t2: AMBIGUOUS — {refs['44444444-5555-4666-8777-88888888888b']}, "
+             f"{refs['44444444-5555-4666-8777-88888888888c']}: write a note, change neither\n"
+             f"t3: {refs['44444444-5555-4666-8777-88888888888a']} (done) — already done\n"
+             "t4: NOT FOUND — write a note\n")
+    assert block in prompt
+    assert "north scaffold" not in prompt.split("Named targets")[1].split("Instruction")[0]
+
+
+def test_write_prompt_without_targets_is_unchanged():
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    prompt = _write_prompt(model)
+    assert "Named targets" not in prompt
+    assert "Write in this language: en\n\nInstruction from the user" in prompt
+
+
+# ---- PR-3 Task 3.5: ACTION_MAX_ROUNDS --------------------------------------------------
+
+@pytest.mark.parametrize("knob,model_rounds", [("2", 1), ("1", 0), ("4", 3), ("99", 7)])
+def test_model_rounds_honours_knob(monkeypatch, knob, model_rounds):
+    monkeypatch.setenv("ACTION_MAX_ROUNDS", knob)
+    # Every round asks for a fresh call and is never done, so only the cap stops it.
+    rounds = [{"calls": [{"tool": "search_records", "args": {"query": f"q{i}"}}],
+               "done": False} for i in range(20)]
+    model = Model(rounds=rounds)
+    payload = st.run(make_ctx(), deps(model=model))
+    made = [c for c in model.calls if c["caller"] == "action_round"]
+    assert len(made) == model_rounds
+    assert payload["run_trace"]["rounds"] == model_rounds + 1
+    for i, call in enumerate(made):                 # the prompt counts down to the knob
+        assert f"{model_rounds - i - 1} rounds remain after this one" in call["prompt"]
