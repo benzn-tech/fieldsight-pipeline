@@ -123,3 +123,14 @@ def test_a_full_checklists_section_titles_do_not_capture_other_checks():
 def test_a_generic_name_falls_back_to_its_section_titles():
     qa = tpl("QA Checklists", sections=(dict(CHECK, title="Pre-pour"),))
     assert im.match({"kind": "pre-pour"}, [qa])[0]["name"] == "QA Checklists"
+
+
+def test_unit_words_do_not_dilute_the_match():
+    """Multi-unit walks name the unit in the opening (spec 2026-11-03):
+    "Lot 150 to 154" and "units 1 to 5 today" are not the check's type."""
+    tpl = {"id": "t1", "name": "Wall Framing Inspection", "scope": "org",
+           "body": {"sections": [{"title": "Wall framing", "kind": "checklist", "items": ["Studs"]}]}}
+    for said in ("wall framing inspection today, Lot 150 to 154",
+                 "wall framing check, units 1 to 5 today"):
+        t, s = im.match({"name": said, "kind": ""}, [tpl])
+        assert t is tpl and s == 1.0, (said, s)

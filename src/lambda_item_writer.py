@@ -53,11 +53,13 @@ Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
+import datetime
 import json
 import todo_collapse
 import logging
 import os
 import re
+import uuid
 from urllib.parse import unquote_plus
 
 import boto3
@@ -87,6 +89,7 @@ import inspection_match
 import photo_rebind
 import pipeline_trace
 import thread_match
+import units
 from repositories import inspection_windows, location_markers
 from repositories import memberships
 from repositories import (companies, decision_records, findings, meeting_session,
@@ -1881,12 +1884,126 @@ def _store_inspections(conn, company_id, user_id, user_folder, date, session, sp
             "template": tpl["name"] if tpl else None, "score": round(score, 2),
             "candidates": sum(1 for t in templates if inspection_match.is_checklist(t.get("body")))},
             evidence=w.get("start_quote"))
+    _assign_walks(conn, company_id, user_folder, date, session, rows)
     inspection_windows.replace_for_session(conn, company_id, user_folder, date, session, rows)
+    _backfill_walks(conn, company_id, user_folder, date, session, rows)
     return rows
+
+
+def _assign_walks(conn, company_id, user_folder, date, session, rows):
+    """Give each window of a multi-unit walk the walk's key (units.assign_walk),
+    so the walk's recordings make one report. The open walks are the day's
+    OTHER recordings: this one's rows are about to be replaced, and a window of
+    this recording that opened a walk earlier counts as soon as it has its key.
+    Never costs the windows: on any error they are stored with no walk_key."""
+    for r in rows:
+        r["walk_key"] = None
+    if conn is None or company_id is None:
+        return
+    try:
+        walks = {}
+        for r in sorted(rows, key=lambda r: r["start_at"]):
+            tid = r.get("template_id")
+            if tid is None:
+                continue
+            if tid not in walks:
+                with conn.transaction():          # a failed read must not abort the extraction
+                    walks[tid] = [w for w in inspection_windows.open_walks(
+                        conn, company_id, user_folder, date, tid) if w.get("session") != session]
+            r["walk_key"] = units.assign_walk(r, walks[tid], company_id, user_folder, date)
+            if r["walk_key"]:
+                walks[tid].append({"walk_key": r["walk_key"], "start_at": r["start_at"],
+                                   "units": r.get("units"), "session": session})
+    except Exception:  # noqa: BLE001 -- the windows matter more than the walk
+        logger.exception("walk keys not assigned for %s/%s %s", user_folder, date, session)
+        for r in rows:
+            r["walk_key"] = None
+
+
+def _backfill_walks(conn, company_id, user_folder, date, session, rows):
+    """R13: a recording that OPENS a walk may be extracted after a later
+    recording of the same walk, which found no walk and stored none -- or, by
+    entering two or more units, keyed a walk of its own (R47). Each walk this
+    recording opens claims those later, opening-less windows: the keyless
+    ones, and -- for a window with a spoken opening -- the self-keyed ones,
+    whole. The latest opening claims first, so an earlier walk never reaches
+    past a later one. After the windows are stored, in its own savepoint, and
+    never fatal: the windows are already kept."""
+    if conn is None or company_id is None:
+        return
+    opened = [r for r in rows if r.get("walk_key") and r["walk_key"] == units.walk_key(
+        company_id, user_folder, date, r["template_id"], r["start_at"])]
+    for r in sorted(opened, key=lambda r: r["start_at"], reverse=True):
+        tid = r["template_id"]
+        self_key = ((lambda start, tid=tid: units.walk_key(company_id, user_folder, date, tid,
+                                                           start))
+                    if units._opens_a_walk(r) else None)
+        try:
+            with conn.transaction():
+                n = inspection_windows.backfill_walk(conn, company_id, user_folder, date,
+                                                     tid, r["start_at"], r["walk_key"],
+                                                     session, self_key=self_key)
+            if n:
+                logger.info("walk %s claimed %d later window(s)", r["walk_key"], n)
+        except Exception:  # noqa: BLE001 -- the windows are stored; only the back-fill is lost
+            logger.exception("walk back-fill failed for %s/%s %s", user_folder, date, session)
+
+
+_WALK_KEY_RE = units.WALK_KEY_RE
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _requeue_walk_error(event):
+    """Why a requeue_walk invoke is refused, or None."""
+    key, company, folder, date = (event.get(k) for k in ("walk_key", "company_id", "folder", "date"))
+    if not isinstance(key, str) or not _WALK_KEY_RE.match(key):
+        return "walk_key invalid"
+    try:
+        uuid.UUID(str(company)) if company else None
+    except ValueError:
+        company = None
+    if not company:
+        return "company_id invalid"
+    # The folder spelling item-writer itself files by (users.safe_folder_name), and
+    # one path segment -- an extraction key's folder (EXTRACTION_KEY_RE) has no "/".
+    if (not isinstance(folder, str) or not folder or folder in (".", "..")
+            or users_repo.safe_folder_name(folder) != folder):
+        return "folder invalid"
+    if not isinstance(date, str) or not _ISO_DATE_RE.match(date):
+        return "date invalid"
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        return "date invalid"
+    return None
+
+
+def _requeue_walk(event):
+    """A walk report queued again after an on-site answer (multi-unit walks,
+    Task 11, R31): async-invoked by CheckGaps, which is outside the VPC and
+    cannot run org-api's code against Aurora. checklist_reports.requeue_walk
+    never raises; its result (request id or reason) is returned and logged."""
+    err = _requeue_walk_error(event)
+    if err:
+        logger.warning("requeue_walk refused: %s", err)
+        return {"error": err}
+    pipeline_trace.begin("item-writer", user_folder=event["folder"], date=event["date"])
+    try:
+        with get_connection() as conn:
+            result = checklist_reports.requeue_walk(conn, event["company_id"], event["folder"],
+                                                    event["date"], event["walk_key"])
+    finally:
+        pipeline_trace.flush(s3, S3_BUCKET)
+    logger.info("requeue_walk %s: %s", event["walk_key"], result)
+    return {"requeued": result}
 
 
 def lambda_handler(event, context):
     event = event or {}
+    # A direct invoke from CheckGaps. An S3 notification is {"Records": [...]} and
+    # never carries a top-level action; one that has Records is never this.
+    if event.get("action") == "requeue_walk" and "Records" not in event:
+        return _requeue_walk(event)
     results = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])
