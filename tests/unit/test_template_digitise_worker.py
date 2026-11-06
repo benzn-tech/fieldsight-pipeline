@@ -535,6 +535,66 @@ def test_alert_subject_is_ascii_and_at_most_100_chars(s3, sns, audit_on, monkeyp
     assert subject.startswith("[FieldSight test] Template upload problems: Inspeccion")
 
 
+
+def _stats(s3):
+    keys = [k for k in s3.puts if k.startswith("template_digitise_audit_stats/")]
+    assert len(keys) == 1, keys
+    return keys[0], json.loads(s3.puts[keys[0]])
+
+
+def test_a_problems_audit_keeps_a_stats_line_with_no_customer_text(s3, sns, audit_on, monkeypatch):
+    _docx_source(s3, _rule_read_docx())
+    _http(monkeypatch, [_audit_answer("problems", 2, missing=[
+        {"section": "", "text": "Fence intact"}, {"section": "", "text": "Roof flashing"}])])
+    worker.lambda_handler(_event(), None)
+    rec = _audit(s3)
+    key, line = _stats(s3)
+    assert key == f"template_digitise_audit_stats/{rec['auditedAt'][:7]}/{COMPANY}/{RID}.json"
+    assert line == {
+        "v": 1, "id": RID, "companyId": COMPANY, "auditedAt": rec["auditedAt"],
+        "verdict": "problems", "reason": None, "status": "done", "route": "docx",
+        "readModel": rec["readModel"], "auditModel": "google/gemini-3.8-flash",
+        "fileTypes": ["docx"], "files": 1, "sections": 1, "items": 1, "sourceItems": 2,
+        "missing": 1, "extra": 0, "reworded": 0, "splitOrMerged": 0, "droppedClaims": 1,
+        "elapsedS": rec["elapsed_s"]}
+    text = s3.puts[key]
+    for customer in ("Fence intact", "Roof flashing", "Gate locked", "Site inspection", "u-1"):
+        assert customer not in text
+    lines = [json.loads(v) for k, v in s3.puts.items() if k.startswith("lake_manifest/")]
+    assert any(l["key"] == key and l["hint"].get("company_id") == COMPANY for l in lines)
+
+
+def test_a_skipped_audit_keeps_a_stats_line_too(s3, sns, audit_on, monkeypatch):
+    import template_types
+    key = f"template_sources/{COMPANY}/{'e' * 32}.pdf"
+    s3.store[key] = b"x"
+    s3.sizes[key] = template_types.MAX_BYTES + 1
+    _request(s3, [key])
+    _http(monkeypatch, [])
+    worker.lambda_handler(_event(), None)
+    _, line = _stats(s3)
+    assert (line["verdict"], line["reason"], line["status"]) == ("skipped", "too_large", "error")
+    assert (line["fileTypes"], line["files"], line["auditModel"]) == (["pdf"], 1, None)
+    assert line["sourceItems"] is None and line["missing"] == 0
+
+
+def test_a_failed_stats_write_still_stores_and_publishes(s3, sns, audit_on, monkeypatch, caplog):
+    _docx_source(s3, _rule_read_docx())
+    _http(monkeypatch, [_audit_answer("problems", 2, missing=[
+        {"section": "", "text": "Fence intact"}])])
+    put = s3.put_object
+
+    def no_stats(Bucket, Key, Body, **kw):
+        if Key.startswith("template_digitise_audit_stats/"):
+            raise RuntimeError("denied")
+        return put(Bucket=Bucket, Key=Key, Body=Body, **kw)
+    monkeypatch.setattr(s3, "put_object", no_stats)
+    assert worker.lambda_handler(_event(), None) == {"ok": True}
+    assert _audit(s3)["verdict"] == "problems" and len(sns.published) == 1
+    assert any(r.getMessage() == f"template audit {RID}: could not store the stats line"
+               for r in caplog.records)
+
+
 def test_audit_problems_without_topic_logs_and_stores(s3, audit_on, monkeypatch, caplog):
     import logging
     monkeypatch.delenv("ALERT_TOPIC_ARN", raising=False)
