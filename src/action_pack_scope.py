@@ -41,7 +41,9 @@ or is removed (`field_said_on_mismatch`); a deadline before that day is removed
 the model's (no date parsing here).
 
 The action's planner target is its `target_ref`; with none, the target whose resolved
-item (or one of whose ambiguous candidates) is the action's item.
+item is the action's item, or -- under `named` only -- one whose ambiguous candidates
+include it (so it becomes a note, not `drop_unasked_target`). Under `tidy` an unnamed
+action on an ambiguous candidate is an ordinary tidy change.
 
 Pure: no I/O, no logging. Instruction text, stated values and item text never reach the
 counts.
@@ -74,8 +76,9 @@ def _bump(d, key, n=1):
     d[key] = d.get(key, 0) + n
 
 
-def _named_target(a, resolution):
-    """The planner target id this action acts on, or None (unnamed)."""
+def _named_target(a, resolution, *, ambiguous=True):
+    """The planner target id this action acts on, or None (unnamed). `ambiguous`: also
+    infer it from an ambiguous target's candidates (not under `tidy`)."""
     ref = a.get("target_ref")
     if ref in resolution:
         return ref
@@ -84,7 +87,7 @@ def _named_target(a, resolution):
         if r.kind == targets.RESOLVED and r.stable_id == sid:
             return tid
     for tid, r in resolution.items():
-        if r.kind == targets.AMBIGUOUS and sid in r.candidates:
+        if ambiguous and r.kind == targets.AMBIGUOUS and sid in r.candidates:
             return tid
     return None
 
@@ -102,7 +105,7 @@ def _note(a, lang, suffix_key, items, candidates=()):
 def _scope(a, *, plan, resolution, items, named_sids, lang, counts):
     """Rules 1-2 for one close/update -> the action, a note, or None (dropped)."""
     sid = a.get("target_stable_id")
-    tid = _named_target(a, resolution)
+    tid = _named_target(a, resolution, ambiguous=plan.change_scope != "tidy")
     r = resolution.get(tid) if tid is not None else None
     if r is not None:
         if r.kind == targets.AMBIGUOUS:
@@ -268,7 +271,8 @@ def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
             a = _scope(a, plan=plan, resolution=resolution, items=items,
                        named_sids=named_sids, lang=lang, counts=counts)
         if a is not None and a.get("type") in SOURCED:
-            tid = _named_target(a, resolution) if a["type"] in TARGETED else None
+            tid = (_named_target(a, resolution, ambiguous=False)
+                   if a["type"] in TARGETED else None)
             a = _provenance(a, tid=tid, plan=plan, items=items, registry=registry,
                             counts=counts)
         if a is not None:

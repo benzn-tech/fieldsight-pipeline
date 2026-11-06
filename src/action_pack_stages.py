@@ -869,6 +869,8 @@ def plan_stage(run: Run) -> Plan:
             run.trace["plan_scope"] = plan.change_scope
             run.trace["plan_key_defaulted"] = list(plan.defaulted)
             run.trace["plan_targets"] = len(plan.targets)
+            run.trace["plan_stated_values"] = len(plan.stated_values)
+            run.trace["plan_delegations"] = len(plan.delegations)
             run.trace["plan_sub_tasks"] = len(plan.sub_tasks)
             return plan
         logger.info("action agent plan rejected pack=%s code=%s", ctx.pack_id, code)
@@ -1337,7 +1339,7 @@ Rules:
 - Change only items the instruction names, unless it asks you to tidy open items. For anything else worth changing, write a note.
 - target_ref: on close_item / update_item, the id (t1, t2 ...) of the named target it acts on, from the named targets list; null when the item is not a named target.
 - field_sources: on close_item, update_item and create_item, one entry for every proposed field except a create's text (close_item's field is "status"): {{"source": "user" | "evidence" | "assumed_default", "refs": [...], "said_on": "YYYY-MM-DD" or null}}.
-  "user": the user gave this value in the instruction. "evidence": a record (R topic/chunk) or a project document (D) states it -- cite those refs; an item's own line never justifies changing that item, except a deadline worked out from its own deadline_text; web refs (W) never set a field. "assumed_default": only for a deadline the user told you to set when the item has neither a deadline nor a deadline_text; propose the item's raised_on.
+  "user": the user gave this value in the instruction. "evidence": a record (R topic/chunk) or a project document (D) states it -- cite those refs; an item's own line never justifies changing that item, except a deadline worked out from its own deadline_text; web refs (W) never set a field. "assumed_default": only for a deadline the user told you to set when the item has neither a deadline nor a deadline_text; propose the item's raised_on as YYYY-MM-DD.
   said_on: for an "evidence" deadline, the said_on of the record it was resolved from (an item's raised_on when it comes from its deadline_text); otherwise null.
   A field without a valid source is removed before anyone sees it.
 - Action types and their "proposed" fields:

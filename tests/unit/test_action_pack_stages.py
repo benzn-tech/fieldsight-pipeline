@@ -943,6 +943,8 @@ def test_plan_v2_trace_is_counts_shaped():
     assert trace["plan_scope"] == "named"
     assert trace["plan_key_defaulted"] == ["delegations"]
     assert trace["plan_targets"] == 2 and trace["plan_sub_tasks"] == 2
+    # Counts only, so Task 4.6 can tell a planner miss from a writer or gate miss (R3).
+    assert trace["plan_stated_values"] == 2 and trace["plan_delegations"] == 0
     assert action_pack_view.fail_trace_error(trace) is None
 
 

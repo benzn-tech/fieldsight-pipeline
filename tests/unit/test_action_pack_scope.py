@@ -130,6 +130,24 @@ def test_tidy_allows_unnamed_open_item():
     assert counts == {}
 
 
+def test_tidy_keeps_an_unnamed_ambiguous_candidate():
+    # Under tidy any open item may be changed: an action with no target_ref on one of an
+    # ambiguous target's candidates is a tidy change, not a demotion. With the target_ref
+    # it still becomes a note; under named, even without one.
+    res = {"t1": Resolution(AMBIGUOUS, None, [SID_B, SID_C])}
+    actions = [upd(SID_B, {"status": "in_progress"}), upd(SID_C, {"status": "blocked"})]
+    out, counts = gate(actions, plan=make_plan("tidy"), resolution=res)
+    assert [a["target_stable_id"] for a in out["actions"]] == [SID_B, SID_C]
+    assert counts == {}
+    actions[0]["target_ref"] = "t1"
+    out, counts = gate(actions, plan=make_plan("tidy"), resolution=res)
+    assert [a["type"] for a in out["actions"]] == ["note", "update_item"]
+    assert counts == {"demoted_ambiguous": 1}
+    actions[0]["target_ref"] = None
+    out, counts = gate(actions, plan=make_plan("named"), resolution=res)
+    assert counts == {"demoted_ambiguous": 2}
+
+
 def test_tidy_rejects_closed_item():
     out, counts = gate([upd(SID_DONE, {"priority": "high"})],
                        plan=make_plan("tidy", targets=()), resolution={})
