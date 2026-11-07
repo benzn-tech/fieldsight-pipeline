@@ -2073,26 +2073,30 @@ def build_payload(run, conclusion, actions):
             row["target_stable_id"] = sid
             row["target_snapshot"] = {f: item.get(f) for f in SNAPSHOT_FIELDS}
         out_actions.append(row)
-    return {
+    payload = {
         "title": plan.title,
         "reading": plan.reading,
         "conclusion": [{"text": c["text"], "refs": list(c["refs"]),
                         "confidence": c["confidence"]} for c in conclusion],
         "actions": out_actions,
         "as_of": run.as_of,
-        # Spec 2026-11-05 §4.2: action references are seqs (index + 1, as above);
-        # conclusion references are 0-based positions in the stored conclusion.
-        "sub_tasks": (None if run.sub_tasks is None else [
-            {"id": e["id"], "ask": e["ask"], "kind": e["kind"], "status": e["status"],
-             "actions": [i + 1 for i in e["actions"]], "conclusion": list(e["conclusion"]),
-             "reason_code": e["reason_code"], "reason": e["reason"]}
-            for e in run.sub_tasks]),
         "models": {**{k: run.models.get(k) for k in ("planner", "writer", "verifier")},
                    **{k: run.models[k] for k in ("planner_served", "writer_served")
                       if run.models.get(k)}},
         "run_trace": None,          # filled by run()
         "sources": refs,            # replaced by run() with the rows
     }
+    # Spec 2026-11-05 §4.2: action references are seqs (index + 1, as above);
+    # conclusion references are 0-based positions in the stored conclusion.
+    # Sent only when there are sub-tasks: an org-api still on the old key set (during a
+    # deploy's roll-out) then rejects only those packs, never every pack.
+    if run.sub_tasks is not None:
+        payload["sub_tasks"] = [
+            {"id": e["id"], "ask": e["ask"], "kind": e["kind"], "status": e["status"],
+             "actions": [i + 1 for i in e["actions"]], "conclusion": list(e["conclusion"]),
+             "reason_code": e["reason_code"], "reason": e["reason"]}
+            for e in run.sub_tasks]
+    return payload
 
 
 # ---- the runner ------------------------------------------------------------------------

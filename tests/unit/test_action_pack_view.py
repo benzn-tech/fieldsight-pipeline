@@ -188,3 +188,17 @@ def test_shape_pack_returns_sub_tasks():
         view = v.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
                             applicable={}, viewer_id="u")
         assert "sub_tasks" in view and view["sub_tasks"] is None
+
+
+def test_sub_task_positions_follow_the_reader_visible_conclusion():
+    # Stored conclusion [c0 cites R2, c1 cites R1]; a sub-task points at both, and at both
+    # actions (a2 cites only R2). The reader cannot see R2: c0 and a2 are hidden, c1 is
+    # now position 0.
+    subs = [{"id": "s1", "ask": "x", "kind": "close", "status": "done", "actions": [1, 2],
+             "conclusion": [0, 1], "reason_code": None, "reason": None}]
+    view = v.shape_pack(_pack(sub_tasks=subs), removed_refs={"R2"}, site_name=None,
+                        targets={}, applicable={}, viewer_id="u")
+    assert [c["text"] for c in view["conclusion"]] == ["kept"]
+    assert view["sub_tasks"][0]["conclusion"] == [0]
+    assert view["sub_tasks"][0]["actions"] == [1]
+    assert subs[0]["conclusion"] == [0, 1]          # the stored pack is not mutated

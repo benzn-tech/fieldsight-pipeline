@@ -1664,7 +1664,7 @@ def test_done_subtask_dropped_by_the_verifier_becomes_not_done():
 def test_plan_without_subtasks_stores_null():
     write = write_obj(sub_tasks=[_sub("s1", "done", actions=[0])])
     payload = st.run(make_ctx(), deps(model=Model(write=[write])))
-    assert payload["sub_tasks"] is None
+    assert "sub_tasks" not in payload
     assert action_pack_view.payload_shape_error(payload) is None
     # ... and so does a plan with sub-tasks whose writer sent none: every one not_answered.
     model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)])
