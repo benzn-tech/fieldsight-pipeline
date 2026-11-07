@@ -466,6 +466,7 @@ class Run:
     others: list = field(default_factory=list)        # non-citable items (people)
     envelopes: list = field(default_factory=list)     # (round, envelope) for the headers
     items: dict = field(default_factory=dict)         # stable_id -> items row (latest read)
+    sub_tasks: Optional[list] = None                  # accounted sub-tasks (§4.2), internal
     truncated: bool = False
     truncated_reasons: list = field(default_factory=list)
     plan: Optional[Plan] = None
@@ -619,6 +620,13 @@ ASK_MAX_CHARS = 200
 STATED_FIELDS = ("deadline", "responsible", "priority", "status")
 DELEGATED_FIELDS = ("deadline",)
 SUB_TASK_KINDS = ("close", "update", "create", "review", "standards", "draft", "other")
+# The writer's answer per planner sub-task (spec 2026-11-05 §4.2). The writer's reason
+# codes are closed; the code adds two of its own (never offered to the writer).
+SUB_TASK_STATUSES = ("done", "partly", "not_done")
+SUB_TASK_REASON_CODES = ("no_evidence", "not_found", "ambiguous_target", "out_of_scope",
+                         "already_done", "other")
+SUB_TASK_CODE_REASONS = ("not_answered", "dropped_by_checks")
+SUB_TASK_REASON_MAX_CHARS = 300
 # Ids become run_trace keys (target_resolution) and call ids: a closed shape.
 _TARGET_ID = re.compile(r"^t[0-9]{1,2}$")
 _SUB_TASK_ID = re.compile(r"^s[0-9]{1,2}$")
@@ -1338,6 +1346,7 @@ Rules:
 - Never state a clause or requirement of a standard from memory. When neither the project documents nor the web evidence cover it, say no standard was found in the project library (uncertain) and suggest uploading it.
 - Standards, codes and procedures: when the instruction asks what a standard, code or procedure requires, or whether something complies, the answer is a note action: proposed.text is the answer, with the clause, page or heading when the evidence gives it; refs are the D refs, or the W answer and its sources. Several short notes are fine, one per question. Use create_item for it only when the instruction asks for a task or the evidence shows work still to do; use draft_rfi only when the instruction asks for an RFI or the answer needs a party outside the team.
 - Never ask the user questions.
+- sub_tasks: when sub-tasks are listed above, write one entry for every listed sub-task, with its id: {{"id": "s1", "status": "done" | "partly" | "not_done", "actions": [indices], "conclusion": [indices], "reason_code": ..., "reason": "..."}}. actions and conclusion are 0-based positions in your "actions" and "conclusion" lists. done and partly need at least one action or conclusion index. For partly and not_done give reason_code, one of no_evidence, not_found, ambiguous_target, out_of_scope, already_done, other, and reason, one sentence of at most 300 characters. A sub-task already done, or outside what you may change, is not_done with that reason_code -- never pad it with an action. With no sub-tasks listed, "sub_tasks" is [].
 - Never reopen an item, and only change an item whose current status allows it.
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
 - Change only items the instruction names, unless it asks you to tidy open items. For anything else worth changing, write a note.
@@ -1356,7 +1365,8 @@ Rules:
 
 Return ONLY a JSON object:
 {{"conclusion": [{{"text": "...", "refs": ["R1"], "confidence": "supported"}}],
-  "actions": [{{"type": "close_item", "target_stable_id": "<stable_id or null>", "target_ref": "<t1 or null>", "proposed": {{...}}, "field_sources": {{"status": {{"source": "evidence", "refs": ["R2"], "said_on": null}}}}, "rationale": "why, in one or two sentences", "refs": ["R2"]}}]}}
+  "actions": [{{"type": "close_item", "target_stable_id": "<stable_id or null>", "target_ref": "<t1 or null>", "proposed": {{...}}, "field_sources": {{"status": {{"source": "evidence", "refs": ["R2"], "said_on": null}}}}, "rationale": "why, in one or two sentences", "refs": ["R2"]}}],
+  "sub_tasks": [{{"id": "s1", "status": "done", "actions": [0], "conclusion": [0], "reason_code": null, "reason": null}}]}}
 
 {evidence}
 """
@@ -1384,12 +1394,25 @@ def delegations_render(run) -> str:
     return out
 
 
+def sub_tasks_render(run) -> str:
+    """The planner's sub-tasks (spec 2026-11-05 §4.2), one line each: id, kind, the ask
+    (sanitised: the planner's paraphrase of the instruction) and its target ids. "" without
+    sub-tasks, so such a plan leaves WRITE_PROMPT unchanged."""
+    subs = run.plan.sub_tasks if run.plan else []
+    if not subs:
+        return ""
+    lines = [f"{e['id']} ({e['kind']}): {sanitize(e['ask'])}"
+             + (f" [{', '.join(e['targets'])}]" if e.get("targets") else "") for e in subs]
+    return ("\nSub-tasks (the separate asks in the instruction; answer every one):\n"
+            + "\n".join(lines))
+
+
 def targets_render(run) -> str:
     """The planner's named targets as resolved in round 1 (spec 2026-11-05 §3.2.2), one line
-    each -- ids, refs and statuses only, never the phrase -- then the delegated values. ""
-    with neither, so such a plan leaves WRITE_PROMPT unchanged."""
+    each -- ids, refs and statuses only, never the phrase -- then the delegated values and
+    the sub-tasks. "" with none of them, so such a plan leaves WRITE_PROMPT unchanged."""
     if not run.resolution:
-        return delegations_render(run)
+        return delegations_render(run) + sub_tasks_render(run)
 
     def ref(sid):
         return str((run.items.get(sid) or {}).get("ref") or "?")
@@ -1406,7 +1429,7 @@ def targets_render(run) -> str:
         else:
             lines.append(f"{tid}: NOT FOUND — write a note")
     return ("\nNamed targets (the items the instruction names, matched in code):\n"
-            + "\n".join(lines) + delegations_render(run))
+            + "\n".join(lines) + delegations_render(run) + sub_tasks_render(run))
 
 
 def write_render(run):
@@ -1591,7 +1614,8 @@ def validate_draft(obj, run, citable):
     # a list), confidence, cap, and downgraded (kept, as uncertain).
     counts = {}
     conclusion = []
-    for c in obj["conclusion"]:
+    cmap, amap = {}, {}              # the writer's index -> the kept index (sub_tasks, §4.2)
+    for ci, c in enumerate(obj["conclusion"]):
         if len(conclusion) >= MAX_CONCLUSION:
             _bump(counts, "conclusion__cap")
             continue
@@ -1610,10 +1634,11 @@ def validate_draft(obj, run, citable):
         if conf == "supported" and not refs:
             conf = "uncertain"                       # G2: not citable -> uncertain
             _bump(counts, "conclusion__downgraded")
+        cmap[ci] = len(conclusion)
         conclusion.append({"text": text, "refs": refs, "confidence": conf})
     plan_targets = {t["id"] for t in (run.plan.targets if run.plan else [])}
     actions = []
-    for a in obj["actions"]:
+    for ai, a in enumerate(obj["actions"]):
         atype = a.get("type") if isinstance(a, dict) else None
         kind = atype if atype in ACTION_TYPES else "unknown"
         if len(actions) >= MAX_ACTIONS:
@@ -1672,6 +1697,7 @@ def validate_draft(obj, run, citable):
                 ref = None
             sources = _field_sources(a.get("field_sources"), proposed, citable=citable)
             el.update(target_ref=ref, field_sources=sources)
+        amap[ai] = len(actions)
         actions.append(el)
         for k, n in removed.items():
             _bump(counts, k, n)
@@ -1683,7 +1709,108 @@ def validate_draft(obj, run, citable):
         added += n
     if added:
         run.trace["web_refs_added"] = added
-    return {"conclusion": conclusion, "actions": actions}
+    sub_tasks = _writer_sub_tasks(obj.get("sub_tasks"), run, amap=amap, cmap=cmap,
+                                  n_actions=len(obj["actions"]),
+                                  n_conclusion=len(obj["conclusion"]))
+    return {"conclusion": conclusion, "actions": actions, "sub_tasks": sub_tasks}
+
+
+def _indices(value, n):
+    """The ints in 0..n-1 of a writer's index list, in order and once each; None when the
+    value is not a list."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return None
+    return list(dict.fromkeys(i for i in value if _is_int(i) and 0 <= i < n))
+
+
+def _writer_sub_tasks(raw, run, *, amap, cmap, n_actions, n_conclusion):
+    """The writer's `sub_tasks` (spec 2026-11-05 §4.2) -> internal entries for the planner's
+    sub-task ids, indices moved onto validate_draft's kept lists. Each entry keeps `listed`
+    (the writer named at least one action) so a done/partly whose actions are all dropped
+    later can be told apart from one answered by conclusion lines only.
+
+    Counted in run.trace: `subtask_unknown` (an id the plan does not have) and
+    `subtask_malformed` (not an object, a repeated id, a status outside
+    SUB_TASK_STATUSES, an index list that is not a list, or a done/partly without one valid
+    index). A dropped entry leaves its sub-task to account_sub_tasks (`not_answered`).
+    A reason_code outside SUB_TASK_REASON_CODES -- the code's own two included -- is
+    `other`; a not_done without one is `other`; a reason is cut to
+    SUB_TASK_REASON_MAX_CHARS."""
+    planned = {e["id"] for e in (run.plan.sub_tasks if run.plan else [])}
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        _bump(run.trace, "subtask_malformed")
+        return []
+    out, seen = [], set()
+    for e in raw:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str):
+            _bump(run.trace, "subtask_malformed")
+            continue
+        sid, status = e["id"], e.get("status")
+        if sid not in planned:
+            _bump(run.trace, "subtask_unknown")
+            continue
+        acts = _indices(e.get("actions"), n_actions)
+        concl = _indices(e.get("conclusion"), n_conclusion)
+        if (sid in seen or status not in SUB_TASK_STATUSES or acts is None or concl is None
+                or (status != "not_done" and not (acts or concl))):
+            _bump(run.trace, "subtask_malformed")
+            continue
+        seen.add(sid)
+        code = e.get("reason_code")
+        if code not in SUB_TASK_REASON_CODES:
+            code = "other" if (code is not None or status == "not_done") else None
+        reason = e.get("reason")
+        reason = (reason.strip()[:SUB_TASK_REASON_MAX_CHARS] or None
+                  if isinstance(reason, str) else None)
+        out.append({"id": sid, "status": status,
+                    "actions": [amap[i] for i in acts if amap.get(i) is not None],
+                    "conclusion": [cmap[i] for i in concl if cmap.get(i) is not None],
+                    "reason_code": code, "reason": reason, "listed": bool(acts)})
+    return out
+
+
+def remap_sub_tasks(sub_tasks, action_map, conclusion_map=None):
+    """Move accounted sub-tasks' indices through one drop step ({old index: new index or
+    None}; conclusion indices stay when `conclusion_map` is None), then settle: a done or
+    partly whose listed actions are all gone -- or that has no index left at all -- becomes
+    not_done with reason code `dropped_by_checks`."""
+    out = []
+    for e in sub_tasks:
+        acts = [action_map[i] for i in e["actions"] if action_map.get(i) is not None]
+        concl = (list(e["conclusion"]) if conclusion_map is None else
+                 [conclusion_map[i] for i in e["conclusion"]
+                  if conclusion_map.get(i) is not None])
+        e = dict(e, actions=acts, conclusion=concl)
+        if e["status"] != "not_done" and ((e["listed"] and not acts)
+                                          or not (acts or concl)):
+            e.update(status="not_done", reason_code="dropped_by_checks")
+        out.append(e)
+    return out
+
+
+def account_sub_tasks(plan, draft, index_map):
+    """One entry per planner sub-task, in plan order (spec 2026-11-05 §4.2), after the scope
+    gate: the writer's answer with its action indices moved through the gate's
+    `index_map`, or not_done / `not_answered` when the writer left it out. None when the
+    plan has no sub-tasks. No repair call: a missing answer is reported, not retried."""
+    planned = getattr(plan, "sub_tasks", None) or []
+    if not planned:
+        return None
+    written = {e["id"]: e for e in draft.get("sub_tasks") or []}
+    out = []
+    for p in planned:
+        e = written.get(p["id"]) or {
+            "status": "not_done", "actions": [], "conclusion": [],
+            "reason_code": "not_answered", "reason": None, "listed": False}
+        out.append({"id": p["id"], "ask": p["ask"], "kind": p["kind"],
+                    "status": e["status"], "actions": list(e["actions"]),
+                    "conclusion": list(e["conclusion"]), "reason_code": e["reason_code"],
+                    "reason": e["reason"], "listed": e["listed"]})
+    return remap_sub_tasks(out, index_map)
 
 
 def with_web_sources(refs, registry):
@@ -1731,11 +1858,14 @@ def write_stage(run):
             # The scope gate (spec 2026-11-05 §3.2.4): which items the draft may change
             # and which proposed fields have a source. Counts only in the trace.
             import action_pack_scope
-            draft, counts = action_pack_scope.gate(
+            draft, counts, index_map = action_pack_scope.gate(
                 draft, plan=plan, resolution=run.resolution, items=run.items,
                 registry=run.registry)
             run.trace["scope_gate"] = counts
-            return draft
+            # Sub-tasks (§4.2) are accounted here and kept on the run: the verifier reads
+            # only the conclusion and the actions.
+            run.sub_tasks = account_sub_tasks(plan, draft, index_map)
+            return {"conclusion": draft["conclusion"], "actions": draft["actions"]}
     raise agent.ModelFailure("write schema")
 
 
@@ -1850,7 +1980,7 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def apply_verdicts(draft, result):
+def apply_verdicts(draft, result, kept=None):
     """Map the verifier's answer back onto the draft: the verifier may only LABEL and DROP.
 
     `result` = {"conclusion": [{"index": i, "confidence": supported|uncertain}],
@@ -1862,6 +1992,8 @@ def apply_verdicts(draft, result):
     ignored; a conclusion can be downgraded, never upgraded. All three are counted.
     A malformed answer (non-int index, unknown label, odd refs, empty model, non-int
     counts) is reason `verifier`.
+    `kept`, when given a dict, receives {"conclusion": {draft index: kept index or None},
+    "actions": {...}} (the sub-task accounting follows the verifier's drops, §4.2).
     -> (conclusion, actions, model, counts, tokens, ignored counts)."""
     bad = agent.VerifierFailure
     if (not isinstance(result, dict)
@@ -1919,6 +2051,11 @@ def apply_verdicts(draft, result):
         conclusion.append(dict(c, confidence=conf))
     actions = [dict(a, verifier=a_labels[i]) for i, a in enumerate(draft["actions"])
                if i in a_labels]
+    if kept is not None:
+        for key, labelled in (("conclusion", c_labels), ("actions", a_labels)):
+            survivors = [i for i in range(len(draft[key])) if i in labelled]
+            kept[key] = {i: (survivors.index(i) if i in labelled else None)
+                         for i in range(len(draft[key]))}
     return conclusion, actions, result["model"], counts, tokens, ignored
 
 
@@ -1943,6 +2080,13 @@ def build_payload(run, conclusion, actions):
                         "confidence": c["confidence"]} for c in conclusion],
         "actions": out_actions,
         "as_of": run.as_of,
+        # Spec 2026-11-05 §4.2: action references are seqs (index + 1, as above);
+        # conclusion references are 0-based positions in the stored conclusion.
+        "sub_tasks": (None if run.sub_tasks is None else [
+            {"id": e["id"], "ask": e["ask"], "kind": e["kind"], "status": e["status"],
+             "actions": [i + 1 for i in e["actions"]], "conclusion": list(e["conclusion"]),
+             "reason_code": e["reason_code"], "reason": e["reason"]}
+            for e in run.sub_tasks]),
         "models": {**{k: run.models.get(k) for k in ("planner", "writer", "verifier")},
                    **{k: run.models[k] for k in ("planner_served", "writer_served")
                       if run.models.get(k)}},
@@ -2007,7 +2151,11 @@ def _run(r: Run) -> dict:
                          deadline=ctx.deadline_for("verify"),
                          writer_served=r.models.get("writer_served"))
     # The verifier only labels and drops: every other field comes from the draft.
-    conclusion, actions, vmodel, vcounts, vtokens, vignored = apply_verdicts(draft, result)
+    kept = {}
+    conclusion, actions, vmodel, vcounts, vtokens, vignored = apply_verdicts(draft, result,
+                                                                             kept=kept)
+    if r.sub_tasks is not None:
+        r.sub_tasks = remap_sub_tasks(r.sub_tasks, kept["actions"], kept["conclusion"])
     r.models["verifier"] = vmodel
     r.tokens += vtokens
     r.trace.setdefault("ms", {})["verify"] = int((ctx.clock() - t0) * 1000)

@@ -1,6 +1,7 @@
 """The action agent's stages (Task 11): plan, gather, write, snapshots, verify seam -> the
 store payload. Every seam is faked: models (an injected call_model), tools (execute / items
 run), the web (general_answer), the fetcher, S3 and the verifier. No network, no AWS."""
+import dataclasses
 import datetime as dt
 import json
 
@@ -1570,3 +1571,205 @@ def test_write_prompt_has_standards_note_rule():
     # It is general wording, and the prompt still formats.
     st.WRITE_PROMPT.format(site="s", today="t", as_of="a", reading="r", language="en",
                            targets="", instruction="i", evidence="e")
+
+
+# ---- PR-5 Task 5.2: the writer's sub_tasks and their accounting (spec 2026-11-05 §4.2) ---
+
+PLAN_SUBS = [{"id": "s1", "ask": "Close #1", "kind": "close", "targets": ["t1"]},
+             {"id": "s2", "ask": "Email the client about the pour", "kind": "draft",
+              "targets": []}]
+
+
+def _sub(sid, status, actions=(), conclusion=(), reason_code=None, reason=None):
+    return {"id": sid, "status": status, "actions": list(actions),
+            "conclusion": list(conclusion), "reason_code": reason_code, "reason": reason}
+
+
+def _stored(sid, ask, kind, status, actions=(), conclusion=(), reason_code=None,
+            reason=None):
+    return {"id": sid, "ask": ask, "kind": kind, "status": status,
+            "actions": list(actions), "conclusion": list(conclusion),
+            "reason_code": reason_code, "reason": reason}
+
+
+class DropVerify(Verify):
+    """Labels every element but leaves out the action indices in `drop`."""
+
+    def __init__(self, drop=()):
+        super().__init__()
+        self.drop = set(drop)
+
+    def __call__(self, draft, **kw):
+        out = super().__call__(draft, **kw)
+        out["actions"] = [a for a in out["actions"] if a["index"] not in self.drop]
+        return out
+
+
+def _close1(**over):
+    return dict({"type": "close_item", "target_stable_id": SID1, "target_ref": "t1",
+                 "proposed": {"status": "done"}, "field_sources": {"status": src("R1")},
+                 "rationale": "Records say done.", "refs": ["R1", "R2"]}, **over)
+
+
+def _email():
+    return {"type": "draft_email", "proposed": {"subject": "Pour", "body": "Hi"},
+            "rationale": "Tell the client.", "refs": ["R1"]}
+
+
+def test_missing_subtask_not_answered():
+    write = write_obj(actions=[_close1()],
+                      sub_tasks=[_sub("s1", "done", actions=[0], conclusion=[0]),
+                                 _sub("s9", "done", actions=[0])])      # unknown id
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model))
+    assert payload["sub_tasks"] == [
+        _stored("s1", "Close #1", "close", "done", actions=[1], conclusion=[0]),
+        _stored("s2", "Email the client about the pour", "draft", "not_done",
+                reason_code="not_answered")]
+    assert payload["run_trace"]["subtask_unknown"] == 1
+    assert action_pack_view.payload_shape_error(payload) is None
+    assert action_pack_view.fail_trace_error(payload["run_trace"]) is None
+
+
+def test_done_subtask_all_dropped_becomes_not_done():
+    # s1's only action is an unasked update (the scope gate drops it); s2's email has no
+    # refs (validate_draft drops it). Both said done/partly: both become not_done.
+    write = write_obj(
+        actions=[{"type": "update_item", "target_stable_id": SID2,
+                  "proposed": {"priority": "high"}, "field_sources": {"priority": src("R1")},
+                  "rationale": "r", "refs": ["R1"]},
+                 dict(_email(), refs=[])],
+        sub_tasks=[_sub("s1", "done", actions=[0]),
+                   _sub("s2", "partly", actions=[1], conclusion=[0])])
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model))
+    assert payload["actions"] == []
+    assert [(s["id"], s["status"], s["reason_code"], s["actions"], s["conclusion"])
+            for s in payload["sub_tasks"]] == [
+        ("s1", "not_done", "dropped_by_checks", [], []),
+        ("s2", "not_done", "dropped_by_checks", [], [0])]
+
+
+def test_done_subtask_dropped_by_the_verifier_becomes_not_done():
+    write = write_obj(actions=[_close1(), _email()],
+                      sub_tasks=[_sub("s1", "done", actions=[0]),
+                                 _sub("s2", "done", actions=[1])])
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=DropVerify(drop={0})))
+    assert [a["type"] for a in payload["actions"]] == ["draft_email"]
+    assert [(s["status"], s["reason_code"], s["actions"]) for s in payload["sub_tasks"]] == [
+        ("not_done", "dropped_by_checks", []), ("done", None, [1])]
+
+
+def test_plan_without_subtasks_stores_null():
+    write = write_obj(sub_tasks=[_sub("s1", "done", actions=[0])])
+    payload = st.run(make_ctx(), deps(model=Model(write=[write])))
+    assert payload["sub_tasks"] is None
+    assert action_pack_view.payload_shape_error(payload) is None
+    # ... and so does a plan with sub-tasks whose writer sent none: every one not_answered.
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)])
+    payload = st.run(make_ctx(), deps(model=model))
+    assert [(s["status"], s["reason_code"]) for s in payload["sub_tasks"]] == [
+        ("not_done", "not_answered"), ("not_done", "not_answered")]
+
+
+def test_subtask_indices_follow_demotion():
+    # #1 is already done: its close becomes an "already done" note and keeps its place
+    # among the survivors; the unasked update before it is dropped.
+    write = write_obj(
+        actions=[_email(),
+                 {"type": "update_item", "target_stable_id": SID2,
+                  "proposed": {"priority": "high"}, "field_sources": {"priority": src("R1")},
+                  "rationale": "r", "refs": ["R1"]},
+                 _close1(proposed={"status": "closed"})],
+        sub_tasks=[_sub("s1", "done", actions=[2]),
+                   _sub("s2", "partly", actions=[0, 1], reason_code="other",
+                        reason="The client's address is not in the records.")])
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model,
+                                      tools=NamedTools({SID1: {"status": "done"}})))
+    assert [(a["seq"], a["type"]) for a in payload["actions"]] == [(1, "draft_email"),
+                                                                   (2, "note")]
+    assert payload["sub_tasks"] == [
+        _stored("s1", "Close #1", "close", "done", actions=[2]),
+        _stored("s2", "Email the client about the pour", "draft", "partly", actions=[1],
+                reason_code="other", reason="The client's address is not in the records.")]
+
+
+def test_validate_draft_parses_writer_sub_tasks():
+    run = _vrun()
+    run.plan.sub_tasks = [{"id": f"s{i}", "ask": "a", "kind": "other", "targets": []}
+                          for i in range(1, 8)]
+    obj = {"conclusion": [{"text": "", "refs": [], "confidence": "supported"},   # dropped
+                          {"text": "c", "refs": ["R1"], "confidence": "supported"}],
+           "actions": [_note("bad", refs=[]),                                     # dropped
+                       _note("n", refs=["R1"])],
+           "sub_tasks": [
+               _sub("s1", "done", actions=[1, 1, 7, "0", True], conclusion=[1]),
+               _sub("s2", "not_done", reason_code="dropped_by_checks",            # code's
+                    reason="x" * 400),
+               _sub("s3", "finished", actions=[1]),                               # status
+               _sub("s4", "done"),                                                # no index
+               _sub("s1", "partly", actions=[1]),                                 # repeat
+               _sub("s5", "not_done"),
+               _sub("s6", "partly", actions=[9]),                                 # no index
+               "not an object", _sub("s99", "done", actions=[1])]}
+    draft = st.validate_draft(obj, run, {"R1", "D1"})
+    by_id = {e["id"]: e for e in draft["sub_tasks"]}
+    assert set(by_id) == {"s1", "s2", "s5"}
+    assert (by_id["s1"]["status"], by_id["s1"]["actions"], by_id["s1"]["conclusion"]) == (
+        "done", [0], [0])
+    assert by_id["s2"]["reason_code"] == "other"
+    assert by_id["s2"]["reason"] == "x" * st.SUB_TASK_REASON_MAX_CHARS
+    assert by_id["s5"]["reason_code"] == "other" and by_id["s5"]["reason"] is None
+    assert run.trace["subtask_unknown"] == 1
+    assert run.trace["subtask_malformed"] == 5        # s3, s4, s1 again, s6, a non-object
+    assert action_pack_view.fail_trace_error(run.trace) is None
+
+
+def test_validate_draft_without_sub_tasks_key_is_empty():
+    run = _vrun()
+    draft = st.validate_draft({"conclusion": [], "actions": []}, run, {"R1"})
+    assert draft["sub_tasks"] == []
+    draft = st.validate_draft({"conclusion": [], "actions": [], "sub_tasks": "s1"}, run,
+                              {"R1"})
+    assert draft["sub_tasks"] == [] and run.trace["subtask_malformed"] == 1
+
+
+def test_account_sub_tasks_rules():
+    plan = st.Plan(reading="r", title="t", language="en", site_matches=True,
+                   date_from=TODAY, date_to=TODAY, record_queries=[], document_queries=[],
+                   web=None, sub_tasks=PLAN_SUBS)
+    draft = {"conclusion": [], "actions": [],
+             "sub_tasks": [dict(_sub("s1", "done", actions=[0, 1]), listed=True)]}
+    out = st.account_sub_tasks(plan, draft, {0: None, 1: 0})
+    assert [(s["id"], s["status"], s["actions"], s["reason_code"]) for s in out] == [
+        ("s1", "done", [0], None), ("s2", "not_done", [], "not_answered")]
+    assert st.account_sub_tasks(dataclasses.replace(plan, sub_tasks=[]), draft, {}) is None
+
+
+def test_the_verifier_sees_no_sub_tasks():
+    write = write_obj(sub_tasks=[_sub("s1", "done", actions=[0])])
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)],
+                  write=[dict(write, actions=[_close1()])])
+    st.run(make_ctx(), deps(model=model, verify=verify))
+    assert set(verify.calls[0]["draft"]) == {"conclusion", "actions"}
+
+
+def test_write_prompt_lists_sub_tasks_and_the_rule():
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)])
+    st.run(make_ctx(), deps(model=model))
+    prompt = _write_prompt(model)
+    assert ("Sub-tasks (the separate asks in the instruction; answer every one):\n"
+            "s1 (close): Close #1 [t1]\n"
+            "s2 (draft): Email the client about the pour") in prompt
+    p = st.WRITE_PROMPT
+    assert "one entry for every listed sub-task" in p
+    for code in st.SUB_TASK_REASON_CODES:
+        assert code in p
+    assert "dropped_by_checks" not in p and "not_answered" not in p
+    # Without sub-tasks the block is absent.
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    assert "Sub-tasks (" not in _write_prompt(model)
