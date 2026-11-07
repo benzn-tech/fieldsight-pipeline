@@ -59,13 +59,14 @@ def upd(sid, proposed, *, ref=None, sources=None, refs=("R1",), atype="update_it
             "rationale": rationale, "refs": list(refs)}
 
 
-def gate(actions, *, plan=None, resolution=None, items=None):
+def gate(actions, *, plan=None, resolution=None, items=None, index_map=False):
     items = items or make_items()
     draft = {"conclusion": [], "actions": copy.deepcopy(actions)}
-    return scope.gate(draft, plan=plan or make_plan(),
-                      resolution=resolution if resolution is not None
-                      else {"t1": Resolution(RESOLVED, SID_A)},
-                      items=items, registry=make_registry(items))
+    out = scope.gate(draft, plan=plan or make_plan(),
+                     resolution=resolution if resolution is not None
+                     else {"t1": Resolution(RESOLVED, SID_A)},
+                     items=items, registry=make_registry(items))
+    return out if index_map else out[:2]
 
 
 # ---- Task 4.2: rules 1-2 ------------------------------------------------------------------
@@ -187,9 +188,10 @@ def test_conclusion_and_untargeted_actions_pass_untouched():
     draft = {"conclusion": [{"text": "c", "refs": ["R1"], "confidence": "supported"}],
              "actions": [rfi]}
     items = make_items()
-    out, counts = scope.gate(copy.deepcopy(draft), plan=make_plan(), resolution={},
-                             items=items, registry=make_registry(items))
-    assert out == draft and counts == {}
+    out, counts, index_map = scope.gate(copy.deepcopy(draft), plan=make_plan(),
+                                        resolution={}, items=items,
+                                        registry=make_registry(items))
+    assert out == draft and counts == {} and index_map == {0: 0}
 
 
 
@@ -453,3 +455,22 @@ def test_field_refs_join_the_action_only_when_the_field_survives():
     assert out["actions"][0]["proposed"] == {"status": "blocked"}
     assert out["actions"][0]["refs"] == ["R1", "R2"]
     assert counts == {"field_unsourced__priority": 1}
+
+
+# ---- PR-5 Task 5.2: the index map (spec 2026-11-05 §4.2) ---------------------------------
+
+def test_gate_returns_the_index_map_of_kept_demoted_and_dropped_actions():
+    res = {"t1": Resolution(RESOLVED, SID_A), "t2": Resolution(NONE)}
+    actions = [upd(SID_B, {"priority": "high"}),                          # 0 dropped
+               upd(SID_A, {"status": "in_progress"}, ref="t1"),           # 1 kept
+               upd(SID_C, {"status": "blocked"}, ref="t2"),               # 2 demoted
+               {"type": "note", "target_stable_id": None, "proposed": {"text": "n"},
+                "rationale": "r", "refs": ["R1"]},                       # 3 untouched
+               upd(SID_A, {"priority": "high"}, ref="t1",
+                   sources={"priority": ev("R4")})]                       # 4 unsourced
+    out, counts, index_map = gate(actions, plan=make_plan(targets=("t1", "t2")),
+                                  resolution=res, index_map=True)
+    assert [a["type"] for a in out["actions"]] == ["update_item", "note", "note"]
+    assert index_map == {0: None, 1: 0, 2: 1, 3: 2, 4: None}
+    assert counts == {"drop_unasked_target": 1, "demoted_target_none": 1,
+                      "field_unsourced__priority": 1, "drop_no_sourced_fields": 1}

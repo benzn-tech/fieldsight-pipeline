@@ -147,3 +147,58 @@ def test_an_oversized_public_trace_is_replaced_by_a_marker():
     assert v.public_trace(big) == {"dropped": "size"}
     small = {"tokens": 1, "ms": {"total": 2}}
     assert v.public_trace(small) == small
+
+
+# ---------------------------------------------------------------- PR-5 (spec 2026-11-05 §9.2)
+
+def _store_payload(**over):
+    p = {"title": "t", "conclusion": [],
+         "sources": [{"ref": "R1", "kind": "topic", "provenance": "records"}],
+         "actions": [{"seq": 1, "type": "note", "refs": ["R1"], "verifier": "weak",
+                      "proposed": {"text": "n"}}]}
+    p.update(over)
+    return p
+
+
+def test_payload_shape_accepts_sub_tasks_and_verifier_detail():
+    sub = [{"id": "s1", "ask": "Close #1", "kind": "close", "status": "done",
+            "actions": [1], "conclusion": [], "reason_code": None, "reason": None}]
+    p = _store_payload(sub_tasks=sub)
+    p["actions"][0]["verifier_detail"] = {"reason": "date_assumed"}
+    assert v.payload_shape_error(p) is None
+    assert v.payload_shape_error(_store_payload(sub_tasks=None)) is None
+    assert v.payload_shape_error(_store_payload(sub_tasks={"s1": 1})) == "pack_field_type"
+    bad = _store_payload()
+    bad["actions"][0]["verifier_detail"] = ["weak"]
+    assert v.payload_shape_error(bad) == "action_field_type"
+
+
+_SUBS = [{"id": "s1", "ask": "Close #69", "kind": "close", "status": "done", "actions": [1],
+          "conclusion": [0], "reason_code": None, "reason": None},
+         {"id": "s2", "ask": "Email the client", "kind": "draft", "status": "not_done",
+          "actions": [], "conclusion": [], "reason_code": "not_answered", "reason": None}]
+
+
+def test_shape_pack_returns_sub_tasks():
+    view = v.shape_pack(_pack(sub_tasks=_SUBS), removed_refs=set(), site_name=None,
+                        targets={}, applicable={}, viewer_id="u")
+    assert view["sub_tasks"] == _SUBS
+    # An old pack (stored before migration 0097, or a plan without sub-tasks): None.
+    for pack in (_pack(), _pack(sub_tasks=None)):
+        view = v.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
+                            applicable={}, viewer_id="u")
+        assert "sub_tasks" in view and view["sub_tasks"] is None
+
+
+def test_sub_task_positions_follow_the_reader_visible_conclusion():
+    # Stored conclusion [c0 cites R2, c1 cites R1]; a sub-task points at both, and at both
+    # actions (a2 cites only R2). The reader cannot see R2: c0 and a2 are hidden, c1 is
+    # now position 0.
+    subs = [{"id": "s1", "ask": "x", "kind": "close", "status": "done", "actions": [1, 2],
+             "conclusion": [0, 1], "reason_code": None, "reason": None}]
+    view = v.shape_pack(_pack(sub_tasks=subs), removed_refs={"R2"}, site_name=None,
+                        targets={}, applicable={}, viewer_id="u")
+    assert [c["text"] for c in view["conclusion"]] == ["kept"]
+    assert view["sub_tasks"][0]["conclusion"] == [0]
+    assert view["sub_tasks"][0]["actions"] == [1]
+    assert subs[0]["conclusion"] == [0, 1]          # the stored pack is not mutated
