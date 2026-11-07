@@ -1,8 +1,11 @@
 # Site decision loop: site events run themselves, only decisions reach a person
 
-Status: design, rev 4 (2026-11-06). Architecture research. Not built, no flag, no migration yet.
+Status: design, rev 5 (2026-11-08). Architecture research. Not built, no flag, no migration yet.
 Rev 2 folds in a Fable builder check (§15): six grounding corrections and seven builder
 questions, answered as my calls where the owner had not ruled.
+Rev 5 re-baselines §2 on origin/develop 43dce308 (2026-11-08), after the owner had every line
+push and merge its work first, so later changes do not confuse the review. Rev 5 also folds
+in a Fable review of rev 3-5 (§17).
 Rev 4 records the owner's 2026-11-06 rulings: all my calls approved, the spoken location
 onboarding (§9), answers do not add a chain level (§4.7), quiet hours (§6.6).
 Rev 3 compares the design with the author's open-sourced code (§16,
@@ -45,7 +48,7 @@ Owner's framing: "工地上的事，自己跑；只有要拍板的，才递到�
 - A loop that keeps calling models with no bound.
 - "Accept as is" on a safety item with no recorded reason.
 
-## 2. Grounding: what exists (origin/develop 69fb69a8, 2026-11-05)
+## 2. Grounding: what exists (origin/develop 43dce308, 2026-11-08; first written on 69fb69a8)
 
 Each line names a piece the loop reuses. Items marked (verify) were read from specs or
 memory, not re-read in code for this document.
@@ -53,21 +56,22 @@ memory, not re-read in code for this document.
 | Piece | Where | Role in the loop |
 |---|---|---|
 | Session end / finalize, extraction | `lambda_extract_session`, `lambda_item_writer` | event source "session ended"; handler output |
-| Decisions extracted per topic | 0058 `topics.decisions` jsonb, plus `topic_decisions` rows with `stable_id` / `carried_from` since 0073 (`repositories/topic_decisions.py`) | not a ledger (rewritten per extraction). A meeting decision's `subject_ref` is `topic_decisions.stable_id`, as status suggestions key on `action_items.stable_id`. Caveat: ids survive re-extraction only partly on prod while `PROD_DECLARE_CONTINUITY` is false |
-| Checklist gaps (step B) | spec 2026-10-16, on prod; **computed at read time** from the session-report result JSON, no table, null until status `done`, reset by a longer-window re-extraction | needs a new emitter (§4.1) |
+| Decisions extracted per topic | 0058 `topics.decisions` jsonb, plus `topic_decisions` rows with `stable_id` / `carried_from` since 0073 (`repositories/topic_decisions.py`) | not a ledger (rewritten per extraction). A meeting decision's `subject_ref` is `topic_decisions.stable_id`, as status suggestions key on `action_items.stable_id`. `PROD_DECLARE_CONTINUITY` is true on prod since 2026-11-05 (set for status suggestions), so ids carry across re-extraction on prod as on TEST |
+| Checklist gaps (step B) | spec 2026-10-16, on prod. A `checklist_reports` row (0084: `company_id`, `result_key`) exists per report, but the **gaps themselves live in the S3 result JSON** (`lambda_org_api.py:5612`, `:5653`), null until status `done`, reset by a longer-window re-extraction. `lambda_session_report` is non-VPC, has no DB access and does not know whether an extraction is final; the final gate is in `lambda_item_writer.py:1662-1667` | needs a new emitter (§4.1) |
 | Check done (step A) | #1149, TEST; invoked from `AskVoiceWorkerFunction`, on demand with a human caller | not a background handler in v1 |
-| Status suggestions | spec 2026-10-27, migration 0090 | closest existing card: propose, human accepts/dismisses, model never writes status |
-| Action packs | spec 2026-11-01, #1210, migrations 0093-0095, TEST internal; runs as `created_by_sub`; records planner/writer/verifier model ids (`action_pack_stages.py`) | stays its own entry point in v1 (§4.8) |
+| Status suggestions | spec 2026-10-27, migration 0090; **on prod since 2026-11-06** (`PROD_STATUS_SUGGESTIONS=true`) | closest existing card, live with real users: propose, human accepts/dismisses, model never writes status. Its accept/dismiss rates are the first real measure of how people treat a one-tap suggestion |
+| Action packs | spec 2026-11-01, #1210, migrations 0093-0095, TEST internal; runs as `created_by_sub`; records planner/writer/verifier model ids (`action_pack_stages.py`). Since rev 4: config (#1230), date handling (#1229, #1249), targets (#1235), a scope gate with field provenance (#1247), notes survive the writer schema (#1248) | stays its own entry point in v1 (§4.8) |
 | Multi-unit walks | spec 2026-11-03, #1218, migration 0096 | handler; also the first user of a project location list (§9) |
-| Model fallback | **three separate chains**: `llm_utils.model_chain` (`LLM_FALLBACK_MODELS`), `llm_tools_client._model_chain` (`ASK_JUDGE_FALLBACKS`, ignores the former), action packs (`ACTION_VERIFIER_FALLBACKS`) | the model-call layer (§4.3) is a refactor of two clients, not a wrapper; deferred past P0 |
+| Model fallback | **four separate chains**: `llm_utils.model_chain` (`LLM_FALLBACK_MODELS`), `llm_tools_client._model_chain` (`ASK_JUDGE_FALLBACKS`, ignores the former), action-pack writer (`ACTION_WRITER_FALLBACKS`, `lambda_action_agent.py`), action-pack verifier (`ACTION_VERIFIER_FALLBACKS`, excludes the writer's family) | the model-call layer (§4.3) is a refactor of two clients, not a wrapper; deferred past P0 |
 | Tool-calling client with Anthropic route | `llm_tools_client.py` (#1214) | Claude models go only via `ANTHROPIC_API_KEY`, never OpenRouter (owner rule 2026-11-04) |
 | Token accounting | `llm_usage.log_usage`: provider, model, caller (call-site name), latency, tokens. **No company, site, run id or cost** | a per-company budget needs a run context threaded through the clients (§4.3) |
 | Device liveness | `devices.last_seen_at` (`device_heartbeat.py`), `device_alerts.py` "quiet" rule in working days, pushed to ops via Notion. `device_upload_freezes` (0035) is written by nothing yet | "device offline" is a new timer scan, not an existing source |
-| Company status | migration 0092 (`tenancy_status.py`), `COMPANY_STATUS_ENFORCE` | hub drops events for exited companies |
+| Company status | migration 0092 (`tenancy_status.py`: active / suspended / exited), `COMPANY_STATUS_ENFORCE` | hub drops events for companies that are not active |
 | Project documents | #1145 | source for the project location list (§9) |
-| Roles | `global_role` admin / gm / pm / worker / platform_admin; site roles pm / site_manager / worker; external memberships. No foreman, H&S, QS, no delegation | v1 maps cards onto these (§6.4) |
+| Roles | `ALLOWED_GLOBAL_ROLES` (`lambda_org_api.py:245`): admin, gm, regional_manager, pm, site_manager, worker, platform_admin; site roles pm / site_manager / worker; external memberships. Existing authority predicate `is_site_authority` = site role pm or site_manager (`:9079`). No foreman, H&S, QS, no delegation | v1 maps cards onto these (§6.4); `is_site_authority` seeds the answer authority check (§4.5.6) |
 | Channels | email via `EMAIL_SENDER` (SES or stub), device voice (`lambda_ws_send_voice`). No push, no Teams | P1 uses a web card inbox + email (§12) |
 | Inspection pass/fail | none: 0082 / 0084 carry no pass status, org-api has no write path | "mark as passed" is out of v1 (§6.2) |
+| Action items | `action_items.deadline` date (0003), `deadline_text` unparsed fallback (0011), status `'open'` (`repositories/action_items.py:152`); has `site_id`, **no `company_id`** (resolve through the site) | source of `todo.overdue` (§4.1) |
 
 ## 3. The loop in one paragraph
 
@@ -79,8 +83,9 @@ review (≤3 rounds), enforces project isolation, and asks "does a person need t
 if no: publish (internal) and verify; if yes: write a card → the judgement stage checks the
 ledger, routes to people with authority, chases until a deadline, applies a conservative
 default on timeout, writes the answer to the ledger → the answer is a new event, back to the
-hub. Failures and timeouts at any stage report back to the hub, which retries up to 3 times
-and then raises a fault card to the company admin and FieldSight ops (not the PM).
+hub. Failures and timeouts at any stage report back to the hub, which backs off and retries;
+on the 3rd failure a fault card goes to the company admin and FieldSight ops (not the PM);
+after the 5th it stops and the same fault card is updated to "stopped" (no second card).
 
 ## 4. Components
 
@@ -110,14 +115,20 @@ the author.
 hours" do not happen by themselves; a timer scan emits them (the article's 定时 source).
 
 **Emitters for the two P0 sources (my call):**
-- `checklist.gap`: emitted by `lambda_session_report` when a checklist result lands with
-  status `done`, **only for the final extraction of a session** (not live, not a re-run that
-  replaces `result_key` with identical gaps). `subject_ref` = (session id, checklist item key).
-  A later run that still has the gap hits the same `dedupe_key` and is dropped; a run where the
-  gap disappeared closes any open card for it as `superseded`.
-- `todo.overdue`: a daily timer scan (EventBridge) over open `action_items` with a parsed due
-  date in the past. `subject_ref` = `action_items.stable_id`; bucket = the NZ day, so one item
-  raises at most one event per day and the ledger's "asked before" rule stops repeats.
+- `checklist.gap`: **a timer scan in a VPC function** over `checklist_reports` rows that
+  reached status `done` since the last scan, reading each result JSON from S3. Not emitted from
+  `lambda_session_report`: that function has no DB access and cannot tell a final extraction
+  from a live one or an on-demand re-queue (§2). A report counts only if its session's latest
+  extraction is final (the `tier == "final"` gate in `lambda_item_writer`). `subject_ref` =
+  (session id, checklist item key); no time bucket. A later report that still has the gap is
+  dropped by `dedupe_key` and the open-card key; a report where the gap disappeared closes any
+  open card for it as `superseded`.
+- `todo.overdue`: a daily timer scan (EventBridge) over `action_items` with status `'open'` and
+  `deadline` (date) in the past; items with only an unparsed `deadline_text` are skipped in P0.
+  `company_id` comes from the item's site. `subject_ref` = `action_items.stable_id`; bucket =
+  the NZ day. `occurred_at` = the scan day, not the due date, so long-overdue items are not
+  dropped as late. While a card for the item is open no new card is made (open-card key);
+  "asked before" is a `decision_cards` lookup, not a ledger one.
 
 ### 4.2 Hub
 
@@ -125,9 +136,9 @@ hours" do not happen by themselves; a timer scan emits them (the article's 定�
    companies whose status is not active (0092).
 2. **Late?** If `occurred_at` plus the rule's relevance window is already past (the pour has
    happened; the device was offline for six hours), record it as after-the-fact only. No card.
-3. **Dedupe.** Key = (`company_id`, `site_id`, `type`, `subject_ref`, coarse time bucket).
-   `decision.made` events are keyed by card id and are never merged with the event that
-   produced the card (Fable review issue 5).
+3. **Dedupe.** One key, defined in §5.1. `decision.made` events are keyed by card id and
+   are never merged with the event that produced the card. The table's unique index is the
+   real dedupe (an SQS FIFO dedupe id only covers 5 minutes).
 4. **Match rule.** Rules table, one row per `source`+`type`:
    handler, model tier, skill, concurrency, who to notify, urgency inputs, per-day cap.
    Companies may override a small set: who receives cards, per-day cap, quiet hours.
@@ -136,24 +147,26 @@ hours" do not happen by themselves; a timer scan emits them (the article's 定�
      FieldSight ops admin; approved rules are written to the table. Otherwise it goes into a
      weekly digest to the company admin. An unmatched event that falls in an ask-first
      category (§6.2) skips the pool and goes straight to a person.
-5. **Urgency** (§7). 6. **Queue** (urgent work bypasses per-day caps and budget pauses).
+5. **Urgency** (§7). 6. **Queue** (only the injury override bypasses per-day caps, budget
+   pauses and quiet hours).
 7. **Dispatch** to the handler.
 8. **Results.** Every handler returns one of: success, nothing to do, failure, or (lease
    expired without an answer) unknown. Failure and unknown: back off and redispatch, waiting
    5 min doubling to a 1 h cap (the author's numbers). Two separate thresholds (my call):
    **notify** (fault card to company admin + ops) on the 3rd failure, **stop retrying** on the
    5th. The author stops at 10; we stop earlier because each attempt can spend model calls
-   (§8). While a run waits to retry, **new events for the same subject are merged into it**
-   instead of starting another run (borrowed: this is what stops a re-extracted checklist
-   gap from producing a second card). Success without a person needed, or nothing to do:
-   close.
+   (§8). **Failure path only:** while a run is `queued` waiting to retry, new events for the
+   same subject are joined to it (`run_events`, §5.2) and the handler receives all of them on
+   the next attempt; an event that arrives while a run is `running` queues behind it, it is
+   not merged. (Duplicate suppression in the normal path is the dedupe key plus the open-card
+   key, not this merge.) Success without a person needed, or nothing to do: close.
 
 ### 4.3 Handlers and the model-call layer
 
 Handlers are the existing pieces (§2) plus small new ones. **P0 handlers are deterministic**
 (a gap or an overdue item becomes a card from data, no model), so P0 does not wait for this
 layer; it arrives with the first model-backed rule (P2/P3). When it does, every model call
-from any stage goes through one layer (today there are three separate fallback chains, §2):
+from any stage goes through one layer (today there are four separate fallback chains, §2):
 - **Registry:** model + parameters per task, one line to change (prompt and parameters stored
   together; see memory prompt-tuning-history-per-model).
 - **Fallback chain** on provider failure (existing).
@@ -188,23 +201,27 @@ In order:
 ### 4.5 Judgement stage
 
 1. **Write the card** (§6.3), with deadline and "if nobody answers".
-2. **Ledger lookup:** decided before → act on it, no card. Asked before and nothing changed →
-   do not re-send.
+2. **Lookups:** decided before (a ledger row of kind `decided` or `declined`) → act on it,
+   no card. Asked before (an open card with the same card key in `decision_cards`) → do not
+   re-send. A `defaulted` ledger row does not count as decided.
 3. **Route** to people who have authority for this project and this kind of decision
    (§6.4), by urgency, through their channels (app, email, Teams, device voice).
 4. **Delivery check;** undelivered → retry at 0/1/3/7/15/25/35/45/55 min (the author's
    schedule), then the next channel; the card stays open throughout. Each delivered message
    carries the card's version, so an update edits the original message instead of sending a
    new one. The idempotency key for a send is the card id + version.
-5. **Deadline:** before it, one reminder, then escalate to the delegate. At the deadline with
-   no answer → the card kind's conservative default (§6.2), and a ledger row "timed out".
+5. **Deadline:** before it, one reminder, then escalate (v1: to the company admin). At the
+   deadline with no answer → the card kind's conservative default (§6.2) and a ledger row of
+   kind `defaulted`. A defaulted subject may be asked again when it changes; it is never
+   treated as decided.
 6. **Answer checks**, all required:
    - the answer refers to the message actually delivered (card id + version);
    - **only the first valid answer counts**; later answers are told it is already decided;
    - the person is signed in (no answer-by-link; the author's open link form suits one
      user, not a company);
    - "has authority to decide for this project?" (owner ruling: not "is it the PM";
-     delegation while on leave must work). No → not counted, and the person is told.
+     delegation while on leave must work). v1 starts from `is_site_authority` (site role pm or
+     site_manager) plus company admin/gm. No → not counted, and the person is told.
 7. **Ledger write** (append-only, §5.3) → a `decision.made` event → hub.
 
 ### 4.6 Records
@@ -214,8 +231,9 @@ outcome), cost ledger, check log, decision ledger.
 
 ### 4.7 Chain depth
 
-Events emitted by a handler inherit `chain_id` and increment `chain_depth`. At depth 3 the
-hub records the event and stops asking, so two handlers cannot keep triggering each other.
+Events emitted by a handler inherit `chain_id` and increment `chain_depth`. Events with
+depth greater than 3 are recorded, not dispatched, and one fault card goes to ops, so two
+handlers cannot keep triggering each other.
 **A person's answer does not add a level** (owner, 2026-11-06, same as the author's code).
 Only events a handler emits count, and timer scans start at 0. A chain that passes through a
 person (PM decides → foreman reminded → foreman confirms) is never cut short. The cap of 3
@@ -244,12 +262,16 @@ needs a `sub`, `patch_action_item` checks the caller's ACL, action packs run as
 ### 5.1 `site_events`
 `event_id`, `company_id`, `site_id`, `source`, `type`, `subject_ref`, `occurred_at`,
 `received_at`, `summary`, `link`, `chain_id`, `chain_depth`, `dedupe_key` (unique),
-`status` (`late`, `unmatched`, `queued`, `running`, `done`, `nothing`, `failed`, `blocked`), `rule_id`.
-`dedupe_key` is built from (company_id, source, source key); events the hub itself emits get
-a suffix so they can never collide with a source's own keys (borrowed).
+`seq` (bigserial, the replay order), `status` (`late`, `unmatched`, `duplicate`, `merged`,
+`queued`, `running`, `done`, `nothing`, `failed`, `blocked`, `too_deep`), `rule_id`.
+**The one dedupe key:** `dedupe_key` = (company_id, site_id, type, subject_ref, bucket), where
+the bucket is set per rule (`todo.overdue`: the NZ day; `checklist.gap`: none). Events the hub
+itself emits get a suffix so they can never collide with a source's keys (borrowed).
 
-### 5.2 `event_runs`
-`run_id`, `event_id`, `attempt`, `handler`, `claim_id`, `lease_until`, `started_at`, `ended_at`,
+### 5.2 `event_runs` and `run_events`
+`run_events(run_id, event_id)` joins every event a run handles (one at dispatch, more when a
+retry absorbs same-subject events, §4.2.8).
+`event_runs`: `run_id`, `attempt`, `handler`, `claim_id`, `lease_until`, `started_at`, `ended_at`,
 `outcome` (`done`, `nothing`, `failed`, `unknown`, `cancelled`), `result_hash`, `error`,
 `tokens_in`, `tokens_out`, `cost_usd`, `model_calls`, `models` (per-call model names; action
 packs already record planner/writer/verifier ids, reuse that shape). A result reported twice
@@ -262,12 +284,15 @@ claim is rejected (borrowed: makes retries and lost responses safe).
   one marked recommended), `evidence` (jsonb spans), `urgency`, `deadline_at`,
   `timeout_default`, `recipients`, `version`, `delivered_refs`,
   `status` (`open`, `answered` → `done` once the follow-up action has run, `timed_out`,
-  `superseded`). Card key = (company_id, site_id, rule, subject_ref, purpose); dedupe applies
+  `superseded`; a `superseded` card writes no ledger row). P0 adds `shadow_label`
+  (`needed` / `not_needed` / `wrong_evidence`), `labelled_by`, `labelled_at`, `label_note`;
+  labelling never changes `status`. Card key = (company_id, site_id, rule, subject_ref, purpose); dedupe applies
   only while a card with that key is open.
 - `decision_ledger`: **append-only**, enforced by a trigger that rejects UPDATE and DELETE
   (the stack has a single DB role, see 0092/0093/0095 "No GRANT", so a grant cannot do it).
   `entry_id`, `company_id`, `site_id`, `card_id` (nullable: meeting decisions confirmed
-  later), `subject_ref`, `decision`, `kind` (`decided`, `declined` = "decided not to do"),
+  later), `subject_ref`, `decision`, `kind` (`decided`, `declined` = "decided not to do",
+  `defaulted` = timed out with the conservative default; excluded from "decided before"),
   `decided_by`, `authority_basis` (role / delegation), `decided_at`, `evidence`,
   `supersedes_entry_id`, `source` (`card`, `timeout_default`, `meeting`).
   Changing one's mind is a new row that supersedes the old one.
@@ -300,7 +325,7 @@ sends people to rework the wrong place).
 | Change the programme | yes | no change |
 | Delete data | yes | no delete |
 | Assign recordings to a person | yes | leave unassigned |
-| Accept a gap on a safety item | yes, reason required, copy to H&S rep | not accepted |
+| Accept a gap on a safety item | yes, reason required, copy to the H&S rep (until P3: the company admin) | not accepted |
 | Internal to-do, reminder, report section | no | n/a |
 
 The default is always the side that changes nothing outside and certifies nothing.
@@ -320,7 +345,8 @@ authority on this project, plus any delegate.
 
 **v1 (P0-P2) maps onto roles that exist** (my call): site `pm` → project manager,
 site `site_manager` → foreman, company `admin`/`gm` → company admin, `platform_admin` →
-FieldSight ops. Escalation goes pm → company admin (no delegate table yet). New roles (H&S,
+FieldSight ops; `regional_manager` is treated as company admin for the sites it reaches.
+Escalation goes pm → company admin (no delegate table yet). New roles (H&S,
 QS) and a delegation table (who, for which site, from-to dates) are P3, with their own
 migration and membership UI.
 
@@ -332,6 +358,13 @@ migration and membership UI.
   and the item is a defect).
 - Conflict: "Monday said C30, Wednesday said C35, which stands?"
 - Not a card: "Is next Wednesday 12 Nov?" (inferred).
+- `todo.overdue` (P0): kind `choose`, question "'<item>' was due <date>, still open", options
+  *remind the owner* (recommended) / *mark done* / *set a new date* / *no longer needed*,
+  deadline end of the next NZ working day, timeout default: nothing changes.
+- `checklist.gap` (P0): kind `choose`, options *remind <person> to recheck* (recommended) /
+  *accept with reason* (reason required; a safety item also copies the company admin) /
+  *reassign*. In P0 a safety item is one whose template section or item text names safety,
+  H&S or a hazard; the builder makes this a list in the rule, not a model call.
 
 ### 6.6 Quiet hours (owner, 2026-11-06)
 Default 21:00-06:00 NZ time, plus all of Sunday. Cards raised in that window wait until
@@ -342,7 +375,8 @@ change this. Possible injury ignores quiet hours (§7). Each company can change 
 
 Owner, 2026-11-04:
 - **Possible injury → highest, always** (override, not a rank): bypasses per-day caps and
-  budget pauses, and copies the H&S representative.
+  budget pauses, and copies the H&S representative (until that role exists in P3: the
+  company admin).
 - Then by: (1) time to the deadline, (2) downstream work it blocks, (3) complexity and number
   of stakeholders (more people, more friction, so earlier).
 
@@ -355,7 +389,7 @@ Any brake that trips stops the work and sends one alert.
 1. Model calls per attempt: 8.
 2. Attempts per task: notify at 3, stop at 5, back-off 5 min doubling to 1 h (worst case 40
    calls).
-3. Chain depth: 3.
+3. Chain depth: events deeper than 3 are recorded, not dispatched (§4.7).
 4. Per-company daily budget: warn at 80 %, pause non-urgent work at 100 %.
 5. Circuit breaker: a burst of the same error type pauses that handler, one alert.
 
@@ -386,6 +420,18 @@ do not fill forms. So:
 5. **Later additions are candidates.** Names heard in recordings that are not on the list,
    and anything read from drawings once that is reliable, become candidates. They are asked
    about only when it matters (a defect would attach to a place not on the list).
+6. **Risks to design for (Fable review, 2026-11-08):**
+   - ASR fails on digits and street or Māori names ("115" vs "150"). The confirm card shows the
+     raw transcript beside the parsed tree, with the clip; each node offers "say this part
+     again"; never auto-confirm.
+   - Anyone may describe; only `is_site_authority` members (and company admin) confirm. The
+     device prompt fires only for pm / site_manager, not for the first worker who records.
+   - The list belongs to the site (`sites.company_id`). External members (0085) can read it but
+     never get the prompt or confirm. No merging across sites in v1, even when two companies'
+     sites share an address.
+   - Node ids are stable because defects reference them: rename, never delete; edits are
+     versioned. Reconcile with `inspection_windows.units` (0096), which already stores unit
+     names.
 
 ## 10. Tenancy, privacy, retention
 
@@ -406,7 +452,7 @@ only when the device is online.
 
 | Phase | What | Gate to move on |
 |---|---|---|
-| P0 shadow | hub + rules + ledger tables; two deterministic rules (checklist gap, overdue to-do), no model calls; cards written, **not sent**; owner reviews them on a shadow-review page | ≥50 shadow cards labelled by the owner: needs-a-person precision ≥80 % (handler-declared and hub-checked counted separately), fabricated evidence 0, cards/person/day ≤3. Engineering gate (borrowed): an independent replay judge over the event log, invariant checks (no card without an event, no answer counted twice, no cross-company row), and mutation testing where every planted fault is caught, run nightly |
+| P0 shadow | hub + rules + ledger tables; two deterministic rules (checklist gap, overdue to-do), no model calls; cards written and routed (recipients computed) but **not sent**; no card timers, status stays `open`; owner labels them on a shadow-review page | ≥50 shadow cards labelled by the owner: precision = needed / (needed + not_needed) ≥80 %; fabricated evidence = count(`wrong_evidence`) = 0; cards per would-be recipient per NZ working day ≤3 (p95). In P0 every card comes from a deterministic rule, so "handler-declared vs hub-checked" is first measured in P2. Engineering gate (borrowed): a replay judge that runs `site_events` in `seq` order through the pure hub (late, dedupe, match, gate) and must reproduce `decision_cards` modulo ids; invariants as SQL checks (no card without an event, no cross-company row, no two open cards with one key); mutation testing where each planted fault is caught (drop the company filter, skip dedupe, skip the late check, duplicate an event, skip the attempt counter); nightly. "No answer counted twice" cannot be exercised until P1 |
 | P1 internal | cards sent to FieldSight staff on Test Project, via a **web card inbox + email** (no push or Teams yet) | same metrics hold for 2 weeks; timeout defaults and pm → admin escalation fire correctly |
 | P2 one customer | one pilot company, PM + foreman | PM-rated useful ≥70 %; no outward action without approval (audited) |
 | P3 | more rules (device, inspection due, weather), more roles | per rule |
@@ -464,7 +510,7 @@ is merged by the owner, so they gate P0's review and P1.
 - Check done is invoked on demand from the voice worker.
 - There is no DeviceStatusWorker; `device_upload_freezes` is written by nothing.
 - `LLM_USAGE` has no company or cost.
-- There are three fallback chains, not one.
+- There are three fallback chains, not one (four by rev 5, §2).
 - Action packs already record model ids.
 - Append-only cannot be enforced by a grant (single DB role).
 
@@ -542,3 +588,32 @@ an append-only log.
 - the model-call layer;
 - the three card purposes;
 - infer-don't-ask.
+
+## 17. Fable review of rev 3-5 (2026-11-08), folded in
+
+Contradictions fixed:
+- §3 now matches notify at 3 / stop at 5.
+- Duplicate suppression is the dedupe key plus the open-card key; the retry merge is for the
+  failure path only and needs `run_events` (§4.2.8, §5.2).
+- There is one dedupe key, with a per-rule bucket (§5.1).
+- A timeout writes a `defaulted` ledger row that never counts as decided (§4.5, §5.3).
+- Chain depth beyond 3 alerts like the other brakes (§4.7, §8).
+- Only the injury override bypasses caps (§4.2.6).
+- The H&S copy goes to the company admin until P3.
+- "Not active" companies, not only exited ones (§2).
+
+Code corrections:
+- The full role list and `is_site_authority` (§2, §4.5.6, §6.4).
+- The `checklist.gap` emitter moved to a VPC timer scan, because `lambda_session_report` has
+  no DB and does not know "final" (§2, §4.1).
+- `todo.overdue` columns named (§2, §4.1).
+
+P0 made concrete:
+- the label enum and the precision formula;
+- routing without sending;
+- no timers in shadow;
+- `occurred_at` for overdue items;
+- the replay judge, invariants and mutations;
+- card shapes for both rules (§5.3, §6.5, §12).
+
+§9 risks written down: ASR on digits and names, who confirms, external members, stable node ids.
