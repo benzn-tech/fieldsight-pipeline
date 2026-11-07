@@ -130,6 +130,9 @@ SNAPSHOT_FIELDS = ("status", "deadline", "responsible", "priority", "text", "upd
 _DRAFT_FIELDS = {"draft_rfi": (("subject", "body"), ()),
                  "draft_email": (("subject", "body"), ("to",)),
                  "note": (("text",), ())}
+# The keys an action may carry; any other is removed and counted (extra_key__<type>).
+_ACTION_KEYS = {"type", "target_stable_id", "proposed", "rationale", "refs", "target_ref",
+                "field_sources"}
 
 # Citable kinds (the sources table's kinds) and their keep-priority under a render budget:
 # records outrank documents outrank web (A4); the items a pack may target come first.
@@ -1333,6 +1336,7 @@ Rules:
 - A finding the evidence does not support is written with "confidence": "uncertain" -- never a guess dressed as a finding.
 - Records (R) and the project's documents (D) come first. Use web refs (W) only for what the records and documents do not cover, and never let a web source override the project's own records or documents.
 - Never state a clause or requirement of a standard from memory. When neither the project documents nor the web evidence cover it, say no standard was found in the project library (uncertain) and suggest uploading it.
+- Standards, codes and procedures: when the instruction asks what a standard, code or procedure requires, or whether something complies, the answer is a note action: proposed.text is the answer, with the clause, page or heading when the evidence gives it; refs are the D refs, or the W answer and its sources. Several short notes are fine, one per question. Use create_item for it only when the instruction asks for a task or the evidence shows work still to do; use draft_rfi only when the instruction asks for an RFI or the answer needs a party outside the team.
 - Never ask the user questions.
 - Never reopen an item, and only change an item whose current status allows it.
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
@@ -1418,7 +1422,9 @@ def write_render(run):
     return _fence([_line(e, full=True) for e in kept]), {e["ref"] for e in kept}
 
 
-def _clean_refs(refs, citable, counts):
+def _clean_refs(refs, citable, counts, kind):
+    """The citable refs of `refs` (deduplicated), or None when it is not a list. Each ref
+    removed is counted `<kind>__refs` (kind: an action type, `unknown` or `conclusion`)."""
     if not isinstance(refs, list):
         return None
     out = []
@@ -1427,33 +1433,59 @@ def _clean_refs(refs, citable, counts):
             if r.strip() not in out:
                 out.append(r.strip())
         else:
-            _bump(counts, "refs")
+            _bump(counts, f"{kind}__refs")
     return out
 
 
-def _proposed(atype, raw, counts=None):
-    """The validated `proposed` of one action, or None. Apply types follow
-    action_pack_view (APPLY_EDIT_FIELDS, CLOSE_STATUSES, CREATE_TEXT_MAX_CHARS): anything
-    apply would refuse (409 unsupported_field) is dropped here instead of stored dead. A
-    priority outside ACTION_PRIORITIES (after lower-casing) drops just that field, counted
-    in `counts["priority"]`."""
+# Proposed fields per type: apply types follow action_pack_view.APPLY_EDIT_FIELDS.
+def _known_fields(atype):
+    if atype in action_pack_view.APPLY_EDIT_FIELDS:
+        return set(action_pack_view.APPLY_EDIT_FIELDS[atype])
+    required, optional = _DRAFT_FIELDS[atype]
+    return set(required) | set(optional)
+
+
+def _draft_cap(field):
+    if field in ("subject", "to"):
+        return SUBJECT_MAX_CHARS
+    return BODY_MAX_CHARS                      # a draft's body, a note's text (spec §5.2)
+
+
+_ALL_FIELDS = (set().union(*action_pack_view.APPLY_EDIT_FIELDS.values())
+               | {f for req, opt in _DRAFT_FIELDS.values() for f in req + opt})
+
+
+def _proposed(atype, raw, counts, removed):
+    """(the validated `proposed` of one action, None) or (None, the drop reason). Apply
+    types follow action_pack_view (APPLY_EDIT_FIELDS, CLOSE_STATUSES,
+    CREATE_TEXT_MAX_CHARS): a value apply would refuse is dropped here instead of stored
+    dead. A key this type does not carry is removed and counted `extra_key__<type>`, never
+    sent on (apply would 409 it) and never the reason the action is lost (spec 2026-11-05
+    §5.2); a field of another type removed is `<type>__foreign_field`, since the
+    action then does less than the writer meant. Both go to `removed`, which the caller
+    counts only when the action is kept. A priority outside ACTION_PRIORITIES (after lower-casing) drops just that field,
+    counted `<type>__priority`. Draft text fields (a note's text, a draft's body) take up to
+    BODY_MAX_CHARS; longer is the reason `<field>_too_long`."""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
-        return None
-    raw = {k: v for k, v in raw.items() if v is not None}
+        return None, "proposed"
+    known = _known_fields(atype)
+    for k in raw:
+        if k not in known:
+            _bump(removed, f"{atype}__foreign_field" if k in _ALL_FIELDS
+                  else f"extra_key__{atype}")
+    raw = {k: v for k, v in raw.items() if v is not None and k in known}
     if atype in action_pack_view.APPLY_EDIT_FIELDS:
-        if set(raw) - set(action_pack_view.APPLY_EDIT_FIELDS[atype]):
-            return None
         out = {}
         for k, v in raw.items():
             if k == "status":
                 if v not in ITEM_STATUSES:
-                    return None
+                    return None, "proposed"
                 out[k] = v
             elif k == "deadline":
                 if _iso_date(v) is None:
-                    return None
+                    return None, "proposed"
                 out[k] = v.strip()
             elif k == "responsible":
                 out[k] = _str(v, SHORT_FIELD_MAX_CHARS)
@@ -1463,31 +1495,33 @@ def _proposed(atype, raw, counts=None):
                 p = _str(v, PRIORITY_MAX_CHARS)
                 p = p.lower() if p is not None else None
                 if p not in action_pack_view.ACTION_PRIORITIES:
-                    _bump(counts if counts is not None else {}, "priority")
+                    _bump(counts, f"{atype}__priority")
                     continue
                 out[k] = p
             elif k == "text":
                 out[k] = _str(v, action_pack_view.CREATE_TEXT_MAX_CHARS)
+                if out[k] is None and isinstance(v, str) and v.strip():
+                    return None, "text_too_long"
             if out.get(k) is None:
-                return None
+                return None, "proposed"
         if atype == "close_item":
             out.setdefault("status", "done")
             if out["status"] not in action_pack_view.CLOSE_STATUSES:
-                return None
+                return None, "proposed"
         if atype == "create_item" and "text" not in out:
-            return None
-        return out or None
-    required, optional = _DRAFT_FIELDS[atype]
-    if set(raw) - set(required) - set(optional) or not set(required) <= set(raw):
-        return None
+            return None, "proposed"
+        return (out, None) if out else (None, "proposed")
+    required, _optional = _DRAFT_FIELDS[atype]
+    if not set(required) <= set(raw):
+        return None, "proposed"
     out = {}
     for k, v in raw.items():
-        cap = SUBJECT_MAX_CHARS if k in ("subject", "to") else (
-            action_pack_view.CREATE_TEXT_MAX_CHARS if k == "text" else BODY_MAX_CHARS)
-        out[k] = _str(v, cap)
+        out[k] = _str(v, _draft_cap(k))
         if out[k] is None:
-            return None
-    return out
+            if isinstance(v, str) and v.strip():
+                return None, f"{k}_too_long"
+            return None, "proposed"
+    return out, None
 
 
 def legal_change(atype, proposed, current):
@@ -1548,52 +1582,71 @@ def validate_draft(obj, run, citable):
     if not isinstance(obj, dict) or not isinstance(obj.get("conclusion"), list) \
             or not isinstance(obj.get("actions"), list):
         return None
+    # Counts are typed (spec 2026-11-05 §5.2): `<type>__<reason>` for an action (`unknown`
+    # when the type is not an ACTION_TYPES one), `conclusion__<reason>` for a finding, and
+    # `extra_key__<type>` for a key removed from an action that is kept. Reasons: cap,
+    # schema, type, refs (one ref removed), no_refs, rationale, proposed, <field>_too_long,
+    # foreign_field (another type's field removed from a kept action), priority, targets,
+    # transitions, target_ref; a finding's text, refs (one ref removed), schema (refs not
+    # a list), confidence, cap, and downgraded (kept, as uncertain).
     counts = {}
     conclusion = []
     for c in obj["conclusion"]:
         if len(conclusion) >= MAX_CONCLUSION:
-            _bump(counts, "conclusion")
+            _bump(counts, "conclusion__cap")
             continue
         text = _str(c.get("text"), CONCLUSION_MAX_CHARS) if isinstance(c, dict) else None
-        refs = _clean_refs(c.get("refs", []), citable, counts) if text else None
-        conf = c.get("confidence") if isinstance(c, dict) else None
-        if text is None or refs is None or conf not in CONFIDENCE:
-            _bump(counts, "conclusion")
+        if text is None:
+            _bump(counts, "conclusion__text")
+            continue
+        refs = _clean_refs(c.get("refs", []), citable, counts, "conclusion")
+        if refs is None:
+            _bump(counts, "conclusion__schema")
+            continue
+        conf = c.get("confidence")
+        if conf not in CONFIDENCE:
+            _bump(counts, "conclusion__confidence")
             continue
         if conf == "supported" and not refs:
             conf = "uncertain"                       # G2: not citable -> uncertain
-            _bump(counts, "conclusion_downgraded")
+            _bump(counts, "conclusion__downgraded")
         conclusion.append({"text": text, "refs": refs, "confidence": conf})
     plan_targets = {t["id"] for t in (run.plan.targets if run.plan else [])}
     actions = []
     for a in obj["actions"]:
+        atype = a.get("type") if isinstance(a, dict) else None
+        kind = atype if atype in ACTION_TYPES else "unknown"
         if len(actions) >= MAX_ACTIONS:
-            _bump(counts, "actions")
+            _bump(counts, f"{kind}__cap")
             continue
-        if not isinstance(a, dict) or set(a) - {"type", "target_stable_id", "proposed",
-                                                "rationale", "refs", "target_ref",
-                                                "field_sources"}:
-            _bump(counts, "actions")
+        if not isinstance(a, dict):
+            _bump(counts, "unknown__schema")
             continue
-        atype = a.get("type")
         if atype not in ACTION_TYPES:
-            _bump(counts, "actions")
+            _bump(counts, "unknown__type")
             continue
-        refs = _clean_refs(a.get("refs"), citable, counts)
+        removed = {}                                  # counted only if the action is kept
+        extra = set(a) - _ACTION_KEYS
+        if extra:
+            _bump(removed, f"extra_key__{atype}", len(extra))
+        refs = _clean_refs(a.get("refs"), citable, counts, atype)
         if not refs:
-            _bump(counts, "actions")
+            _bump(counts, f"{atype}__no_refs")
             continue
         rationale = _str(a.get("rationale"), RATIONALE_MAX_CHARS)
-        proposed = _proposed(atype, a.get("proposed"), counts)
-        if rationale is None or proposed is None:
-            _bump(counts, "actions")
+        if rationale is None:
+            _bump(counts, f"{atype}__rationale")
+            continue
+        proposed, reason = _proposed(atype, a.get("proposed"), counts, removed)
+        if proposed is None:
+            _bump(counts, f"{atype}__{reason}")
             continue
         target = None
         if atype in TARGETED:
             raw = a.get("target_stable_id")
             target = _uuid_or_none(raw) if isinstance(raw, str) else None
             if target is None or target not in run.items:
-                _bump(counts, "targets")
+                _bump(counts, f"{atype}__targets")
                 continue
             current = run.items[target].get("status")
             # A target that is no longer open is the scope gate's (rule 1): a named one
@@ -1602,7 +1655,7 @@ def validate_draft(obj, run, citable):
             if (current or "open") in OPEN_STATUSES:
                 proposed = legal_change(atype, proposed, current)
                 if proposed is None:
-                    _bump(counts, "transitions")
+                    _bump(counts, f"{atype}__transitions")
                     continue
         el = {"type": atype, "target_stable_id": target, "proposed": proposed,
               "rationale": rationale, "refs": refs}
@@ -1615,11 +1668,13 @@ def validate_draft(obj, run, citable):
             ref = a.get("target_ref")
             if ref is not None and (atype not in TARGETED or not isinstance(ref, str)
                                     or ref not in plan_targets):
-                _bump(counts, "target_ref")
+                _bump(counts, f"{atype}__target_ref")
                 ref = None
             sources = _field_sources(a.get("field_sources"), proposed, citable=citable)
             el.update(target_ref=ref, field_sources=sources)
         actions.append(el)
+        for k, n in removed.items():
+            _bump(counts, k, n)
     if counts:
         run.trace["write_dropped"] = counts
     added = 0

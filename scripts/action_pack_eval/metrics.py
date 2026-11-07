@@ -109,7 +109,10 @@ def score_fabrication(run, labels, *, max_rate=DEFAULT_THRESHOLDS["fabrication_s
     for r in run.get("packs") or []:
         wd = ((r.get("pack") or {}).get("run_trace") or {}).get("write_dropped")
         if isinstance(wd, dict):
-            write_dropped += sum(v for v in wd.values() if isinstance(v, int))
+            # extra_key__<type> counts a key removed from an action that was kept, not a
+            # drop (spec 2026-11-05 §5.2); every other key is summed as before.
+            write_dropped += sum(v for k, v in wd.items()
+                                 if isinstance(v, int) and not k.startswith("extra_key__"))
     if shown["labelled"] == 0 or shown["unlabelled"]:
         verdict = INSUFFICIENT
     else:
