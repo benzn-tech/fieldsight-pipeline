@@ -222,6 +222,43 @@ def test_a_web_source_without_a_snapshot_caps_the_claim_at_weak(monkeypatch):
     assert result["counts"]["no_snapshot_capped"] == 1
 
 
+def _assumed_update(assumed=True):
+    a = {"type": "update_item", "target_stable_id": SID1,
+         "proposed": {"deadline": "2026-10-08"}, "rationale": "Asked to pick a date.",
+         "refs": ["R1"]}
+    if assumed:
+        a["assumed"] = ["deadline"]
+    return a
+
+
+@pytest.mark.parametrize("answer", ["unsupported", "supported", "weak"])
+def test_an_assumed_default_is_shown_as_weak_whatever_the_model_answers(monkeypatch,
+                                                                         answer):
+    draft = {"conclusion": [], "actions": [_assumed_update()]}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(label=answer))
+    assert labels(result) == {0: "weak"}
+    assert result["counts"].get("date_assumed_weak", 0) == (0 if answer == "weak" else 1)
+    assert result["counts"].get("actions_unsupported", 0) == 0
+
+
+def test_an_update_without_the_assumed_marker_keeps_the_model_label(monkeypatch):
+    draft = {"conclusion": [], "actions": [_assumed_update(assumed=False)]}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(label="unsupported"))
+    assert labels(result) == {0: "unsupported"}
+    assert "date_assumed_weak" not in result["counts"]
+
+
+def test_an_assumed_default_whose_check_got_no_answer_stays_unsupported(monkeypatch):
+    def answer(prompt, model):
+        if "2026-10-08" in prompt:
+            raise RuntimeError("down")
+        return '{"label": "supported"}', None, model, 1
+    draft = {"conclusion": [line()], "actions": [_assumed_update()]}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(answer=answer))
+    assert labels(result) == {0: "unsupported"}
+    assert "date_assumed_weak" not in result["counts"]
+
+
 def test_unsupported_lines_drop_weak_lines_become_uncertain_unsupported_actions_stay(
         monkeypatch):
     def answer(prompt, model):

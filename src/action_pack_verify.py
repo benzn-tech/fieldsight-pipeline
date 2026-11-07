@@ -78,6 +78,10 @@ What it does
    on web evidence the pack did not archive is at most weak (§6, `no_snapshot_capped`;
    `not_archived`: a web_answer none of whose own sources has a snapshot, or a web_source
    cited on its own without one). Documents and records can be supported.
+   An action carrying the scope gate's `assumed` marker (a deadline the code set to the
+   item's raised_on, spec 2026-11-05 §3.2.4) is shown as weak whatever the model answered
+   (`date_assumed_weak`): no record states the value, so a checker answers unsupported
+   and the owner's default would be hidden. A check that got no answer stays unsupported.
 
 Model selection (S6)
 --------------------
@@ -100,7 +104,7 @@ Counts (run_trace["verify"], flat ints, no text): raw_conclusion, raw_actions, d
 conclusion_no_refs, empty_refs, checks, check_failures, check_timeouts, family_skips,
 family_answers_rejected, fallback_answers, near_duplicate_flagged, label_conclusion_<label>, label_actions_<label>,
 conclusion_unsupported, actions_unsupported, web_only_conclusion, web_only_actions,
-no_snapshot_capped -- so the eval can report the writer's raw rates and the post-verifier
+no_snapshot_capped, date_assumed_weak -- so the eval can report the writer's raw rates and the post-verifier
 rates separately (S16).
 
 Logs: counts and codes only.
@@ -532,6 +536,10 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
             _bump(counts, "no_snapshot_capped")
         if kind == "actions" and i in flagged and label == "supported":
             label = "weak"                  # a fuzzy near-duplicate: never bulk-applied
+        if (kind == "actions" and el.get("assumed") and res is not None
+                and res["label"] is not None and label != "weak"):
+            label = "weak"                  # an assumed default: shown, never bulk-applied
+            _bump(counts, "date_assumed_weak")
         _bump(counts, f"label_{kind}_{label}")
         if kind == "conclusion":
             if label == "unsupported":
