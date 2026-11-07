@@ -30,7 +30,9 @@ internal "store" task (Task 6). Keys are the column names; unknown keys raise Va
       "run_trace":  {...},               # counts / timings / truncated -- never free text
       "models":     {"planner": id, "writer": id, "verifier": id},   # ids actually used
       "as_of":      ISO-8601 str | datetime,   # when the evidence was read (apply compares)
-      "sources": [{                      # one per cited ref; `ref` unique within the pack
+      "sub_tasks":  [{...}] | None,      # 0097: the planner's sub-tasks, answered (spec
+                                         #   2026-11-05 §4.2); None = the plan had none
+      "sources": [{                     # one per cited ref; `ref` unique within the pack
           "ref": "R3",                    # required
           "kind": "topic"|"chunk"|"document"|"web_answer"|"web_source"|"item",   # required
           "provenance": "records"|"documents"|"web",                            # required
@@ -51,6 +53,7 @@ internal "store" task (Task 6). Keys are the column names; unknown keys raise Va
           "rationale": str,
           "refs": [ref, ...],             # required, >= 1 (DB CHECK)
           "verifier": "supported"|"weak"|"unsupported",   # required
+          "verifier_detail": {...} | None,   # 0097: the verifier's record (spec §7)
       }, ...],
     }
 
@@ -108,7 +111,14 @@ _SOURCE_FIELDS = ("ref", "kind", "provenance", "topic_id", "chunk_id", "document
                   "who", "excerpt", "url", "fetched_at", "snapshot_s3_key")
 _ACTION_FIELDS = ("seq", "type", "target_stable_id", "target_snapshot", "proposed",
                   "rationale", "refs", "verifier")
-_ACTION_JSONB = ("target_snapshot", "proposed")
+_ACTION_JSONB = ("target_snapshot", "proposed", "verifier_detail")
+# Spec 2026-11-05 §9 (migration 0097): nullable columns the code may meet before the
+# migration has reached a database. A store that names them retries without them; a read
+# selects them only when they exist (`_has_new_columns`) and returns None otherwise.
+_PACK_NEW = ("sub_tasks",)
+_ACTION_NEW = ("verifier_detail",)
+_LEGACY_ERRORS = (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable)
+_NEW_COLUMNS = None          # per-process cache; only a positive answer is kept
 
 _PACK_COLS = ("p.id, p.company_id, p.site_id, p.created_by, p.title, p.instruction, p.reading, "
               "p.conclusion, p.state, p.failure, p.heartbeat_at, p.run_trace, p.models, "
@@ -119,6 +129,33 @@ _ACTION_COLS = ("id, pack_id, seq, type, target_stable_id, target_snapshot, prop
                 "rationale, refs, verifier, state, applied_by, applied_at, applied_result, "
                 "created_item_stable_id, created_at, updated_at")
 _SOURCE_COLS = "id, pack_id, " + ", ".join(_SOURCE_FIELDS) + ", created_at"
+
+
+def _has_new_columns(conn) -> bool:
+    """True when migration 0097's two columns exist (information_schema, this schema). A
+    True answer is cached for the process; a False one is asked again next time, so a
+    database migrated while the process lives is picked up."""
+    global _NEW_COLUMNS
+    if _NEW_COLUMNS:
+        return True
+    n = conn.execute(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND ((table_name = 'action_packs' AND column_name = 'sub_tasks') "
+        "OR (table_name = 'action_pack_actions' AND column_name = 'verifier_detail'))"
+    ).fetchone()[0]
+    if n == 2:
+        _NEW_COLUMNS = True
+    return n == 2
+
+
+def _pack_cols(conn) -> str:
+    return _PACK_COLS + (", p.sub_tasks" if _has_new_columns(conn)
+                         else ", NULL::jsonb AS sub_tasks")
+
+
+def _action_cols(conn) -> str:
+    return _ACTION_COLS + (", verifier_detail" if _has_new_columns(conn)
+                           else ", NULL::jsonb AS verifier_detail")
 
 
 class ActivePackExists(Exception):
@@ -170,7 +207,7 @@ def create_queued(conn, *, site_id, created_by, instruction) -> dict | None:
                 "INSERT INTO action_packs AS p (company_id, site_id, created_by, instruction, "
                 "heartbeat_at) "
                 "SELECT s.company_id, s.id, %s, %s, now() FROM sites s WHERE s.id = %s "
-                f"RETURNING {_PACK_COLS}",
+                f"RETURNING {_pack_cols(conn)}",
                 (created_by, instruction, site_id)).fetchone()
     except psycopg.errors.UniqueViolation as e:
         if e.diag.constraint_name == _ONE_ACTIVE_INDEX:
@@ -268,13 +305,13 @@ def _check_keys(obj, allowed, what):
 
 
 def _validate_payload(payload):
-    _check_keys(payload, _PACK_FIELDS + ("sources", "actions"), "pack")
+    _check_keys(payload, _PACK_FIELDS + _PACK_NEW + ("sources", "actions"), "pack")
     sources = payload.get("sources") or []
     actions = payload.get("actions") or []
     for s in sources:
         _check_keys(s, _SOURCE_FIELDS, "source")
     for a in actions:
-        _check_keys(a, _ACTION_FIELDS, "action")
+        _check_keys(a, _ACTION_FIELDS + _ACTION_NEW, "action")
     known = {s.get("ref") for s in sources}
     for a in actions:
         missing = set(a.get("refs") or []) - known
@@ -300,16 +337,43 @@ def store_result(conn, pack_id, payload: dict) -> str:
     Raises ValueError for a malformed payload (unknown keys, refs with no source) before any
     write, and lets a database error (a CHECK / UNIQUE violation in a source or action)
     propagate after rolling back the savepoint -- the pack stays `running` with no rows; the
-    caller then fails it ('internal')."""
+    caller then fails it ('internal').
+
+    Before migration 0097 (spec 2026-11-05 §9.2): a payload carrying `sub_tasks` or an
+    action's `verifier_detail` that meets a missing column (42703) or table (42P01) has its
+    savepoint rolled back and the WHOLE store retried without those keys -- never a partial
+    pack. The stored run_trace then carries `store_legacy_columns: 1`, and the answer is
+    'ok_legacy' instead of 'ok'. A payload whose new keys are all null never names the new
+    columns, so it stores on either schema."""
     sources, actions = _validate_payload(payload)
+    if payload.get("sub_tasks") is None and all(a.get("verifier_detail") is None
+                                                for a in actions):
+        return _store(conn, pack_id, payload, sources, actions, new_columns=False)
+    try:
+        return _store(conn, pack_id, payload, sources, actions, new_columns=True)
+    except _LEGACY_ERRORS:
+        pass                       # the savepoint is rolled back: nothing was written
+    trace = payload.get("run_trace")
+    payload = dict(payload, run_trace=dict(trace if isinstance(trace, dict) else {},
+                                           store_legacy_columns=1))
+    out = _store(conn, pack_id, payload, sources, actions, new_columns=False)
+    return "ok_legacy" if out == "ok" else out
+
+
+def _store(conn, pack_id, payload, sources, actions, *, new_columns):
+    pack_set, pack_vals = "", ()
+    action_fields = _ACTION_FIELDS
+    if new_columns:
+        pack_set, pack_vals = "sub_tasks=%s, ", (_json(payload.get("sub_tasks")),)
+        action_fields = _ACTION_FIELDS + _ACTION_NEW
     with conn.transaction():
         row = conn.execute(
             "UPDATE action_packs SET state='ready', title=%s, reading=%s, conclusion=%s, "
-            "run_trace=%s, models=%s, as_of=%s, updated_at=now() "
+            f"run_trace=%s, models=%s, as_of=%s, {pack_set}updated_at=now() "
             "WHERE id=%s AND state='running' RETURNING id",
             (payload.get("title"), payload.get("reading"), _json(payload.get("conclusion")),
              _json(payload.get("run_trace")), _json(payload.get("models")),
-             payload.get("as_of"), pack_id)).fetchone()
+             payload.get("as_of"), *pack_vals, pack_id)).fetchone()
         if row is None:
             return "refused"
         if sources:
@@ -320,13 +384,13 @@ def store_result(conn, pack_id, payload: dict) -> str:
                     f"INSERT INTO action_pack_sources (pack_id, {cols}) VALUES ({marks})",
                     [(pack_id, *(s.get(k) for k in _SOURCE_FIELDS)) for s in sources])
         if actions:
-            cols = ", ".join(_ACTION_FIELDS)
-            marks = ", ".join(["%s"] * (len(_ACTION_FIELDS) + 1))
+            cols = ", ".join(action_fields)
+            marks = ", ".join(["%s"] * (len(action_fields) + 1))
             with conn.cursor() as cur:
                 cur.executemany(
                     f"INSERT INTO action_pack_actions (pack_id, {cols}) VALUES ({marks})",
                     [(pack_id, *((_json(a.get(k)) if k in _ACTION_JSONB else a.get(k))
-                                 for k in _ACTION_FIELDS)) for a in actions])
+                                 for k in action_fields)) for a in actions])
     return "ok"
 
 
@@ -337,7 +401,7 @@ def lock_action(conn, pack_id, action_id) -> dict | None:
     this pack has no such action. Apply (Task 7) takes it first, so two concurrent appliers
     of one action serialise BEFORE either writes the item; the loser then sees `applied`."""
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_ACTION_COLS} FROM action_pack_actions WHERE id=%s AND pack_id=%s "
+        f"SELECT {_action_cols(conn)} FROM action_pack_actions WHERE id=%s AND pack_id=%s "
         "FOR UPDATE",
         (action_id, pack_id)).fetchone()
 
@@ -369,7 +433,7 @@ def set_action_state(conn, pack_id, action_id, new_state, applied_by=None,
             "UPDATE action_pack_actions SET state=%s, applied_by=%s, applied_at=now(), "
             "applied_result=COALESCE(%s, applied_result), "
             "created_item_stable_id=COALESCE(%s, created_item_stable_id), updated_at=now() "
-            f"WHERE id=%s AND pack_id=%s RETURNING {_ACTION_COLS}",
+            f"WHERE id=%s AND pack_id=%s RETURNING {_action_cols(conn)}",
             (new_state, applied_by, _json(applied_result), created_item_stable_id,
              action_id, pack_id)).fetchone()
     return ("ok", row)
@@ -456,7 +520,7 @@ def get_for_reader(conn, reader: PackReader, pack_id) -> dict | None:
     where, params = _reader_clause(reader)
     cur = conn.cursor(row_factory=dict_row)
     pack = cur.execute(
-        f"SELECT {_PACK_COLS} FROM action_packs p WHERE p.id = %s AND {where}",
+        f"SELECT {_pack_cols(conn)} FROM action_packs p WHERE p.id = %s AND {where}",
         (pack_id, *params)).fetchone()
     if pack is None:
         return None
@@ -464,6 +528,6 @@ def get_for_reader(conn, reader: PackReader, pack_id) -> dict | None:
         f"SELECT {_SOURCE_COLS} FROM action_pack_sources WHERE pack_id=%s ORDER BY ref",
         (pack_id,)).fetchall()
     pack["actions"] = cur.execute(
-        f"SELECT {_ACTION_COLS} FROM action_pack_actions WHERE pack_id=%s ORDER BY seq",
+        f"SELECT {_action_cols(conn)} FROM action_pack_actions WHERE pack_id=%s ORDER BY seq",
         (pack_id,)).fetchall()
     return pack

@@ -196,7 +196,8 @@ def _str_list(v):
 
 # Per-field type rules for the store payload; a value may always be None (= omitted).
 _PACK_TYPES = {"title": "str", "reading": "str", "conclusion": "list", "run_trace": "dict",
-               "models": "dict", "as_of": "datetime", "sources": "list", "actions": "list"}
+               "models": "dict", "as_of": "datetime", "sources": "list", "actions": "list",
+               "sub_tasks": "list"}
 _SOURCE_TYPES = {"ref": "str", "kind": "str", "provenance": "str", "topic_id": "uuid",
                  "chunk_id": "uuid", "document_id": "uuid", "revision": "int",
                  "page_from": "int", "page_to": "int", "stable_id": "uuid", "title": "str",
@@ -204,7 +205,7 @@ _SOURCE_TYPES = {"ref": "str", "kind": "str", "provenance": "str", "topic_id": "
                  "url": "str", "fetched_at": "datetime", "snapshot_s3_key": "str"}
 _ACTION_TYPES = {"seq": "int", "type": "str", "target_stable_id": "uuid",
                  "target_snapshot": "dict", "proposed": "dict", "rationale": "str",
-                 "refs": "strlist", "verifier": "str"}
+                 "refs": "strlist", "verifier": "str", "verifier_detail": "dict"}
 _CHECK = {"str": lambda v: isinstance(v, str), "list": lambda v: isinstance(v, list),
           "dict": lambda v: isinstance(v, dict), "int": _is_int, "uuid": _is_uuid,
           "date": lambda v: _is_iso(v, "date"), "datetime": lambda v: _is_iso(v, "datetime"),

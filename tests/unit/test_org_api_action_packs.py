@@ -477,6 +477,7 @@ def test_store_size_counts_escaped_non_ascii(task_env, monkeypatch):
 
 
 @pytest.mark.parametrize("outcome,expected", [("ok", {"ok": True}),
+                                              ("ok_legacy", {"ok": True}),   # before 0097
                                               ("refused", {"error": "refused"})])
 def test_store_outcomes(task_env, monkeypatch, outcome, expected):
     monkeypatch.setattr(org.action_packs, "store_result", lambda conn, pid, p: outcome)

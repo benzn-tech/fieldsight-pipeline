@@ -147,3 +147,27 @@ def test_an_oversized_public_trace_is_replaced_by_a_marker():
     assert v.public_trace(big) == {"dropped": "size"}
     small = {"tokens": 1, "ms": {"total": 2}}
     assert v.public_trace(small) == small
+
+
+# ---------------------------------------------------------------- PR-5 (spec 2026-11-05 §9.2)
+
+def _store_payload(**over):
+    p = {"title": "t", "conclusion": [],
+         "sources": [{"ref": "R1", "kind": "topic", "provenance": "records"}],
+         "actions": [{"seq": 1, "type": "note", "refs": ["R1"], "verifier": "weak",
+                      "proposed": {"text": "n"}}]}
+    p.update(over)
+    return p
+
+
+def test_payload_shape_accepts_sub_tasks_and_verifier_detail():
+    sub = [{"id": "s1", "ask": "Close #1", "kind": "close", "status": "done",
+            "actions": [1], "conclusion": [], "reason_code": None, "reason": None}]
+    p = _store_payload(sub_tasks=sub)
+    p["actions"][0]["verifier_detail"] = {"reason": "date_assumed"}
+    assert v.payload_shape_error(p) is None
+    assert v.payload_shape_error(_store_payload(sub_tasks=None)) is None
+    assert v.payload_shape_error(_store_payload(sub_tasks={"s1": 1})) == "pack_field_type"
+    bad = _store_payload()
+    bad["actions"][0]["verifier_detail"] = ["weak"]
+    assert v.payload_shape_error(bad) == "action_field_type"
