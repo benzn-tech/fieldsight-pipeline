@@ -101,7 +101,7 @@ def test_update_and_close_must_be_legal_from_the_current_status():
                     ("close_item", SID1, {"status": "done"})]
     # The reopen is the writer schema's; the two on the done item are the scope gate's
     # (rule 1: a target must be open -- spec 2026-11-05 §3.2.4).
-    assert payload["run_trace"]["write_dropped"]["transitions"] == 1
+    assert payload["run_trace"]["write_dropped"] == {"update_item__transitions": 1}
     assert payload["run_trace"]["scope_gate"] == {"drop_target_closed": 2}
 
 
