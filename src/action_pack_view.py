@@ -554,6 +554,10 @@ def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id,
         "sources": [_source_out(s, s["ref"] in removed_refs) for s in pack.get("sources") or []],
         "run_trace": public_trace(pack.get("run_trace")),
         "models": public_models(pack.get("models")),
+        # Spec 2026-11-05 §4.2/§9.3: the planner's sub-tasks and how the run answered each
+        # (action refs are seqs; conclusion refs are positions in the stored conclusion).
+        # None for an old pack and for a plan without sub-tasks.
+        "sub_tasks": pack.get("sub_tasks"),
     }
 
 

@@ -171,3 +171,20 @@ def test_payload_shape_accepts_sub_tasks_and_verifier_detail():
     bad = _store_payload()
     bad["actions"][0]["verifier_detail"] = ["weak"]
     assert v.payload_shape_error(bad) == "action_field_type"
+
+
+_SUBS = [{"id": "s1", "ask": "Close #69", "kind": "close", "status": "done", "actions": [1],
+          "conclusion": [0], "reason_code": None, "reason": None},
+         {"id": "s2", "ask": "Email the client", "kind": "draft", "status": "not_done",
+          "actions": [], "conclusion": [], "reason_code": "not_answered", "reason": None}]
+
+
+def test_shape_pack_returns_sub_tasks():
+    view = v.shape_pack(_pack(sub_tasks=_SUBS), removed_refs=set(), site_name=None,
+                        targets={}, applicable={}, viewer_id="u")
+    assert view["sub_tasks"] == _SUBS
+    # An old pack (stored before migration 0097, or a plan without sub-tasks): None.
+    for pack in (_pack(), _pack(sub_tasks=None)):
+        view = v.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
+                            applicable={}, viewer_id="u")
+        assert "sub_tasks" in view and view["sub_tasks"] is None
