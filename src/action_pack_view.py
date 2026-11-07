@@ -196,7 +196,8 @@ def _str_list(v):
 
 # Per-field type rules for the store payload; a value may always be None (= omitted).
 _PACK_TYPES = {"title": "str", "reading": "str", "conclusion": "list", "run_trace": "dict",
-               "models": "dict", "as_of": "datetime", "sources": "list", "actions": "list"}
+               "models": "dict", "as_of": "datetime", "sources": "list", "actions": "list",
+               "sub_tasks": "list"}
 _SOURCE_TYPES = {"ref": "str", "kind": "str", "provenance": "str", "topic_id": "uuid",
                  "chunk_id": "uuid", "document_id": "uuid", "revision": "int",
                  "page_from": "int", "page_to": "int", "stable_id": "uuid", "title": "str",
@@ -204,7 +205,7 @@ _SOURCE_TYPES = {"ref": "str", "kind": "str", "provenance": "str", "topic_id": "
                  "url": "str", "fetched_at": "datetime", "snapshot_s3_key": "str"}
 _ACTION_TYPES = {"seq": "int", "type": "str", "target_stable_id": "uuid",
                  "target_snapshot": "dict", "proposed": "dict", "rationale": "str",
-                 "refs": "strlist", "verifier": "str"}
+                 "refs": "strlist", "verifier": "str", "verifier_detail": "dict"}
 _CHECK = {"str": lambda v: isinstance(v, str), "list": lambda v: isinstance(v, list),
           "dict": lambda v: isinstance(v, dict), "int": _is_int, "uuid": _is_uuid,
           "date": lambda v: _is_iso(v, "date"), "datetime": lambda v: _is_iso(v, "datetime"),
@@ -499,6 +500,30 @@ def visible_conclusion(pack, removed_refs) -> list:
             and not (non_web_removed and not c.get("refs"))]
 
 
+def visible_sub_tasks(pack, conclusion, action_seqs):
+    """The stored sub-tasks as this reader sees them, or None. A sub-task's conclusion
+    positions point into the STORED conclusion; `conclusion` is the reader's visible list
+    (visible_conclusion, which keeps the stored dicts), so each position is remapped to
+    the visible one and a hidden line is left out. Action seqs not visible to the reader
+    are left out too."""
+    subs = pack.get("sub_tasks")
+    if not isinstance(subs, list):
+        return None
+    shown = {id(c): n for n, c in enumerate(conclusion)}
+    pos = {i: shown[id(c)] for i, c in enumerate(pack.get("conclusion") or [])
+           if id(c) in shown}
+    out = []
+    for e in subs:
+        if not isinstance(e, dict):
+            continue
+        e = dict(e)
+        e["conclusion"] = [pos[i] for i in e.get("conclusion") or []
+                           if isinstance(i, int) and i in pos]
+        e["actions"] = [s for s in e.get("actions") or [] if s in action_seqs]
+        out.append(e)
+    return out
+
+
 def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id,
                reasons=None) -> dict:
     """The GET /action-packs/{id} body.
@@ -553,6 +578,12 @@ def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id,
         "sources": [_source_out(s, s["ref"] in removed_refs) for s in pack.get("sources") or []],
         "run_trace": public_trace(pack.get("run_trace")),
         "models": public_models(pack.get("models")),
+        # Spec 2026-11-05 §4.2/§9.3: the planner's sub-tasks and how the run answered each
+        # (action refs are seqs; conclusion refs are positions in the conclusion returned
+        # here, remapped through S13). None for an old pack and for a plan without
+        # sub-tasks.
+        "sub_tasks": visible_sub_tasks(pack, conclusion,
+                                       {a.get("seq") for a in actions}),
     }
 
 

@@ -477,6 +477,7 @@ def test_store_size_counts_escaped_non_ascii(task_env, monkeypatch):
 
 
 @pytest.mark.parametrize("outcome,expected", [("ok", {"ok": True}),
+                                              ("ok_legacy", {"ok": True}),   # before 0097
                                               ("refused", {"error": "refused"})])
 def test_store_outcomes(task_env, monkeypatch, outcome, expected):
     monkeypatch.setattr(org.action_packs, "store_result", lambda conn, pid, p: outcome)
@@ -746,3 +747,18 @@ def test_store_without_snapshots_never_looks_the_pack_up(task_env, monkeypatch):
                         lambda conn, pid: pytest.fail("looked up"))
     assert _store({"sources": [dict(WEB, snapshot_s3_key=None)]}) == {"ok": True}
     assert stored == [PACK] and recorded == []
+
+
+
+# ---------------------------------------------------------------- PR-5 (spec 2026-11-05 §9.2)
+
+def test_get_one_returns_sub_tasks(env):
+    subs = [{"id": "s1", "ask": "Close #69", "kind": "close", "status": "not_done",
+             "actions": [], "conclusion": [], "reason_code": "dropped_by_checks",
+             "reason": None}]
+    env.pack = _pack(sub_tasks=subs)
+    status, body = _call(env, "GET", f"/action-packs/{PACK}")
+    assert status == 200 and body["sub_tasks"] == subs
+    env.pack = _pack()                                  # an old pack: no such key at all
+    status, body = _call(env, "GET", f"/action-packs/{PACK}")
+    assert status == 200 and body["sub_tasks"] is None

@@ -285,14 +285,16 @@ def _provenance(a, *, tid, plan, items, registry, counts):
 
 
 def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
-    """-> (the gated draft, counts). `resolution` is {target id: Resolution} (round 1),
-    `items` the run's items by stable_id, `registry` its refs. The conclusion and the
-    actions that change no item pass untouched."""
-    counts = {}
+    """-> (the gated draft, counts, index_map). `resolution` is {target id: Resolution}
+    (round 1), `items` the run's items by stable_id, `registry` its refs. The conclusion
+    and the actions that change no item pass untouched. `index_map` is {old action index:
+    new index, or None when dropped}; a demoted action (now a note) keeps a new index --
+    the sub-task accounting (spec 2026-11-05 §4.2) follows it."""
+    counts, index_map = {}, {}
     lang = st._lang_key(getattr(plan, "language", None))
     named_sids = {r.stable_id for r in resolution.values() if r.kind == targets.RESOLVED}
     out = []
-    for a in draft.get("actions") or []:
+    for i, a in enumerate(draft.get("actions") or []):
         if a.get("type") in TARGETED:
             a = _scope(a, plan=plan, resolution=resolution, items=items,
                        named_sids=named_sids, lang=lang, counts=counts)
@@ -301,6 +303,7 @@ def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
                    if a["type"] in TARGETED else None)
             a = _provenance(a, tid=tid, plan=plan, items=items, registry=registry,
                             counts=counts)
+        index_map[i] = len(out) if a is not None else None
         if a is not None:
             out.append(a)
-    return dict(draft, actions=out), counts
+    return dict(draft, actions=out), counts, index_map

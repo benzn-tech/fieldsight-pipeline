@@ -430,6 +430,75 @@ def test_store_result_with_no_actions_or_sources(db):
     assert _state(db, pack["id"]) == ("ready", None)
 
 
+# ---------------------------------------------------------------- PR-5: sub_tasks /
+# verifier_detail (spec 2026-11-05 §9.1-§9.2)
+
+_SUB_TASKS = [{"id": "s1", "ask": "Close the fire doors", "kind": "close",
+               "status": "done", "actions": [1], "conclusion": [0],
+               "reason_code": None, "reason": None},
+              {"id": "s2", "ask": "Email the client", "kind": "draft",
+               "status": "not_done", "actions": [], "conclusion": [],
+               "reason_code": "not_answered", "reason": None}]
+_DETAIL = {"reason": "date_assumed", "served": "google/gemini-3.8-flash"}
+
+
+def _new_payload():
+    p = _payload(sub_tasks=_SUB_TASKS)
+    p["actions"][0]["verifier_detail"] = _DETAIL
+    return p
+
+
+def test_store_and_get_with_new_columns(db):
+    ap._NEW_COLUMNS = None
+    _, site, creator = _world(db)
+    pack = _running(db, site, creator)
+    assert ap.store_result(db, pack["id"], _new_payload()) == "ok"
+    got = ap.get_for_reader(db, _reader(db, creator), pack["id"])
+    assert got["sub_tasks"] == _SUB_TASKS
+    assert [a["verifier_detail"] for a in got["actions"]] == [_DETAIL, None]
+    assert "store_legacy_columns" not in got["run_trace"]
+    locked = ap.lock_action(db, pack["id"], got["actions"][0]["id"])
+    assert locked["verifier_detail"] == _DETAIL
+
+
+def test_store_without_migration_retries_whole_store(db):
+    # Review Focus 2: the code ships before the migration reaches a database. The store
+    # retries the WHOLE transaction without the two new keys -- never a partial pack.
+    db.execute("ALTER TABLE action_packs DROP COLUMN sub_tasks")
+    db.execute("ALTER TABLE action_pack_actions DROP COLUMN verifier_detail")
+    ap._NEW_COLUMNS = None
+    try:
+        _, site, creator = _world(db)
+        pack = _running(db, site, creator)
+        assert ap.store_result(db, pack["id"], _new_payload()) == "ok_legacy"
+        assert _state(db, pack["id"]) == ("ready", None)
+        n = db.execute("SELECT (SELECT count(*) FROM action_pack_sources WHERE pack_id=%s), "
+                       "(SELECT count(*) FROM action_pack_actions WHERE pack_id=%s)",
+                       (pack["id"], pack["id"])).fetchone()
+        assert n == (2, 2)
+        got = ap.get_for_reader(db, _reader(db, creator), pack["id"])
+        assert got["sub_tasks"] is None
+        assert [a["verifier_detail"] for a in got["actions"]] == [None, None]
+        assert got["run_trace"] == {"rounds": 3, "tool_calls": 7, "store_legacy_columns": 1}
+        assert ap.lock_action(db, pack["id"], got["actions"][0]["id"])["verifier_detail"] \
+            is None
+        # A payload whose new keys are null never takes the legacy path.
+        plain = _running(db, site, creator)
+        assert ap.store_result(db, plain["id"], _payload(sub_tasks=None)) == "ok"
+        assert _state(db, plain["id"]) == ("ready", None)
+    finally:
+        ap._NEW_COLUMNS = None
+
+
+def test_get_old_pack_new_fields_null(db):
+    ap._NEW_COLUMNS = None
+    _, site, creator = _world(db)
+    pack, _ = _ready_pack(db, site, creator)
+    got = ap.get_for_reader(db, _reader(db, creator), pack["id"])
+    assert got["sub_tasks"] is None
+    assert [a["verifier_detail"] for a in got["actions"]] == [None, None]
+
+
 # ---------------------------------------------------------------- sweep_stale
 
 def test_sweep_fails_stale_running_and_queued_only(db):

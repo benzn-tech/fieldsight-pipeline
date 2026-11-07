@@ -1510,9 +1510,14 @@ def _action_pack_store(conn, pack_id, event):
                      getattr(exc, "sqlstate", None))
         action_packs.fail(conn, pack_id, "internal")
         return {"error": "invalid", "detail": "constraint"}
-    if outcome != "ok":
+    if outcome not in ("ok", "ok_legacy"):
         logger.info("action pack store refused pack=%s", pack_id)
         return {"error": "refused"}
+    if outcome == "ok_legacy":
+        # Spec 2026-11-05 §9.2: stored without sub_tasks / verifier_detail (migration 0097
+        # not applied yet); the stored run_trace counts it as store_legacy_columns.
+        logger.warning("action pack stored without the 0097 columns pack=%s "
+                       "store_legacy_columns=1", pack_id)
     recorded = 0
     for key in action_pack_view.snapshot_keys(payload) if snap_pack is not None else ():
         recorded += bool(lake_objects.record_best_effort(
