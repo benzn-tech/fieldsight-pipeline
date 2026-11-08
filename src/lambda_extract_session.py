@@ -2347,16 +2347,22 @@ def _run_linker(prior, topics, transcript_text, budget_deadline=None):
     started = time.monotonic()
     record = {"status": "error", "ms": 0, "dropped": 0, "model": None}
     refs = []
+    timed = True   # False: no call was made, `ms` stays 0
     try:
         refs = item_continuity.assign_refs(topics)
         for _ref, _ln, child in refs:
             child.pop("continues", None)
             child.pop(status_suggestions.FIELD, None)
+        if not refs:   # nothing new to link: no call, nothing dropped
+            record["status"] = "ok"
+            timed = False
+            return record
         deadline = LINKER_CAP_S
         if budget_deadline is not None:
             deadline = min((budget_deadline - time.monotonic()) - LINKER_RESERVE_S, LINKER_CAP_S)
         if deadline < LINKER_MIN_S:
             record["status"] = "skipped_budget"
+            timed = False
             logger.warning("continuity linker: skipped, %.0fs left for the call (refs=%d, "
                            "prior=%d)", deadline, len(refs), len(prior))
             return record
@@ -2385,7 +2391,7 @@ def _run_linker(prior, topics, transcript_text, budget_deadline=None):
         logger.warning("continuity linker: failed (%s; refs=%d) -- exact matches only",
                        type(e).__name__, len(refs))
     finally:
-        if record["status"] != "skipped_budget":
+        if timed:
             record["ms"] = int((time.monotonic() - started) * 1000)
     return record
 

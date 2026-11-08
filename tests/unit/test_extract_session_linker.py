@@ -324,3 +324,15 @@ def test_run_linker_unparseable_answer_logs_no_item_text(monkeypatch, caplog):
     assert "SECRET ITEM TEXT" not in caplog.text
     mine = [r for r in caplog.records if "continuity linker" in r.getMessage()]
     assert mine and "answer unusable" in mine[0].getMessage()
+
+
+def test_run_linker_without_new_items_makes_no_call(monkeypatch):
+    """Final review: nothing new to link -> no model call, an ok record with nothing dropped."""
+    fake = _Calls([LINK_ANSWER])
+    monkeypatch.setattr(llm_utils, "call_llm", fake)
+    prior = ic.prior_items(_prior([str(uuid.uuid4()), str(uuid.uuid4())]))
+    assert prior
+    for topics in ([], [{"topic_title": "t", "action_items": []}]):
+        rec = les._run_linker(prior, topics, "text", budget_deadline=None)
+        assert rec == {"status": "ok", "ms": 0, "dropped": 0, "model": None}
+    assert fake.calls == []
