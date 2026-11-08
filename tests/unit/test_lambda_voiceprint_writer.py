@@ -79,7 +79,8 @@ def test_propagation_recomputes_claims_once_after_the_names(calls):
                     {"turn_ref": "f.wav@2.0", "state": "confirmed", "cluster_ref": "C1"}]},
         None)
     assert calls["recomputes"] == [{"company_id": CO, "site_id": None,
-                                    "session_base": "sid" + "a" * 32}]
+                                    "session_base": "sid" + "a" * 32,
+                                    "statement_timeout": "15s"}]
 
 
 def test_nothing_written_means_no_recompute(calls):

@@ -21,6 +21,7 @@ count; derive enforces that.
 claim_basis holds ids and statuses only -- never a display name, never text.
 """
 
+from psycopg.errors import QueryCanceled
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -137,16 +138,18 @@ def _session_key_suffix(session_base):
 
 
 def _session_sites(conn, company_id, suffix):
-    """The sites of `company_id` that hold a topic of this session (by extraction-key
-    suffix). Scoped through sites.company_id: a same-named session in another company is
-    never returned."""
+    """The sites of `company_id` that hold a LIVE, visible topic of this session (by
+    extraction-key suffix). Scoped through sites.company_id: a same-named session in another
+    company is never returned; a site holding only superseded/deleted topics costs nothing."""
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT t.site_id::text FROM topics t JOIN sites s ON s.id = t.site_id "
-        "WHERE s.company_id = %s AND right(t.source_s3_key, %s) = %s ORDER BY 1",
+        "WHERE s.company_id = %s AND right(t.source_s3_key, %s) = %s AND "
+        + visible_topics_predicate("t") + " ORDER BY 1",
         (company_id, len(suffix), suffix)).fetchall()]
 
 
-def recompute_session(conn, *, company_id, site_id=None, session_base) -> dict:
+def recompute_session(conn, *, company_id, site_id=None, session_base,
+                      statement_timeout=None) -> dict:
     """Re-derive claim_type for every live item of one session on `site_id`.
 
     The session's items are the live (visible_topics_predicate) rows that either have a
@@ -156,15 +159,36 @@ def recompute_session(conn, *, company_id, site_id=None, session_base) -> dict:
     `{rows, changed, claim: {type|null: n}}`.
 
     `site_id=None` (the voiceprint writer, which knows the company and session but not
-    the site): every site OF `company_id` holding a topic of the session, each recomputed
-    as above, counts summed, plus `sites: n`."""
+    the site): every site OF `company_id` holding a live topic of the session, each
+    recomputed as above in its OWN savepoint, counts summed, plus `sites: n` and
+    `failed: n` / `errors: [exception type names]`. One site's failure rolls back only
+    that site. A QueryCanceled (the caller's statement_timeout) stops the loop -- the
+    budget is spent -- and the sites already done stand (`timed_out: True`).
+
+    `statement_timeout` (e.g. "15s"), when given, is set LOCAL to the caller's transaction
+    first, so a synchronous caller has a bound on every statement below."""
     if not company_id or not session_base:
         raise ValueError("company_id and session_base are required")
+    if statement_timeout is not None:
+        conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                     (str(statement_timeout),))
     if site_id is None:
-        total = {"rows": 0, "changed": 0, "sites": 0,
+        total = {"rows": 0, "changed": 0, "sites": 0, "failed": 0, "errors": [],
+                 "timed_out": False,
                  "claim": {c: 0 for c in claim_type.CLAIM_TYPES + ("null",)}}
         for sid in _session_sites(conn, company_id, _session_key_suffix(session_base)):
-            one = _recompute_site(conn, company_id, sid, session_base)
+            try:
+                with conn.transaction():
+                    one = _recompute_site(conn, company_id, sid, session_base)
+            except QueryCanceled as exc:
+                total["failed"] += 1
+                total["errors"].append(type(exc).__name__)
+                total["timed_out"] = True
+                break
+            except Exception as exc:
+                total["failed"] += 1
+                total["errors"].append(type(exc).__name__)
+                continue
             total["sites"] += 1
             total["rows"] += one["rows"]
             total["changed"] += one["changed"]

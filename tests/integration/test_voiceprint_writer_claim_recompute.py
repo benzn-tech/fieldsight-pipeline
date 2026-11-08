@@ -70,8 +70,8 @@ def _artifact():
     }
 
 
-def _tenant(seed, tag, label):
-    co = companies.create_company(seed, f"Claims-VW-{label}-{tag}")
+def _tenant(seed, tag, label, co=None):
+    co = co or companies.create_company(seed, f"Claims-VW-{label}-{tag}")
     site = sites.create_site(seed, co["id"], f"Claims-VW-Site-{label}-{tag}")
     folder = f"ClaimsVW{label}-{tag}"
     user = users.upsert_field_only_user(seed, co["id"], folder, "Fol", "Der", "worker")
@@ -94,8 +94,10 @@ def world(monkeypatch, migrated_db_url):
         monkeypatch.setattr(lambda_item_writer.match_request, "emit", lambda *a, **k: None)
         monkeypatch.setattr(vw, "get_connection", lambda *a, **k: get_connection(migrated_db_url))
 
-        def tenant(label):
-            t = _tenant(seed, tag, label)
+        def tenant(label, same_company_as=None):
+            t = _tenant(seed, tag, label,
+                        co=same_company_as["co"] if same_company_as else None)
+            t["owns_co"] = same_company_as is None
             tenants.append(t)
             t["key"] = f"extractions/{t['folder']}/{DATE}/{session_base}.json"
             fake_s3.objects[t["key"]] = json.dumps(_artifact())
@@ -121,7 +123,9 @@ def world(monkeypatch, migrated_db_url):
                          (t["co"]["id"],))
             for u in ("user", "other"):
                 seed.execute("DELETE FROM users WHERE id=%s", (t[u]["id"],))
-            seed.execute("DELETE FROM companies WHERE id=%s", (t["co"]["id"],))
+        for t in tenants:
+            if t["owns_co"]:
+                seed.execute("DELETE FROM companies WHERE id=%s", (t["co"]["id"],))
         seed.close()
 
 
@@ -165,7 +169,7 @@ def test_match_names_triggers_one_recompute_per_session(world, monkeypatch):
     assert len(calls) == 1, calls
     kw, counts = calls[0]
     assert kw == {"company_id": str(a["co"]["id"]), "site_id": None,
-                  "session_base": w["session_base"]}
+                  "session_base": w["session_base"], "statement_timeout": "15s"}
     assert counts["sites"] == 1 and counts["rows"] == 2 and counts["changed"] == 2
     act = _claim(w, a, "action_items", "Synthetic task one")
     fnd = _claim(w, a, "findings", "Synthetic finding one")
@@ -259,3 +263,70 @@ def test_backfill_dry_run_writes_nothing_then_apply_writes(world, monkeypatch):
     assert done["changed"] == 2
     assert _claim(w, a, "action_items", "Synthetic task one")[0] == "observed"
     assert _claim(w, a, "findings", "Synthetic finding one")[0] == "stated"
+
+
+def test_a_timeout_is_bounded_logged_by_type_and_the_names_stand(world, monkeypatch, caplog):
+    """The real store under the hook's statement_timeout: the setting is in force on the
+    recompute's statements, and a forced cancel (QueryCanceled) is a logged failure -- the
+    names are committed and the reply is the same shape as a clean run's."""
+    w = world
+    a = w["tenant"]("A")
+    seen = []
+
+    def cancelled(conn, company_id, site_id, session_base):
+        seen.append(conn.execute("SHOW statement_timeout").fetchone()[0])
+        conn.execute("SELECT set_config('statement_timeout', '10ms', true)")
+        conn.execute("SELECT pg_sleep(1)")
+    monkeypatch.setattr(claim_type_store, "_recompute_site", cancelled)
+
+    with caplog.at_level(logging.INFO):
+        out = vw.lambda_handler(_match_event(w, a), None)
+    assert seen == ["15s"], seen
+    assert out == {"written": 2, "declined": 0, "inherited": 0}
+    names = w["seed"].execute(
+        "SELECT count(*) FROM speaker_turn_names WHERE company_id = %s AND session_base = %s "
+        "AND superseded_at IS NULL", (a["co"]["id"], w["session_base"])).fetchone()[0]
+    assert names == 2
+    assert _claim(w, a, "action_items", "Synthetic task one")[0] is None
+    warn = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("QueryCanceled" in m for m in warn), warn
+    assert not any("Synthetic" in m for m in warn)
+
+
+def test_one_sites_failure_does_not_roll_back_the_others(world, monkeypatch, caplog):
+    w = world
+    a = w["tenant"]("A")
+    a2 = w["tenant"]("A2", same_company_as=a)
+    real = claim_type_store._recompute_site
+
+    def flaky(conn, company_id, site_id, session_base):
+        if str(site_id) == str(a["site"]["id"]):
+            real(conn, company_id, site_id, session_base)   # its writes must roll back
+            conn.execute("SELECT 1/0")
+        return real(conn, company_id, site_id, session_base)
+    monkeypatch.setattr(claim_type_store, "_recompute_site", flaky)
+    # Names for the turns of both sites (one session, one company).
+    with caplog.at_level(logging.INFO):
+        out = vw.lambda_handler(_match_event(w, a), None)
+    assert out["written"] == 2
+    assert _claim(w, a, "action_items", "Synthetic task one")[0] is None
+    # A's recorder named on A2's turn: A2's recorder is someone else, so `stated`.
+    assert _claim(w, a2, "action_items", "Synthetic task one")[0] == "stated"
+    warn = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("1 site(s) failed" in m and "DivisionByZero" in m for m in warn), warn
+
+
+def test_a_site_with_only_superseded_topics_is_not_visited(world):
+    w = world
+    a = w["tenant"]("A")
+    a2 = w["tenant"]("A2", same_company_as=a)
+    w["seed"].execute("UPDATE topics SET superseded_at = now() WHERE site_id = %s",
+                      (a2["site"]["id"],))
+    conn = get_connection(w["url"])
+    try:
+        with conn:
+            counts = claim_type_store.recompute_session(
+                conn, company_id=str(a["co"]["id"]), session_base=w["session_base"])
+    finally:
+        conn.close()
+    assert counts["sites"] == 1 and counts["failed"] == 0
