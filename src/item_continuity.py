@@ -183,8 +183,11 @@ def render_linker_prompt(prior, refs, transcript_text, extra_instruction=""):
     """The linker call's prompt (spec L3): its instruction, the optional status rule, the prior
     list exactly as render_block fences it (minus CONTINUITY_INSTRUCTION), the new items in their
     own fence, then the transcript the extraction saw, verbatim."""
+    def new_text(ln, child):   # a non-string text is still listed, as "", so refs stay aligned
+        text = _text(ln, child)
+        return _scrub(text) if isinstance(text, str) else ""
     new_lines = [json.dumps({"ref": ref, "kind": KINDS[ln].record_type,
-                             "text": _scrub(_text(ln, child))}, ensure_ascii=False)
+                             "text": new_text(ln, child)}, ensure_ascii=False)
                  for ref, ln, child in refs]
     extra = (extra_instruction + "\n") if extra_instruction else ""
     prior_block = ("\n## Items from the earlier pass\n" + _prior_lines(prior)) if prior else ""
