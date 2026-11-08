@@ -138,7 +138,7 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 - Modify: `src/lambda_session_finalize.py` (the confirmation email's topic table gains a *Where* column from `group_day`, blank when unknown)
 - `fieldsight-ui` (separate repo): a "By location" toggle on the day view reading `location_groups`. Out of this repo's scope; note the payload contract in `BACKEND-CONTEXT.md`.
 
-- [ ] **Step 1:** **Deferred 2026-11-06.** The email table's three-column header (AGENDA ITEM / ASSIGNED / DUE DATE) is literal on BOTH the email and the frontend's Preview & copy (owner, 2026-10-08). A *Where* column must land in both at once, so it waits for the UI line. Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
+- [ ] **Step 1:** (backend half done 2026-11-09 behind EMAIL_WHERE_COLUMN, off in TEST and prod; UI half = UI line; flip TEST when the UI lands) **Deferred 2026-11-06.** The email table's three-column header (AGENDA ITEM / ASSIGNED / DUE DATE) is literal on BOTH the email and the frontend's Preview & copy (owner, 2026-10-08). A *Where* column must land in both at once, so it waits for the UI line. Email column; byte parity between email and Preview & copy on one fixture (the check that has caught four divergences).
 - [x] **Step 2:** (contract below, handed to the UI line, which owns fieldsight-ui) Write the `location_groups` contract into the UI repo's backend-context doc.
 
 **`location_groups` contract (org-api `/timeline` rendered day, PR #1228):**
