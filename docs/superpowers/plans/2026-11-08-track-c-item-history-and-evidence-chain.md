@@ -424,7 +424,13 @@ ALTER TABLE topic_questions ADD CONSTRAINT topic_questions_claim_type_check
 
 ### Task 10: Run the measurement and switch on for TEST (operational; needs the owner)
 
-- [ ] **Step 1:** `build.py` + `run.py` on TEST finals (fit half). Fix the constants; commit them to `item_support.py` with the fit numbers in the commit body.
+- [x] **Step 1:** `build.py` + `run.py` on TEST finals (fit half). Fix the constants; commit them to `item_support.py` with the fit numbers in the commit body.
+  - Result 2026-11-09 (counts only; outputs gitignored). Set: 59 eligible TEST sessions since 2026-08-01 (Aug 13, Sep 4, Oct 30, Nov 12); fit half 30 sessions / 306 items, held-out 29 / 252. Quotes 454 verified, 454 resolved; 0 empty labeller views.
+  - Agent gold, blind: 558 items labelled (489 `turn`, 69 `several`, 0 `none`).
+  - Fit: **no feasible point** among the 208 grid points. Link precision cleared 0.97 everywhere (best 0.987: 79 links, 1 wrong), but the `inferred` constraint (>= 0.95) failed at every point: each point leaves >= 32 `none_close` items, and gold finds a supporting turn for every one. At nothing_close 0.10 all 32 are English item text over Chinese transcripts; word overlap cannot see across languages. Best fit-half coverage ~26% (79/306), under the owner's 60% line.
+  - Verdict under the pre-registration: **fail**. Constants stay None; EMIT_ITEM_SUPPORT stays off; held-out half not scored.
+  - Dataset caveats: the same recordings recur under several session refs (some across halves); 37 of 59 sessions come from one folder. Both bias toward the owner's own test recordings.
+  - Next, per the owner's ruling (spec §9.2, coverage < 60%): a separate pre-registration for the topic-quote-index prompt option, which is also language-independent. Not started; it needs paid extraction runs, and the call count goes to the owner first.
 - [ ] **Step 2:** The agent labels gold. `label.py` exports the owner sample. Hand the owner the file path and the count. The owner labels.
 - [ ] **Step 3:** `score.py` on the held-out half. Commit `results/summary.json` and paste one line per bar into this step.
 - [ ] **Step 4:** All bars pass → open the PR note asking the owner to set `TEST_EMIT_ITEM_SUPPORT=true`, then redeploy TEST (give the workflow name and run link). Any fail → record it here and stop; no flag change.
