@@ -48,6 +48,12 @@ def test_bare_string_kinds_rejected():
         _call(kinds="finding")
 
 
+def test_bare_string_exclude_source_keys_rejected():
+    """One key as a str would iterate to characters and silently exclude nothing."""
+    with pytest.raises(ValueError, match="exclude_source_keys"):
+        _call(exclude_source_keys="extractions/u/2026-11-01/sid.json")
+
+
 def test_unknown_status_kind_rejected():
     with pytest.raises(ValueError, match="unknown"):
         _call(statuses={"safety": ["open"]})

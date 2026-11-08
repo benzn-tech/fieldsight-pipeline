@@ -45,6 +45,9 @@ CREATE INDEX IF NOT EXISTS idx_event_links_ai ON event_links (src_action_item_id
 CREATE INDEX IF NOT EXISTS idx_event_links_fi ON event_links (src_finding_id)     WHERE src_finding_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_event_links_de ON event_links (src_decision_id)    WHERE src_decision_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_event_links_qu ON event_links (src_question_id)    WHERE src_question_id IS NOT NULL;
+-- find_items and the claim recompute read decisions/questions per site.
+CREATE INDEX IF NOT EXISTS idx_topic_decisions_site ON topic_decisions (site_id);
+CREATE INDEX IF NOT EXISTS idx_topic_questions_site ON topic_questions (site_id);
 
 -- Derived, never self-reported (assessment §2.4). NULL = unknown.
 ALTER TABLE action_items    ADD COLUMN IF NOT EXISTS claim_type text;

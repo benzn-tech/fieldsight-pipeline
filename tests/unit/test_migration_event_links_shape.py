@@ -79,3 +79,11 @@ def test_every_add_constraint_is_pg_constraint_guarded():
         flat = " ".join(inside[0][2].split())
         assert (f"IF NOT EXISTS ( SELECT 1 FROM pg_constraint WHERE conname = '{name}'"
                 in flat), name
+
+
+def test_decisions_and_questions_are_indexed_by_site():
+    sql = _flat()
+    assert ("CREATE INDEX IF NOT EXISTS idx_topic_decisions_site "
+            "ON topic_decisions (site_id);") in sql
+    assert ("CREATE INDEX IF NOT EXISTS idx_topic_questions_site "
+            "ON topic_questions (site_id);") in sql

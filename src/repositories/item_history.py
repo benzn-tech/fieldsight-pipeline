@@ -171,6 +171,9 @@ def find_items(conn, *, company_id, site_id, kinds, statuses=None, since=None, u
     """
     kinds, statuses, since, until = _validate(company_id, site_id, kinds, statuses,
                                               since, until, limit)
+    if isinstance(exclude_source_keys, str):
+        # A bare key would iterate to characters and exclude nothing.
+        raise ValueError("exclude_source_keys must be a collection of source keys")
     live = visible_topics_predicate("t")
     excluded = set(exclude_source_keys or ())
     want_resp = _norm(responsible) if responsible is not None else None
