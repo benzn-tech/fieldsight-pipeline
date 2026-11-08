@@ -1,6 +1,6 @@
 # Track C, slice 1: shared item history and the evidence chain (design)
 
-**Date:** 2026-11-08 · **Status:** design, for owner approval · **Branch:** `feature/track-c-event-links`
+**Date:** 2026-11-08 · **Status:** design, approved by the owner 2026-11-08 (§9) · **Branch:** `feature/track-c-event-links`
 **Inputs:** assessment `specs/2026-09-24-event-graph-and-jev-assessment.md` §2.4, §2.5, §6 (Track C);
 Track A verdict `specs/2026-09-28-jev-shadow-eval-findings.md` §8 (Jev is not the decision centre);
 Track B plan and the continuity plan `plans/2026-09-30-extractor-declares-item-continuity.md` (template
@@ -203,7 +203,7 @@ find_items(conn, *, company_id, site_id, kinds,
 - **Columns** on the four item tables: `claim_type text NULL CHECK IN ('observed','stated','inferred')`
   and `claim_basis jsonb` (link id, speaker identity used, rule_version).
 - **Rule v1,** computed by `lambda_item_writer` in-VPC at write time:
-  - **no `supported_by` link:** `inferred`.
+  - **no link and nothing close in the topic's turns:** `inferred`; no link but weak or tied candidates: `NULL` (§9.3).
   - **linked turn's speaker identified as the recorder**, through `speaker_turn_names` → voiceprint →
     user = the session's user: `observed`.
   - **linked turn's speaker identified as someone else:** `stated`.
@@ -255,14 +255,33 @@ go in dated addenda.
   Its correctness rests on bar 1 plus speaker identity. A labelled check of `observed` vs `stated`
   waits until prod speaker identity is on.
 
-## 9. Owner decisions pending
+## 9. Owner decisions (2026-11-08, approved)
 
-1. **Who re-runs `claim_type` after names land.** Recommended: the voiceprint writer, in-VPC, calls
-   the recompute for the session right after writing its `speaker_turn_names` (one function call, no
-   new Lambda; the voiceprint line is told the interface). Alternatives: a nightly in-VPC sweep, or
-   only the manual backfill script (then `observed` / `stated` stay empty in practice).
-2. **Coverage line.** Below what held-out coverage the next step is to measure the topic-quote-index
-   prompt option (+~3% output tokens).
+1. **Recompute after names land:** the voiceprint writer, in-VPC, calls the per-session
+   `claim_type` recompute right after writing that session's `speaker_turn_names`. It is one function
+   call, with no new Lambda and no model. A backfill script uses the same function.
+2. **Coverage line = 60%.** If held-out link coverage on final items is below 60%, the next step is a
+   separate pre-registration measuring the topic-quote-index prompt option (+~3% output tokens).
+   At or above 60%, the prompt stays unchanged.
+3. **`inferred` is narrowed** (rule v1 amended before any result). An item is `inferred` only when the
+   matcher found *nothing close* to it in the topic's turns, with best score below a low "nothing
+   close" floor, the same idea as `evidence_match.NOTHING_CLOSE_RATIO`. An item with candidates that
+   were too weak or tied is `NULL` (unknown). Otherwise at 60% coverage, most of the 40% unlinked
+   items, which someone did say, would be mislabelled `inferred`. The nothing-close floor is fixed
+   on the fit half like the others, and is checked by bar 5 below.
+4. **A nightly model re-match agent** (owner's idea) belongs to the site decision loop
+   (`specs/2026-11-05-site-decision-loop-design.md`, architecture line) as its first scheduled-scan
+   handler, with a separate design. It is not built by Track C. Agreed constraints:
+   - silent writes only in the store-only layer (`event_links` repairs, `claim_type`), tagged
+     `method='nightly_*'`, reversible;
+   - anything user-visible or state-changing (status, `continues`, `resolves`) is a proposal for a
+     person;
+   - each judgement kind has its own `decision_records` kind and bars.
+   Track C provides it `find_items`, `event_links` and the recompute entry point.
+
+Bar 5 (added with decision 3): **`inferred` precision**. Among held-out items the rule labels
+`inferred`, the share that gold says some turn did support is ≤ 10%, judged by the one-sided 95%
+Clopper–Pearson upper bound. Below 20 such items it is reported only.
 
 ## 8. Left to the builder
 
