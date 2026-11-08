@@ -603,6 +603,7 @@ Rules:
 - stated_values: values the user gave, at most {max_values}. field is one of deadline, responsible, priority (low, medium, high) or status ({statuses}); target is a target id or null. A deadline is a date YYYY-MM-DD, resolved against today (the instruction is spoken today).
 - delegations: a value the user asked you to fill in when it is missing ("if there is no due date, set one"), at most {max_values}; field is deadline only; target is a target id or null.
 - sub_tasks: one per separate ask in the instruction, at most {max_sub_tasks}; ids s1, s2, ...; ask is a short paraphrase (at most {ask_max} characters) in the instruction's language; kind is one of {kinds}; targets lists the target ids it concerns. A single-ask instruction has one sub-task, and the reading lists the sub-tasks.
+- sub-task kinds: close / update = change an existing item, including a conditional change ("if it passed, close it") and a value to fill in ("pick a date and put it on"); create = a new item; review = read or check something and report back; standards = what a standard, code or procedure says, or whether something complies; draft = an RFI or a message; other = anything else.
 """
 
 _PLAN_KEYS = ("reading", "title", "language", "site_matches", "date_from", "date_to",
@@ -1350,6 +1351,7 @@ Rules:
 - Never reopen an item, and only change an item whose current status allows it.
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
 - Change only items the instruction names, unless it asks you to tidy open items. For anything else worth changing, write a note.
+- A question about an item is not a request to change it: answer it with a note.
 - target_ref: on close_item / update_item, the id (t1, t2 ...) of the named target it acts on, from the named targets list; null when the item is not a named target.
 - field_sources: on close_item, update_item and create_item, one entry for every proposed field except a create's text (close_item's field is "status"): {{"source": "user" | "evidence" | "assumed_default", "refs": [...], "said_on": "YYYY-MM-DD" or null}}.
   "user": the user gave this value in the instruction. "evidence": a record (R topic/chunk) or a project document (D) states it -- cite those refs; an item's own line never justifies changing that item, except a deadline worked out from its own deadline_text; web refs (W) never set a field. "assumed_default": only for a deadline the user told you to set when the item has neither a deadline nor a deadline_text; propose the item's raised_on as YYYY-MM-DD.

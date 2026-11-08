@@ -36,6 +36,15 @@ removed (`field_unsourced__<field>`); a close/update left with nothing is droppe
                      action is marked `assumed = ["deadline"]` (`date_assumed`).
 A stated status still has to be a legal change for the type (`drop_illegal_after_gate`).
 
+Rule 5 -- an asked change (spec §3.5), under `named` only, after rules 1-2 and before rule
+3. `T` is every planner target that resolved to the action's item; `covering` the plan's
+sub-tasks whose targets meet `T` (with exactly one planner target, an untargeted sub-task
+covers it). With no sub-tasks or nothing covering, the action passes (no planner signal).
+A covering sub-task of a kind in `CHANGE_KINDS` passes it unchanged. Otherwise every field
+the user did not ask for -- no stated value and no delegation for (an id in `T` or null,
+that field) -- is removed (`field_unasked__<field>`), and a close/update left with none is
+dropped (`drop_unasked_change`): a question about an item is not a request to change it.
+
 Rule 4 -- deadline sanity. An `evidence` deadline carries `said_on` equal to the date of
 one of its source refs (a topic's or chunk's date; the target's own item row's raised_on)
 or is removed (`field_said_on_mismatch`); a deadline before that day is removed
@@ -61,6 +70,7 @@ from action_pack_verify import OPEN_STATUSES
 
 TARGETED = ("close_item", "update_item")
 SOURCED = TARGETED + ("create_item",)
+CHANGE_KINDS = ("close", "update", "other")
 EVIDENCE_KINDS = ("topic", "chunk", "document")
 
 NOTE_SUFFIX = {
@@ -140,6 +150,41 @@ def _scope(a, *, plan, resolution, items, named_sids, lang, counts):
         _bump(counts, "drop_unasked_target")
         return None
     return a
+
+
+def _asked(a, *, plan, resolution, counts):
+    """Rule 5 for one close/update that passed rules 1-2 -> the action with only its asked
+    fields, or None (dropped)."""
+    if plan.change_scope == "tidy":
+        return a
+    subs = getattr(plan, "sub_tasks", None) or []
+    if not subs:
+        return a
+    sid = a.get("target_stable_id")
+    tids = {tid for tid, r in resolution.items()
+            if r.kind == targets.RESOLVED and r.stable_id == sid}
+    single = len(getattr(plan, "targets", None) or []) == 1
+    covering = [s for s in subs if tids & set(s.get("targets") or ())
+                or (single and not s.get("targets"))]
+    if not covering or any(s.get("kind") in CHANGE_KINDS for s in covering):
+        return a
+    scope_ids = tids | {None}
+
+    def asked(fld):
+        return any(e["field"] == fld and e["target"] in scope_ids
+                   for e in list(getattr(plan, "stated_values", None) or [])
+                   + list(getattr(plan, "delegations", None) or []))
+
+    proposed = dict(a.get("proposed") or {})
+    for fld in [f for f in proposed if f != "text"]:
+        if not asked(fld):
+            proposed.pop(fld)
+            _bump(counts, f"field_unasked__{fld}")
+    if not [f for f in proposed if f != "text"]:
+        _bump(counts, "drop_unasked_change")
+        return None
+    sources = {k: v for k, v in (a.get("field_sources") or {}).items() if k in proposed}
+    return dict(a, proposed=proposed, field_sources=sources)
 
 
 def _day_iso(value):
@@ -298,6 +343,8 @@ def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
         if a.get("type") in TARGETED:
             a = _scope(a, plan=plan, resolution=resolution, items=items,
                        named_sids=named_sids, lang=lang, counts=counts)
+            if a is not None and a.get("type") in TARGETED:
+                a = _asked(a, plan=plan, resolution=resolution, counts=counts)
         if a is not None and a.get("type") in SOURCED:
             tid = (_named_target(a, resolution, ambiguous=False)
                    if a["type"] in TARGETED else None)
