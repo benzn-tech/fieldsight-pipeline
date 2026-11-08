@@ -995,6 +995,61 @@ def _walk_sections(walk, template, prose, futures, items, turns, date, name=None
     return secs, walk_report.reports(secs), walk_report.result(laid, walk.get("key"))
 
 
+LOCATIONS_TITLE = "Locations"
+
+
+def _locations_section(artifact, offer, walk):
+    """The report's topics under the places he said out loud, as one prose
+    section, or None (Track L Task 6; spec 2026-11-09).
+
+    The day report's own entries (report_sections.locations_section), built
+    from THIS report's offer -- the topics in its window, the same list the
+    grouping and the titles read, so position identity holds -- and the
+    request's markers. One line per place in visit order: the place in bold,
+    then its topic titles.
+
+    ABSENT, NEVER EMPTY: no markers, no grouping, or no topic at a named
+    place -- a section of only "Before any location was announced" says
+    nothing. A walk report has none: it is laid out by unit already.
+    `walk` is the worker's local, so a walk demoted to an ordinary report
+    (its template has no checklist) gets one like any other.
+
+    Never raises: a failure is logged and the report goes out without it.
+    """
+    if walk:
+        logger.info("locations: absent (walk report)")
+        return None
+    markers = (artifact.get("reportFacts") or {}).get("locations")
+    if not markers:
+        logger.info("locations: absent (no markers)")
+        return None
+    try:
+        # Lazy, inside the try: an import that fails costs this section,
+        # never the report.
+        import report_sections
+        built = report_sections.locations_section(offer, markers, None)
+        rows = (built or {}).get("items") or []
+        if not rows:
+            logger.info("locations: absent (no grouping)")
+            return None
+        placed = [r for r in rows if r.get("title") not in report_sections.NO_PLACE_TITLES]
+        if not placed:
+            logger.info("locations: absent (no topic at a named place)")
+            return None
+        # Counted from the rows' titles (deduplicated as the day report does).
+        logger.info("locations: %d places, %d topics placed, %d unplaced",
+                    len(placed), sum(len(r.get("topics") or []) for r in placed),
+                    sum(len(r.get("topics") or []) for r in rows
+                        if r.get("title") in report_sections.NO_PLACE_TITLES))
+        return {"title": LOCATIONS_TITLE, "level": 1, "covers": [],
+                "paragraphs": ["**%s** — %s" % (r["title"], r.get("note") or "")
+                               for r in rows],
+                "line_refs": [[] for _ in rows]}
+    except Exception:  # noqa: BLE001 - one section, never the report
+        logger.exception("locations: could not be built -- written without it")
+        return None
+
+
 def _generate_document(artifact, context=None):
     """Returns (buffer, meta). Raises on anything that must not produce a document."""
     gen = artifact["generate"]
@@ -1224,6 +1279,13 @@ def _generate_document(artifact, context=None):
         code_placements = walk_report.anchor_placements(code_placements, template, prose)
     report_facts.insert(prose, code_placements, code_sections,
                         (template.get("catch_all") or {}).get("title"))
+    # WHERE EACH TOPIC WAS (Track L Task 6): last of the template's sections,
+    # after every photograph has been placed -- so it can never catch one --
+    # and before the Actions table and the coverage note.
+    if os.environ.get("REPORT_LOCATIONS_SECTION", "").lower() == "true":
+        locations = _locations_section(artifact, topic_offer, walk)
+        if locations:
+            prose.append(locations)
 
     buf = lambda_meeting_minutes.generate_prose_document(
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",

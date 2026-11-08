@@ -84,7 +84,7 @@ Pure: no database, no network.
 """
 from photo_binding import parse_time_range, photo_time
 from place_normalise import normalise, place_key, resolve
-from repositories.location_markers import locate
+from location_locate import locate
 
 
 def _clean_markers(markers):

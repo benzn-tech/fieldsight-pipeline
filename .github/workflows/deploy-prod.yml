@@ -398,6 +398,7 @@ jobs:
               "ContinuityLinker=${{ vars.PROD_CONTINUITY_LINKER || 'false' }}" \
               "StatusEvidenceFloorTokens=${{ vars.PROD_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
+              "ReportLocationsSection=${{ vars.PROD_REPORT_LOCATIONS_SECTION || 'false' }}" \
               "EmitItemSupport=${{ vars.PROD_EMIT_ITEM_SUPPORT || 'false' }}" \
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \

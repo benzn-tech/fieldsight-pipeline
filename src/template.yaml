@@ -1318,6 +1318,17 @@ Parameters:
       morning after. Declared here rather than left to the code default so the
       rollback survives a deploy.
 
+  ReportLocationsSection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Track L Task 6. Whether a generated (template) report ends its sections
+      with a Locations section: the report's topics under the places he
+      announced, in visit order. Changes what customers receive, so prod is
+      the owner's switch. Off = the document is exactly today's. Passed on
+      every deploy: SAM keeps a parameter's previous value otherwise.
+
   EmitItemSupport:
     Type: String
     Default: 'false'
@@ -2352,6 +2363,8 @@ Resources:
           # Company offboarding gate (tenancy_status): off = shadow log only.
           COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref IngestBucketName   # the lake — where org-api enqueues the request
+          # Track L Task 6: a Locations section after the template's sections.
+          REPORT_LOCATIONS_SECTION: !Ref ReportLocationsSection
           # Email is stub (logs, sends nothing) until an SES identity is verified as
           # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
           EMAIL_SENDER: stub
