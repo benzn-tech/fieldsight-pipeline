@@ -89,7 +89,13 @@ def owner_sample(rows, n=OWNER_SAMPLE_SIZE, seed=store.OWNER_SEED):
 
 
 def export(data_dir=store.DATA_DIR, labels_dir=store.LABELS_DIR):
-    rows = blind_rows(store.load_sessions(data_dir))
+    digest = store.manifest_digest(data_dir)
+    for todo, dones in store.LABEL_FILES.items():
+        # Re-exporting over answers made on another manifest would launder them onto this one.
+        old = {r.get("manifest_digest") for r in store.read_jsonl(Path(labels_dir, todo))}
+        if old - {digest} and any(store.read_jsonl(Path(labels_dir, x)) for x in dones):
+            raise SystemExit(f"Refusing: {todo} has answers made on another manifest.")
+    rows = [{**r, "manifest_digest": digest} for r in blind_rows(store.load_sessions(data_dir))]
     sample = owner_sample(rows)
     store.write_jsonl(Path(labels_dir, "todo.agent.jsonl"), rows)
     store.write_jsonl(Path(labels_dir, "todo.owner.jsonl"), sample)

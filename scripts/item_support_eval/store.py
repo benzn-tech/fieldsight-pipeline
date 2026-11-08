@@ -168,10 +168,41 @@ def load_sessions(data_dir=DATA_DIR, split=None):
 
 
 def manifest_digest(data_dir=DATA_DIR):
-    """sha256 of data/manifest.json, or None if there is none. Recorded by every run and by the
-    fit, so a rebuilt set (a different split) cannot be scored against a fit made on another."""
+    """sha256 of data/manifest.json. Recorded by every run, by the fit and by the label todo
+    files, so a rebuilt set (a different split) cannot be scored against a fit or labels made on
+    another. A missing manifest raises: None would compare equal to an unrecorded digest."""
     p = Path(data_dir, "manifest.json")
-    return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+    if not p.exists():
+        raise SystemExit(f"Refusing: {p} is missing. Build the set first; nothing is scored "
+                         f"without a frozen manifest.")
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+LABEL_FILES = {"todo.agent.jsonl": ("done.agent.jsonl",),
+               "todo.owner.jsonl": ("done.owner.jsonl", "done.adjudicate.owner.jsonl")}
+
+
+def require_labels_on_manifest(labels_dir=LABELS_DIR, data_dir=DATA_DIR):
+    """Refuse labels made on another manifest. Every todo row export wrote carries the
+    manifest digest; a label file with answers needs its todo file, on the current digest. A
+    done row that itself carries a digest must match too. Returns the current digest."""
+    current = manifest_digest(data_dir)
+    d = Path(labels_dir)
+    for todo, dones in LABEL_FILES.items():
+        answered = [x for x in dones if read_jsonl(d / x)]
+        todo_rows = read_jsonl(d / todo)
+        if answered and not todo_rows:
+            raise SystemExit(f"Refusing: {', '.join(answered)} without {todo}: the labels' "
+                             f"manifest is unknown.")
+        recorded = {r.get("manifest_digest") for r in todo_rows}
+        for x in dones:
+            recorded |= {r["manifest_digest"] for r in read_jsonl(d / x)
+                         if "manifest_digest" in r}
+        if recorded - {current}:
+            raise SystemExit(f"Refusing: labels in {todo} (and its answers) were made on "
+                             f"manifest {sorted(map(str, recorded - {current}))}, data/ now "
+                             f"holds {current}. The split is frozen; rebuild nothing.")
+    return current
 
 
 def require_same_manifest(recorded, data_dir=DATA_DIR, what="run"):

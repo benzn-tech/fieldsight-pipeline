@@ -400,7 +400,8 @@ def flag_decisions(rows):
             if isinstance(r.get("confirmed"), bool)}
 
 
-def load_gold(labels_dir=store.LABELS_DIR):
+def load_gold(labels_dir=store.LABELS_DIR, data_dir=store.DATA_DIR):
+    store.require_labels_on_manifest(labels_dir, data_dir)
     d = Path(labels_dir)
     agent = gold_by_ref(store.read_jsonl(d / "done.agent.jsonl"))
     owner = gold_by_ref(store.read_jsonl(d / "done.owner.jsonl"))
@@ -414,7 +415,7 @@ def fit(grid_dir=store.RUNS_DIR / "grid", data_dir=store.DATA_DIR,
     if gmeta.get("split") != "fit":
         raise SystemExit(f"Refusing: the grid run is on split {gmeta.get('split')!r}, not 'fit'")
     digest = store.require_same_manifest(gmeta.get("manifest_digest"), data_dir, "grid run")
-    agent, owner, adj = load_gold(labels_dir)
+    agent, owner, adj = load_gold(labels_dir, data_dir)
     judge = Judge(store.load_sessions(data_dir, split="fit"), merge_gold(agent, owner, adj))
     by_point = defaultdict(list)
     for r in store.read_jsonl(Path(grid_dir, "rows.jsonl")):
@@ -444,7 +445,7 @@ def build_summary(*, run_a, run_b, out_path, both_paths_run=None, data_dir=store
     from scripts.item_support_eval import run as run_mod
 
     sessions = store.load_sessions(data_dir)
-    agent, owner, adj = load_gold(labels_dir)
+    agent, owner, adj = load_gold(labels_dir, data_dir)
     judge = Judge(sessions, merge_gold(agent, owner, adj))
     meta = store.read_json(Path(run_a, "meta.json"))
     for rd in (run_a, run_b) + ((both_paths_run,) if both_paths_run is not None else ()):

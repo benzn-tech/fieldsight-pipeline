@@ -452,16 +452,22 @@ def test_build_summary_end_to_end_counts_only(tmp_path):
     s = _session()
     rec = {**s, "turns": [store.encode_turn(t) for t in s["turns"]]}
     store.write_json(data / "sessions" / "abc.json", rec)
+    store.write_json(data / "manifest.json", {"seed": store.SPLIT_SEED, "sessions": ["abc"]})
+    digest = store.manifest_digest(data)
     sessions = store.load_sessions(data)
     rows = run.run_point(sessions, 0.5, 0.1, 0.2, ("quote", "window"))
     meta = {"split": "heldout", "paths": ["quote", "window"], "floor": 0.5, "margin": 0.1,
-            "nothing_close": 0.2}
+            "nothing_close": 0.2, "manifest_digest": digest}
     run.write_point_run(runs / "a", rows, meta)
     run.write_point_run(runs / "b", rows, meta)
+    store.write_jsonl(labels / "todo.agent.jsonl", [
+        {"item_ref": "abc:0:findings:0", "manifest_digest": digest},
+        {"item_ref": "abc:0:decisions:0", "manifest_digest": digest}])
     store.write_jsonl(labels / "done.agent.jsonl", [
         {"item_ref": "abc:0:findings:0", "label": "turn", "turns": [1]},
         {"item_ref": "abc:0:decisions:0", "label": "none", "turns": []}])
-    store.write_jsonl(labels / "todo.owner.jsonl", [{"item_ref": "abc:0:findings:0"}])
+    store.write_jsonl(labels / "todo.owner.jsonl",
+                      [{"item_ref": "abc:0:findings:0", "manifest_digest": digest}])
     store.write_jsonl(labels / "done.owner.jsonl", [
         {"item_ref": "abc:0:findings:0", "label": "turn", "turns": [1]}])
     out = tmp_path / "results" / "summary.json"
@@ -579,3 +585,71 @@ def test_fit_refuses_a_grid_not_on_the_fit_split_and_records_the_digest(tmp_path
     out = score.fit(grid_dir, data, labels, out_path=runs / "fit" / "choice.json")
     assert out["manifest_digest"] == store.manifest_digest(data)
     assert store.read_json(runs / "fit" / "choice.json")["manifest_digest"] ==         store.manifest_digest(data)
+
+
+# =========================================================================================
+# Final fix: labels are pinned to the manifest
+# =========================================================================================
+
+def test_a_missing_manifest_raises_never_none(tmp_path):
+    data = tmp_path / "item_support_eval" / "data"
+    with pytest.raises(SystemExit):
+        store.manifest_digest(data)
+    with pytest.raises(SystemExit):
+        store.require_same_manifest(None, data)
+
+
+def _labelled_fixture(tmp_path):
+    root = tmp_path / "item_support_eval"
+    data, labels = root / "data", root / "labels"
+    s = _session()
+    store.write_json(data / "sessions" / "abc.json",
+                     {**s, "turns": [store.encode_turn(t) for t in s["turns"]]})
+    store.write_json(data / "manifest.json", {"seed": store.SPLIT_SEED, "sessions": ["abc"]})
+    return data, labels
+
+
+def test_export_records_the_manifest_digest_in_both_todo_files(tmp_path):
+    data, labels = _labelled_fixture(tmp_path)
+    label.export(data, labels)
+    digest = store.manifest_digest(data)
+    agent = store.read_jsonl(labels / "todo.agent.jsonl")
+    assert agent and all(r["manifest_digest"] == digest for r in agent)
+    assert all(r["manifest_digest"] == digest
+               for r in store.read_jsonl(labels / "todo.owner.jsonl"))
+    assert store.require_labels_on_manifest(labels, data) == digest
+
+
+def test_score_refuses_labels_made_on_another_manifest(tmp_path):
+    data, labels = _labelled_fixture(tmp_path)
+    label.export(data, labels)
+    store.write_jsonl(labels / "done.agent.jsonl",
+                      [{"item_ref": "abc:0:findings:0", "label": "turn", "turns": [1]}])
+    score.load_gold(labels, data)                                # same manifest: fine
+    store.write_json(data / "manifest.json", {"seed": "rebuilt", "sessions": ["abc"]})
+    with pytest.raises(SystemExit):
+        score.load_gold(labels, data)
+    # ...and re-exporting cannot launder the old answers onto the new manifest.
+    with pytest.raises(SystemExit):
+        label.export(data, labels)
+
+
+def test_score_refuses_answers_whose_todo_file_is_missing_or_unpinned(tmp_path):
+    data, labels = _labelled_fixture(tmp_path)
+    store.write_jsonl(labels / "done.owner.jsonl",
+                      [{"item_ref": "abc:0:findings:0", "label": "turn", "turns": [1]}])
+    with pytest.raises(SystemExit):
+        score.load_gold(labels, data)
+    store.write_jsonl(labels / "todo.owner.jsonl", [{"item_ref": "abc:0:findings:0"}])
+    with pytest.raises(SystemExit):
+        score.load_gold(labels, data)
+
+
+def test_a_done_row_carrying_another_digest_is_refused(tmp_path):
+    data, labels = _labelled_fixture(tmp_path)
+    label.export(data, labels)
+    store.write_jsonl(labels / "done.agent.jsonl",
+                      [{"item_ref": "abc:0:findings:0", "label": "turn", "turns": [1],
+                        "manifest_digest": "0" * 64}])
+    with pytest.raises(SystemExit):
+        score.load_gold(labels, data)
