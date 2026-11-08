@@ -2381,8 +2381,8 @@ def _run_linker(prior, topics, transcript_text, budget_deadline=None):
                         len(refs), len(prior), record["dropped"])
     except Exception as e:
         record.update(status="error", dropped=0, model=None)
-        logger.exception("continuity linker: failed (%s; refs=%d) -- exact matches only",
-                         type(e).__name__, len(refs))
+        logger.warning("continuity linker: failed (%s; refs=%d) -- exact matches only",
+                       type(e).__name__, len(refs))
     finally:
         if record["status"] != "skipped_budget":
             record["ms"] = int((time.monotonic() - started) * 1000)

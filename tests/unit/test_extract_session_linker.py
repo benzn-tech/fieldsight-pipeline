@@ -177,7 +177,7 @@ def test_live_pass_ignores_linker_flag(monkeypatch):
     assert len(fake.calls) == 1
     prompt = fake.calls[0]["prompt"]
     assert "<<<PRIOR_ITEMS>>>" in prompt
-    assert prompt.index("## Session Transcript") < prompt.index("<<<PRIOR_ITEMS>>>")
+    assert prompt.index("<<<PRIOR_ITEMS>>>") < prompt.index("## Session Transcript")
     assert "linker" not in out["continuity"]
     assert out["continuity"]["question_set"] == ic.QUESTION_SET
 
@@ -294,3 +294,20 @@ def test_handler_passes_the_remaining_budget_on_the_final_branch(monkeypatch):
     les.lambda_handler({"Records": [{"s3": {"object": {
         "key": "extraction_requests/" + SESSION_BASE + ".json"}}}]}, None)
     assert seen["remaining_ms"] is None
+
+
+def test_run_linker_failure_logs_a_warning_with_the_type_only(monkeypatch, caplog):
+    """Spec L7: WARNING, counts only -- no traceback (it can carry item text) and no message."""
+    def _boom(*a, **k):
+        raise ValueError("secret item text")
+    monkeypatch.setattr(ic, "attach_links", _boom)
+    monkeypatch.setattr(llm_utils, "call_llm", _Calls([LINK_ANSWER]))
+    with caplog.at_level("DEBUG"):
+        rec = les._run_linker([], [{"action_items": [{"action": "x"}]}], "text",
+                              budget_deadline=None)
+    assert rec["status"] == "error"
+    mine = [r for r in caplog.records if "continuity linker" in r.getMessage()]
+    assert mine and all(r.levelname == "WARNING" for r in mine)
+    assert all(r.exc_info is None for r in mine)
+    assert "ValueError" in mine[0].getMessage()
+    assert "secret item text" not in caplog.text
