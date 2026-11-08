@@ -770,6 +770,84 @@ def test_finalize_linker_context_skips_chains_with_an_error_step(tmp_path):
     assert finalize_mod.linker_context(tmp_path) == {"linker_p90_ms": 200, "linker_not_ok": 0}
 
 
+# ---------------------------------------------------------------------------
+# finalize.prompt_mismatches: spec section 6's byte-equality check, automated.
+# ---------------------------------------------------------------------------
+
+def _step(sha, *, final=False, linker=None, linker_mode=True, error=None):
+    return {"prompt_sha1": sha, "linker_mode": linker_mode, "is_final": final,
+            "linker": linker, "prior_count": 2 if final else 0, "error": error}
+
+
+_OK = {"status": "ok", "ms": 100}
+
+
+def test_prompt_mismatches_empty_when_final_prompts_are_byte_equal(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    # Live steps differ by construction (the block); only linker finals are compared.
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("same", final=True, linker=_OK)])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [_step("b0"), _step("same", final=True)])
+    assert finalize_mod.prompt_mismatches(tmp_path) == []
+
+
+def test_prompt_mismatches_reports_a_mismatch_and_a_missing_baseline(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("aaaa", final=True, linker=_OK)])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [_step("b0"), _step("bbbb", final=True)])
+    _write_chain(tmp_path, "a", "with_block", 2, "s1",
+                 [_step("w0"), _step("cccc", final=True, linker=_OK)])
+    got = finalize_mod.prompt_mismatches(tmp_path)
+    assert len(got) == 2
+    assert "s1" in got[0] and "rep 1" in got[0] and "step 1" in got[0]
+    assert "aaaa" in got[0] and "bbbb" in got[0]
+    assert "rep 2" in got[1] and "no baseline" in got[1]
+
+
+def test_prompt_mismatches_compares_only_linker_finals_in_error_free_chains(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "baseline", 1, "s1", [_step("b0"), _step("base", final=True)])
+    # Not compared: the linker never ran (no prior), no linker mode, a chain with an error step.
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("x1", final=True, linker=None)])
+    _write_chain(tmp_path, "b", "with_block", 1, "s1",
+                 [_step("w0", linker_mode=False),
+                  _step("x2", final=True, linker=_OK, linker_mode=False)])
+    _write_chain(tmp_path, "a", "with_block", 2, "s1",
+                 [_step("w0", error="boom"), _step("x3", final=True, linker=_OK)])
+    assert finalize_mod.prompt_mismatches(tmp_path) == []
+
+
+def test_prompt_mismatches_ignores_a_baseline_chain_with_an_error_step(tmp_path):
+    """A baseline chain gather() skips is not a comparison partner: reported as no baseline."""
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("same", final=True, linker=_OK)])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [_step("b0", error="boom"), _step("same", final=True)])
+    got = finalize_mod.prompt_mismatches(tmp_path)
+    assert len(got) == 1 and "no baseline" in got[0]
+
+
+def test_linker_report_adds_the_mismatch_count_only_with_linker_records(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [{"prior_count": 0}, {"prior_count": 2, "prompt_has_block": True,
+                                      "prompt_sha1": "x"}])
+    assert finalize_mod.linker_report(tmp_path) == ({}, [])
+
+    _write_chain(tmp_path, "b", "with_block", 1, "s1",
+                 [_step("w0"), _step("aaaa", final=True, linker=_OK)])
+    _write_chain(tmp_path, "b", "baseline", 1, "s1",
+                 [_step("b0"), _step("bbbb", final=True)])
+    ctx, mismatches = finalize_mod.linker_report(tmp_path)
+    assert ctx["linker_prompt_mismatches"] == 1 == len(mismatches)
+    assert ctx["linker_p90_ms"] == 100
+
+
 @pytest.mark.parametrize("status_on", [True, False])
 def test_linker_prompt_carries_status_rule_only_when_status_suggestions_on(
         monkeypatch, tmp_path, status_on):
