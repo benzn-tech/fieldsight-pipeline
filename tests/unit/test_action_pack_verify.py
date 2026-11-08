@@ -834,3 +834,83 @@ def test_verify_prompt_carries_ref_dates():
     bare = apv.build_prompt("action", dict(el, refs=["D1"]), registry=registry,
                             items={SID1: item_row(SID1, "Inspect scaffold before Monday")})
     assert "(current status open) | raised_on -" in bare and "deadline_text" not in bare
+
+
+# ---- tolerant label parsing (spec 2026-11-05 §7.2, Task 7.1) --------------------------------
+
+def test_parse_fenced_with_reason():
+    text = ('```json\n{"label": "weak", "reason_code": "partly_stated", '
+            '"reason": "The record names the wall, not the date."}\n```')
+    label, info = apv.parse_label(text)
+    assert label == "weak"
+    assert info == {"reason_code": "partly_stated",
+                    "reason": "The record names the wall, not the date.", "form": "json"}
+    # the old strict shape still parses, as plain json
+    assert apv.parse_label('{"label": "supported"}') == (
+        "supported", {"reason_code": None, "reason": None, "form": "json"})
+
+
+def test_parse_prose_wrapped_object():
+    text = ('Here is my verdict:\n{"label": "unsupported", "reason_code": "contradicted", '
+            '"reason": "Ann says Friday, not Monday.", "confidence": 0.9}\nThanks.')
+    label, info = apv.parse_label(text)
+    assert label == "unsupported"
+    assert info == {"reason_code": "contradicted", "reason": "Ann says Friday, not Monday.",
+                    "form": "relaxed_json"}
+    # an invalid JSON label is a failure, never a fall-through to a word in the text
+    assert apv.parse_label('weak {"label": "maybe"}')[0] is None
+    assert apv.parse_label('{"label": "Supported"}')[0] is None
+    long = "x" * 300
+    assert len(apv.parse_label('{"label": "weak", "reason": "%s"}' % long)[1]["reason"]) \
+        == 200
+
+
+def test_parse_leading_word_weak():
+    label, info = apv.parse_label("Weak — the record says the scaffold was inspected, "
+                                  "not when.")
+    assert label == "weak" and info["form"] == "leading_word"
+    assert info["reason_code"] is None
+    assert info["reason"] == "the record says the scaffold was inspected, not when."
+    for text, want in [("**Supported**", "supported"), ('"unsupported"', "unsupported"),
+                       ("Label: weak", "weak"), ("**Verdict:** _supported_.", "supported"),
+                       ("unsupported: nothing in the evidence says this", "unsupported")]:
+        assert apv.parse_label(text)[0] == want, text
+    # a different label anywhere in a word answer is two verdicts: refused, not guessed
+    assert apv.parse_label("Weak. It is not supported by a dated record.")[0] is None
+
+
+def test_parse_rejects_two_labels():
+    for text in ("supported or weak", "Supported/weak", "weak, maybe unsupported",
+                 "label: supported or unsupported"):
+        label, info = apv.parse_label(text)
+        assert label is None and info["form"] is None, text
+
+
+def test_parse_rejects_mid_prose_label():
+    for text in ("The claim is weak.", "I think supported", "", "   ", None, 42,
+                 "supportedly so", '{"verdict": "weak"}'):
+        assert apv.parse_label(text)[0] is None, text
+
+
+def test_parse_bad_reason_code_none():
+    label, info = apv.parse_label('{"label": "weak", "reason_code": "vibes", '
+                                  '"reason": 7}')
+    assert label == "weak" and info["reason_code"] is None and info["reason"] is None
+    for code in ("partly_stated", "not_in_evidence", "value_not_in_evidence",
+                 "date_anchor", "contradicted", "other"):
+        assert apv.parse_label('{"label": "weak", "reason_code": "%s"}' % code)[1][
+            "reason_code"] == code
+
+
+def test_parse_forms_are_counted(monkeypatch):
+    answers = iter(['{"label": "supported"}', 'Sure: {"label": "weak"}', "Weak - partly",
+                    "maybe"])
+
+    def answer(prompt, model):
+        return next(answers), None, model, 1
+    monkeypatch.setattr(apv, "MAX_WORKERS", 1)
+    draft = {"conclusion": [line("a"), line("b"), line("c"), line("d")], "actions": []}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(answer))
+    c = result["counts"]
+    assert (c["parse_json"], c["parse_relaxed_json"], c["parse_leading_word"],
+            c["parse_fail"]) == (1, 1, 1, 1)

@@ -104,7 +104,8 @@ Counts (run_trace["verify"], flat ints, no text): raw_conclusion, raw_actions, d
 conclusion_no_refs, empty_refs, checks, check_failures, check_timeouts, family_skips,
 family_answers_rejected, fallback_answers, near_duplicate_flagged, label_conclusion_<label>, label_actions_<label>,
 conclusion_unsupported, actions_unsupported, web_only_conclusion, web_only_actions,
-no_snapshot_capped, date_assumed_weak -- so the eval can report the writer's raw rates and the post-verifier
+no_snapshot_capped, date_assumed_weak, parse_json, parse_relaxed_json, parse_leading_word,
+parse_fail (parse_label's form per answer read, spec 2026-11-05 §7.2) -- so the eval can report the writer's raw rates and the post-verifier
 rates separately (S16).
 
 Logs: counts and codes only.
@@ -122,12 +123,20 @@ from concurrent.futures import wait as futures_wait
 import carry_forward
 import lambda_action_agent as agent
 import todo_collapse
-from action_pack_stages import _day
+from action_pack_stages import _day, parse_json_object
 from ask_orchestrator import _fence, sanitize
 
 logger = logging.getLogger()
 
 LABELS = ("supported", "weak", "unsupported")
+# The verifier's reason codes (spec 2026-11-05 §7.2); anything else reads as None.
+REASON_CODES = ("partly_stated", "not_in_evidence", "value_not_in_evidence", "date_anchor",
+                "contradicted", "other")
+REASON_MAX_CHARS = 200
+_WHOLE_FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+_WORD_STRIP = "*_\"'`“”‘’ \t\r\n"
+_LABEL_PREFIX = re.compile(r"(?:label|verdict)\s*:", re.IGNORECASE)
+_LABEL_WORDS = re.compile(r"\b(supported|weak|unsupported)\b", re.IGNORECASE)
 TARGETED = ("close_item", "update_item")
 WEB_KINDS = ("web_answer", "web_source")
 OPEN_STATUSES = ("open", "in_progress", "blocked")
@@ -368,22 +377,67 @@ def build_prompt(kind, el, *, registry, items):
     return VERIFY_PROMPT.format(what=what, data=_fence(lines))
 
 
-def parse_label(text):
-    """The label of an answer that is exactly {"label": <one of LABELS>} (whitespace or a
-    ```json fence allowed), else None."""
-    if not isinstance(text, str):
+def _reason(value):
+    """A model-written reason: whitespace collapsed, at most REASON_MAX_CHARS, else None."""
+    if not isinstance(value, str):
         return None
-    t = text.strip()
-    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", t, re.DOTALL)
+    return " ".join(value.split())[:REASON_MAX_CHARS] or None
+
+
+def _strict_json(text):
+    """The object when the whole answer (or a fence that is the whole answer) is JSON."""
+    m = _WHOLE_FENCE.match(text)
     if m:
-        t = m.group(1)
+        text = m.group(1)
     try:
-        obj = json.loads(t)
+        obj = json.loads(text)
     except ValueError:
         return None
-    if not isinstance(obj, dict) or set(obj) != {"label"} or obj["label"] not in LABELS:
-        return None
-    return obj["label"]
+    return obj if isinstance(obj, dict) else None
+
+
+def parse_label(text):
+    """-> (label or None, {"reason_code", "reason", "form"}) -- spec 2026-11-05 §7.2.
+
+    Forms, in order:
+      json / relaxed_json -- a JSON object: the whole answer or a fence that is the whole
+          answer (`json`), else one found in the text by parse_json_object (`relaxed_json`:
+          prose around it, a fence inside prose, a brace slice). Its `label` must be one of
+          LABELS exactly; extra keys are allowed. An object with any other label is None
+          (never a fall-through to a word in the text).
+      leading_word -- no JSON object: after stripping markdown emphasis, quotes and a
+          `label:` / `verdict:` prefix, the first word is a label (any case), and no OTHER
+          label word appears anywhere in the answer ("supported or weak" is None). The
+          rest of the text is the reason.
+    reason_code is kept only when it is in REASON_CODES; reason is cut to REASON_MAX_CHARS.
+    A None label has form None."""
+    info = {"reason_code": None, "reason": None, "form": None}
+    if not isinstance(text, str) or not text.strip():
+        return None, info
+    t = text.strip()
+    obj, form = _strict_json(t), "json"
+    if obj is None:
+        obj, form = parse_json_object(t), "relaxed_json"
+    if obj is not None:
+        label = obj.get("label")
+        if not isinstance(label, str) or label not in LABELS:
+            return None, info
+        code = obj.get("reason_code")
+        return label, {"reason_code": code if code in REASON_CODES else None,
+                       "reason": _reason(obj.get("reason")), "form": form}
+    w = t.lstrip(_WORD_STRIP)
+    m = _LABEL_PREFIX.match(w)
+    if m:
+        w = w[m.end():].lstrip(_WORD_STRIP)
+    m = re.match(r"[A-Za-z]+", w)
+    if not m or m.group(0).lower() not in LABELS:
+        return None, info
+    label = m.group(0).lower()
+    said = {x.lower() for x in _LABEL_WORDS.findall(re.sub(r"[*_`]", " ", t))}
+    if said != {label}:
+        return None, info
+    rest = w[m.end():].lstrip(_WORD_STRIP + ".,;:!-–—")
+    return label, {"reason_code": None, "reason": _reason(rest), "form": "leading_word"}
 
 
 def _check(prompt, *, cands, writer_fams, deadline, clock):
@@ -391,7 +445,7 @@ def _check(prompt, *, cands, writer_fams, deadline, clock):
     -> {"label": str|None, "model": str|None, "tokens": int, "rejected": int}.
     An answer whose requested OR served id is in one of the writer's families is invalid
     and the next candidate is asked."""
-    out = {"label": None, "model": None, "tokens": 0, "rejected": 0}
+    out = {"label": None, "model": None, "tokens": 0, "rejected": 0, "parse": {}}
     for model in cands:
         left = deadline - MARGIN_S - clock()
         if left < MIN_CALL_S:
@@ -410,7 +464,8 @@ def _check(prompt, *, cands, writer_fams, deadline, clock):
         if family(used) in writer_fams or family(served) in writer_fams:
             out["rejected"] += 1
             continue
-        label = parse_label(text)
+        label, info = parse_label(text)
+        _bump(out["parse"], f"parse_{info['form']}" if label else "parse_fail")
         if label is None:
             continue
         out.update(label=label, model=used)
@@ -515,6 +570,8 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
             tokens += res["tokens"]
             if res["rejected"]:
                 _bump(counts, "family_answers_rejected", res["rejected"])
+            for key, n in (res.get("parse") or {}).items():
+                _bump(counts, key, n)
         label = res["label"] if res is not None else None
         if label is None:
             if res is not None:
