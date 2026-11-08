@@ -1849,3 +1849,15 @@ def test_apply_verdicts_carries_hidden_and_rejects_a_non_bool():
         st.apply_verdicts(draft, {"conclusion": [{"index": 0, "confidence": "uncertain",
                                                   "hidden": "yes"}],
                                   "actions": [], "model": VERIFIER})
+
+
+def test_sources_cited_only_by_a_hidden_line_are_not_in_the_pack():
+    # review of #1254: GET sources and refs_cited follow the shown lines only
+    write = write_obj(conclusion=[{"text": "Hidden one.", "refs": ["R2"],
+                                   "confidence": "supported"},
+                                  {"text": "The pour was done.", "refs": ["R1"],
+                                   "confidence": "supported"}], actions=[])
+    model = Model(plan=[plan_obj()], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=HideVerify(hide={0})))
+    assert payload["conclusion"][0].get("hidden") is True
+    assert {s["ref"] for s in payload["sources"]} == {"R1"}

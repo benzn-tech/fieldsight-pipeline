@@ -1256,3 +1256,22 @@ def test_hide_mode_in_trace(monkeypatch, mode, want):
         st.run(base.make_ctx(), base.deps(verify=apv.verify))
     assert ei.value.run_trace["verify_hide_mode"] == want
     assert action_pack_view.fail_trace_error(ei.value.run_trace) is None
+
+
+def test_parse_leading_supported_with_a_hedge_falls_back():
+    # review of #1254: a leading "supported" followed by more words may be a hedge; the
+    # old parser returned None (a fallback model asks again), and so does this one.
+    for text in ("Supported by the minutes; the deadline is not stated",
+                 "Supported? Partly.", "supported, but only the date"):
+        assert apv.parse_label(text)[0] is None, text
+    for text in ("Supported.", "**Supported**", "**Verdict:** _supported_."):
+        assert apv.parse_label(text)[0] == "supported", text
+    assert apv.parse_label("Weak - the date is not said.")[0] == "weak"
+
+
+def test_date_assumed_keeps_a_contradiction(monkeypatch):
+    answer = '{"label": "unsupported", "reason_code": "contradicted", "reason": "x"}'
+    result, _ = run_verify({"conclusion": [], "actions": [_assumed_update()]}, monkeypatch,
+                           fake=Fake(lambda p, m: (answer, None, m, 1)))
+    a = result["actions"][0]
+    assert (a["verifier"], a["detail"]["reason_code"]) == ("weak", "contradicted")

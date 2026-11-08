@@ -515,6 +515,10 @@ def parse_label(text):
     if said != {label}:
         return None, info
     rest = w[m.end():].lstrip(_WORD_STRIP + ".,;:!-–—")
+    if label == "supported" and rest.strip(_WORD_STRIP + ".!"):
+        # words after a bare "supported" may hedge it ("Supported? Partly."): ask the
+        # next candidate, as the strict parser did; a weaker label with words is kept
+        return None, info
     return label, {"reason_code": None, "reason": _reason(rest), "form": "leading_word"}
 
 
@@ -706,7 +710,9 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
             # the model already answered weak (the UI reads date_assumed, spec §9.3)
             if label != "weak":
                 _bump(counts, "date_assumed_weak")
-            label, cap = "weak", "date_assumed"
+            label = "weak"
+            # a contradiction is the more useful reason to keep (hide-off, the UI)
+            cap = (None if res.get("reason_code") == "contradicted" else "date_assumed")
         detail = _detail(res, "not_checked" if unchecked else cap, CAP_REASONS.get(cap))
         if (kind == "actions" and not hide and label == "unsupported" and not unchecked
                 and detail["reason_code"] not in HIDE_OFF_KEEP_UNSUPPORTED):

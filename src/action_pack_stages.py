@@ -2120,7 +2120,8 @@ def _conclusion_row(c):
 
 def build_payload(run, conclusion, actions):
     ctx, plan = run.ctx, run.plan
-    refs = cited_refs(conclusion, actions)
+    # sources follow the shown lines: a hidden line's refs never reach GET (#1254 review)
+    refs = cited_refs([c for c in conclusion if not c.get("hidden")], actions)
     out_actions = []
     for seq, a in enumerate(actions, start=1):
         row = {"seq": seq, "type": a["type"], "proposed": a.get("proposed") or {},
