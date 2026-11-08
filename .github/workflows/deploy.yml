@@ -343,6 +343,7 @@ jobs:
               "$TEMPLATE_DIGITISE_AUDIT_ALT_MODEL_PARAM" \
               "CheckDoneGaps=${{ vars.TEST_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.TEST_PROJECT_DOCUMENTS || 'false' }}" \
+              "ContactFieldSight=${{ vars.TEST_CONTACT_FIELDSIGHT || 'false' }}" \
               $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
