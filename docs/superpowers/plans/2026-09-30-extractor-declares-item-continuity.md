@@ -1371,9 +1371,17 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
   - there is an accepted `item_continuity` record.
   - Done 2026-10-27 (owner, one TEST session, 5 passes 22:17-22:25 UTC). **Pass.** The ticked item kept its `stable_id` and `item_id` through all 5 passes and stayed `done` while its text was reworded twice; `CarriedByMethod` Method=item_id 3/7/7/5, OrphanedHumanEdits 0 in every pass; `decision_records` item_continuity: 10 accepted, 2 rejected `echo`, 12 `exact_matched_item`.
   - Miss noted: an unticked item reworded in the final pass had its claim rejected by `echo`, fell below the fuzzy floor and got a new id. `starts` was not persisted, so the cause is unknown; #1186 now records it (capped `starts`, reason, prefix match, colliding alias) on echo rejections in the artifact's `continuity.claims`.
-- [ ] **Step 3:** Watch until at least 20 real sessions have run with the flag on, for at most 2 weeks (owner, 2026-10-01):
+- [x] **Step 3:** Watch until at least 20 real sessions have run with the flag on, for at most 2 weeks (owner, 2026-10-01):
   - `OrphanedHumanEdits`, `CarriedByMethod` by method;
   - `prior_stale` counts: grep the `continuity_write` lines, and join them with the writer's processed `extracted_at` lines using the Logs Insights query written in this step's note;
   - accepted and rejected `item_continuity` records by guard.
   - Progress 2026-10-27: 4 sessions with `item_continuity` records since 2026-10-23 (need 20; window ends 2026-11-06).
-- [ ] **Step 4:** Summarise for the owner. Prod needs the owner's decision and a prod-config measurement run (Task 10's `run.py` pointed at `fieldsight-prod-extract-session`'s env) first.
+  - Closed 2026-11-07 at the 2-week limit with 17 sessions (§7 rule: fewer than 20 after two weeks → report on what exists). 5 sessions before and 12 after `STATUS_SUGGESTIONS` went on.
+    - `decision_records` `item_continuity`: 512 records, 108 accepted; `echo` rejections 2, both the 10-27 case above (before #1186).
+    - `OrphanedHumanEdits` 0 over 121 writer passes.
+    - `prior_stale`: S3 keeps only the last published pass per key, so per-pass counts cannot be recovered after the fact. On the last pass of each key since 10-23: 24 extractions carry `continuity`, 3 with `prior_stale` true, 0 with `continuity.error`.
+- [x] **Step 4:** Summarise for the owner. Prod needs the owner's decision and a prod-config measurement run (Task 10's `run.py` pointed at `fieldsight-prod-extract-session`'s env) first.
+  - The owner switched `PROD_DECLARE_CONTINUITY` and `PROD_STATUS_SUGGESTIONS` on 2026-11-06, before the prod-config run finished; the owner kept both on after it (2026-11-08).
+  - Prod-config run (`prod-config-2026-11-06`, 13 prod sessions, 1768 blind agent labels): every bar passed except admission drift (0.743 vs tolerance 0.616). Cause: the thinking final pass re-emits the live list it is shown. Fixed by #1257 (block before the transcript, live passes) and the final-pass linker #1259 behind `CONTINUITY_LINKER` (spec `2026-11-08-continuity-linker-design.md`).
+  - Linker run (`linker-2026-11-09`): admission drift 0.374 (tolerance 0.582), carry recall 0.947, linker p90 10.1 s, 0 linker errors; 6 of 310 accepted claims disputed by the agent labeller, with the owner for adjudication. `CONTINUITY_LINKER` stays off on TEST and prod until that is settled.
+  - First prod read (sid9993b500, 2026-11-06): an `echo` rejection ("Gut" → "Gutter") kept its `stable_id` through the fuzzy pass but changed `item_id`, so its status suggestion was dropped as `not_carried` (4 offered, 3 kept). #1186 (echo diagnostics) was not yet on prod.
