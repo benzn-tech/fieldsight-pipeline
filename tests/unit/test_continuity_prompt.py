@@ -42,7 +42,7 @@ def test_empty_block_leaves_exactly_the_old_single_blank_line_before_instruction
 def test_block_sits_before_the_transcript_so_the_transcript_is_read_last():
     """Placed after the transcript, the prior list was the last thing the model read before
     answering and later passes re-emitted it instead of extracting (11-08 prod-config
-    measurement, shape b: finals 25 items with the block after vs 36-42 before, baseline ~43)."""
+    measurement, shape b: finals 19-31 items with the block after vs 36-42 before, baseline 39-48)."""
     block = ic.render_block([ic.PriorItem("A1", "action_items", "Book the crane", "id")])
     prompt, _ = les.build_extraction_prompt("u", "2026-09-30", "sidx", _turns(), 1,
                                             continuity_block=block)
