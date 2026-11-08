@@ -573,7 +573,7 @@ def _linker_stubs(monkeypatch, calls, linker_answer=None, extraction_info=None):
     monkeypatch.setattr(run_mod.les, "build_extraction_prompt", fake_build)
 
     def fake_call_llm(prompt, **kw):
-        calls.append(kw)
+        calls.append({**kw, "_prompt": prompt})
         if kw.get("caller") == "continuity_link_final":
             answer = linker_answer if linker_answer is not None else {
                 "links": [{"ref": "N1", "continues": {"id": "A1", "starts": "Fix the leaking pump"}}]}
@@ -746,3 +746,59 @@ def test_finalize_linker_context_absent_without_linker_records(tmp_path):
     _write_chain(tmp_path, "a", "with_block", 1, "s1",
                  [{"prior_count": 0}, {"prior_count": 2, "prompt_has_block": True}])
     assert finalize_mod.linker_context(tmp_path) == {}
+
+
+def test_finalize_linker_context_skips_chains_with_an_error_step(tmp_path):
+    """Same chains as gather() (and so the bars): a chain with any error step is skipped."""
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [{"prior_count": 0, "linker": None},
+                  {"prior_count": 2, "linker": {"status": "ok", "ms": 200}}])
+    _write_chain(tmp_path, "a", "with_block", 2, "s1",
+                 [{"prior_count": 0, "linker": None},
+                  {"prior_count": 2, "linker": None, "error": "boom"}])
+    _write_chain(tmp_path, "a", "with_block", 3, "s1",
+                 [{"prior_count": 0, "linker": None, "error": "boom"},
+                  {"prior_count": 2, "linker": {"status": "error", "ms": 50000}}])
+    assert finalize_mod.linker_context(tmp_path) == {"linker_p90_ms": 200, "linker_not_ok": 0}
+
+
+@pytest.mark.parametrize("status_on", [True, False])
+def test_linker_prompt_carries_status_rule_only_when_status_suggestions_on(
+        monkeypatch, tmp_path, status_on):
+    tmp_path = tmp_path / "continuity_eval_runs"
+    _install_gather_and_assemble(monkeypatch)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", True)
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", status_on)
+    calls = []
+    _linker_stubs(monkeypatch, calls)
+
+    run_mod.run_chain("bucket", SESSION, "a", sessions_mod.shapes()["a"],
+                      "with_block", 1, tmp_path)
+
+    linker_prompts = [c["_prompt"] for c in calls if c.get("caller") == "continuity_link_final"]
+    assert len(linker_prompts) == 1
+    rule = run_mod.status_suggestions.LINKER_INSTRUCTION
+    assert (rule in linker_prompts[0]) is status_on
+
+
+@pytest.mark.parametrize("flag,expected", [(["--status-instruction"], True), ([], False)])
+def test_status_instruction_flag_turns_on_les_status_suggestions(
+        monkeypatch, tmp_path, flag, expected):
+    # main() writes these module globals; record them via monkeypatch so teardown restores.
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", False)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", False)
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.EXTRA_INSTRUCTION)
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    s1 = {"env": "prod", "user_folder": "u", "date": "2026-09-01", "session_base": "s1",
+          "n_segments": 5}
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions", lambda env, **kw: [s1])
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_status"
+    run_mod.main(["--env", "prod", "--out", str(out_dir), "--linker", "--dry-run", *flag])
+
+    assert run_mod.les.STATUS_SUGGESTIONS is expected

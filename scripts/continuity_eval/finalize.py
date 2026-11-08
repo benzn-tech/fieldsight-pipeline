@@ -92,14 +92,14 @@ def linker_context(run_dir):
       linker_p90_ms: p90 of linker["ms"] where the linker status is "ok";
       linker_not_ok: steps with a prior (prior_count > 0) whose linker status is not "ok"
                      (error, skipped_budget, or never ran, e.g. the extraction call failed).
-    Every chain counts, including ones with an error step: a failed pass is exactly what
-    linker_not_ok is there to show. Report-only; no bar reads it."""
+    Chains with an error step are skipped, as gather() skips them, so these counts cover the
+    same chains as the bars. Report-only; no bar reads it."""
     finals = []
     for _shape, arm, _rep, _sess, d in chains(run_dir):
         if arm != "with_block":
             continue
         steps = load_steps(d)
-        if steps:
+        if steps and not any(s.get("error") for s in steps):
             finals.append(steps[-1])
     if not any(s.get("linker") is not None for s in finals):
         return {}

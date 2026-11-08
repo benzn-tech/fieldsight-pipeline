@@ -293,6 +293,11 @@ def main(argv=None):
     config_env = args.config_env if args.config_env is not None else args.env
     global EXTRA_INSTRUCTION, LINKER_MODE
     EXTRA_INSTRUCTION = status_suggestions.INSTRUCTION if args.status_instruction else ""
+    if args.status_instruction:
+        # The deployed extractor's linker adds status_suggestions.LINKER_INSTRUCTION when
+        # STATUS_SUGGESTIONS is on; les._run_linker reads this module global, so a prod-config
+        # run (both flags on) measures the linker under the same prompt.
+        les.STATUS_SUGGESTIONS = True
     LINKER_MODE = bool(args.linker)
 
     out_dir = paths_mod.require_run_dir(args.out)
