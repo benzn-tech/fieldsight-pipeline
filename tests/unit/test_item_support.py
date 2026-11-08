@@ -326,6 +326,23 @@ def test_cjk_direction_guard_refuses_wrong_side():
     assert s["status"] == "below_floor" and s["guard"] == "distinguishing_token"
 
 
+def test_cjk_numeral_guard_refuses_wrong_building():
+    turns = [_turn("四号楼防水", F1, 10.0, 10, 0, 10)]
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "三号楼防水"}])]}
+    isup.attach_support(result, turns, DATE, **CAL)
+    s = result["topics"][0]["findings"][0]["support"]
+    assert s["status"] == "below_floor" and s["guard"] == "distinguishing_token"
+
+
+def test_cjk_numeral_guard_passes_when_turn_has_the_numeral():
+    turns = [_turn("三号楼的防水", F1, 10.0, 10, 0, 10)]
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "三号楼防水"}])]}
+    isup.attach_support(result, turns, DATE, **CAL)
+    assert result["topics"][0]["findings"][0]["support"]["status"] == "linked"
+
+
 def test_guard_passes_when_turn_has_the_digit():
     turns = [_turn("level 2 slab is poured", F1, 10.0, 10, 0, 10)]
     result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],

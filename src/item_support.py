@@ -67,6 +67,8 @@ _KNOWN_PATHS = ("quote", "window")
 # Twin items differ in one of these; the linked turn must contain the item's.
 _ASCII_DIRECTIONS = frozenset({"east", "west", "north", "south", "left", "right"})
 _CJK_DIRECTIONS = "东西南北左右"  # east west south north left right
+# Chinese numerals ("三号楼" / "四号楼"): the CJK twin of the digit-token rule.
+_CJK_NUMERALS = "〇零一二三四五六七八九十百两"
 
 
 def _evidence_turns(evidence, turns):
@@ -134,12 +136,13 @@ def _window_turns(time_range, session_date, turns):
 
 
 def _distinguishing_ok(item_text, turn_text):
-    """Every digit token and direction word in the item must also be in the turn.
+    """Every digit token, direction word and Chinese numeral in the item must also be in
+    the turn.
 
     Twin items ("unit 3 ..." / "unit 4 ...", "east block ..." / "west block ...")
     differ in exactly one such token, and containment scoring alone still gives
-    the wrong twin 0.75-0.8. CJK directions are checked on the normalised text,
-    because tokenising puts them inside bigrams.
+    the wrong twin 0.75-0.8. CJK directions and numerals are checked character by
+    character on the normalised text, because tokenising puts them inside bigrams.
     """
     item_toks, turn_toks = set(tokens(item_text)), set(tokens(turn_text))
     for tok in item_toks:
@@ -147,7 +150,7 @@ def _distinguishing_ok(item_text, turn_text):
                 and tok not in turn_toks:
             return False
     item_n, turn_n = _norm(item_text), _norm(turn_text)
-    return all(ch in turn_n for ch in _CJK_DIRECTIONS if ch in item_n)
+    return all(ch in turn_n for ch in _CJK_DIRECTIONS + _CJK_NUMERALS if ch in item_n)
 
 
 def _norm(text):
