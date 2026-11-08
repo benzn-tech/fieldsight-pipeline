@@ -74,6 +74,22 @@ WHERE kind = 'photo'
 
 SQL_COMPANIES = "SELECT id::text, name FROM companies"
 
+# A photograph bound to a topic of a different site than the one its own
+# recording row was filed under. Binding is by person + day + time (with a
+# session-span filter), never by site, so this is the one way a photo can land
+# under another site's topic: taken between sessions after a site change,
+# inside the 30-minute carry-forward. 0/209 on prod and 0/74 on TEST on
+# 2026-11-07 (90 days); counted here so Task 8 sees it move.
+SQL_SITE_MISMATCH = """
+SELECT count(*)::text,
+       count(*) FILTER (WHERE r.id IS NULL)::text,
+       count(*) FILTER (WHERE r.site_id IS NULL)::text,
+       count(*) FILTER (WHERE r.site_id IS NOT NULL AND r.site_id <> t.site_id)::text
+FROM topic_photos tp
+JOIN topics t ON t.id = tp.topic_id
+LEFT JOIN recordings r ON r.s3_key = tp.s3_key AND r.kind = 'photo'
+WHERE t.superseded_at IS NULL AND t.report_date >= current_date - {days}"""
+
 
 def run(sql, database):
     assert sql.strip().upper().startswith(("SELECT", "WITH")), "read-only: SELECT only"
@@ -99,6 +115,8 @@ def measure(database, days):
     markers = run(SQL_MARKERS.format(days=int(days)), database)
     photos = run(SQL_PHOTOS.format(days=int(days)), database)
     companies = dict(run(SQL_COMPANIES, database))
+    bound, no_recording, no_site, other_site = (
+        int(x or 0) for x in run(SQL_SITE_MISMATCH.format(days=int(days)), database)[0])
 
     topic_days = defaultdict(list)            # (company, folder, date) -> [start]
     for company, folder, d, starts in topics:
@@ -173,6 +191,10 @@ def measure(database, days):
             _pct(tot["photos_placed_locate"], tot["photos"]),
             _pct(tot["photos_placed_place_at"], tot["photos"]), tot["locators_disagree"],
             orphan_marker_days, len(raw_strings)))
+    report.append(
+        "BOUND photos bound to a topic %d | bound to another site's topic %d (%s) | "
+        "no recording row %d | recording without a site %d" % (
+            bound, other_site, _pct(other_site, bound), no_recording, no_site))
     private = ["labels:"] + ["  %s = %s" % (label[c], companies.get(c, c)) for c in sorted(label, key=label.get)]
     private += ["", "top 50 raw location strings (customer speech; never commit):"]
     private += ["  %4d  %s" % (n, s) for s, n in raw_strings.most_common(50)]

@@ -25,6 +25,8 @@ def _seed(db):
                      ("Measure Co %s" % uuid.uuid4().hex[:6],)).fetchone()[0]
     sid = db.execute("INSERT INTO sites (company_id, name) VALUES (%s, 'S') RETURNING id",
                      (cid,)).fetchone()[0]
+    other = db.execute("INSERT INTO sites (company_id, name) VALUES (%s, 'S2') RETURNING id",
+                       (cid,)).fetchone()[0]
     uid = db.execute(
         "INSERT INTO users (cognito_sub, company_id, email, global_role) "
         "VALUES (%s, %s, %s, 'worker') RETURNING id",
@@ -34,13 +36,14 @@ def _seed(db):
     old = (today - datetime.timedelta(days=60)).isoformat()
 
     def topic(date, key, time_range, superseded=False):
-        db.execute(
+        return db.execute(
             "INSERT INTO topics (site_id, report_date, title, source_s3_key, time_range, superseded_at) "
-            "VALUES (%s, %s, 't', %s, %s, %s)",
-            (sid, date, key, time_range, datetime.datetime.now(datetime.timezone.utc) if superseded else None))
+            "VALUES (%s, %s, 't', %s, %s, %s) RETURNING id",
+            (sid, date, key, time_range, datetime.datetime.now(datetime.timezone.utc) if superseded else None)
+        ).fetchone()[0]
 
     ext = "extractions/%s/%s/s.json" % (FOLDER, day)
-    topic(day, ext, "09:05–09:20")           # after the 09:00 marker -> placed
+    placed = topic(day, ext, "09:05–09:20")  # after the 09:00 marker -> placed
     topic(day, ext, "08:30–08:40")           # before any marker -> not placed
     topic(day, ext, "11:00–11:05", superseded=True)   # not counted at all
     topic(day, "agent://pack/1", "09:10–09:12")       # no folder -> not a topic-day
@@ -48,10 +51,13 @@ def _seed(db):
     db.execute("INSERT INTO day_location_markers (company_id, user_folder, report_date, markers) "
                "VALUES (%s, %s, %s, %s::jsonb)",
                (cid, FOLDER, day, '[{"at": "09:00", "location": "Level 1"}]'))
-    for hms in ("09-10-00", "08-00-00"):
+    # Both photos are bound to the placed topic (site S); the 08:00 one was
+    # filed under site S2 -> one photo bound to another site's topic.
+    for hms, site in (("09-10-00", sid), ("08-00-00", other)):
         key = "users/%s/pictures/%s/%s_%s_%s.jpg" % (FOLDER, day, FOLDER.lower(), day, hms)
         db.execute("INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, client_uuid, started_at) "
-                   "VALUES (%s, %s, %s, 'photo', %s, %s, now())", (cid, uid, sid, key, uuid.uuid4().hex))
+                   "VALUES (%s, %s, %s, 'photo', %s, %s, now())", (cid, uid, site, key, uuid.uuid4().hex))
+        db.execute("INSERT INTO topic_photos (topic_id, s3_key) VALUES (%s, %s)", (placed, key))
     return cid
 
 
@@ -59,7 +65,9 @@ def test_the_scripts_own_sql_measures_a_hand_built_day(db, monkeypatch):
     _seed(db)
     monkeypatch.setattr(mlm, "run", lambda sql, database: [list(r) for r in db.execute(sql).fetchall()])
     report, private = mlm.measure("ignored", 30)
-    line = report[-1]
+    line = report[-2]
+    assert report[-1] == ("BOUND photos bound to a topic 2 | bound to another site's topic 1 (50.0%) | "
+                          "no recording row 0 | recording without a site 0")
     assert "topic-days 1 |" in line
     assert "photo-days 1 |" in line
     assert "marker-days 1 (100.0% of topic-days, 100.0% of photo-days)" in line
@@ -70,5 +78,6 @@ def test_the_scripts_own_sql_measures_a_hand_built_day(db, monkeypatch):
 
 
 def test_every_statement_is_a_select():
-    for sql in (mlm.SQL_TOPICS, mlm.SQL_MARKERS, mlm.SQL_PHOTOS, mlm.SQL_COMPANIES):
+    for sql in (mlm.SQL_TOPICS, mlm.SQL_MARKERS, mlm.SQL_PHOTOS, mlm.SQL_COMPANIES,
+                mlm.SQL_SITE_MISMATCH):
         assert sql.strip().upper().startswith("SELECT")
