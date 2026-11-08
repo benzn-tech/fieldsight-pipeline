@@ -190,9 +190,10 @@ class Verify:
         self.label, self.model, self.calls = label, model, []
 
     def __call__(self, draft, *, registry, items, sources, ctx, writer_model, deadline,
-                 writer_served=None):
+                 writer_served=None, user_values=None):
         self.calls.append({"draft": draft, "sources": sources, "writer_model": writer_model,
-                           "deadline": deadline, "registry": registry})
+                           "deadline": deadline, "registry": registry,
+                           "user_values": user_values})
         return {"conclusion": [{"index": i, "confidence": c["confidence"]}
                                for i, c in enumerate(draft["conclusion"])],
                 "actions": [{"index": i, "verifier": self.label}
@@ -1773,3 +1774,25 @@ def test_write_prompt_lists_sub_tasks_and_the_rule():
     model = Model()
     st.run(make_ctx(), deps(model=model))
     assert "Sub-tasks (" not in _write_prompt(model)
+
+
+# ---- the verifier's user values (spec 2026-11-05 §7.2, Task 7.2) ----------------------------
+
+def test_run_passes_the_instruction_and_stated_values_to_the_verifier():
+    stated = [{"target": "t1", "field": "deadline", "value": "2026-11-13"},
+              {"target": "t2", "field": "priority", "value": "high"},
+              {"target": None, "field": "responsible", "value": "Mike"}]
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=TARGETS2, stated_values=stated)])
+    st.run(make_ctx(instruction="Push task 2 to the 13th"),
+           deps(model=model, tools=TargetTools(), verify=verify))
+    uv = verify.calls[0]["user_values"]
+    assert uv["instruction"] == "Push task 2 to the 13th"
+    # a resolved target carries its item's stable id; the verifier renders that item
+    assert uv["stated_values"] == [
+        {"target": "t1", "field": "deadline", "value": "2026-11-13",
+         "target_stable_id": SID2},
+        {"target": "t2", "field": "priority", "value": "high",
+         "target_stable_id": SID_DONE},
+        {"target": None, "field": "responsible", "value": "Mike",
+         "target_stable_id": None}]

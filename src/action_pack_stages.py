@@ -2126,6 +2126,21 @@ def run(ctx, deps: Optional[Deps] = None) -> dict:
         raise
 
 
+def user_values(run) -> dict:
+    """What the verifier is told the user asked (spec 2026-11-05 §7.2): the instruction and
+    Plan's stated values, each with the stable id its target resolved to in round 1 (None
+    for a null, ambiguous or unmatched target)."""
+    stated = []
+    for v in (run.plan.stated_values if run.plan else []):
+        res = run.resolution.get(v["target"]) if v.get("target") else None
+        sid = (res.stable_id if res is not None
+               and res.kind == action_pack_targets.RESOLVED else None)
+        stated.append({"target": v["target"], "field": v["field"], "value": v["value"],
+                       "target_stable_id": sid})
+    return {"instruction": str((run.ctx.pack or {}).get("instruction") or ""),
+            "stated_values": stated}
+
+
 def _run(r: Run) -> dict:
     ctx, deps = r.ctx, r.deps
     t_start = ctx.clock()
@@ -2155,7 +2170,8 @@ def _run(r: Run) -> dict:
     result = deps.verify(draft, registry=dict(r.registry), items=dict(r.items),
                          sources=sources, ctx=ctx, writer_model=r.models.get("writer"),
                          deadline=ctx.deadline_for("verify"),
-                         writer_served=r.models.get("writer_served"))
+                         writer_served=r.models.get("writer_served"),
+                         user_values=user_values(r))
     # The verifier only labels and drops: every other field comes from the draft.
     kept = {}
     conclusion, actions, vmodel, vcounts, vtokens, vignored = apply_verdicts(draft, result,
