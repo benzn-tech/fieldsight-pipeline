@@ -150,6 +150,18 @@ result existed.
   half. TEST has had EMIT_EVIDENCE on since August. The bars are unchanged; a path still
   `insufficient` after this is disabled as §5.6 says.
 
+- **Note, 2026-11-09: smoke run before any result.** While building the harness, `build --limit 2`
+  ran against TEST (2 sessions), followed by one point run twice, the grid, the label export and a
+  summary. There was no gold and no bar result, and every output (data/, runs/, labels/) was
+  deleted. Its listing is the source of the "42 eligible sessions since 2026-10-01" in A12. It
+  read no item outcome against gold, so it cannot have informed any choice here.
+- **A13. Frozen split.** Every run records the sha256 of `data/manifest.json`; the fit records it
+  in `runs/fit/choice.json`. A point run, the fit and the summary refuse a manifest whose digest
+  differs, and the fit refuses a grid not run on the fit split. A rebuilt set cannot be scored
+  against a fit made on another split.
+- **A14. Only a JSON boolean answers a twin flag.** `null`, `"no"`, `0` and the like count as
+  unanswered, so bar 2 stays `insufficient` (§5.2).
+
 ## 9. Known costs, reported and not gated
 
 - An exact cited turn plus an identical uncited repeat in the window is `ambiguous` (the runner-up

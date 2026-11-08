@@ -388,6 +388,18 @@ class Judge:
         return out
 
 
+def paths_match(run_paths, ship_paths):
+    """The scored run used exactly the paths bar 6 keeps (as a set: order is not the claim)."""
+    return set(run_paths or []) == set(ship_paths or [])
+
+
+def flag_decisions(rows):
+    """{flag_id: True|False}. Only a JSON boolean is an answer: null, "no", 0 and the like are
+    unanswered, so bar 2 stays insufficient on them (pre-registration §5.2)."""
+    return {r["flag_id"]: r["confirmed"] for r in rows
+            if isinstance(r.get("confirmed"), bool)}
+
+
 def load_gold(labels_dir=store.LABELS_DIR):
     d = Path(labels_dir)
     agent = gold_by_ref(store.read_jsonl(d / "done.agent.jsonl"))
@@ -398,6 +410,10 @@ def load_gold(labels_dir=store.LABELS_DIR):
 
 def fit(grid_dir=store.RUNS_DIR / "grid", data_dir=store.DATA_DIR,
         labels_dir=store.LABELS_DIR, out_path=None):
+    gmeta = store.read_json(Path(grid_dir, "meta.json"))
+    if gmeta.get("split") != "fit":
+        raise SystemExit(f"Refusing: the grid run is on split {gmeta.get('split')!r}, not 'fit'")
+    digest = store.require_same_manifest(gmeta.get("manifest_digest"), data_dir, "grid run")
     agent, owner, adj = load_gold(labels_dir)
     judge = Judge(store.load_sessions(data_dir, split="fit"), merge_gold(agent, owner, adj))
     by_point = defaultdict(list)
@@ -406,7 +422,7 @@ def fit(grid_dir=store.RUNS_DIR / "grid", data_dir=store.DATA_DIR,
     evaluated = [(pt, evaluate_point(rs, judge.correct, judge.supported))
                  for pt, rs in sorted(by_point.items())]
     chosen = choose_point(evaluated)
-    result = {"points": len(evaluated), "feasible": sum(1 for _, e in evaluated if feasible(e)),
+    result = {"manifest_digest": digest, "points": len(evaluated), "feasible": sum(1 for _, e in evaluated if feasible(e)),
               "chosen": None if chosen is None else
               {"floor": chosen[0][0], "margin": chosen[0][1], "nothing_close": chosen[0][2],
                **chosen[1]},
@@ -416,7 +432,8 @@ def fit(grid_dir=store.RUNS_DIR / "grid", data_dir=store.DATA_DIR,
 
 
 def build_summary(*, run_a, run_b, out_path, both_paths_run=None, data_dir=store.DATA_DIR,
-                  labels_dir=store.LABELS_DIR, latency=None, claim_type_counts=None):
+                  labels_dir=store.LABELS_DIR, latency=None, claim_type_counts=None,
+                  fit_choice=store.RUNS_DIR / "fit" / "choice.json"):
     """Bars 1-6 plus the reported numbers -> results/summary.json (counts only).
 
     `run_a`/`run_b` are two runs of the shipping configuration on the held-out half (bar 3).
@@ -430,9 +447,14 @@ def build_summary(*, run_a, run_b, out_path, both_paths_run=None, data_dir=store
     agent, owner, adj = load_gold(labels_dir)
     judge = Judge(sessions, merge_gold(agent, owner, adj))
     meta = store.read_json(Path(run_a, "meta.json"))
+    for rd in (run_a, run_b) + ((both_paths_run,) if both_paths_run is not None else ()):
+        store.require_same_manifest(store.read_json(Path(rd, "meta.json")).get("manifest_digest"),
+                                    data_dir, f"run {Path(rd).name}")
+    if fit_choice is not None and Path(fit_choice).exists():
+        store.require_same_manifest(store.read_json(fit_choice).get("manifest_digest"),
+                                    data_dir, "fit")
     rows = [r for r in store.read_jsonl(Path(run_a, "rows.jsonl")) if r["split"] == "heldout"]
-    decisions = {r["flag_id"]: bool(r["confirmed"])
-                 for r in store.read_jsonl(Path(labels_dir, "done.flags.owner.jsonl"))}
+    decisions = flag_decisions(store.read_jsonl(Path(labels_dir, "done.flags.owner.jsonl")))
 
     linked = [r for r in rows if r["status"] == "linked"]
     link_rows = [{"path": r["path"], "correct": judge.correct(r)} for r in linked]
@@ -460,7 +482,7 @@ def build_summary(*, run_a, run_b, out_path, both_paths_run=None, data_dir=store
     missing_by_path = Counter(r["path"] for r in bp_link if r["correct"] is None)
     b6 = score_paths([r for r in bp_link if r["correct"] is not None], bp_flags,
                      dict(missing_by_path))
-    ship_matches = list(meta.get("paths") or []) == b6["ship_paths"]
+    ship_matches = paths_match(meta.get("paths"), b6["ship_paths"])
 
     bars = {"link_precision": b1, "twin_hard_negatives": b2, "run_to_run": b3,
             "agent_owner_agreement": b4, "inferred_precision": b5, "per_path": b6}

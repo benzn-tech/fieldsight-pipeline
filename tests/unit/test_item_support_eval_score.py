@@ -466,7 +466,8 @@ def test_build_summary_end_to_end_counts_only(tmp_path):
         {"item_ref": "abc:0:findings:0", "label": "turn", "turns": [1]}])
     out = tmp_path / "results" / "summary.json"
     summary = score.build_summary(run_a=runs / "a", run_b=runs / "b", out_path=out,
-                                  data_dir=data, labels_dir=labels)
+                                  data_dir=data, labels_dir=labels,
+                                  fit_choice=runs / "fit" / "choice.json")
     b = summary["bars"]
     assert b["link_precision"]["accepted"] == 1 and b["link_precision"]["wrong"] == 0
     assert b["link_precision"]["verdict"] == I
@@ -484,3 +485,97 @@ def test_build_summary_end_to_end_counts_only(tmp_path):
 def test_nested_datetimes_round_trip():
     t = {**_turn("x"), "words": [{"at": datetime(2026, 10, 5, 9, 0, 1)}]}
     assert store.decode_turn(json.loads(json.dumps(store.encode_turn(t)))) == t
+
+
+# =========================================================================================
+# Fix round 1
+# =========================================================================================
+
+def test_unanswered_or_non_boolean_flag_answers_stay_unanswered():
+    rows = [{"flag_id": "a", "confirmed": None}, {"flag_id": "b", "confirmed": "no"},
+            {"flag_id": "c", "confirmed": 0}, {"flag_id": "d", "confirmed": False},
+            {"flag_id": "e", "confirmed": True}, {"flag_id": "f"}]
+    assert score.flag_decisions(rows) == {"d": False, "e": True}
+
+
+@pytest.mark.parametrize("answer", [None, "no", "yes"])
+def test_bar2_non_boolean_answer_on_a_real_flag_is_insufficient(answer):
+    s = _session()
+    rows = [{"item_ref": "abc:0:findings:0", "session": "abc", "status": "linked", "turn": 2,
+             "path": "window"}]
+    fid = score.flag_id(rows[0])
+    judge = score.Judge([s], {})
+    flags = judge.flags(rows, score.flag_decisions([{"flag_id": fid, "confirmed": answer}]))
+    assert len(flags) == 1
+    assert score.score_twins(flags)["verdict"] == I
+
+
+def test_bar2_rejected_flag_passes_and_confirmed_fails_through_the_glue():
+    s = _session()
+    rows = [{"item_ref": "abc:0:findings:0", "session": "abc", "status": "linked", "turn": 2,
+             "path": "window"}]
+    fid = score.flag_id(rows[0])
+    judge = score.Judge([s], {})
+    for answer, verdict in ((False, P), (True, F)):
+        flags = judge.flags(rows, score.flag_decisions([{"flag_id": fid, "confirmed": answer}]))
+        assert score.score_twins(flags)["verdict"] == verdict
+
+
+def test_paths_match_is_a_set_comparison():
+    assert score.paths_match(["window", "quote"], ["quote", "window"])
+    assert score.paths_match(["quote"], ["quote"])
+    assert not score.paths_match(["quote", "window"], ["quote"])
+    assert not score.paths_match(None, ["quote"])
+
+
+def test_view_widening_clamps_at_the_ends_of_the_day():
+    assert label._hhmm_shift(0, 1, -label.VIEW_PAD) == "00:00"
+    assert label._hhmm_shift(23, 58, label.VIEW_PAD) == "23:59"
+    assert label._hhmm_shift(9, 0, -label.VIEW_PAD) == "08:58"
+
+
+def _frozen_fixture(tmp_path):
+    root = tmp_path / "item_support_eval"
+    data, runs = root / "data", root / "runs"
+    store.write_json(data / "manifest.json", {"seed": store.SPLIT_SEED, "sessions": []})
+    return data, runs
+
+
+def test_point_refuses_a_manifest_that_differs_from_the_fit(tmp_path):
+    data, runs = _frozen_fixture(tmp_path)
+    choice = runs / "fit" / "choice.json"
+    store.write_json(choice, {"manifest_digest": store.manifest_digest(data)})
+    run.check_fit_manifest(data, choice)                       # same manifest: fine
+    store.write_json(data / "manifest.json", {"seed": "rebuilt", "sessions": []})
+    with pytest.raises(SystemExit):
+        run.check_fit_manifest(data, choice)
+
+
+def test_summary_refuses_runs_made_on_another_manifest(tmp_path):
+    data, runs = _frozen_fixture(tmp_path)
+    meta = {"split": "heldout", "paths": ["quote", "window"],
+            "manifest_digest": store.manifest_digest(data)}
+    run.write_point_run(runs / "a", [], meta)
+    run.write_point_run(runs / "b", [], meta)
+    store.write_json(data / "manifest.json", {"seed": "rebuilt", "sessions": []})
+    with pytest.raises(SystemExit):
+        score.build_summary(run_a=runs / "a", run_b=runs / "b",
+                            out_path=tmp_path / "results" / "s.json", data_dir=data,
+                            labels_dir=tmp_path / "item_support_eval" / "labels",
+                            fit_choice=runs / "fit" / "choice.json")
+
+
+def test_fit_refuses_a_grid_not_on_the_fit_split_and_records_the_digest(tmp_path):
+    data, runs = _frozen_fixture(tmp_path)
+    labels = tmp_path / "item_support_eval" / "labels"
+    grid_dir = runs / "grid"
+    store.write_jsonl(grid_dir / "rows.jsonl", [])
+    store.write_json(grid_dir / "meta.json",
+                     {"split": "heldout", "manifest_digest": store.manifest_digest(data)})
+    with pytest.raises(SystemExit):
+        score.fit(grid_dir, data, labels, out_path=runs / "fit" / "choice.json")
+    store.write_json(grid_dir / "meta.json",
+                     {"split": "fit", "manifest_digest": store.manifest_digest(data)})
+    out = score.fit(grid_dir, data, labels, out_path=runs / "fit" / "choice.json")
+    assert out["manifest_digest"] == store.manifest_digest(data)
+    assert store.read_json(runs / "fit" / "choice.json")["manifest_digest"] ==         store.manifest_digest(data)

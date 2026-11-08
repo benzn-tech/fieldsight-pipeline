@@ -105,6 +105,14 @@ def run_digest(run_dir):
     return h.hexdigest()
 
 
+def check_fit_manifest(data_dir, choice_path=None):
+    """Refuse a point run when a fit exists and was made on a different manifest."""
+    choice_path = Path(choice_path or store.RUNS_DIR / "fit" / "choice.json")
+    if choice_path.exists():
+        store.require_same_manifest(store.read_json(choice_path).get("manifest_digest"),
+                                    data_dir, "fit")
+
+
 def run_grid(sessions, paths=item_support.PATHS):
     out = []
     with configured(paths):
@@ -139,14 +147,17 @@ def main(argv=None):
         store.write_jsonl(Path(out, "rows.jsonl"), rows)
         store.write_json(Path(out, "meta.json"),
                          {"split": a.split, "paths": list(item_support.PATHS),
-                          "points": len(grid()), "sessions": len(sessions)})
+                          "points": len(grid()), "sessions": len(sessions),
+                          "manifest_digest": store.manifest_digest(a.data)})
         print(store.dumps({"rows": len(rows), "sessions": len(sessions)}))
         return rows
     paths = tuple(x for x in a.paths.split(",") if x)
+    check_fit_manifest(a.data)
     rows = run_point(sessions, a.floor, a.margin, a.nothing_close, paths)
     write_point_run(a.out, rows, {"split": a.split, "paths": list(paths), "floor": a.floor,
                                   "margin": a.margin, "nothing_close": a.nothing_close,
-                                  "sessions": len(sessions), "items": len(rows)})
+                                  "sessions": len(sessions), "items": len(rows),
+                                  "manifest_digest": store.manifest_digest(a.data)})
     print(store.dumps({"items": len(rows), "digest": run_digest(store.require_eval_dir(a.out))}))
     return rows
 

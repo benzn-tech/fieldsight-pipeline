@@ -167,6 +167,21 @@ def load_sessions(data_dir=DATA_DIR, split=None):
     return out
 
 
+def manifest_digest(data_dir=DATA_DIR):
+    """sha256 of data/manifest.json, or None if there is none. Recorded by every run and by the
+    fit, so a rebuilt set (a different split) cannot be scored against a fit made on another."""
+    p = Path(data_dir, "manifest.json")
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+
+
+def require_same_manifest(recorded, data_dir=DATA_DIR, what="run"):
+    current = manifest_digest(data_dir)
+    if recorded != current:
+        raise SystemExit(f"Refusing: the {what} was made on manifest {recorded}, "
+                         f"data/ now holds {current}. The split is frozen; rebuild nothing.")
+    return current
+
+
 def item_text_at(session, ref):
     """The item text behind an item_ref, read from the session's own (un-normalised) topics."""
     _sref, ti, list_name, ci = ref.split(":")

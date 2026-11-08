@@ -42,7 +42,10 @@ BLIND_LABEL_INSTRUCTION = (
 
 
 def _hhmm_shift(hhmm_h, hhmm_m, delta):
-    t = datetime(2000, 1, 2, hhmm_h, hhmm_m) + delta
+    """HH:MM shifted by delta, clamped to 00:00..23:59 (never wraps to the other end of the
+    day, which would turn a widened range into one that crosses midnight)."""
+    base = datetime(2000, 1, 2, hhmm_h, hhmm_m)
+    t = min(max(base + delta, datetime(2000, 1, 2, 0, 0)), datetime(2000, 1, 2, 23, 59))
     return f"{t.hour:02d}:{t.minute:02d}"
 
 
