@@ -63,7 +63,8 @@ def _kind(kind):
     return kind
 
 
-def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id, source_s3_key,
+def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id=None,
+                        source_s3_key,
                         dst_turn: dict, score: float, rule_version: str,
                         method="lexical_v1"):
     """Write one item -> turn link; sets the FK column of `src_kind` to `src_row_id`.
@@ -71,22 +72,28 @@ def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id, s
 
     The link's site is the source row's own site: a `site_id` that differs from it (or a
     `src_row_id` that names no row of `src_kind`) raises ValueError instead of writing a
-    link another site's reader would resolve."""
+    link another site's reader would resolve.
+
+    The link's src_stable_id is likewise the row's own CURRENT stable_id, read here: the
+    item writer links after carry-forward, which may have rewritten it. Pass None to take
+    the row's value; a non-None `src_stable_id` that differs from it raises ValueError."""
     kind = _kind(src_kind)
     table, col = KIND_TABLE[kind], KIND_SRC_COLUMN[kind]
     if not isinstance(dst_turn, dict):
         raise ValueError("dst_turn must be a dict")
-    row = conn.execute(f"SELECT site_id::text FROM {table} WHERE id = %s",
+    row = conn.execute(f"SELECT site_id::text, stable_id FROM {table} WHERE id = %s",
                        (src_row_id,)).fetchone()
     if row is None:
         raise ValueError(f"no {kind} row {src_row_id}")
     if str(site_id) != row[0]:
         raise ValueError(f"site_id {site_id} is not the {kind} row's site {row[0]}")
+    if src_stable_id is not None and str(src_stable_id) != str(row[1]):
+        raise ValueError(f"src_stable_id is not the {kind} row's current stable_id")
     return conn.execute(
         f"INSERT INTO event_links (site_id, link_type, src_kind, src_stable_id, {col}, "
         f"source_s3_key, dst_kind, dst_turn, method, score, rule_version) "
         f"VALUES (%s,'supported_by',%s,%s,%s,%s,'turn',%s::jsonb,%s,%s,%s) RETURNING id",
-        (row[0], kind, src_stable_id, src_row_id, source_s3_key, json.dumps(dst_turn),
+        (row[0], kind, row[1], src_row_id, source_s3_key, json.dumps(dst_turn),
          method, score, rule_version),
     ).fetchone()[0]
 

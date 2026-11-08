@@ -55,6 +55,7 @@ Environment Variables:
 """
 import datetime
 import json
+import time
 import todo_collapse
 import logging
 import os
@@ -66,6 +67,7 @@ import boto3
 from lake_put import lake_put
 
 import carry_forward_apply
+from repositories import claim_type_store
 import status_suggestions
 from repositories import status_suggestions as status_suggestions_repo
 import index_request
@@ -1141,6 +1143,92 @@ def _store_status_suggestions(conn, extraction_topics, new_topic_ids, company_id
     return stats
 
 
+def _supported_children(t, action_item_ids, finding_rows, decision_rows, question_rows):
+    """`[(kind, row_id, support)]` for one topic's children that carry a `support` object.
+
+    Pairs each source child with the row inserted for it, in input order. Action items and
+    findings insert one row per entry; decisions and questions skip blank entries, so the
+    same blank filter is applied here before pairing. A list whose count still disagrees
+    with its rows is skipped whole (logged), never paired by guess."""
+    def kept(children, field):
+        return [c for c in (children or [])
+                if (c.get(field) if isinstance(c, dict) else c)]
+
+    out = []
+    for kind, children, ids in (
+            ("action_item", list(t.get("action_items") or []), list(action_item_ids)),
+            ("finding", list(t.get("findings") or []), [r["id"] for r in finding_rows]),
+            ("decision", kept(t.get("decisions"), "decision"), [r["id"] for r in decision_rows]),
+            ("question", kept(t.get("questions"), "question"), [r["id"] for r in question_rows])):
+        if len(children) != len(ids):
+            logger.warning("item support: %s count %d != rows %d -- not linked",
+                           kind, len(children), len(ids))
+            continue
+        for child, rid in zip(children, ids):
+            if isinstance(child, dict) and isinstance(child.get("support"), dict):
+                out.append((kind, rid, child["support"]))
+    return out
+
+
+def _write_item_support(conn, items, *, company_id, site_id, session_base, key,
+                        recorder_user_id):
+    """Write supported_by links and claim_type for this pass's supported children.
+
+    Its own SAVEPOINT (same posture as _carry_forward_children, Ruling R10): a failure rolls
+    back every link and claim of this step and leaves the items committable. Then one EMF
+    line (in-VPC: stdout, no CloudWatch API) with counts per support status and claim type.
+    """
+    counts = None
+    try:
+        with conn.transaction():
+            counts = claim_type_store.write_pass(
+                conn, company_id=company_id, site_id=site_id, session_base=session_base,
+                source_s3_key=key, recorder_user_id=recorder_user_id, items=items)
+    except Exception:
+        logger.exception("item support: links/claim_type not stored for %s", key)
+        counts = None
+    _emit_item_support_metric(key, items, counts)
+    return counts
+
+
+_SUPPORT_METRIC = {"linked": "SupportLinked", "none_close": "SupportNoneClose",
+                   "ambiguous": "SupportAmbiguous", "below_floor": "SupportBelowFloor"}
+_CLAIM_METRIC = {"observed": "ClaimObserved", "stated": "ClaimStated",
+                 "inferred": "ClaimInferred", "null": "ClaimNull"}
+
+
+def _emit_item_support_metric(key, items, counts):
+    """One EMF line: support statuses (from the artifact, so reported even on failure),
+    claim types and links written (zero on failure), and ItemSupportWriteFailed. Counts
+    only. Never raises."""
+    try:
+        values = {m: 0 for m in list(_SUPPORT_METRIC.values()) + list(_CLAIM_METRIC.values())}
+        for _, _, sup in items:
+            m = _SUPPORT_METRIC.get(sup.get("status"))
+            if m:
+                values[m] += 1
+        if counts is not None:
+            for c, n in counts["claim"].items():
+                values[_CLAIM_METRIC[c]] = n
+        values["LinksWritten"] = counts["links"] if counts is not None else 0
+        values["ItemSupportWriteFailed"] = 0 if counts is not None else 1
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(time.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "FieldSight/Pipeline",
+                    "Dimensions": [["Stage"]],
+                    "Metrics": [{"Name": n, "Unit": "Count"} for n in values],
+                }],
+            },
+            "Stage": os.environ.get("STAGE", "unknown"),
+            **values,
+            "key": key,
+        }))
+    except Exception:
+        logger.warning("could not emit the item support metric for %s", key)
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
@@ -1457,6 +1545,10 @@ def write_extraction_items(date, user_folder, extraction_key):
         # the str(...) collected_topics uses for the match_request artifact) -- the "new"
         # side of carry_forward's site-scoped pool, gathered once the loop below is done.
         new_topic_ids = []
+        # Track C Task 7: (kind, row_id, support) for every child carrying a `support`
+        # object (item_support, final tier, EMIT_ITEM_SUPPORT on), paired at insert time.
+        # Linked and classified after carry-forward, below.
+        support_items = []
         keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"), date)
@@ -1549,10 +1641,13 @@ def write_extraction_items(date, user_folder, extraction_key):
             # entries exist. A stable_id here is what lets Task 4's carry_forward (below)
             # keep a decision or an answered question attached to the same commitment
             # across a re-extraction that reworded it.
-            topic_decisions.insert_decisions(
+            decision_rows = topic_decisions.insert_decisions(
                 conn, row["id"], site["id"], t.get("decisions") or [])
-            topic_questions.insert_questions(
+            question_rows = topic_questions.insert_questions(
                 conn, row["id"], site["id"], t.get("questions") or [])
+            support_items.extend(_supported_children(
+                t, row.get("action_item_ids") or [], finding_rows, decision_rows,
+                question_rows))
 
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
@@ -1609,6 +1704,14 @@ def write_extraction_items(date, user_folder, extraction_key):
             carry_forward_apply._carry_forward_children(
                 conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
                 extraction_key)
+
+        # Track C Task 7 -- supported_by links + derived claim_type, AFTER carry-forward so
+        # each link carries the row's post-carry stable_id. Own SAVEPOINT, never fatal.
+        # Nothing to do (and no metric) when no child carries support: flag off.
+        if support_items:
+            _write_item_support(
+                conn, support_items, company_id=owner_company_id, site_id=site["id"],
+                session_base=session_base, key=extraction_key, recorder_user_id=user_id)
 
         # Task 7 (spec D6): every continuity claim the extractor made (item_continuity.resolve,
         # carried in the artifact's `continuity.claims`) becomes its own decision_records row --

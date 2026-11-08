@@ -275,6 +275,29 @@ def test_insert_supported_by_rejects_another_sites_row(db):
                       (item["id"],)).fetchone()[0] == 0
 
 
+def test_insert_supported_by_takes_the_rows_current_stable_id(db):
+    """The link carries the row's stable_id as it is NOW (after any carry-forward): None
+    takes it from the row, a matching value is accepted, a stale one raises."""
+    s = Seed(db)
+    item = s.item("decision", s.topic("sid" + "a" * 32))
+    carried = uuid.uuid4()
+    db.execute("UPDATE topic_decisions SET stable_id = %s WHERE id = %s", (carried, item["id"]))
+    with pytest.raises(ValueError):
+        event_links.insert_supported_by(
+            db, site_id=s.site["id"], src_kind="decision", src_row_id=item["id"],
+            src_stable_id=item["stable_id"], source_s3_key=None, dst_turn=_turn(),
+            score=0.5, rule_version="v-test")
+    for passed in (None, carried):
+        link_id = event_links.insert_supported_by(
+            db, site_id=s.site["id"], src_kind="decision", src_row_id=item["id"],
+            src_stable_id=passed, source_s3_key=None, dst_turn=_turn(),
+            score=0.5, rule_version="v-test")
+        assert db.execute("SELECT src_stable_id FROM event_links WHERE id = %s",
+                          (link_id,)).fetchone()[0] == carried
+    assert db.execute("SELECT count(*) FROM event_links WHERE src_decision_id = %s",
+                      (item["id"],)).fetchone()[0] == 2
+
+
 def test_link_types_validation(db):
     s = Seed(db)
     with pytest.raises(ValueError):
