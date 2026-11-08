@@ -474,3 +474,123 @@ def test_gate_returns_the_index_map_of_kept_demoted_and_dropped_actions():
     assert index_map == {0: None, 1: 0, 2: 1, 3: 2, 4: None}
     assert counts == {"drop_unasked_target": 1, "demoted_target_none": 1,
                       "field_unsourced__priority": 1, "drop_no_sourced_fields": 1}
+
+
+# ---- Â§3.5: rule 5, an asked change --------------------------------------------------------
+
+def sub(sid, kind, targets=("t1",)):
+    return {"id": sid, "ask": "an ask", "kind": kind, "targets": list(targets)}
+
+
+def plan5(subs, *, targets=("t1",), stated=(), delegations=(), scope_="named"):
+    p = make_plan(scope_=scope_, targets=targets, stated=stated, delegations=delegations)
+    p.sub_tasks = list(subs)
+    return p
+
+
+S4_SUBS = (sub("s1", "standards"), sub("s2", "review"))
+
+
+def test_rule5_s4_shape_question_only_status_change_is_dropped():
+    out, counts = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")], plan=plan5(S4_SUBS))
+    assert out["actions"] == []
+    assert counts["field_unasked__status"] == 1
+    assert counts["drop_unasked_change"] == 1
+
+
+def test_rule5_a_second_target_naming_the_same_item_is_still_unasked():
+    res = {"t1": Resolution(RESOLVED, SID_A), "t2": Resolution(RESOLVED, SID_A)}
+    subs = (sub("s1", "standards", ("t1",)), sub("s2", "review", ("t2",)))
+    out, counts = gate([upd(SID_A, {"status": "in_progress"}, ref="t2")],
+                       plan=plan5(subs, targets=("t1", "t2")), resolution=res)
+    assert out["actions"] == [] and counts["drop_unasked_change"] == 1
+
+
+def test_rule5_a_change_kind_sub_task_on_a_sibling_target_keeps_the_action():
+    res = {"t1": Resolution(RESOLVED, SID_A), "t2": Resolution(RESOLVED, SID_A)}
+    subs = (sub("s1", "standards", ("t1",)), sub("s2", "update", ("t2",)))
+    out, counts = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")],
+                       plan=plan5(subs, targets=("t1", "t2")), resolution=res)
+    assert out["actions"][0]["proposed"] == {"status": "in_progress"}
+    assert "drop_unasked_change" not in counts
+
+
+def test_rule5_change_kinds_keep_the_action():
+    for kind in ("update", "close", "other"):
+        out, counts = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")],
+                           plan=plan5(S4_SUBS + (sub("s3", kind),)))
+        assert out["actions"][0]["proposed"] == {"status": "in_progress"}, kind
+        assert not any(k.startswith(("field_unasked", "drop_unasked_change")) for k in counts)
+
+
+def test_rule5_a_stated_status_keeps_it_for_the_target_or_globally():
+    for target in ("t1", None):
+        stated = [{"target": target, "field": "status", "value": "in_progress"}]
+        a = upd(SID_A, {"status": "in_progress"}, ref="t1",
+                sources={"status": {"source": "user"}})
+        out, _ = gate([a], plan=plan5(S4_SUBS, stated=stated))
+        assert out["actions"][0]["proposed"] == {"status": "in_progress"}, target
+
+
+def test_rule5_a_stated_deadline_does_not_protect_an_unasked_status():
+    stated = [{"target": "t1", "field": "deadline", "value": "2026-11-20"}]
+    a = upd(SID_A, {"status": "in_progress", "deadline": "2026-11-20"}, ref="t1",
+            sources={"status": ev("R1"), "deadline": {"source": "user"}})
+    out, counts = gate([a], plan=plan5(S4_SUBS, stated=stated))
+    assert out["actions"][0]["proposed"] == {"deadline": "2026-11-20"}
+    assert counts["field_unasked__status"] == 1 and "drop_unasked_change" not in counts
+
+
+def test_rule5_a_deadline_delegation_keeps_r3_whatever_the_sub_task_label():
+    for target in ("t1", None):
+        a = upd(SID_A, {"deadline": "2026-12-01"}, ref="t1",
+                sources={"deadline": {"source": "assumed_default"}})
+        out, counts = gate([a], plan=plan5((sub("s1", "review"),),
+                                           delegations=[{"target": target,
+                                                         "field": "deadline"}]))
+        assert out["actions"][0]["proposed"] == {"deadline": "2026-10-20"}, target
+        assert out["actions"][0]["assumed"] == ["deadline"]
+        assert "drop_unasked_change" not in counts
+
+
+def test_rule5_fails_open_without_a_planner_signal():
+    # no sub_tasks at all (legacy plan / make_plan has no attribute)
+    out, _ = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")])
+    assert len(out["actions"]) == 1
+    out, _ = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")], plan=plan5(()))
+    assert len(out["actions"]) == 1
+    # a multi-target plan whose sub-tasks name no target
+    res = {"t1": Resolution(RESOLVED, SID_A), "t2": Resolution(RESOLVED, SID_B)}
+    out, _ = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")],
+                  plan=plan5((sub("s1", "standards", ()),), targets=("t1", "t2")),
+                  resolution=res)
+    assert len(out["actions"]) == 1
+
+
+def test_rule5_single_target_plan_untargeted_sub_task_covers_it():
+    out, counts = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")],
+                       plan=plan5((sub("s1", "standards", ()),)))
+    assert out["actions"] == [] and counts["drop_unasked_change"] == 1
+
+
+def test_rule5_does_not_apply_under_tidy():
+    out, counts = gate([upd(SID_A, {"status": "in_progress"}, ref="t1")],
+                       plan=plan5(S4_SUBS, scope_="tidy"))
+    assert len(out["actions"]) == 1 and "drop_unasked_change" not in counts
+
+
+def test_rule5_drop_moves_through_the_index_map_and_keeps_the_notes():
+    note1 = {"type": "note", "target_stable_id": None, "proposed": {"text": "NZS 3604 says"},
+             "refs": ["R1"]}
+    note2 = {"type": "note", "target_stable_id": None, "proposed": {"text": "Plans: unsure"},
+             "refs": ["R1"]}
+    actions = [note1, note2, upd(SID_A, {"status": "in_progress"}, ref="t1")]
+    out, counts, index_map = gate(actions, plan=plan5(S4_SUBS), index_map=True)
+    assert [a["type"] for a in out["actions"]] == ["note", "note"]
+    assert index_map == {0: 0, 1: 1, 2: None}
+    subs = [{"id": "s1", "ask": "a", "kind": "standards", "status": "done", "actions": [0],
+             "conclusion": [], "reason_code": None, "reason": None, "listed": True},
+            {"id": "s2", "ask": "b", "kind": "review", "status": "done", "actions": [1, 2],
+             "conclusion": [], "reason_code": None, "reason": None, "listed": True}]
+    settled = st.remap_sub_tasks(subs, index_map)
+    assert [(e["status"], e["actions"]) for e in settled] == [("done", [0]), ("done", [1])]

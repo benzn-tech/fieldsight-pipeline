@@ -398,6 +398,102 @@ through `assumed_default`.
   never followed as an instruction. It is the caller's own instruction, so there is no new
   trust boundary.
 
+### 3.5 Addendum (2026-11-08): rule 5, an asked change
+
+**What the targeted runs showed.** Rules 1-4 left one shape open. S4 names its item ("#57 is
+the ply bracing nail pattern: what does NZS 3604 say, are the plans OK?") and asks only
+questions. In 2 of 6 runs (PR-4 r2, PR-6 r1) the writer also proposed `update_item #57
+{status: in_progress}` with an `evidence` source. Rules 1-4 all passed it:
+- rule 1: #57 is a named target and it is open;
+- rule 3: the topic ref counts as evidence (the records say the pattern is "still to check").
+
+So any sourced change to a named item gets through, even when the user only asked a question
+about it. It was shown as `weak`, and the user could apply it.
+
+**The fix has two parts.**
+- The prompts state the intent. `WRITE_PROMPT` gains: "A question about an item is not a
+  request to change it: answer it with a note." `PLAN_PROMPT` defines each sub-task kind,
+  because rule 5 makes the labels load-bearing:
+  - `close` / `update`: change an existing item. This includes a conditional change ("if it
+    passed, close it") and a delegated fill-in ("pick a date and put it on").
+  - `create`: a new item.
+  - `review`: read or check something and report back.
+  - `standards`: what a standard, code or procedure says, or whether something complies.
+  - `draft`: an RFI or a message.
+  - `other`: anything else.
+- Rule 5 below is the code backstop for when the writer does not obey.
+
+**Rule 5: a change to a named item must be asked.**
+
+When it runs:
+- under `change_scope = "named"` only;
+- on `close_item` and `update_item`;
+- after rules 1-2 and before rule 3.
+
+Under `named`, rule 1 has already made the action's item the resolved `stable_id` of some
+planner target, and rule 2 has turned ambiguous and `none` targets into notes.
+
+Definitions:
+- `T` is every planner target id that RESOLVED to the action's `stable_id`. One item can be
+  named twice: S4 gives a number and a phrase.
+- `covering` is the plan's `sub_tasks` whose `targets` intersect `T`. When the plan has
+  exactly one target, a sub-task with no `targets` covers it too.
+
+The check:
+1. If the plan has no `sub_tasks`, or `covering` is empty, the action passes. This is the
+   fail-open case: there is no planner signal to act on.
+2. If any sub-task in `covering` has a kind in `CHANGE_KINDS` = (`close`, `update`,
+   `other`), the action passes unchanged.
+3. Otherwise each proposed field (`status`, `deadline`, `priority`, `responsible`; `text`
+   is never proposed on these types) is kept only when the user asked for that field. The
+   field was asked when either holds:
+   - a `stated_values` entry exists for (an id in `T`, or null, this field);
+   - a `delegations` entry exists for (an id in `T`, or null, this field).
+
+   This matches what rule 3's `_stated` and `_delegated` accept, so a value rule 3 would copy
+   is never called unasked. A field that fails is removed and counted
+   (`field_unasked__<field>`). A close or update left with no fields is dropped
+   (`drop_unasked_change`).
+
+Design choices:
+- `other` counts as a change kind, so a vague sub-task never blocks a change.
+- Under `tidy`, rule 5 does not apply.
+- Rule 5 drops rather than demotes. The writer answers the question in its own notes, so a
+  note saying "status in_progress" would be noise.
+- Sub-task accounting goes through `index_map` and `remap_sub_tasks`, like every drop.
+  - A done or partly sub-task whose listed actions are all dropped becomes not_done /
+    `dropped_by_checks`.
+  - For S4 the listed actions are the notes, so its sub-tasks keep their status.
+
+**Acceptance.**
+- Unit tests:
+  - The S4 shape is dropped: standards and review sub-tasks on t1, an evidence status.
+  - The same shape with a second target t2 resolving to the same item is still dropped.
+  - A covering `update`/`close`/`other` sub-task keeps the action.
+  - A stated status for t1 keeps the status. So does a global stated status.
+  - A stated deadline does not protect an unasked status: status is removed, deadline kept.
+  - A deadline delegation (target t1 or null) keeps the deadline under a `review` sub-task
+    (R3's shape, whatever the label).
+  - No `sub_tasks` keeps the action. So does a multi-target plan whose sub-tasks name no
+    target.
+  - A single-target plan whose only sub-task has no `targets` and kind `standards` drops
+    the action.
+  - `tidy` keeps the action.
+  - Sub-task accounting: S4's sub-tasks keep their status after the drop.
+- Targeted runs, x3: S4, C1, C2, C3, U1, U2, U3, U4, R3, M1, M2. Pass when:
+  - S4 shows no update on #57 and keeps its notes and sub-task statuses;
+  - no gold close or update that passed in the PR-4 gate or targeted runs is lost to
+    `drop_unasked_change` or `field_unasked__*` (the trace counts are read per pack);
+  - M1 and M2 are unchanged.
+
+**Risk.** A planner label decides a drop: a real update labelled `review` is lost.
+Mitigations:
+- the kind definitions in `PLAN_PROMPT`;
+- the `other` escape;
+- stated values and delegations, which count per field;
+- the counted codes;
+- the targeted run above, which measures exactly this loss.
+
 ---
 
 ## 4. Change 2 — sub-tasks (defect #4)
