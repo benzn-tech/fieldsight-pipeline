@@ -152,8 +152,10 @@ def count_recent(keys, now_utc, window=timedelta(hours=1)):
     return len(recent_times(keys, now_utc, window))
 
 
-def _subject(context, stage):
-    name = _one_line(context.get("name")) or "(no name)"
+def _subject(context, stage, claim_name=None):
+    # The account's own name (authorizer claim) when there is one; the browser's
+    # report otherwise.
+    name = _one_line(claim_name) or _one_line(context.get("name")) or "(no name)"
     company = _one_line(context.get("company")) or "no company"
     prefix = "" if stage == "prod" else "[TEST] "
     return _one_line(f"{prefix}FieldSight message from {name} ({company})")
@@ -177,6 +179,7 @@ def build_email(*, record, audio, ext, sender, to, stage, now_nz_label):
     details = [
         ("Email", record.get("email") or ""),
         ("Cognito sub", record.get("sub") or ""),
+        ("Name (account)", _one_line(record.get("claim_name"))),
         ("Name (as reported by the browser)", ctx.get("name") or ""),
         ("Company (as reported by the browser)", ctx.get("company") or ""),
         ("Project (as reported by the browser)", ctx.get("project") or ""),
@@ -211,7 +214,7 @@ def build_email(*, record, audio, ext, sender, to, stage, now_nz_label):
     h.append("</table></body></html>")
 
     msg = EmailMessage()
-    msg["Subject"] = _subject(ctx, stage)
+    msg["Subject"] = _subject(ctx, stage, record.get("claim_name"))
     msg["From"] = sender
     msg["To"] = to
     reply_to = _one_line(record.get("email"))
