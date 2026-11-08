@@ -86,6 +86,30 @@ def gather(run_dir):
     return finals, latencies, step_items
 
 
+def linker_context(run_dir):
+    """Linker-mode context (spec 2026-11-08 section 6), {} when no final with-block step has a
+    `linker` record (a run without --linker). Over final with-block steps:
+      linker_p90_ms: p90 of linker["ms"] where the linker status is "ok";
+      linker_not_ok: steps with a prior (prior_count > 0) whose linker status is not "ok"
+                     (error, skipped_budget, or never ran, e.g. the extraction call failed).
+    Every chain counts, including ones with an error step: a failed pass is exactly what
+    linker_not_ok is there to show. Report-only; no bar reads it."""
+    finals = []
+    for _shape, arm, _rep, _sess, d in chains(run_dir):
+        if arm != "with_block":
+            continue
+        steps = load_steps(d)
+        if steps:
+            finals.append(steps[-1])
+    if not any(s.get("linker") is not None for s in finals):
+        return {}
+    ok_ms = [s["linker"]["ms"] for s in finals
+             if isinstance(s.get("linker"), dict) and s["linker"].get("status") == "ok"]
+    not_ok = sum(1 for s in finals if s.get("prior_count", 0) > 0 and not (
+        isinstance(s.get("linker"), dict) and s["linker"].get("status") == "ok"))
+    return {"linker_p90_ms": score._percentile(ok_ms, 90), "linker_not_ok": not_ok}
+
+
 def admission_drift(finals):
     metric, tolerance = {}, {}
     for cell, arms in finals.items():
@@ -249,6 +273,7 @@ def main():
         "unsupported_overall": {k: {"unsupported": v[0], "total": v[1]} for k, v in overall.items()},
         "drift_cells": len(metric),
         "gold": "agent+owner" if owner_n else "agent only (preliminary)",
+        **linker_context(run_dir),
     }
     Path(out).write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
