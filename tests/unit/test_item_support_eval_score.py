@@ -347,8 +347,9 @@ def test_gitignore_covers_data_runs_labels():
 
 def test_build_eligibility():
     ev = {"tier": "final", "topics": [{"evidence": [{"status": "verified"}]}]}
-    assert build.eligible(ev, "2026-10-01") is None
-    assert build.eligible(ev, "2026-09-30") == "before_since"
+    assert build.DEFAULT_SINCE == "2026-08-01"
+    assert build.eligible(ev, "2026-08-01") is None
+    assert build.eligible(ev, "2026-07-31") == "before_since"
     assert build.eligible({**ev, "tier": "live"}, "2026-10-05") == "not_final"
     assert build.eligible({"tier": "final", "topics": [{"evidence": [{"status": "unmatched"}]}]},
                           "2026-10-05") == "no_evidence"

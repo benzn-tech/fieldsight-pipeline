@@ -7,7 +7,7 @@ session's turns are rebuilt with the extractor's own `gather_session_segments` +
 (seeded sha256, first half = fit) is fixed once the whole set is known and recorded in
 data/manifest.json.
 
-    python -m scripts.item_support_eval.build --since 2026-10-01
+    python -m scripts.item_support_eval.build            # --since defaults to 2026-08-01 (A12)
 
 Never writes to S3 or a database. boto3 only (the aws CLI misbehaves inside shell read loops
 on Windows).
@@ -26,7 +26,7 @@ from scripts.item_support_eval import store
 DEFAULT_PROFILE = "fieldsight-deployer"
 DEFAULT_REGION = "ap-southeast-2"
 TEST_BUCKET = "fieldsight-data-test-509194952652"
-DEFAULT_SINCE = "2026-10-01"
+DEFAULT_SINCE = "2026-08-01"   # pre-registration A12
 _EVIDENCE_OK = ("verified", "verified_fuzzy")
 
 

@@ -18,7 +18,7 @@ the fit half: `FLOOR`, `MARGIN`, `NOTHING_CLOSE`. The bars below are judged on t
 
 - **Source:** the TEST bucket, `extractions/{folder}/{date}/{base}.json`, read-only.
 - **Eligible session:** the extraction's `tier` is `final`; its date folder is on or after
-  2026-10-01; and at least one topic has an evidence entry with status `verified` or
+  2026-08-01 (A12); and at least one topic has an evidence entry with status `verified` or
   `verified_fuzzy` ("with evidence").
 - **Turns:** rebuilt now with `lambda_extract_session.gather_session_segments` and
   `assemble_session_turns`, the same calls the final pass makes. The session date passed to
@@ -145,6 +145,10 @@ result existed.
 - **A10. Bar 6 re-run rule** (§5.6) for a single surviving path.
 - **A11. Missing gold** makes a fit point infeasible (§4), and makes bar 1 (accepted links) or
   bar 5 (`inferred` items) `insufficient` (§5).
+- **A12. Wider date range: since 2026-08-01, not 2026-10-01** (controller ruling, 2026-11-09).
+  42 eligible sessions since 10-01 cannot reach bar 1's 59 accepted links per path on a held-out
+  half. TEST has had EMIT_EVIDENCE on since August. The bars are unchanged; a path still
+  `insufficient` after this is disabled as §5.6 says.
 
 ## 9. Known costs, reported and not gated
 

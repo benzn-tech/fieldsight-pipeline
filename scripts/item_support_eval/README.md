@@ -10,7 +10,7 @@ output is `results/summary.json` (counts, rates, verdicts).
 Run from the repo root with `PYTHONPATH=<repo>;<repo>/src` and the `fieldsight-deployer`
 profile (boto3 only; no aws CLI loops). Nothing writes to S3 or a database.
 
-1. **Build** the TEST set (finals with evidence since 2026-10-01, seeded split):
+1. **Build** the TEST set (finals with evidence since 2026-08-01, amendment A12, seeded split):
    `python -m scripts.item_support_eval.build`
    Check `data/manifest.json`: `sessions` >= 40, and `resolved_quotes` close to
    `verified_quotes` (turns are rebuilt from today's transcripts).
