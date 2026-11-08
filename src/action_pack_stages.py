@@ -1982,12 +1982,37 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+VERIFIER_DETAIL_KEYS = {"model": str, "served": str, "attempt": int, "reason_code": str,
+                        "reason": str}
+VERIFIER_REASON_MAX_CHARS = 200     # action_pack_verify.REASON_MAX_CHARS
+
+
+def verifier_detail_ok(detail) -> bool:
+    """A verifier_detail (spec 2026-11-05 §7.2): an object with only VERIFIER_DETAIL_KEYS,
+    each None or of its type, the reason at most VERIFIER_REASON_MAX_CHARS."""
+    if not isinstance(detail, dict) or set(detail) - set(VERIFIER_DETAIL_KEYS):
+        return False
+    for k, v in detail.items():
+        want = VERIFIER_DETAIL_KEYS[k]
+        if v is None:
+            continue
+        if want is int and not _is_int(v):
+            return False
+        if want is str and not isinstance(v, str):
+            return False
+    return len(detail.get("reason") or "") <= VERIFIER_REASON_MAX_CHARS
+
+
 def apply_verdicts(draft, result, kept=None):
     """Map the verifier's answer back onto the draft: the verifier may only LABEL and DROP.
 
-    `result` = {"conclusion": [{"index": i, "confidence": supported|uncertain}],
-                "actions": [{"index": i, "verifier": supported|weak|unsupported}],
-                "model": str, "counts": {str: int}?, "tokens": int?}.
+    `result` = {"conclusion": [{"index": i, "confidence": supported|uncertain,
+                                "detail": {...}?}],
+                "actions": [{"index": i, "verifier": supported|weak|unsupported,
+                             "detail": {...}?}],
+                "model": str, "counts": {str: int}?, "tokens": int?,
+                "verifier_answers": {model: int}?}.
+    An element's `detail` (verifier_detail_ok) is copied onto it as `verifier_detail`.
     Every other field (type, target, proposed, rationale, refs, text) comes from the draft;
     a draft element the answer does not name is dropped; an element with no index, an
     index out of range or repeated, is ignored; a field that differs from the draft is
@@ -2012,6 +2037,10 @@ def apply_verdicts(draft, result, kept=None):
         raise bad("verifier counts")
     if not _is_int(tokens):
         raise bad("verifier tokens")
+    answers = result.get("verifier_answers", {})
+    if not isinstance(answers, dict) or not all(isinstance(k, str) and k and _is_int(v)
+                                                for k, v in answers.items()):
+        raise bad("verifier answers")
     ignored = {"elements": 0, "fields": 0, "upgrades": 0}
 
     def labels(elements, drafted, label_key, allowed):
@@ -2031,34 +2060,49 @@ def apply_verdicts(draft, result, kept=None):
             idx = el["index"]
             if not _is_int(idx):
                 raise bad("verifier index")
+            detail = el.get("detail")
+            if detail is not None and not verifier_detail_ok(detail):
+                raise bad("verifier detail")
             if not 0 <= idx < len(drafted) or idx in out:
                 ignored["elements"] += 1
                 continue
             for k, v in el.items():
-                if k not in ("index", label_key) and drafted[idx].get(k) != v:
+                if k not in ("index", label_key, "detail") and drafted[idx].get(k) != v:
                     ignored["fields"] += 1
-            out[idx] = el[label_key]
+            out[idx] = (el[label_key], dict(detail) if detail is not None else None)
         return out
 
     c_labels = labels(result["conclusion"], draft["conclusion"], "confidence", CONFIDENCE)
     a_labels = labels(result["actions"], draft["actions"], "verifier", VERIFIER_LABELS)
+    def with_detail(el, detail):
+        if detail is not None:
+            el["verifier_detail"] = detail
+        return el
+
     conclusion = []
     for i, c in enumerate(draft["conclusion"]):
         if i not in c_labels:
             continue
-        conf = c_labels[i]
+        conf, detail = c_labels[i]
         if conf == "supported" and c["confidence"] != "supported":
             ignored["upgrades"] += 1
             conf = c["confidence"]
-        conclusion.append(dict(c, confidence=conf))
-    actions = [dict(a, verifier=a_labels[i]) for i, a in enumerate(draft["actions"])
-               if i in a_labels]
+        conclusion.append(with_detail(dict(c, confidence=conf), detail))
+    actions = [with_detail(dict(a, verifier=a_labels[i][0]), a_labels[i][1])
+               for i, a in enumerate(draft["actions"]) if i in a_labels]
     if kept is not None:
         for key, labelled in (("conclusion", c_labels), ("actions", a_labels)):
             survivors = [i for i in range(len(draft[key])) if i in labelled]
             kept[key] = {i: (survivors.index(i) if i in labelled else None)
                          for i in range(len(draft[key]))}
     return conclusion, actions, result["model"], counts, tokens, ignored
+
+
+def _conclusion_row(c):
+    row = {"text": c["text"], "refs": list(c["refs"]), "confidence": c["confidence"]}
+    if c.get("verifier_detail") is not None:
+        row["verifier_detail"] = dict(c["verifier_detail"])
+    return row
 
 
 def build_payload(run, conclusion, actions):
@@ -2069,6 +2113,8 @@ def build_payload(run, conclusion, actions):
         row = {"seq": seq, "type": a["type"], "proposed": a.get("proposed") or {},
                "rationale": a.get("rationale"), "refs": list(a["refs"]),
                "verifier": a["verifier"]}
+        if a.get("verifier_detail") is not None:
+            row["verifier_detail"] = dict(a["verifier_detail"])
         if a["type"] in TARGETED:
             sid = a.get("target_stable_id")
             item = run.items.get(sid) or {}
@@ -2078,13 +2124,14 @@ def build_payload(run, conclusion, actions):
     payload = {
         "title": plan.title,
         "reading": plan.reading,
-        "conclusion": [{"text": c["text"], "refs": list(c["refs"]),
-                        "confidence": c["confidence"]} for c in conclusion],
+        "conclusion": [_conclusion_row(c) for c in conclusion],
         "actions": out_actions,
         "as_of": run.as_of,
         "models": {**{k: run.models.get(k) for k in ("planner", "writer", "verifier")},
                    **{k: run.models[k] for k in ("planner_served", "writer_served")
-                      if run.models.get(k)}},
+                      if run.models.get(k)},
+                   **({"verifier_answers": dict(run.models["verifier_answers"])}
+                      if "verifier_answers" in run.models else {})},
         "run_trace": None,          # filled by run()
         "sources": refs,            # replaced by run() with the rows
     }
@@ -2179,6 +2226,8 @@ def _run(r: Run) -> dict:
     if r.sub_tasks is not None:
         r.sub_tasks = remap_sub_tasks(r.sub_tasks, kept["actions"], kept["conclusion"])
     r.models["verifier"] = vmodel
+    if "verifier_answers" in result:          # validated by apply_verdicts
+        r.models["verifier_answers"] = dict(result["verifier_answers"])
     r.tokens += vtokens
     r.trace.setdefault("ms", {})["verify"] = int((ctx.clock() - t0) * 1000)
     if any(vignored.values()):

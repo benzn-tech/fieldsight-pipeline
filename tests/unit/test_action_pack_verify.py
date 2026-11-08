@@ -497,12 +497,13 @@ def test_counts_are_flat_ints_and_the_result_passes_apply_verdicts(monkeypatch):
     draft = {"conclusion": [line(), line("w", ["W1"])],
              "actions": [close(), create("Fence the pit", ["W1"]), close(SID2)]}
     result, _ = run_verify(draft, monkeypatch)
-    assert set(result) <= {"conclusion", "actions", "model", "counts", "tokens"}
+    assert set(result) <= {"conclusion", "actions", "model", "counts", "tokens",
+                           "verifier_answers"}
     assert all(isinstance(k, str) and type(v) is int for k, v in result["counts"].items())
     for el in result["conclusion"]:
-        assert set(el) == {"index", "confidence"}
+        assert set(el) == {"index", "confidence", "detail"}
     for el in result["actions"]:
-        assert set(el) == {"index", "verifier"}
+        assert set(el) == {"index", "verifier", "detail"}
     c = result["counts"]
     assert c["raw_conclusion"] == 2 and c["raw_actions"] == 3
     assert c["label_conclusion_supported"] == 1 and c["label_conclusion_weak"] == 1
@@ -563,6 +564,26 @@ def test_a_failed_call_moves_the_element_to_the_next_candidate(monkeypatch):
     assert labels(result) == {0: "supported"} and result["model"] == LUNA
     assert result["counts"]["fallback_answers"] == 1
     assert [c["model"] for c in fake.calls] == [VERIFIER, LUNA]
+
+
+def test_fallback_attempt_recorded(monkeypatch):
+    monkeypatch.setenv("ACTION_VERIFIER_FALLBACKS", LUNA)
+
+    def answer(prompt, model):
+        if model == VERIFIER and "FALLBACK" in prompt:
+            return None, "HTTP 503", None, 0
+        return ('{"label": "supported"}', None, model, 3,
+                "openai/gpt-6-luna-pro-0601" if model == LUNA else None)
+    draft = {"conclusion": [line("FALLBACK")], "actions": [close()]}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(answer))
+    assert result["conclusion"][0]["detail"] == {
+        "model": LUNA, "served": "openai/gpt-6-luna-pro-0601", "attempt": 2,
+        "reason_code": None, "reason": None}
+    assert result["actions"][0]["detail"]["attempt"] == 1
+    assert result["actions"][0]["detail"]["model"] == VERIFIER
+    assert result["verifier_answers"] == {VERIFIER: 1, LUNA: 1}
+    c = result["counts"]
+    assert (c["answered_primary"], c["answered_fallback"]) == (1, 1)
 
 
 def test_the_real_call_caps_one_attempt_so_a_hang_leaves_time_for_a_fallback(monkeypatch):
@@ -981,3 +1002,100 @@ def test_verify_puts_the_user_values_in_every_prompt(monkeypatch):
     result, fake = run_verify(draft, monkeypatch, user_values=USER_VALUES)
     assert len(fake.calls) == 2
     assert all("USER INSTRUCTION" in c["prompt"] for c in fake.calls)
+
+
+# ---- per-check verifier_detail (spec 2026-11-05 §7.2, Task 7.3) ---------------------------
+
+def test_every_checked_element_has_detail_model(monkeypatch):
+    def answer(prompt, model):
+        if "WEAKME" in prompt:
+            return ('{"label": "weak", "reason_code": "partly_stated", '
+                    '"reason": "Only the wall is named."}', None, model, 1)
+        return '{"label": "supported"}', None, model, 1
+    draft = {"conclusion": [line(), line("WEAKME")], "actions": [close(), close(SID2)]}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(answer))
+    for el in result["conclusion"] + result["actions"]:
+        assert el["detail"]["model"] == VERIFIER and el["detail"]["attempt"] == 1
+        assert el["detail"]["served"] is None          # the seam returned no served id
+    weak = [e for e in result["conclusion"] if e["index"] == 1][0]["detail"]
+    assert (weak["reason_code"], weak["reason"]) == ("partly_stated",
+                                                     "Only the wall is named.")
+    assert result["verifier_answers"] == {VERIFIER: 4}
+    assert result["counts"]["answered_primary"] == 4
+    assert result["counts"].get("answered_fallback", 0) == 0
+    # an element with no model call still carries a detail, with no model
+    nocall = {"conclusion": [line("No standard found.", [], "uncertain")], "actions": []}
+    result, _ = run_verify(nocall, monkeypatch)
+    assert result["conclusion"][0]["detail"]["model"] is None
+    assert result["verifier_answers"] == {}
+
+
+def _capped(monkeypatch, draft, label="supported", **fx):
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(label=label), **fx)
+    return [(e["verifier"] if "verifier" in e else e["confidence"],
+             e["detail"]["reason_code"]) for e in result["actions"] + result["conclusion"]]
+
+
+def test_code_caps_set_reason_code(monkeypatch):
+    # web_only: a claim on web refs only is at most weak
+    assert _capped(monkeypatch, {"conclusion": [line("Cure 7 days.", ["W2"])],
+                                 "actions": []}) == [("uncertain", "web_only")]
+    # not_archived: a record plus a web answer none of whose pages was archived
+    assert _capped(monkeypatch, {"conclusion": [line("Cure 7 days.", ["R1", "W1"])],
+                                 "actions": []}) == [("uncertain", "not_archived")]
+    # near_duplicate: a fuzzy near-duplicate create is never above weak
+    assert _capped(monkeypatch, {"conclusion": [], "actions": [
+        create("Seal the west wall joints")]},
+        items={SID1: item_row(SID1, "Seal the east wall joints")}) == [
+        ("weak", "near_duplicate")]
+    # date_assumed: the scope gate's assumed default, whatever the model answered
+    for answer in ("supported", "unsupported", "weak"):
+        assert _capped(monkeypatch, {"conclusion": [], "actions": [_assumed_update()]},
+                       label=answer) == [("weak", "date_assumed")], answer
+    # a cap that does not change the label leaves the model's code
+    result, _ = run_verify({"conclusion": [line("Cure 7 days.", ["W2"])], "actions": []},
+                           monkeypatch, fake=Fake(lambda p, m: (
+                               '{"label": "weak", "reason_code": "partly_stated"}', None,
+                               m, 1)))
+    assert result["conclusion"][0]["detail"]["reason_code"] == "partly_stated"
+    # a cap writes its own reason: the model's reason was for a label it no longer has
+    result, _ = run_verify({"conclusion": [line("Cure 7 days.", ["W2"])], "actions": []},
+                           monkeypatch, fake=Fake(lambda p, m: (
+                               '{"label": "supported", "reason": "Stated."}', None, m, 1)))
+    assert result["conclusion"][0]["detail"]["reason"] == apv.CAP_REASONS["web_only"]
+
+
+def test_the_stage_runner_stores_verifier_detail_and_answers(monkeypatch):
+    import action_pack_view
+    from tests.unit import test_action_pack_stages as base
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+    monkeypatch.setattr(apv, "call_json", Fake(lambda p, m: (
+        '{"label": "weak", "reason_code": "partly_stated", "reason": "Part."}', None, m, 1,
+        m + "-served")))
+    payload = st.run(base.make_ctx(), base.deps(model=base.Model(), verify=apv.verify))
+    assert action_pack_view.payload_shape_error(payload) is None
+    want = {"model": VERIFIER, "served": VERIFIER + "-served", "attempt": 1,
+            "reason_code": "partly_stated", "reason": "Part."}
+    assert [a["verifier_detail"] for a in payload["actions"]] == [want]
+    assert [c["verifier_detail"] for c in payload["conclusion"]] == [want]
+    assert payload["models"]["verifier_answers"] == {VERIFIER: 2}
+    v = payload["run_trace"]["verify"]
+    assert v["answered_primary"] == 2 and v.get("answered_fallback", 0) == 0
+
+
+def test_apply_verdicts_rejects_a_malformed_detail():
+    draft = {"conclusion": [], "actions": [close()]}
+    ok = {"model": VERIFIER, "served": None, "attempt": 1, "reason_code": None,
+          "reason": "r"}
+    for bad in (["x"], dict(ok, attempt="1"), dict(ok, reason=7), dict(ok, extra=1),
+                dict(ok, reason="x" * 201)):
+        with pytest.raises(agent.StageError):
+            st.apply_verdicts(draft, {"conclusion": [], "model": VERIFIER, "actions": [
+                {"index": 0, "verifier": "weak", "detail": bad}]})
+    with pytest.raises(agent.StageError):
+        st.apply_verdicts(draft, {"conclusion": [], "actions": [], "model": VERIFIER,
+                                  "verifier_answers": {VERIFIER: "1"}})
+    _, actions, *_rest, ignored = st.apply_verdicts(draft, {
+        "conclusion": [], "model": VERIFIER, "verifier_answers": {VERIFIER: 1},
+        "actions": [{"index": 0, "verifier": "weak", "detail": ok}]})
+    assert actions[0]["verifier_detail"] == ok and ignored["fields"] == 0
