@@ -67,6 +67,19 @@ def test_contraction_fragments_are_not_content():
         assert toks == ["tom", "crane", "arrive", "done"]
 
 
+def test_millimetre_unit_survives():
+    assert "mm" in itm.tokens("50 mm pipe")
+
+
+def test_the_name_don_survives_but_dont_is_empty():
+    assert "don" in itm.tokens("tell Don the crane")
+    for apos in ("'", "’"):
+        assert itm.tokens(f"don{apos}t") == []
+        assert itm.tokens(f"isn{apos}t") == []
+        assert itm.tokens(f"won{apos}t") == []
+        assert itm.tokens(f"can{apos}t") == []
+
+
 def test_single_letter_domain_tokens_survive():
     assert itm.tokens("Block B") == ["block", "b"]
     assert itm.tokens("Level 2") == ["level", "2"]

@@ -33,12 +33,14 @@ as than then so if or and but not no
 i me my we us our you your he him his she her it its they them their
 this that these those there here
 re ll ve
-don won isn aren wasn weren didn doesn hasn haven couldn shouldn wouldn
-ok okay yeah yep just get got go going like um uh mm
+won isn aren wasn weren didn doesn hasn haven couldn shouldn wouldn
+ok okay yeah yep just get got go going like um uh
 """.split())
-# "don won ...": what a negated contraction leaves once `_CONTRACTION` strips
-# its 't. "ok okay ...": spoken fillers, since turns are speech. "re ll ve" only
-# catch contractions written without an apostrophe.
+# "won isn ...": what a negated contraction leaves once `_CONTRACTION` strips
+# its 't (where `_NEGATION` did not apply). "don" is NOT here: "don't" goes
+# through `_NEGATION` to "do", and "Don" is a name. "mm" is NOT a filler here:
+# it is the millimetre unit. "ok okay ...": spoken fillers, since turns are
+# speech. "re ll ve" only catch contractions written without an apostrophe.
 #
 # Single letters and "right"/"left" are NOT stop words: site labels use them
 # ("Block D", "Level M") and left/right tell twin locations apart.
@@ -50,6 +52,15 @@ _ASCII_WORD = re.compile(r"[a-z0-9]+")
 # "Tom's crane" matched "it's fine" on "s". n't is covered by 't: "won't" ->
 # "won", "isn't" -> "isn", and those stems are stop words above.
 _CONTRACTION = re.compile(r"(?<=[a-z0-9])['\u2019](?:s|t|re|ll|ve|d|m)\b")
+
+# A negated contraction whose stem without "n't" is itself a stop word ("don't"
+# -> "do", "isn't" -> "is") drops the whole n't; otherwise ("won't" -> "wo") the
+# word is left for `_CONTRACTION`'s 't rule ("won").
+_NEGATION = re.compile(r"\b([a-z0-9]+)n['\u2019]t\b")
+
+
+def _strip_negation(m):
+    return m.group(1) if m.group(1) in STOP_WORDS else m.group(0)
 
 
 def _is_cjk_word_char(ch):
@@ -69,6 +80,7 @@ def tokens(text):
     """
     t = unicodedata.normalize("NFKC", text or "")
     t = strip_cjk_spacing(t).lower()
+    t = _NEGATION.sub(_strip_negation, t)
     t = _CONTRACTION.sub("", t)
     out = []
     i, n = 0, len(t)
