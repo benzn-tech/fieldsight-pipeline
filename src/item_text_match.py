@@ -32,18 +32,24 @@ of in on at to for from by with about into onto over under up down off out
 as than then so if or and but not no
 i me my we us our you your he him his she her it its they them their
 this that these those there here
-s t re ll ve d m
+re ll ve
 don won isn aren wasn weren didn doesn hasn haven couldn shouldn wouldn
-ok okay yeah yep just get got go going like um uh mm right
+ok okay yeah yep just get got go going like um uh mm
 """.split())
-# The last three lines. "s t re ...": apostrophe-contraction fragments. `[a-z0-9]+` splits
-# "Tom's" into "tom" + "s" and "won't" into "won" + "t"; left in, "Tom's crane"
-# matched "it's fine" on "s". Listed explicitly rather than dropping every
-# single letter, because "B" in "Block B" and lone digits are domain-bearing.
-# "don won ...": contraction stems. "ok okay ...": spoken fillers, since
-# turns are speech.
+# "don won ...": what a negated contraction leaves once `_CONTRACTION` strips
+# its 't. "ok okay ...": spoken fillers, since turns are speech. "re ll ve" only
+# catch contractions written without an apostrophe.
+#
+# Single letters and "right"/"left" are NOT stop words: site labels use them
+# ("Block D", "Level M") and left/right tell twin locations apart.
 
 _ASCII_WORD = re.compile(r"[a-z0-9]+")
+
+# A contraction suffix attached by an apostrophe (' or U+2019), stripped before
+# tokenising. Without this, `[a-z0-9]+` split "Tom's" into "tom" + "s" and
+# "Tom's crane" matched "it's fine" on "s". n't is covered by 't: "won't" ->
+# "won", "isn't" -> "isn", and those stems are stop words above.
+_CONTRACTION = re.compile(r"(?<=[a-z0-9])['\u2019](?:s|t|re|ll|ve|d|m)\b")
 
 
 def _is_cjk_word_char(ch):
@@ -63,6 +69,7 @@ def tokens(text):
     """
     t = unicodedata.normalize("NFKC", text or "")
     t = strip_cjk_spacing(t).lower()
+    t = _CONTRACTION.sub("", t)
     out = []
     i, n = 0, len(t)
     while i < n:

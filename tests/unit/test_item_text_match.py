@@ -73,5 +73,18 @@ def test_single_letter_domain_tokens_survive():
 
 
 def test_spoken_fillers_dropped():
-    toks = itm.tokens("ok yeah so um we just got the crane going right")
+    toks = itm.tokens("ok yeah so um we just got the crane going")
     assert toks == ["crane"]
+
+
+def test_site_labels_and_sides_survive():
+    toks = itm.tokens("Block D level M right side")
+    for t in ("d", "m", "right"):
+        assert t in toks
+
+
+def test_contraction_suffix_stripped_not_tokenised():
+    for apos in ("'", "’"):
+        assert "d" not in itm.tokens(f"we{apos}d")
+        assert itm.tokens(f"Tom{apos}s") == ["tom"]
+        assert itm.tokens(f"we{apos}re") == []
