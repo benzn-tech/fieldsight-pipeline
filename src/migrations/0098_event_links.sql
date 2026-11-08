@@ -55,11 +55,49 @@ ALTER TABLE topic_decisions ADD COLUMN IF NOT EXISTS claim_type text;
 ALTER TABLE topic_decisions ADD COLUMN IF NOT EXISTS claim_basis jsonb;
 ALTER TABLE topic_questions ADD COLUMN IF NOT EXISTS claim_type text;
 ALTER TABLE topic_questions ADD COLUMN IF NOT EXISTS claim_basis jsonb;
-ALTER TABLE action_items    ADD CONSTRAINT action_items_claim_type_check
-  CHECK (claim_type IN ('observed','stated','inferred'));
-ALTER TABLE findings        ADD CONSTRAINT findings_claim_type_check
-  CHECK (claim_type IN ('observed','stated','inferred'));
-ALTER TABLE topic_decisions ADD CONSTRAINT topic_decisions_claim_type_check
-  CHECK (claim_type IN ('observed','stated','inferred'));
-ALTER TABLE topic_questions ADD CONSTRAINT topic_questions_claim_type_check
-  CHECK (claim_type IN ('observed','stated','inferred'));
+-- Postgres has no ADD CONSTRAINT IF NOT EXISTS: each CHECK is guarded on pg_constraint so
+-- the file is safe to execute again (same shape as 0092_company_status.sql).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'action_items_claim_type_check' AND conrelid = 'action_items'::regclass
+  ) THEN
+    ALTER TABLE action_items
+      ADD CONSTRAINT action_items_claim_type_check
+      CHECK (claim_type IN ('observed','stated','inferred'));
+  END IF;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'findings_claim_type_check' AND conrelid = 'findings'::regclass
+  ) THEN
+    ALTER TABLE findings
+      ADD CONSTRAINT findings_claim_type_check
+      CHECK (claim_type IN ('observed','stated','inferred'));
+  END IF;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'topic_decisions_claim_type_check' AND conrelid = 'topic_decisions'::regclass
+  ) THEN
+    ALTER TABLE topic_decisions
+      ADD CONSTRAINT topic_decisions_claim_type_check
+      CHECK (claim_type IN ('observed','stated','inferred'));
+  END IF;
+END $$;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'topic_questions_claim_type_check' AND conrelid = 'topic_questions'::regclass
+  ) THEN
+    ALTER TABLE topic_questions
+      ADD CONSTRAINT topic_questions_claim_type_check
+      CHECK (claim_type IN ('observed','stated','inferred'));
+  END IF;
+END $$;

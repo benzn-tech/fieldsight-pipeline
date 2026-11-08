@@ -61,3 +61,21 @@ def test_claim_columns_on_all_four_tables():
             f"ALTER TABLE {table} ADD CONSTRAINT {table}_claim_type_check "
             "CHECK (claim_type IN ('observed','stated','inferred'));" in sql
         ), table
+
+
+def test_every_add_constraint_is_pg_constraint_guarded():
+    """Postgres has no ADD CONSTRAINT IF NOT EXISTS; an unguarded one makes the file fail
+    on a second execution. Each must sit in a DO block that checks pg_constraint for its
+    own name first (the shape of 0092_company_status.sql)."""
+    sql = re.sub(r"--[^\n]*", "", _sql())  # comments may mention the syntax
+    blocks = [(m.start(), m.end(), m.group(0))
+              for m in re.finditer(r"DO \$\$.*?END \$\$;", sql, re.S)]
+    adds = list(re.finditer(r"ADD CONSTRAINT (\w+)", sql))
+    assert len(adds) == 4, [m.group(1) for m in adds]
+    for m in adds:
+        name = m.group(1)
+        inside = [b for b in blocks if b[0] < m.start() < b[1]]
+        assert inside, f"{name} is not inside a DO block"
+        flat = " ".join(inside[0][2].split())
+        assert (f"IF NOT EXISTS ( SELECT 1 FROM pg_constraint WHERE conname = '{name}'"
+                in flat), name
