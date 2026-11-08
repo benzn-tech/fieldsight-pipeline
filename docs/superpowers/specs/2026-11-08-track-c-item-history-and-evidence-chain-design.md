@@ -106,7 +106,7 @@ event_links
   src_row_id       uuid                     -- the per-pass row, for supported_by (see deletion)
   dst_kind         text NOT NULL CHECK IN ('turn','action_item','finding','decision','question')
   dst_stable_id    uuid                     -- item → item links
-  dst_turn         jsonb                    -- supported_by: {segment_key, offset_sec, speaker_label, quote_status}
+  dst_turn         jsonb                    -- supported_by: {source_stem, start_sec, end_sec, speaker_label, quote_status}
   method           text NOT NULL            -- 'lexical_v1' | 'human' | ...
   score            real
   rule_version     text NOT NULL
@@ -161,7 +161,7 @@ find_items(conn, *, company_id, site_id, kinds,
     source_s3_key}, recorded_by, carried_from,
     score, matched_terms,
     place (null in this slice),
-    origin (null, or {segment_key, offset_sec, speaker_label, quote_status} from the live
+    origin (null, or {source_stem, start_sec, end_sec, speaker_label, quote_status} from the live
             row's supported_by link) }
 ```
 
