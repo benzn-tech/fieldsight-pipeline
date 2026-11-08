@@ -27,7 +27,7 @@ ALL_FILES = {
     "action_item_history", "decisions", "findings", "observations", "safety_observations",
     "compliance_resolutions", "programmes", "programme_versions", "programme_tasks",
     "programme_task_deps", "programme_task_assignees", "programme_delay_flags",
-    "project_documents",
+    "project_documents", "event_links",
 }
 
 
@@ -161,6 +161,15 @@ class World:
         self._bucket("topics", who, tid)
         ai = self._row("action_items", "INSERT INTO action_items (topic_id, site_id, text) VALUES (%s,%s,'do') "
                        "RETURNING id::text", (tid, site), who)
+        # the item's evidence link follows the item: same owner, same tombstone
+        self._row("event_links",
+                  "INSERT INTO event_links (site_id, link_type, src_kind, src_stable_id, "
+                  "src_action_item_id, dst_kind, dst_turn, method, score, rule_version) "
+                  "SELECT site_id, 'supported_by', 'action_item', stable_id, id, 'turn', "
+                  "'{\"source_stem\": \"stem-x\", \"start_sec\": 1.0, \"end_sec\": 2.0, "
+                  "\"speaker_label\": \"spk_0\", \"quote_status\": \"verified\"}'::jsonb, "
+                  "'lexical_v1', 0.9, 'v-test' FROM action_items WHERE id = %s RETURNING id::text",
+                  (ai,), who)
         self._row("findings", "INSERT INTO findings (topic_id, site_id, observation) VALUES (%s,%s,'f') "
                   "RETURNING id::text", (tid, site), who)
         self._row("decisions", "INSERT INTO topic_decisions (topic_id, site_id, decision) VALUES (%s,%s,'d') "
@@ -284,6 +293,7 @@ def test_tombstones_are_excluded_and_counted(db):
     assert ex["sessions"]["excluded"].get("deleted") == 1
     assert ex["topics"]["excluded"] == {"deleted": 2, "superseded": 1}
     assert ex["action_items"]["excluded"] == {"deleted": 2, "superseded": 1}
+    assert ex["event_links"]["excluded"] == {"deleted": 2, "superseded": 1}
     assert ex["observations"]["excluded"] == {"archived": 1}
     assert ex["compliance_resolutions"]["excluded"] == {"deleted_day": 1}
     assert ex["project_documents"]["excluded"] == {"deleted": 1}

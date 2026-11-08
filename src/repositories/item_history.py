@@ -33,20 +33,18 @@ from deleted_predicates import (
     visible_topics_predicate,
 )
 from item_text_match import overlap
+from repositories.event_links import BEST_LINK_ORDER, KIND_SRC_COLUMN, KIND_TABLE
 
-KINDS = ("action_item", "finding", "decision", "question")
+KINDS = tuple(KIND_TABLE)
 
-# kind -> (table, text column, responsible column, status column, deadline column,
-#          event_links src column). None = the kind has no such field.
+# kind -> (text column, responsible column, status column, deadline column). None = the kind
+# has no such field. The table and the event_links FK column come from event_links
+# (KIND_TABLE / KIND_SRC_COLUMN), the one mapping every Track C module reads.
 _SHAPE = {
-    "action_item": ("action_items", "text", "responsible", "status", "deadline",
-                    "src_action_item_id"),
-    "finding": ("findings", "observation", "entity_name", "status", None,
-                "src_finding_id"),
-    "decision": ("topic_decisions", "decision", "decided_by", None, None,
-                 "src_decision_id"),
-    "question": ("topic_questions", "question", None, "status", None,
-                 "src_question_id"),
+    "action_item": ("text", "responsible", "status", "deadline"),
+    "finding": ("observation", "entity_name", "status", None),
+    "decision": ("decision", "decided_by", None, None),
+    "question": ("question", None, "status", None),
 }
 
 # A status filter is accepted only where status is a closed vocabulary a caller can name.
@@ -97,7 +95,8 @@ def _validate(company_id, site_id, kinds, statuses, since, until, limit):
 def _kind_sql(kind, live_predicate, status_filtered):
     """One kind's candidates: live rows on the site (company-checked through sites), each
     with its earliest undeleted same-stable_id row and its best supported_by link."""
-    table, text_col, resp_col, status_col, deadline_col, link_col = _SHAPE[kind]
+    table, link_col = KIND_TABLE[kind], KIND_SRC_COLUMN[kind]
+    text_col, resp_col, status_col, deadline_col = _SHAPE[kind]
     resp = f"c.{resp_col}" if resp_col else "NULL::text"
     status = f"c.{status_col}" if status_col else "NULL::text"
     deadline = f"c.{deadline_col}" if deadline_col else "NULL::date"
@@ -118,7 +117,7 @@ def _kind_sql(kind, live_predicate, status_filtered):
         f"ORDER BY x.created_at ASC, x.id ASC LIMIT 1) fs ON true "
         f"LEFT JOIN LATERAL (SELECT e.dst_turn FROM event_links e "
         f"WHERE e.{link_col} = c.id AND e.link_type = 'supported_by' AND e.dst_kind = 'turn' "
-        f"ORDER BY e.score DESC NULLS LAST, e.created_at DESC, e.id ASC LIMIT 1) o ON true "
+        f"ORDER BY {BEST_LINK_ORDER} LIMIT 1) o ON true "
         f"WHERE c.site_id = %(site_id)s AND s.company_id = %(company_id)s "
         f"AND {live_predicate}{status_clause} "
         f"AND (%(since)s::date IS NULL OR fs.first_date >= %(since)s::date) "
