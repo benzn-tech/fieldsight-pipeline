@@ -301,6 +301,13 @@
   - Each card carries the company and site names for display.
 - `POST /api/org/decision-shadow/{card_id}/label`, body `{"label": "needed" | "not_needed" | "wrong_evidence", "note": str}`. Platform admin only. An unknown label → 400. An unknown card → 404. Returns the card. Never changes `status`.
 - Both return 404 when `SITE_DECISION_LOOP` is `off` in org-api's env (wired in Task 5).
+- **Response shape (fixed by the ui page already on dev, ui#469; keep these names exactly):**
+  - card: `card_id`, `company_name`, `site_name`, `rule_id`, `kind`, `purpose`, `urgency` (`injury` | `normal`), `question`, `consequence`, `created_at` (ISO 8601 UTC), `shadow_label`, `label_note`;
+  - `options`: `[{id, label, recommended, reason_required?}]`;
+  - `evidence`: `[{quote, at}]`;
+  - `recipients`: `[{user_id, role, display_name}]` (`display_name` = first + last name, so the page shows names);
+  - summary: `labelled`, `needed`, `not_needed`, `wrong_evidence`, `precision` (0..1 or null), `cards_per_recipient_day_p95` (number or null);
+  - the label POST returns the card in the same shape. The `label` filter is one of the three values or absent; there is no `unlabelled` value.
 
 - [ ] **Step 1: Write failing tests:**
   - `test_non_platform_admin_gets_403` (admin, gm, pm);
