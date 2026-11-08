@@ -30,6 +30,12 @@ INSTRUCTION = (
     "INCLUDED. Otherwise omit \"status_suggestion\"."
 )
 
+# The linker call's variant (continuity linker spec L3): there the model links, rather than
+# declares, continuation. Only the opening is reworded; the rest is INSTRUCTION verbatim.
+_OPENING = "For an action item that continues an earlier item"
+assert INSTRUCTION.startswith(_OPENING)
+LINKER_INSTRUCTION = "For an action item you link to an earlier item" + INSTRUCTION[len(_OPENING):]
+
 
 def _children(topics):
     for topic in topics if isinstance(topics, list) else []:

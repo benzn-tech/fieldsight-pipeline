@@ -86,6 +86,71 @@ def gather(run_dir):
     return finals, latencies, step_items
 
 
+def linker_context(run_dir):
+    """Linker-mode context (spec 2026-11-08 section 6), {} when no final with-block step has a
+    `linker` record (a run without --linker). Over final with-block steps:
+      linker_p90_ms: p90 of linker["ms"] where the linker status is "ok";
+      linker_not_ok: steps with a prior (prior_count > 0) whose linker status is not "ok"
+                     (error, skipped_budget, or never ran, e.g. the extraction call failed).
+    Chains with an error step are skipped, as gather() skips them, so these counts cover the
+    same chains as the bars. Report-only; no bar reads it."""
+    finals = []
+    for _shape, arm, _rep, _sess, d in chains(run_dir):
+        if arm != "with_block":
+            continue
+        steps = load_steps(d)
+        if steps and not any(s.get("error") for s in steps):
+            finals.append(steps[-1])
+    if not any(s.get("linker") is not None for s in finals):
+        return {}
+    ok_ms = [s["linker"]["ms"] for s in finals
+             if isinstance(s.get("linker"), dict) and s["linker"].get("status") == "ok"]
+    not_ok = sum(1 for s in finals if s.get("prior_count", 0) > 0 and not (
+        isinstance(s.get("linker"), dict) and s["linker"].get("status") == "ok"))
+    return {"linker_p90_ms": score._percentile(ok_ms, 90), "linker_not_ok": not_ok}
+
+
+def prompt_mismatches(run_dir):
+    """Spec 2026-11-08 section 6's harness assertion, automated: a linker-mode final with-block
+    step's extraction prompt is byte-equal to the baseline arm's prompt for the same
+    (session, shape, rep, step). Compares `prompt_sha1` for every with-block step with
+    `linker_mode` and `is_final` true and a linker record (the linker ran); returns one
+    description per mismatch or missing baseline (hashes and keys only, no item text).
+    Chains with an error step are skipped on both arms, as gather() skips them, so a baseline
+    chain with an error step counts as no baseline."""
+    baseline, checked = {}, []
+    for shape, arm, rep, sess, d in chains(run_dir):
+        steps = load_steps(d)
+        if not steps or any(s.get("error") for s in steps):
+            continue
+        for i, s in enumerate(steps):
+            key = (sess, shape, rep, i)
+            if arm == "baseline":
+                baseline[key] = s.get("prompt_sha1")
+            elif (arm == "with_block" and s.get("linker_mode") and s.get("is_final")
+                  and s.get("linker") is not None):
+                checked.append((key, s.get("prompt_sha1")))
+    out = []
+    for (sess, shape, rep, i), sha in checked:
+        where = f"{sess}|{shape}|rep {rep}|step {i}"
+        if (sess, shape, rep, i) not in baseline:
+            out.append(f"{where}: no baseline record (missing, or its chain has an error step)")
+        elif baseline[(sess, shape, rep, i)] != sha:
+            out.append(f"{where}: with_block prompt_sha1 {sha} != baseline "
+                       f"{baseline[(sess, shape, rep, i)]}")
+    return out
+
+
+def linker_report(run_dir):
+    """(context, mismatches): linker_context plus `linker_prompt_mismatches` (a count), both
+    only when linker records exist; ({}, []) for a run without --linker."""
+    ctx = linker_context(run_dir)
+    if not ctx:
+        return {}, []
+    mismatches = prompt_mismatches(run_dir)
+    return {**ctx, "linker_prompt_mismatches": len(mismatches)}, mismatches
+
+
 def admission_drift(finals):
     metric, tolerance = {}, {}
     for cell, arms in finals.items():
@@ -225,6 +290,9 @@ def main():
     p90b = score._percentile(latencies["baseline"], 90)
     added = [] if p90w is None or p90b is None else [p90w - p90b] * len(latencies["with_block"])
     tor = text_only_recall(run_dir, gold)
+    linker_ctx, mismatches = linker_report(run_dir)
+    if linker_ctx:
+        print(json.dumps({"linker_prompt_mismatches": mismatches}, indent=2))
 
     summary = score.build_summary(
         run_dir, merged, out, latencies_ms=added,
@@ -249,6 +317,7 @@ def main():
         "unsupported_overall": {k: {"unsupported": v[0], "total": v[1]} for k, v in overall.items()},
         "drift_cells": len(metric),
         "gold": "agent+owner" if owner_n else "agent only (preliminary)",
+        **linker_ctx,
     }
     Path(out).write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))

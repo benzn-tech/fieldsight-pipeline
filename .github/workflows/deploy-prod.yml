@@ -395,6 +395,7 @@ jobs:
               "GroupMaxSpanSeconds=${{ vars.PROD_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
               "DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}" \
               "StatusSuggestions=${{ vars.PROD_STATUS_SUGGESTIONS || 'false' }}" \
+              "ContinuityLinker=${{ vars.PROD_CONTINUITY_LINKER || 'false' }}" \
               "StatusEvidenceFloorTokens=${{ vars.PROD_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \

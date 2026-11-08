@@ -12,6 +12,7 @@ owns.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -514,6 +515,10 @@ def test_pinned_sessions_keeps_pinned_order_and_reports_missing():
 
 
 def test_sessions_file_overrides_sessions_count_on_dry_run(monkeypatch, tmp_path, capsys):
+    # main() writes these module globals; record them via monkeypatch so teardown restores.
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", False)
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.EXTRA_INSTRUCTION)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", run_mod.LINKER_MODE)
     monkeypatch.setattr(run_mod.llm_utils, "call_llm",
                          lambda *a, **k: (None, "should never run"))
     s1 = {"env": "prod", "user_folder": "u", "date": "2026-09-01", "session_base": "s1",
@@ -549,3 +554,336 @@ def test_status_instruction_rides_on_the_continuity_block(monkeypatch):
     run_mod._run_one_step("u", "2026-09-01", "s", [], 1, arm="with_block",
                           is_first=False, is_final=False, prior_topics=prior)
     assert prompts and run_mod.status_suggestions.INSTRUCTION.strip()[:40] in prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# --linker: the treatment arm's FINAL pass extracts with no prior block, then the real
+# les._run_linker links new items to the prior list (spec 2026-11-08 section 6).
+# ---------------------------------------------------------------------------
+
+_PRIOR_ACTION = "Fix the leaking pump on level 2"
+
+
+def _linker_stubs(monkeypatch, calls, linker_answer=None, extraction_info=None):
+    """Stub build_extraction_prompt (records the block) and call_llm, branching on caller:
+    "continuity_eval" is the harness's extraction, "continuity_link_final" is the call the
+    REAL les._run_linker makes (same llm_utils module object, so one stub catches both)."""
+    blocks = []
+
+    def fake_build(user_folder, date, session_base, turns, n_segments, speaker_names=None,
+                   continuity_block=""):
+        blocks.append(continuity_block)
+        return f"PROMPT[{len(turns)}]<<<{continuity_block}>>>", {}
+    monkeypatch.setattr(run_mod.les, "build_extraction_prompt", fake_build)
+
+    def fake_call_llm(prompt, **kw):
+        calls.append({**kw, "_prompt": prompt})
+        if kw.get("caller") == "continuity_link_final":
+            answer = linker_answer if linker_answer is not None else {
+                "links": [{"ref": "N1", "continues": {"id": "A1", "starts": "Fix the leaking pump"}}]}
+            return json.dumps(answer), None
+        if extraction_info is not None and isinstance(kw.get("info"), dict):
+            kw["info"].update(extraction_info)
+        n_extractions = sum(1 for c in calls if c.get("caller") == "continuity_eval")
+        text = _PRIOR_ACTION if n_extractions == 1 else _PRIOR_ACTION + ", confirmed done"
+        return json.dumps({"topics": [{"action_items": [{"action": text}]}]}), None
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm", fake_call_llm)
+    return blocks
+
+
+def test_linker_mode_final_step_extracts_without_block_and_links(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"
+    _install_gather_and_assemble(monkeypatch)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", True)
+    calls = []
+    blocks = _linker_stubs(monkeypatch, calls)
+
+    records = run_mod.run_chain("bucket", SESSION, "a", sessions_mod.shapes()["a"],
+                                 "with_block", 1, tmp_path)
+
+    assert blocks == ["", ""]  # step 0: no prior; final: linker mode, so no block either
+    linker_calls = [c for c in calls if c.get("caller") == "continuity_link_final"]
+    assert len(linker_calls) == 1
+    assert linker_calls[0]["enable_thinking"] is False
+    final = records[-1]
+    assert final["prior_count"] == 1
+    assert final["prompt_has_block"] is False
+    assert final["linker"]["status"] == "ok"
+    assert final["linker_mode"] is True
+    assert final["claims"] and final["claims"][0]["outcome"] == "accepted"
+    assert final["void"] is False
+    first_id = records[0]["extraction"]["topics"][0]["action_items"][0]["item_id"]
+    assert final["extraction"]["topics"][0]["action_items"][0]["item_id"] == first_id
+    assert records[0]["linker"] is None  # the linker only runs on the final pass
+
+
+def test_linker_mode_live_steps_unchanged(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"
+    _install_gather_and_assemble(monkeypatch)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", True)
+    calls = []
+    blocks = _linker_stubs(monkeypatch, calls)
+
+    records = run_mod.run_chain("bucket", SESSION, "b", sessions_mod.shapes()["b"],
+                                 "with_block", 1, tmp_path)
+
+    # Step 1 (non-final, with a prior): today's block, exactly render_block's output.
+    expected_prior = item_continuity.prior_items(
+        {"topics": records[0]["extraction"]["topics"]})
+    assert blocks[1] == item_continuity.render_block(expected_prior, run_mod.EXTRA_INSTRUCTION)
+    assert blocks[1]
+    assert records[1]["linker"] is None
+    assert blocks[3] == ""  # only the final step drops the block
+    # One LLM call per non-final step; the linker call happens only on the final step.
+    callers = [c.get("caller") for c in calls]
+    assert callers == ["continuity_eval"] * 4 + ["continuity_link_final"]
+
+
+def test_linker_mode_final_prompt_byte_equal_to_baseline_prompt(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"
+    _install_gather_and_assemble(monkeypatch)
+    calls = []
+    _linker_stubs(monkeypatch, calls)
+    baseline = run_mod.run_chain("bucket", SESSION, "a", sessions_mod.shapes()["a"],
+                                  "baseline", 1, tmp_path)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", True)
+    calls.clear()
+    treated = run_mod.run_chain("bucket", SESSION, "a", sessions_mod.shapes()["a"],
+                                 "with_block", 1, tmp_path)
+
+    expected = hashlib.sha1(b"PROMPT[10]<<<>>>").hexdigest()
+    assert baseline[-1]["prompt_sha1"] == treated[-1]["prompt_sha1"] == expected
+    assert all("prompt_sha1" in r for r in baseline + treated)
+
+
+@pytest.mark.parametrize("run,expected", [
+    # linker mode, final with-block step: the prompt has no block by construction.
+    ({"arm": "with_block", "linker_mode": True, "is_final": True, "prior_count": 3,
+      "prompt_has_block": False, "linker": {"status": "error"}}, True),
+    ({"arm": "with_block", "linker_mode": True, "is_final": True, "prior_count": 3,
+      "prompt_has_block": False, "linker": {"status": "skipped_budget"}}, True),
+    ({"arm": "with_block", "linker_mode": True, "is_final": True, "prior_count": 3,
+      "prompt_has_block": False, "linker": None}, True),
+    ({"arm": "with_block", "linker_mode": True, "is_final": True, "prior_count": 0,
+      "prompt_has_block": False, "linker": {"status": "ok"}}, True),
+    ({"arm": "with_block", "linker_mode": True, "is_final": True, "prior_count": 3,
+      "prompt_has_block": False, "linker": {"status": "ok"}}, False),
+    # linker mode, non-final: today's rule.
+    ({"arm": "with_block", "linker_mode": True, "is_final": False, "prior_count": 3,
+      "prompt_has_block": False, "linker": None}, True),
+    ({"arm": "with_block", "linker_mode": True, "is_final": False, "prior_count": 3,
+      "prompt_has_block": True, "linker": None}, False),
+    # baseline is never void.
+    ({"arm": "baseline", "linker_mode": True, "is_final": True, "prior_count": 0,
+      "prompt_has_block": False, "linker": None}, False),
+])
+def test_void_in_linker_mode(run, expected):
+    assert run_mod.void(run) is expected
+
+
+def test_step_record_carries_served_model(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"
+    _install_gather_and_assemble(monkeypatch)
+    calls = []
+    _linker_stubs(monkeypatch, calls, extraction_info={"model": "m", "served_model": "s"})
+
+    records = run_mod.run_chain("bucket", SESSION, "a", sessions_mod.shapes()["a"],
+                                 "baseline", 1, tmp_path)
+
+    assert all(r["model"] == "m" and r["served_model"] == "s" for r in records)
+    assert all(r["linker"] is None and r["linker_mode"] is False for r in records)
+
+
+def test_sessions_json_marks_linker_treatment(monkeypatch, tmp_path):
+    # main() writes these module globals; record them via monkeypatch so teardown restores.
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", False)
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.EXTRA_INSTRUCTION)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", run_mod.LINKER_MODE)
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    monkeypatch.setattr(run_mod, "load_deployed_llm_env", lambda *a, **k: None)
+    s1 = {"env": "prod", "user_folder": "u", "date": "2026-09-01", "session_base": "s1",
+          "n_segments": 5}
+    s2 = {**s1, "session_base": "s2"}
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions", lambda env, **kw: [s1, s2])
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_linker"
+    run_mod.main(["--env", "prod", "--out", str(out_dir), "--linker", "--dry-run"])
+
+    written = json.loads((out_dir / "sessions.json").read_text(encoding="utf-8"))
+    assert len(written) == 2
+    assert all(s["treatment"] == "linker" for s in written)
+    assert run_mod.LINKER_MODE is True
+
+
+# ---------------------------------------------------------------------------
+# finalize.linker_context: linker latency and non-ok count over final with-block steps.
+# ---------------------------------------------------------------------------
+
+def _write_chain(root, shape, arm, rep, sess, steps):
+    d = root / "runs" / shape / arm / str(rep) / sess
+    d.mkdir(parents=True, exist_ok=True)
+    for i, s in enumerate(steps):
+        (d / f"{i}.json").write_text(json.dumps(s), encoding="utf-8")
+
+
+def test_finalize_linker_context(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    live = {"prior_count": 0, "linker": None}
+    for rep, (ms, status) in enumerate([(100, "ok"), (300, "ok"), (900, "error")], start=1):
+        _write_chain(tmp_path, "a", "with_block", rep, "s1",
+                     [live, {"prior_count": 2, "linker": {"status": status, "ms": ms}}])
+    # A final with a prior whose linker never ran is not ok; one with no prior is not counted.
+    _write_chain(tmp_path, "a", "with_block", 4, "s1",
+                 [live, {"prior_count": 2, "linker": None}])
+    _write_chain(tmp_path, "a", "with_block", 5, "s1",
+                 [live, {"prior_count": 0, "linker": None}])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [live, {"prior_count": 0, "linker": {"status": "ok", "ms": 99999}}])
+
+    ctx = finalize_mod.linker_context(tmp_path)
+    assert ctx == {"linker_p90_ms": 300, "linker_not_ok": 2}
+
+
+def test_finalize_linker_context_absent_without_linker_records(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [{"prior_count": 0}, {"prior_count": 2, "prompt_has_block": True}])
+    assert finalize_mod.linker_context(tmp_path) == {}
+
+
+def test_finalize_linker_context_skips_chains_with_an_error_step(tmp_path):
+    """Same chains as gather() (and so the bars): a chain with any error step is skipped."""
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [{"prior_count": 0, "linker": None},
+                  {"prior_count": 2, "linker": {"status": "ok", "ms": 200}}])
+    _write_chain(tmp_path, "a", "with_block", 2, "s1",
+                 [{"prior_count": 0, "linker": None},
+                  {"prior_count": 2, "linker": None, "error": "boom"}])
+    _write_chain(tmp_path, "a", "with_block", 3, "s1",
+                 [{"prior_count": 0, "linker": None, "error": "boom"},
+                  {"prior_count": 2, "linker": {"status": "error", "ms": 50000}}])
+    assert finalize_mod.linker_context(tmp_path) == {"linker_p90_ms": 200, "linker_not_ok": 0}
+
+
+# ---------------------------------------------------------------------------
+# finalize.prompt_mismatches: spec section 6's byte-equality check, automated.
+# ---------------------------------------------------------------------------
+
+def _step(sha, *, final=False, linker=None, linker_mode=True, error=None):
+    return {"prompt_sha1": sha, "linker_mode": linker_mode, "is_final": final,
+            "linker": linker, "prior_count": 2 if final else 0, "error": error}
+
+
+_OK = {"status": "ok", "ms": 100}
+
+
+def test_prompt_mismatches_empty_when_final_prompts_are_byte_equal(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    # Live steps differ by construction (the block); only linker finals are compared.
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("same", final=True, linker=_OK)])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [_step("b0"), _step("same", final=True)])
+    assert finalize_mod.prompt_mismatches(tmp_path) == []
+
+
+def test_prompt_mismatches_reports_a_mismatch_and_a_missing_baseline(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("aaaa", final=True, linker=_OK)])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [_step("b0"), _step("bbbb", final=True)])
+    _write_chain(tmp_path, "a", "with_block", 2, "s1",
+                 [_step("w0"), _step("cccc", final=True, linker=_OK)])
+    got = finalize_mod.prompt_mismatches(tmp_path)
+    assert len(got) == 2
+    assert "s1" in got[0] and "rep 1" in got[0] and "step 1" in got[0]
+    assert "aaaa" in got[0] and "bbbb" in got[0]
+    assert "rep 2" in got[1] and "no baseline" in got[1]
+
+
+def test_prompt_mismatches_compares_only_linker_finals_in_error_free_chains(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "baseline", 1, "s1", [_step("b0"), _step("base", final=True)])
+    # Not compared: the linker never ran (no prior), no linker mode, a chain with an error step.
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("x1", final=True, linker=None)])
+    _write_chain(tmp_path, "b", "with_block", 1, "s1",
+                 [_step("w0", linker_mode=False),
+                  _step("x2", final=True, linker=_OK, linker_mode=False)])
+    _write_chain(tmp_path, "a", "with_block", 2, "s1",
+                 [_step("w0", error="boom"), _step("x3", final=True, linker=_OK)])
+    assert finalize_mod.prompt_mismatches(tmp_path) == []
+
+
+def test_prompt_mismatches_ignores_a_baseline_chain_with_an_error_step(tmp_path):
+    """A baseline chain gather() skips is not a comparison partner: reported as no baseline."""
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [_step("w0"), _step("same", final=True, linker=_OK)])
+    _write_chain(tmp_path, "a", "baseline", 1, "s1",
+                 [_step("b0", error="boom"), _step("same", final=True)])
+    got = finalize_mod.prompt_mismatches(tmp_path)
+    assert len(got) == 1 and "no baseline" in got[0]
+
+
+def test_linker_report_adds_the_mismatch_count_only_with_linker_records(tmp_path):
+    from scripts.continuity_eval import finalize as finalize_mod
+    _write_chain(tmp_path, "a", "with_block", 1, "s1",
+                 [{"prior_count": 0}, {"prior_count": 2, "prompt_has_block": True,
+                                      "prompt_sha1": "x"}])
+    assert finalize_mod.linker_report(tmp_path) == ({}, [])
+
+    _write_chain(tmp_path, "b", "with_block", 1, "s1",
+                 [_step("w0"), _step("aaaa", final=True, linker=_OK)])
+    _write_chain(tmp_path, "b", "baseline", 1, "s1",
+                 [_step("b0"), _step("bbbb", final=True)])
+    ctx, mismatches = finalize_mod.linker_report(tmp_path)
+    assert ctx["linker_prompt_mismatches"] == 1 == len(mismatches)
+    assert ctx["linker_p90_ms"] == 100
+
+
+@pytest.mark.parametrize("status_on", [True, False])
+def test_linker_prompt_carries_status_rule_only_when_status_suggestions_on(
+        monkeypatch, tmp_path, status_on):
+    tmp_path = tmp_path / "continuity_eval_runs"
+    _install_gather_and_assemble(monkeypatch)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", True)
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", status_on)
+    calls = []
+    _linker_stubs(monkeypatch, calls)
+
+    run_mod.run_chain("bucket", SESSION, "a", sessions_mod.shapes()["a"],
+                      "with_block", 1, tmp_path)
+
+    linker_prompts = [c["_prompt"] for c in calls if c.get("caller") == "continuity_link_final"]
+    assert len(linker_prompts) == 1
+    rule = run_mod.status_suggestions.LINKER_INSTRUCTION
+    assert (rule in linker_prompts[0]) is status_on
+
+
+@pytest.mark.parametrize("flag,expected", [(["--status-instruction"], True), ([], False)])
+def test_status_instruction_flag_turns_on_les_status_suggestions(
+        monkeypatch, tmp_path, flag, expected):
+    # main() writes these module globals; record them via monkeypatch so teardown restores.
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", False)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", False)
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.EXTRA_INSTRUCTION)
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    s1 = {"env": "prod", "user_folder": "u", "date": "2026-09-01", "session_base": "s1",
+          "n_segments": 5}
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions", lambda env, **kw: [s1])
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_status"
+    run_mod.main(["--env", "prod", "--out", str(out_dir), "--linker", "--dry-run", *flag])
+
+    assert run_mod.les.STATUS_SUGGESTIONS is expected

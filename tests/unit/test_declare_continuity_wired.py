@@ -57,3 +57,33 @@ def test_both_workflows_pass_the_flag_defaulting_to_false():
     assert "DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}" in prod, (
         "PROD does not pass DeclareContinuity with a false fallback -- the "
         "Parameter can only ever hold its template default")
+
+
+# Spec 2026-11-08 (continuity linker): CONTINUITY_LINKER, the same three links, extract-session only.
+
+def test_linker_parameter_exists_defaults_off_and_is_constrained():
+    text = TEMPLATE.read_text(encoding="utf-8")
+    block = re.search(r"\n  ContinuityLinker:\n(.*?)(?=\n  \w+:\n)", text, re.S)
+    assert block, "no ContinuityLinker parameter block in the template"
+    assert "Default: 'false'" in block.group(1), (
+        "ContinuityLinker must default to false -- a manual sam deploy would turn on the "
+        "final-pass linker call")
+    assert "AllowedValues: ['true', 'false']" in block.group(1)
+
+
+def test_only_extract_session_receives_the_linker_flag():
+    text = TEMPLATE.read_text(encoding="utf-8")
+    start = text.index("\n  ExtractSessionFunction:\n")
+    nxt = re.search(r"\n  [A-Za-z][A-Za-z0-9]*:\n", text[start + 1:])
+    block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
+    assert "CONTINUITY_LINKER: !Ref ContinuityLinker" in block, (
+        "ExtractSessionFunction does not receive CONTINUITY_LINKER -- it would silently take "
+        "the code default")
+    assert text.count("CONTINUITY_LINKER:") == 1, "CONTINUITY_LINKER is set on another function"
+
+
+def test_both_workflows_pass_the_linker_flag_defaulting_to_false():
+    test = DEPLOY_TEST.read_text(encoding="utf-8")
+    prod = DEPLOY_PROD.read_text(encoding="utf-8")
+    assert "ContinuityLinker=${{ vars.TEST_CONTINUITY_LINKER || 'false' }}" in test
+    assert "ContinuityLinker=${{ vars.PROD_CONTINUITY_LINKER || 'false' }}" in prod

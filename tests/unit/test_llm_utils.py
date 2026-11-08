@@ -212,6 +212,21 @@ def test_extract_json_failure_returns_none():
     assert lu.extract_json("no json here") is None
 
 
+def test_extract_json_failure_logs_the_answer_by_default(caplog):
+    with caplog.at_level("DEBUG"):
+        assert lu.extract_json("no json <<LOUD TEXT>>") is None
+    assert "Failed to extract JSON" in caplog.text
+    assert "LOUD TEXT" in caplog.text
+
+
+def test_extract_json_quiet_logs_nothing(caplog):
+    """A caller whose answer carries item text (the continuity linker) parses quietly."""
+    with caplog.at_level("DEBUG"):
+        assert lu.extract_json("no json <<SECRET ITEM TEXT>>", quiet=True) is None
+        assert lu.extract_json('noise {"b": 2} trailing', quiet=True) == {"b": 2}
+    assert caplog.records == []
+
+
 # ---- sampling temperature ----------------------------------------------
 #
 # Nothing in this repo has ever set `temperature`, so every call has taken the

@@ -16,6 +16,7 @@ Never writes to S3 or any database. Reads use the `fieldsight-deployer` AWS prof
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -49,6 +50,12 @@ DEFAULT_SHAPE_NAMES = ("a", "b")
 # measure continuity under the same prompt.
 EXTRA_INSTRUCTION = ""
 
+# main() sets it from --linker (spec 2026-11-08 section 6): the with-block arm's FINAL pass
+# is extracted with no prior block (the same prompt as the baseline arm), then the real
+# les._run_linker links its items to the prior list. Live (non-final) passes are unchanged.
+# The arm directory stays "with_block" so label.py / finalize.py / score.py need no change.
+LINKER_MODE = False
+
 
 def void(run):
     """Spec §7 "Void condition": a with-block step whose prompt lacks the
@@ -57,7 +64,18 @@ def void(run):
     A chain's first pass always has `prior_count` 0 -- nothing is published yet for
     it to offer -- so it is void under this exact same rule whenever it runs under
     the with-block arm; there is no separate "first step of a chain" case to encode
-    here, the shared rule already covers it."""
+    here, the shared rule already covers it.
+
+    Linker mode (spec 2026-11-08): a FINAL with-block step's prompt has no block by
+    construction, so it is void instead when `prior_count` is 0 or the linker did not
+    answer ok (never ran, errored, or skipped for budget). Non-final steps keep the rule
+    above."""
+    if run.get("arm") != "with_block":
+        return False
+    if run.get("linker_mode") and run.get("is_final"):
+        linker = run.get("linker")
+        return (run.get("prior_count", 0) == 0 or not isinstance(linker, dict)
+                or linker.get("status") != "ok")
     return run.get("arm") == "with_block" and (
         run.get("prior_count", 0) == 0 or not run.get("prompt_has_block", False))
 
@@ -84,8 +102,9 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
         prior_list = item_continuity.prior_items({"topics": prior_topics})
     else:
         prior_list = []
+    use_linker = bool(LINKER_MODE and arm == "with_block" and is_final and prior_list)
     continuity_block = (item_continuity.render_block(prior_list, EXTRA_INSTRUCTION)
-                        if prior_list else "")
+                        if prior_list and not use_linker else "")
 
     prompt, _stats = les.build_extraction_prompt(
         user_folder, date, session_base, turns, n_segments,
@@ -100,13 +119,15 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
     transcript_text, _transcript_stats = les.render_transcript(turns)
 
     started = time.time()
+    info = {}
     raw, error = llm_utils.call_llm(
         prompt, max_tokens=les.max_tokens_for(n_segments), force_json=True,
-        enable_thinking=is_final, caller="continuity_eval")
+        enable_thinking=is_final, caller="continuity_eval", info=info)
     latency_ms = int((time.time() - started) * 1000)
 
     topics = []
     claims = []
+    linker = None
     if raw is not None and error is None:
         parsed = llm_utils.extract_json(raw)
         if isinstance(parsed, dict):
@@ -114,6 +135,12 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
             if isinstance(candidate_topics, list) and all(isinstance(t, dict) for t in candidate_topics):
                 topics = candidate_topics
                 item_continuity.normalise_children(topics)
+                if use_linker:
+                    # The real extractor's linker, reused as is: it drops any model-emitted
+                    # continues / status_suggestion, then attaches its own links for the
+                    # unchanged resolve below to judge. Same transcript text the prompt saw.
+                    linker = les._run_linker(prior_list, topics, transcript_text,
+                                             budget_deadline=None)
                 if arm == "with_block" and prior_list:
                     claims = item_continuity.resolve(topics, prior_list)
                 else:
@@ -123,10 +150,17 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
         else:
             error = error or "could not parse JSON from LLM response"
 
-    run_record = {"arm": arm, "prior_count": prior_count, "prompt_has_block": prompt_has_block}
+    run_record = {"arm": arm, "prior_count": prior_count, "prompt_has_block": prompt_has_block,
+                  "linker_mode": LINKER_MODE, "is_final": is_final, "linker": linker}
     record = {
         "prompt_has_block": prompt_has_block,
         "prior_count": prior_count,
+        "prompt_sha1": hashlib.sha1(prompt.encode("utf-8")).hexdigest(),
+        "linker_mode": LINKER_MODE,
+        "is_final": is_final,
+        "linker": linker,
+        "model": info.get("model"),
+        "served_model": info.get("served_model"),
         "extraction": {"topics": topics},
         "claims": claims,
         "void": void(run_record),
@@ -247,14 +281,24 @@ def main(argv=None):
                          help="Append status_suggestions.INSTRUCTION to the continuity "
                               "block, as the deployed extractor does with "
                               "STATUS_SUGGESTIONS on.")
+    parser.add_argument("--linker", action="store_true",
+                         help="Treatment = the final-pass linker (spec 2026-11-08 section 6): "
+                              "the with-block arm's final pass is extracted with no prior "
+                              "block, then linked by lambda_extract_session._run_linker.")
     parser.add_argument("--dry-run", action="store_true",
                          help="List what would run; makes no LLM call.")
     parser.add_argument("--profile", default=sessions_mod.DEFAULT_PROFILE)
     parser.add_argument("--region", default=sessions_mod.DEFAULT_REGION)
     args = parser.parse_args(argv)
     config_env = args.config_env if args.config_env is not None else args.env
-    global EXTRA_INSTRUCTION
+    global EXTRA_INSTRUCTION, LINKER_MODE
     EXTRA_INSTRUCTION = status_suggestions.INSTRUCTION if args.status_instruction else ""
+    if args.status_instruction:
+        # The deployed extractor's linker adds status_suggestions.LINKER_INSTRUCTION when
+        # STATUS_SUGGESTIONS is on; les._run_linker reads this module global, so a prod-config
+        # run (both flags on) measures the linker under the same prompt.
+        les.STATUS_SUGGESTIONS = True
+    LINKER_MODE = bool(args.linker)
 
     out_dir = paths_mod.require_run_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -278,7 +322,8 @@ def main(argv=None):
     # passed `--config-env` (spec §7 "Decision rule": a prod-sessions run under
     # TEST config).
     sessions_out = [{**s, "data_env": s.get("env", args.env), "config_env": config_env,
-                      **({"status_instruction": True} if args.status_instruction else {})}
+                      **({"status_instruction": True} if args.status_instruction else {}),
+                      **({"treatment": "linker"} if args.linker else {})}
                      for s in chosen]
     (out_dir / "sessions.json").write_text(
         json.dumps(sessions_out, ensure_ascii=False, indent=2), encoding="utf-8")
