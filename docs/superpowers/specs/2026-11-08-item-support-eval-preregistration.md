@@ -70,8 +70,9 @@ the fit half: `FLOOR`, `MARGIN`, `NOTHING_CLOSE`. The bars below are judged on t
 1. **Link precision.** One-sided 95% Clopper–Pearson upper bound of wrong/accepted ≤ 5%. Fewer
    than 59 accepted links → `insufficient` (59 is the smallest n where 0 errors clears 5%). With
    59 or more, pass iff the bound ≤ 0.05. A link to an adjacent same-speaker turn carrying the
-   same words counts as correct (§3). Every held-out item must have gold; any item without gold
-   makes the bar `insufficient`.
+   same words counts as correct (§3). Any accepted link without gold makes this bar
+   `insufficient` (bar 5 likewise for an `inferred` item without gold); an unlabelled item no bar
+   reads changes nothing.
 2. **Twin hard negatives = 0.** A mechanical check flags any accepted link where the item and the
    linked turn both carry a token of the same place class with different values. Classes
    (text NFKC-normalised, English lower-cased):
@@ -142,7 +143,8 @@ result existed.
 - **A9. Gold view widened by 2 minutes** (§3), so a labeller can name a turn the heuristic could not
   see. This can only make bars 1 and 5 harder.
 - **A10. Bar 6 re-run rule** (§5.6) for a single surviving path.
-- **A11. Missing gold** makes a fit point infeasible (§4) and a held-out bar `insufficient` (§5).
+- **A11. Missing gold** makes a fit point infeasible (§4), and makes bar 1 (accepted links) or
+  bar 5 (`inferred` items) `insufficient` (§5).
 
 ## 9. Known costs, reported and not gated
 
