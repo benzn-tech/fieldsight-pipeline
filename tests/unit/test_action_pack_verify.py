@@ -126,6 +126,11 @@ def labels(result, key="actions", label="verifier"):
     return {e["index"]: e[label] for e in result[key]}
 
 
+def shown(result):
+    """The conclusion lines a reader is shown: the ones not answered hidden."""
+    return {e["index"]: e["confidence"] for e in result["conclusion"] if not e.get("hidden")}
+
+
 # ---- family (S6) ---------------------------------------------------------------------
 
 @pytest.mark.parametrize("model, fam", [
@@ -270,14 +275,16 @@ def test_unsupported_lines_drop_weak_lines_become_uncertain_unsupported_actions_
                             line("fine too", confidence="uncertain")],
              "actions": [dict(close(), rationale="DROPME")]}
     result, _ = run_verify(draft, monkeypatch, fake=Fake(answer))
-    assert labels(result, "conclusion", "confidence") == {1: "uncertain", 2: "supported",
-                                                          3: "uncertain"}
+    assert labels(result, "conclusion", "confidence") == {0: "uncertain", 1: "uncertain",
+                                                          2: "supported", 3: "uncertain"}
+    assert [e["index"] for e in result["conclusion"] if e.get("hidden")] == [0]
     assert labels(result) == {0: "unsupported"}
     assert result["counts"]["conclusion_unsupported"] == 1
     assert result["counts"]["actions_unsupported"] == 1
     # the stage runner accepts it: no upgrade attempt, nothing ignored
     conclusion, actions, model, counts, tokens, ignored = st.apply_verdicts(draft, result)
-    assert [c["text"] for c in conclusion] == ["WEAKME", "fine", "fine too"]
+    assert [c["text"] for c in conclusion] == ["DROPME", "WEAKME", "fine", "fine too"]
+    assert [bool(c.get("hidden")) for c in conclusion] == [True, False, False, False]
     assert actions[0]["verifier"] == "unsupported"
     assert ignored == {"elements": 0, "fields": 0, "upgrades": 0}
     assert model == VERIFIER and tokens == 5
@@ -438,7 +445,8 @@ def test_a_failed_call_is_unsupported_and_others_still_count(monkeypatch):
     draft = {"conclusion": [line("BROKEN"), line("fine")],
              "actions": [dict(close(), rationale="GARBLED")]}
     result, _ = run_verify(draft, monkeypatch, fake=Fake(answer))
-    assert labels(result, "conclusion", "confidence") == {1: "supported"}
+    assert labels(result, "conclusion", "confidence") == {0: "uncertain", 1: "supported"}
+    assert result["conclusion"][0]["hidden"] is True
     assert labels(result) == {0: "unsupported"}
     assert result["counts"]["check_failures"] == 2
 
@@ -478,8 +486,11 @@ def test_checks_run_in_parallel_under_the_deadline(monkeypatch):
         release.set()
     elapsed = time.monotonic() - t0
     assert elapsed < 1.6                                   # 6 x 0.2 s in series would not fit
-    assert labels(result, "conclusion", "confidence") == {1: "supported", 2: "supported",
-                                                          3: "supported", 4: "supported"}
+    assert labels(result, "conclusion", "confidence") == {0: "uncertain", 1: "supported",
+                                                          2: "supported", 3: "supported",
+                                                          4: "supported"}
+    assert result["conclusion"][0]["hidden"] is True       # the timed-out line
+    assert result["conclusion"][0]["detail"]["reason_code"] == "not_checked"
     assert labels(result) == {0: "supported"}
     assert result["counts"]["check_timeouts"] == 1
     assert all(0 < c["deadline"] <= 1.0 for c in fake.calls)
@@ -501,7 +512,7 @@ def test_counts_are_flat_ints_and_the_result_passes_apply_verdicts(monkeypatch):
                            "verifier_answers"}
     assert all(isinstance(k, str) and type(v) is int for k, v in result["counts"].items())
     for el in result["conclusion"]:
-        assert set(el) == {"index", "confidence", "detail"}
+        assert set(el) - {"hidden"} == {"index", "confidence", "detail"}
     for el in result["actions"]:
         assert set(el) == {"index", "verifier", "detail"}
     c = result["counts"]
@@ -736,7 +747,8 @@ def test_cited_refs_with_no_text_are_unsupported_without_a_call(monkeypatch):
              "actions": [dict(close(), refs=["R1"]), close(SID2, refs=["D1", "W1"])]}
     result, fake = run_verify(draft, monkeypatch, extra_registry=empty)
     assert len(fake.calls) == 1                      # only the action that cites W1's text
-    assert result["conclusion"] == []
+    assert [(e["index"], e.get("hidden"), e["detail"]["reason_code"])
+            for e in result["conclusion"]] == [(0, True, "not_in_evidence")]
     assert labels(result) == {0: "unsupported", 1: "weak"}
     assert result["counts"]["empty_refs"] == 2
 
@@ -751,7 +763,8 @@ def test_a_raising_worker_is_a_failure_not_a_timeout(monkeypatch):
     monkeypatch.setattr(apv, "_check", check)
     result, _ = run_verify({"conclusion": [line("BOOM"), line("fine")], "actions": []},
                            monkeypatch)
-    assert labels(result, "conclusion", "confidence") == {1: "supported"}
+    assert shown(result) == {1: "supported"}
+    assert result["conclusion"][0]["detail"]["reason_code"] == "not_checked"
     assert result["counts"]["check_failures"] == 1
     assert "check_timeouts" not in result["counts"]
 
@@ -770,8 +783,9 @@ def test_more_elements_than_workers_stay_inside_the_deadline(monkeypatch):
     result, fake = run_verify(draft, monkeypatch, fake=Fake(answer), ctx=ctx)
     elapsed = time.monotonic() - t0
     assert elapsed < 1.6                             # 8 x 0.4 s over 2 workers would be 1.6 s
-    got = labels(result, "conclusion", "confidence")
+    got = shown(result)
     assert 2 <= len(got) <= 6 and set(got.values()) == {"supported"}
+    assert len(result["conclusion"]) == 8               # the rest are stored hidden
     c = result["counts"]
     assert c["label_conclusion_unsupported"] == 8 - len(got)
     assert c.get("check_timeouts", 0) + c.get("check_failures", 0) == 8 - len(got)
@@ -1099,3 +1113,146 @@ def test_apply_verdicts_rejects_a_malformed_detail():
         "conclusion": [], "model": VERIFIER, "verifier_answers": {VERIFIER: 1},
         "actions": [{"index": 0, "verifier": "weak", "detail": ok}]})
     assert actions[0]["verifier_detail"] == ok and ignored["fields"] == 0
+
+
+
+# ---- not_checked, hidden conclusions, the hide switch (spec 2026-11-05 §7.2, Task 7.4) ----
+
+def _pack_row(action):
+    return dict(action, state="proposed")
+
+
+READY = {"state": "ready", "archived_at": None}
+
+
+def _mode(monkeypatch, mode):
+    if mode is None:
+        monkeypatch.delenv("ACTION_VERIFIER_HIDE_UNSUPPORTED", raising=False)
+    else:
+        monkeypatch.setenv("ACTION_VERIFIER_HIDE_UNSUPPORTED", mode)
+
+
+@pytest.mark.parametrize("mode", [None, "on", "off"])
+def test_failed_check_is_not_checked_non_applicable_both_modes(monkeypatch, mode):
+    import action_pack_view
+    _mode(monkeypatch, mode)
+
+    def answer(prompt, model):
+        if "BROKEN" in prompt:
+            return None, "HTTP 500", model, 0
+        if "GARBLED" in prompt:
+            return "I cannot tell.", None, model, 0
+        return '{"label": "supported"}', None, model, 0
+    draft = {"conclusion": [line("fine")],
+             "actions": [dict(close(), rationale="BROKEN"),
+                         dict(close(SID2), rationale="GARBLED")]}
+    result, _ = run_verify(draft, monkeypatch, fake=Fake(answer))
+    assert labels(result) == {0: "unsupported", 1: "unsupported"}
+    for el in result["actions"]:
+        assert el["detail"] == {"model": None, "served": None, "attempt": None,
+                                "reason_code": "not_checked", "reason": None}
+    assert result["counts"]["not_checked"] == 2
+    _, actions, *_ = st.apply_verdicts(draft, result)
+    assert not any(action_pack_view.applicable_candidate(_pack_row(dict(a, type=a["type"])),
+                                                         READY) for a in actions)
+
+
+@pytest.mark.parametrize("mode", ["on", "off"])
+def test_all_checks_fail_still_verifier_failure(monkeypatch, mode):
+    _mode(monkeypatch, mode)
+    fake = Fake(lambda prompt, model: (None, "HTTP 503", model, 0))
+    with pytest.raises(agent.StageError) as ei:
+        run_verify({"conclusion": [line()], "actions": [close(), close(SID2)]}, monkeypatch,
+                   fake=fake)
+    assert agent.failure_reason(ei.value) == "verifier"
+    assert ei.value.verify_counts["not_checked"] == 3
+
+
+@pytest.mark.parametrize("mode", ["on", "off"])
+def test_contradicted_stays_unsupported_both_modes(monkeypatch, mode):
+    _mode(monkeypatch, mode)
+    fake = Fake(lambda p, m: ('{"label": "unsupported", "reason_code": "contradicted", '
+                              '"reason": "Ann says it failed."}', None, m, 1))
+    result, _ = run_verify({"conclusion": [], "actions": [close()]}, monkeypatch, fake=fake)
+    assert labels(result) == {0: "unsupported"}
+    assert result["actions"][0]["detail"]["reason_code"] == "contradicted"
+    assert result["counts"]["actions_unsupported"] == 1
+
+
+@pytest.mark.parametrize("code", ["not_in_evidence", "value_not_in_evidence", None])
+def test_hide_off_not_in_evidence_becomes_weak(monkeypatch, code):
+    import action_pack_view
+    body = '{"label": "unsupported"%s}' % (f', "reason_code": "{code}"' if code else "")
+    fake = Fake(lambda p, m: (body, None, m, 1))
+    draft = {"conclusion": [line()], "actions": [close()]}
+    _mode(monkeypatch, "on")
+    result, _ = run_verify(draft, monkeypatch, fake=fake)
+    assert labels(result) == {0: "unsupported"}
+    _mode(monkeypatch, "off")
+    result, _ = run_verify(draft, monkeypatch, fake=fake)
+    assert labels(result) == {0: "weak"}
+    assert result["actions"][0]["detail"]["reason_code"] == code
+    assert result["counts"]["hide_off_weak"] == 1
+    assert result["counts"].get("actions_unsupported", 0) == 0
+    _, actions, *_ = st.apply_verdicts(draft, result)
+    assert action_pack_view.applicable_candidate(_pack_row(actions[0]), READY)
+    # the switch is for actions: an unsupported conclusion line stays hidden
+    assert result["conclusion"][0]["hidden"] is True
+
+
+def test_hide_off_leaves_an_action_on_empty_refs_unsupported(monkeypatch):
+    _mode(monkeypatch, "off")
+    empty = {"R1": entry("R1", "topic", "   ")}
+    result, fake = run_verify({"conclusion": [], "actions": [close()]}, monkeypatch,
+                              extra_registry=empty)
+    assert fake.calls == [] and labels(result) == {0: "unsupported"}
+
+
+def test_unsupported_conclusion_stored_hidden_and_omitted_by_get(monkeypatch):
+    import action_pack_view
+    from tests.unit import test_action_pack_stages as base
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+
+    def answer(prompt, model):
+        lab = "unsupported" if "HIDEME" in prompt else "supported"
+        return ('{"label": "%s", "reason_code": %s}'
+                % (lab, '"not_in_evidence"' if lab == "unsupported" else "null"),
+                None, model, 1)
+    monkeypatch.setattr(apv, "call_json", Fake(answer))
+    write = base.write_obj(conclusion=[{"text": "HIDEME", "refs": ["R1"],
+                                        "confidence": "supported"},
+                                       {"text": "The pour was done.", "refs": ["R1"],
+                                        "confidence": "supported"}])
+    payload = st.run(base.make_ctx(), base.deps(model=base.Model(write=[write]),
+                                                verify=apv.verify))
+    assert action_pack_view.payload_shape_error(payload) is None
+    assert [(c["text"], c.get("hidden", False)) for c in payload["conclusion"]] == [
+        ("HIDEME", True), ("The pour was done.", False)]
+    assert payload["conclusion"][0]["verifier_detail"]["reason_code"] == "not_in_evidence"
+    assert payload["run_trace"]["conclusion"] == 1        # the lines a reader is shown
+    assert payload["run_trace"]["verify"]["conclusion_unsupported"] == 1
+    pack = {"id": "p", "site_id": base.SITE, "created_by": "u", "state": "ready",
+            "archived_at": None, "conclusion": payload["conclusion"], "actions": [],
+            "sources": payload["sources"]}
+    view = action_pack_view.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
+                                       applicable={}, viewer_id="u")
+    assert [c["text"] for c in view["conclusion"]] == ["The pour was done."]
+
+
+@pytest.mark.parametrize("mode, want", [(None, "on"), ("on", "on"), ("off", "off"),
+                                        ("OFF ", "off"), ("maybe", "on")])
+def test_hide_mode_in_trace(monkeypatch, mode, want):
+    import action_pack_view
+    from tests.unit import test_action_pack_stages as base
+    _mode(monkeypatch, mode)
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+    monkeypatch.setattr(apv, "call_json", Fake())
+    payload = st.run(base.make_ctx(), base.deps(verify=apv.verify))
+    assert payload["run_trace"]["verify_hide_mode"] == want
+    assert action_pack_view.public_trace(payload["run_trace"])["verify_hide_mode"] == want
+    # a failed pack's trace records it too
+    monkeypatch.setattr(apv, "call_json", Fake(lambda p, m: (None, "HTTP 503", None, 0)))
+    with pytest.raises(agent.StageError) as ei:
+        st.run(base.make_ctx(), base.deps(verify=apv.verify))
+    assert ei.value.run_trace["verify_hide_mode"] == want
+    assert action_pack_view.fail_trace_error(ei.value.run_trace) is None

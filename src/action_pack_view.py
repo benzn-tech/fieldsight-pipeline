@@ -231,7 +231,8 @@ def payload_shape_error(payload):
                 claim.get("refs") is not None and not _str_list(claim["refs"])) or (
                 claim.get("confidence") not in (None, "supported", "uncertain")) or (
                 claim.get("verifier_detail") is not None
-                and not isinstance(claim["verifier_detail"], dict)):
+                and not isinstance(claim["verifier_detail"], dict)) or (
+                "hidden" in claim and not isinstance(claim["hidden"], bool)):
             return "conclusion_shape"
     for s in payload.get("sources") or []:
         if not isinstance(s, dict):
@@ -492,13 +493,15 @@ def visible_conclusion(pack, removed_refs) -> list:
     """S13 for the conclusion: a claim citing only removed sources is left out, and so is
     every UNCITED claim (kept as uncertain, never model-checked against a source) once any
     non-web source of the pack is removed for this reader -- it may have been written
-    from that source."""
+    from that source. A line stored `hidden: true` (the verifier found it unsupported,
+    spec 2026-11-05 §7.2) is never shown; a line without the key is shown."""
     removed_refs = set(removed_refs or ())
     non_web_removed = any(isinstance(s, dict) and s.get("ref") in removed_refs
                           and s.get("provenance") != "web"
                           for s in pack.get("sources") or [])
     return [c for c in (pack.get("conclusion") or [])
-            if isinstance(c, dict) and not cites_only_removed(c.get("refs"), removed_refs)
+            if isinstance(c, dict) and c.get("hidden") is not True
+            and not cites_only_removed(c.get("refs"), removed_refs)
             and not (non_web_removed and not c.get("refs"))]
 
 

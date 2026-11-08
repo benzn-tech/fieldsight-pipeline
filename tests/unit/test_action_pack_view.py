@@ -237,3 +237,37 @@ def test_payload_shape_checks_a_conclusion_lines_verifier_detail():
     assert v.payload_shape_error(p) is None
     p["conclusion"][0]["verifier_detail"] = "weak"
     assert v.payload_shape_error(p) == "conclusion_shape"
+
+
+
+# ---- hidden conclusion lines (spec 2026-11-05 §7.2, §9.2; Task 7.4) ----------------------
+
+def test_payload_shape_allows_a_boolean_hidden_on_a_conclusion_line():
+    for hidden in (True, False):
+        p = _store_payload(conclusion=[{"text": "c", "refs": ["R1"],
+                                        "confidence": "uncertain", "hidden": hidden}])
+        assert v.payload_shape_error(p) is None
+    for bad in ("true", 1, None):
+        p = _store_payload(conclusion=[{"text": "c", "refs": ["R1"],
+                                        "confidence": "uncertain", "hidden": bad}])
+        assert v.payload_shape_error(p) == "conclusion_shape", bad
+
+
+def test_get_omits_hidden_lines_and_remaps_sub_task_positions():
+    # Stored conclusion [visible, hidden, visible]; a sub-task points at positions 1 and 2:
+    # GET shows two lines and the sub-task's position 2 is now 1; the hidden one is gone.
+    conclusion = [{"text": "first", "refs": ["R1"], "confidence": "supported"},
+                  {"text": "HIDDEN-LINE", "refs": ["R1"], "confidence": "uncertain",
+                   "hidden": True},
+                  {"text": "third", "refs": ["R1"], "confidence": "uncertain",
+                   "hidden": False}]
+    subs = [{"id": "s1", "ask": "x", "kind": "close", "status": "done", "actions": [],
+             "conclusion": [1, 2], "reason_code": None, "reason": None}]
+    pack = _pack(conclusion=conclusion, sub_tasks=subs)
+    view = v.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
+                        applicable={}, viewer_id="u")
+    assert [c["text"] for c in view["conclusion"]] == ["first", "third"]
+    assert view["sub_tasks"][0]["conclusion"] == [1]
+    assert "HIDDEN-LINE" not in v.render_markdown(view)
+    # an old pack's line has no `hidden`: shown
+    assert [c["text"] for c in v.visible_conclusion(_pack(), set())] == ["gone", "kept"]

@@ -2012,7 +2012,9 @@ def apply_verdicts(draft, result, kept=None):
                              "detail": {...}?}],
                 "model": str, "counts": {str: int}?, "tokens": int?,
                 "verifier_answers": {model: int}?}.
-    An element's `detail` (verifier_detail_ok) is copied onto it as `verifier_detail`.
+    An element's `detail` (verifier_detail_ok) is copied onto it as `verifier_detail`; a
+    conclusion line answered `"hidden": true` (an unsupported line, stored for the eval,
+    never shown) keeps `hidden: True`. A non-bool `hidden` is reason `verifier`.
     Every other field (type, target, proposed, rationale, refs, text) comes from the draft;
     a draft element the answer does not name is dropped; an element with no index, an
     index out of range or repeated, is ignored; a field that differs from the draft is
@@ -2043,7 +2045,7 @@ def apply_verdicts(draft, result, kept=None):
         raise bad("verifier answers")
     ignored = {"elements": 0, "fields": 0, "upgrades": 0}
 
-    def labels(elements, drafted, label_key, allowed):
+    def labels(elements, drafted, label_key, allowed, extra=()):
         out = {}
         for el in elements:
             if not isinstance(el, dict):
@@ -2063,17 +2065,23 @@ def apply_verdicts(draft, result, kept=None):
             detail = el.get("detail")
             if detail is not None and not verifier_detail_ok(detail):
                 raise bad("verifier detail")
+            if "hidden" in extra and not isinstance(el.get("hidden", False), bool):
+                raise bad("verifier hidden")
             if not 0 <= idx < len(drafted) or idx in out:
                 ignored["elements"] += 1
                 continue
             for k, v in el.items():
-                if k not in ("index", label_key, "detail") and drafted[idx].get(k) != v:
+                if (k not in ("index", label_key, "detail") + tuple(extra)
+                        and drafted[idx].get(k) != v):
                     ignored["fields"] += 1
-            out[idx] = (el[label_key], dict(detail) if detail is not None else None)
+            out[idx] = (el[label_key], dict(detail) if detail is not None else None,
+                        el.get("hidden") is True)
         return out
 
-    c_labels = labels(result["conclusion"], draft["conclusion"], "confidence", CONFIDENCE)
+    c_labels = labels(result["conclusion"], draft["conclusion"], "confidence", CONFIDENCE,
+                      extra=("hidden",))
     a_labels = labels(result["actions"], draft["actions"], "verifier", VERIFIER_LABELS)
+
     def with_detail(el, detail):
         if detail is not None:
             el["verifier_detail"] = detail
@@ -2083,11 +2091,14 @@ def apply_verdicts(draft, result, kept=None):
     for i, c in enumerate(draft["conclusion"]):
         if i not in c_labels:
             continue
-        conf, detail = c_labels[i]
+        conf, detail, hidden = c_labels[i]
         if conf == "supported" and c["confidence"] != "supported":
             ignored["upgrades"] += 1
             conf = c["confidence"]
-        conclusion.append(with_detail(dict(c, confidence=conf), detail))
+        line = with_detail(dict(c, confidence=conf), detail)
+        if hidden:
+            line["hidden"] = True
+        conclusion.append(line)
     actions = [with_detail(dict(a, verifier=a_labels[i][0]), a_labels[i][1])
                for i, a in enumerate(draft["actions"]) if i in a_labels]
     if kept is not None:
@@ -2102,6 +2113,8 @@ def _conclusion_row(c):
     row = {"text": c["text"], "refs": list(c["refs"]), "confidence": c["confidence"]}
     if c.get("verifier_detail") is not None:
         row["verifier_detail"] = dict(c["verifier_detail"])
+    if c.get("hidden"):
+        row["hidden"] = True
     return row
 
 
@@ -2212,6 +2225,9 @@ def _run(r: Run) -> dict:
     r.stage = "snapshot"
     snapshot_stage(r, sources)
     r.stage = "verify"
+    # Spec 2026-11-05 §7.2: which mapping the verifier ran under, on every pack (a failed
+    # one too: failure_trace keeps the counts-shaped trace keys).
+    r.trace["verify_hide_mode"] = "on" if agent.verifier_hide_unsupported() else "off"
 
     t0 = ctx.clock()
     result = deps.verify(draft, registry=dict(r.registry), items=dict(r.items),
@@ -2224,7 +2240,11 @@ def _run(r: Run) -> dict:
     conclusion, actions, vmodel, vcounts, vtokens, vignored = apply_verdicts(draft, result,
                                                                              kept=kept)
     if r.sub_tasks is not None:
-        r.sub_tasks = remap_sub_tasks(r.sub_tasks, kept["actions"], kept["conclusion"])
+        # A hidden line is stored (for the eval) but answers no sub-task: GET never shows
+        # it, so a sub-task resting on it alone is not done, as when the line was dropped.
+        shown = {i: (p if p is not None and not conclusion[p].get("hidden") else None)
+                 for i, p in kept["conclusion"].items()}
+        r.sub_tasks = remap_sub_tasks(r.sub_tasks, kept["actions"], shown)
     r.models["verifier"] = vmodel
     if "verifier_answers" in result:          # validated by apply_verdicts
         r.models["verifier_answers"] = dict(result["verifier_answers"])
@@ -2242,7 +2262,8 @@ def _run(r: Run) -> dict:
         "refs_gathered": len(r.registry), "items_seen": len(r.items),
         "refs_cited": len(payload["sources"]),
         "draft_conclusion": len(draft["conclusion"]), "draft_actions": len(draft["actions"]),
-        "conclusion": len(payload["conclusion"]), "actions": len(payload["actions"]),
+        "conclusion": sum(1 for c in payload["conclusion"] if not c.get("hidden")),
+        "actions": len(payload["actions"]),
         "web": dict(r.web_trace),
         "verify": dict(vcounts),
     })
