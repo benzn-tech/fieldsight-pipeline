@@ -2584,9 +2584,10 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
                 floor=item_support.FLOOR, margin=item_support.MARGIN,
                 nothing_close=item_support.NOTHING_CLOSE)
             parsed_topics[:] = work['topics']
-        except Exception:
-            logger.exception("item_support: attach failed -- "
-                             "the extraction is written without support")
+        except Exception as e:
+            # Type name only: a traceback or message could carry item/transcript text.
+            logger.error("item_support: attach failed (%s) -- written without support",
+                         type(e).__name__)
 
     # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
     # the extraction that exists NOW, not the one we read before the LLM call,

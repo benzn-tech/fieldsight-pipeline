@@ -193,9 +193,11 @@ def test_support_failure_is_never_fatal(monkeypatch, caplog):
     warned = [r for r in caplog.records
               if r.levelno >= logging.WARNING and r.getMessage().startswith("item_support")]
     assert warned
-    # No item or transcript text in the message.
+    # No item or transcript text in the message: the exception TYPE, no traceback.
+    assert any("(ValueError)" in r.getMessage() for r in warned)
     for r in warned:
         assert "scaffold" not in r.getMessage().lower()
+        assert r.exc_info is None
 
 
 def test_a_failure_part_way_leaves_no_partial_support(monkeypatch):

@@ -1184,8 +1184,10 @@ def _write_item_support(conn, items, *, company_id, site_id, session_base, key,
             counts = claim_type_store.write_pass(
                 conn, company_id=company_id, site_id=site_id, session_base=session_base,
                 source_s3_key=key, recorder_user_id=recorder_user_id, items=items)
-    except Exception:
-        logger.exception("item support: links/claim_type not stored for %s", key)
+    except Exception as e:
+        # Type name only: a traceback or message could carry item text.
+        logger.error("item support: links/claim_type not stored for %s (%s)", key,
+                     type(e).__name__)
         counts = None
     _emit_item_support_metric(key, items, counts)
     return counts

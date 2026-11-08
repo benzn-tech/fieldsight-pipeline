@@ -10,6 +10,7 @@ Skipped without TEST_DATABASE_URL -- a skip is NOT a pass.
 """
 import io
 import json
+import logging
 import uuid
 
 import pytest
@@ -306,7 +307,7 @@ def test_recompute_after_names_turns_null_into_observed_and_stated(world):
         conn.close()
 
 
-def test_link_write_failure_does_not_fail_the_pass(world, monkeypatch, capsys):
+def test_link_write_failure_does_not_fail_the_pass(world, monkeypatch, capsys, caplog):
     """A SQL error mid-step (after one link row was already inserted) rolls back the whole
     step's savepoint; the items still commit."""
     w = world
@@ -321,9 +322,14 @@ def test_link_write_failure_does_not_fail_the_pass(world, monkeypatch, capsys):
         return link_id
 
     monkeypatch.setattr(claim_type_store.event_links, "insert_supported_by", failing)
-    res = w["write"](_artifact("final", "2026-11-02T10:30:00Z", action_support=_linked(10.0),
-                               finding_support=_linked(20.0)))
+    with caplog.at_level(logging.WARNING):
+        res = w["write"](_artifact("final", "2026-11-02T10:30:00Z",
+                                   action_support=_linked(10.0),
+                                   finding_support=_linked(20.0)))
     assert res == {"skipped": False, "topics": 1}, res
+    failed = [r for r in caplog.records if "links/claim_type not stored" in r.getMessage()]
+    assert len(failed) == 1 and "(DivisionByZero)" in failed[0].getMessage()
+    assert failed[0].exc_info is None, "type name only, never a traceback"
     assert len(calls) == 2
     a = _live(w, "action_items", "Synthetic task one")
     f = _live(w, "findings", "Synthetic finding one")
