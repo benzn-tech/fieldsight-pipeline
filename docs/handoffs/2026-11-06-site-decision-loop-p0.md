@@ -7,9 +7,9 @@ From: the architecture research session, 2026-11-06.
 §13 lists what the owner decided; all of it is approved, so do not re-ask. The diagram and a
 Chinese version are in `docs/superpowers/specs/2026-11-05-site-decision-loop/`.
 
-**Status (2026-11-08): on hold until the implementation plan is written and reviewed.** It
-will be at `docs/superpowers/plans/2026-11-08-site-decision-loop-p0.md`; work from the plan,
-not from this note alone.
+**Status (2026-11-08): ready.** The owner approved the plan
+`docs/superpowers/plans/2026-11-08-site-decision-loop-p0.md` (Fable-reviewed). Work from the plan,
+not from this note alone. Tasks 1-7 and 9: backend line. Task 8: frontend line.
 
 ## What P0 is
 
