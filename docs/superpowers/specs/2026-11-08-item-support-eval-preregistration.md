@@ -59,6 +59,8 @@ the fit half: `FLOOR`, `MARGIN`, `NOTHING_CLOSE`. The bars below are judged on t
 - **Choice:** the feasible point with the highest fit-half coverage (linked items / all items).
 - **Ties:** higher floor, then higher margin, then higher nothing_close (more items get an
   `inferred` answer, since the constraint already holds).
+- **Missing gold:** a grid point where any linked or `inferred` fit item has no gold is not
+  feasible (the agent labels every item, so this only happens on an unfinished label file).
 - **No feasible point:** the constants stay `None`, the verdict is `fail`, and nothing is held out.
 - The chosen point and its fit numbers go into `item_support.py` by a reviewed commit, with the
   numbers in the commit body.
@@ -93,7 +95,8 @@ the fit half: `FLOOR`, `MARGIN`, `NOTHING_CLOSE`. The bars below are judged on t
    to take). No surviving path: `fail` if either path failed, else `insufficient`.
 
 **Overall verdict:** `fail` if any gated bar fails; else `insufficient` if any gated bar is
-insufficient or there are fewer than 40 sessions; else `pass`.
+insufficient, or there are fewer than 40 sessions, or the scored run's `PATHS` is not the set of
+paths bar 6 keeps (the single-path rerun is still owed); else `pass`.
 
 ## 6. Reported, not gated
 
@@ -139,6 +142,7 @@ result existed.
 - **A9. Gold view widened by 2 minutes** (§3), so a labeller can name a turn the heuristic could not
   see. This can only make bars 1 and 5 harder.
 - **A10. Bar 6 re-run rule** (§5.6) for a single surviving path.
+- **A11. Missing gold** makes a fit point infeasible (§4) and a held-out bar `insufficient` (§5).
 
 ## 9. Known costs, reported and not gated
 
