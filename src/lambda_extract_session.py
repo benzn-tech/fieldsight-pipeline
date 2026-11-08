@@ -2367,9 +2367,10 @@ def _run_linker(prior, topics, transcript_text, budget_deadline=None):
                 status_suggestions.LINKER_INSTRUCTION if STATUS_SUGGESTIONS else ""),
             max_tokens=LINKER_MAX_TOKENS, force_json=True, enable_thinking=False,
             deadline=deadline, caller="continuity_link_final", info=info)
-        parsed = llm_utils.extract_json(raw) if raw is not None else None
+        # quiet=True: extract_json's own failure line quotes the raw answer (item text).
+        parsed = llm_utils.extract_json(raw, quiet=True) if raw is not None else None
         if not isinstance(parsed, dict):
-            # Counts only: neither the provider error nor the answer is logged (item text).
+            # Counts only: neither the provider error nor the answer is logged here.
             logger.warning("continuity linker: %s (refs=%d, prior=%d) -- exact matches only",
                            "call failed" if raw is None else "answer unusable",
                            len(refs), len(prior))

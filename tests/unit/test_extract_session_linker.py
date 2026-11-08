@@ -311,3 +311,16 @@ def test_run_linker_failure_logs_a_warning_with_the_type_only(monkeypatch, caplo
     assert all(r.exc_info is None for r in mine)
     assert "ValueError" in mine[0].getMessage()
     assert "secret item text" not in caplog.text
+
+
+def test_run_linker_unparseable_answer_logs_no_item_text(monkeypatch, caplog):
+    """Final review: the linker answer is parsed quietly -- extract_json's failure line would
+    otherwise log the raw answer (item text) at ERROR."""
+    monkeypatch.setattr(llm_utils, "call_llm", _Calls(["not json <<SECRET ITEM TEXT>>"]))
+    with caplog.at_level("DEBUG"):
+        rec = les._run_linker([], [{"action_items": [{"action": "x"}]}], "text",
+                              budget_deadline=None)
+    assert rec["status"] == "error"
+    assert "SECRET ITEM TEXT" not in caplog.text
+    mine = [r for r in caplog.records if "continuity linker" in r.getMessage()]
+    assert mine and "answer unusable" in mine[0].getMessage()

@@ -1089,8 +1089,11 @@ def _strip_control_chars(obj):
     return obj
 
 
-def extract_json(raw_text):
+def extract_json(raw_text, quiet=False):
     """Three-tier fallback: fenced ```json``` block, whole string, brace slice.
+
+    `quiet=True` suppresses the failure log line, which quotes the raw answer: callers
+    whose answers carry item text (the continuity linker) log counts only.
 
     Every tier returns through `_strip_control_chars`: a scrub wired into only
     the first would pass a naive test and still leak on real output, which
@@ -1114,5 +1117,6 @@ def extract_json(raw_text):
                 json.loads(raw_text[first_brace:last_brace + 1]))
         except json.JSONDecodeError:
             pass
-    logger.error(f"Failed to extract JSON from LLM response: {raw_text[:500]}")
+    if not quiet:
+        logger.error(f"Failed to extract JSON from LLM response: {raw_text[:500]}")
     return None
