@@ -1286,6 +1286,15 @@ Parameters:
       the quote verifies. Proposals are stored for a person to accept or dismiss -- never written
       to action_items.status. Needs DeclareContinuity. Off = prompt byte-identical.
 
+  ContinuityLinker:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Spec 2026-11-08 (continuity linker): the FINAL extraction pass gets no prior-items block and a
+      second, thinking-off call states which new item continues which. Needs DeclareContinuity.
+      Live passes unchanged. Off = today's final pass byte-for-byte.
+
   StatusEvidenceFloorTokens:
     Type: Number
     Default: 5
@@ -3908,6 +3917,7 @@ Resources:
         Variables:
           DECLARE_CONTINUITY: !Ref DeclareContinuity
           STATUS_SUGGESTIONS: !Ref StatusSuggestions
+          CONTINUITY_LINKER: !Ref ContinuityLinker
           STATUS_EVIDENCE_FLOOR_TOKENS: !Ref StatusEvidenceFloorTokens
           EMIT_EVIDENCE: !Ref EmitEvidence
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec

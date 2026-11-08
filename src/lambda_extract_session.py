@@ -301,6 +301,14 @@ DECLARE_CONTINUITY = os.environ.get('DECLARE_CONTINUITY', 'false').lower() == 't
 # block, so it does nothing unless DECLARE_CONTINUITY is on too and there is a prior pass. Off:
 # the prompt is byte-identical and every stray `status_suggestion` is stripped.
 STATUS_SUGGESTIONS = os.environ.get('STATUS_SUGGESTIONS', 'false').lower() == 'true'
+# Spec 2026-11-08 (continuity linker): on the FINAL pass the extraction gets no prior block and a
+# second, thinking-off call links new items to earlier ones. Needs DECLARE_CONTINUITY. Live
+# passes are untouched. Off: today's final pass byte-for-byte.
+CONTINUITY_LINKER = os.environ.get('CONTINUITY_LINKER', 'false').lower() == 'true'
+LINKER_MAX_TOKENS = 2000
+LINKER_CAP_S = 120           # the linker call's own deadline ceiling (seconds)
+LINKER_MIN_S = 30            # less than this left for the call -> skip it
+LINKER_RESERVE_S = 60        # Lambda time kept back for the write after the call
 # Its own floor, not EVIDENCE_FLOOR_TOKENS: "that's done" is two tokens, and where this one
 # belongs is a measurement (dropped_by.weak in the eval), not a guess shared with topic evidence.
 STATUS_EVIDENCE_FLOOR_TOKENS = int(os.environ.get('STATUS_EVIDENCE_FLOOR_TOKENS', '5'))
@@ -2323,6 +2331,63 @@ def _find_self_introductions(turns):
         return []
 
 
+def _run_linker(prior, topics, transcript_text, budget_deadline=None):
+    """The final pass's continuity linker (spec 2026-11-08 L3-L6): one thinking-off call that
+    says which NEW child continues which EARLIER item; its answer is written onto the children
+    (`continues` / `status_suggestion`) for the unchanged resolve / filter_suggestions to judge.
+
+    Mutates `topics`: any `continues` / `status_suggestion` the extraction model put there is
+    removed first -- its prompt had no prior block, so those fields are noise.
+
+    `budget_deadline` is an absolute time.monotonic() value (the Lambda's end) or None (no
+    budget known: the call gets LINKER_CAP_S). Returns the `continuity.linker` record
+    {"status": "ok"|"error"|"skipped_budget", "ms", "dropped", "model"}. Never raises: a linker
+    failure leaves only exact-text matches, which is still a correct extraction."""
+    started = time.monotonic()
+    record = {"status": "error", "ms": 0, "dropped": 0, "model": None}
+    refs = []
+    try:
+        refs = item_continuity.assign_refs(topics)
+        for _ref, _ln, child in refs:
+            child.pop("continues", None)
+            child.pop(status_suggestions.FIELD, None)
+        deadline = LINKER_CAP_S
+        if budget_deadline is not None:
+            deadline = min((budget_deadline - time.monotonic()) - LINKER_RESERVE_S, LINKER_CAP_S)
+        if deadline < LINKER_MIN_S:
+            record["status"] = "skipped_budget"
+            logger.warning("continuity linker: skipped, %.0fs left for the call (refs=%d, "
+                           "prior=%d)", deadline, len(refs), len(prior))
+            return record
+        info = {}
+        raw, error = llm_utils.call_llm(
+            item_continuity.render_linker_prompt(
+                prior, refs, transcript_text,
+                status_suggestions.LINKER_INSTRUCTION if STATUS_SUGGESTIONS else ""),
+            max_tokens=LINKER_MAX_TOKENS, force_json=True, enable_thinking=False,
+            deadline=deadline, caller="continuity_link_final", info=info)
+        parsed = llm_utils.extract_json(raw) if raw is not None else None
+        if not isinstance(parsed, dict):
+            # Counts only: neither the provider error nor the answer is logged (item text).
+            logger.warning("continuity linker: %s (refs=%d, prior=%d) -- exact matches only",
+                           "call failed" if raw is None else "answer unusable",
+                           len(refs), len(prior))
+        else:
+            record["dropped"] = item_continuity.attach_links(parsed, refs)
+            record["model"] = info.get("model")
+            record["status"] = "ok"
+            logger.info("continuity linker: ok (refs=%d, prior=%d, dropped=%d)",
+                        len(refs), len(prior), record["dropped"])
+    except Exception as e:
+        record.update(status="error", dropped=0, model=None)
+        logger.exception("continuity linker: failed (%s; refs=%d) -- exact matches only",
+                         type(e).__name__, len(refs))
+    finally:
+        if record["status"] != "skipped_budget":
+            record["ms"] = int((time.monotonic() - started) * 1000)
+    return record
+
+
 def extract_session(bucket, user_folder, date, session_base, final=False, **kw):
     """_extract_session, recorded on the recording's trace (pipeline_trace):
     the pass, what it found, every location marker and whether its quote was
@@ -2364,7 +2429,9 @@ def _trace_extraction(out, final, seconds):
 
 def _extract_session(bucket, user_folder, date, session_base, final=False,
                      min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
-                     generation=0, speaker_names=None, sleep=time.sleep):
+                     generation=0, speaker_names=None, sleep=time.sleep, remaining_ms=None):
+    # The Lambda's end, for the final-pass linker's deadline (spec 2026-11-08 L6). None: unknown.
+    budget_deadline = (time.monotonic() + remaining_ms / 1000) if remaining_ms is not None else None
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail
@@ -2448,10 +2515,16 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
             continuity_prior = item_continuity.prior_items(published)
             prior_extracted_at = published.get('extracted_at')
 
+    # Spec 2026-11-08 L2: on the final pass with the linker on, the extraction sees NO prior block
+    # (with it, the thinking model re-emits the old list instead of extracting); continuity is
+    # stated by a separate call over the same transcript text the extraction saw.
+    use_linker = DECLARE_CONTINUITY and CONTINUITY_LINKER and final and bool(continuity_prior)
+    linker_transcript = (render_transcript(turns, names=speaker_names)[0] if use_linker
+                         else None)
     prompt, transcript_stats = build_extraction_prompt(
         user_folder, date, session_base, turns, n_segments,
         speaker_names=speaker_names,
-        continuity_block=item_continuity.render_block(
+        continuity_block="" if use_linker else item_continuity.render_block(
             continuity_prior,
             status_suggestions.INSTRUCTION if STATUS_SUGGESTIONS else ""))
     max_tokens = max_tokens_for(n_segments)  # BUG-16
@@ -2502,8 +2575,14 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     continuity = None
     if DECLARE_CONTINUITY:
         continuity_error = None
+        linker = {"status": "error", "ms": 0, "dropped": 0, "model": None}
         try:
             item_continuity.normalise_children(parsed_topics)
+            if use_linker:
+                # Never raises, and its failure is not a continuity_error: resolve still runs
+                # and exact-text matches still inherit their ids.
+                linker = _run_linker(continuity_prior, parsed_topics, linker_transcript,
+                                     budget_deadline=budget_deadline)
             claims = (item_continuity.resolve(parsed_topics, continuity_prior) if continuity_prior
                       else (item_continuity.assign_fresh_ids(parsed_topics) or []))
         except Exception as e:
@@ -2516,7 +2595,11 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
             _assign_fresh_ids_best_effort(parsed_topics)
         continuity = {"prior_count": len(continuity_prior),
                       "prior_extracted_at": prior_extracted_at, "prior_stale": False,
-                      "question_set": item_continuity.QUESTION_SET, "claims": claims}
+                      "question_set": (item_continuity.LINKER_QUESTION_SET if use_linker
+                                       else item_continuity.QUESTION_SET),
+                      "claims": claims}
+        if use_linker:
+            continuity["linker"] = linker
         if continuity_error is not None:
             continuity["error"] = continuity_error
 
@@ -2998,6 +3081,12 @@ def _speaker_names_from(req, key):
     return names or None
 
 
+def _remaining_ms(context):
+    """The Lambda's remaining time, or None when there is no real context (tests, scripts)."""
+    getter = getattr(context, "get_remaining_time_in_millis", None)
+    return getter() if callable(getter) else None
+
+
 def lambda_handler(event, context):
     results = []
     for record in event.get('Records', []):
@@ -3020,7 +3109,8 @@ def lambda_handler(event, context):
             try:
                 results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
                                                final=True, generation=generation,
-                                               speaker_names=speaker_names))
+                                               speaker_names=speaker_names,
+                                               remaining_ms=_remaining_ms(context)))
             except FINAL_FAILURES as e:
                 _record_pending(S3_BUCKET, key, user_folder, date, session_base, e,
                                 kind=e.failure_kind)
