@@ -15,7 +15,8 @@ Speaker identity: a turn's name comes from `speaker_turn_names` (voiceprints.liv
 keyed on the normalised `sid{32hex}`), joined to the linked turn by
 turn_name_overlay.resolve (tolerance, one row per turn -- never equality), and the name's
 voiceprint maps to a user through speaker_voiceprints.user_id (withdrawn profiles map to
-nobody). Only `confirmed` names count; derive enforces that.
+nobody; the profile may live in the recorder's home company). Only `confirmed` names
+count; derive enforces that.
 
 claim_basis holds ids and statuses only -- never a display name, never text.
 """
@@ -76,9 +77,13 @@ def _named_turns(conn, company_id, session_base, turns):
     users = {}
     if vp_ids:
         users = {str(vid): uid for vid, uid in conn.execute(
+            # No company filter: the turn-name rows are already company-scoped, and on
+            # another company's site the recorder's OWN profile is matched from their home
+            # company (voiceprints.own_profiles_for_matching, tenancy P5). Filtering on the
+            # site's company would drop exactly the recorder and turn `observed` into NULL.
             "SELECT id, user_id FROM speaker_voiceprints "
-            "WHERE company_id = %s AND id = ANY(%s::uuid[]) AND status <> 'withdrawn'",
-            (company_id, vp_ids)).fetchall()}
+            "WHERE id = ANY(%s::uuid[]) AND status <> 'withdrawn'",
+            (vp_ids,)).fetchall()}
     out = {}
     for si, hit in hits.items():
         named = dict(hit)

@@ -87,6 +87,7 @@ def world(monkeypatch, migrated_db_url):
     tag = uuid.uuid4().hex[:8]
     seed = get_connection(migrated_db_url, autocommit=True)
     made = {}
+    extra_companies = []
     try:
         made["co"] = companies.create_company(seed, f"Links-W-Co-{tag}")
         made["site"] = sites.create_site(seed, made["co"]["id"], f"Links-W-Site-{tag}")
@@ -109,7 +110,8 @@ def world(monkeypatch, migrated_db_url):
             return lambda_item_writer.write_extraction_items(DATE, folder, key)
 
         yield {"seed": seed, "key": key, "session_base": session_base, "write": write,
-               "folder": folder, "url": migrated_db_url, **made}
+               "folder": folder, "url": migrated_db_url, "cleanup_companies": extra_companies,
+               **made}
     finally:
         if "site" in made:
             seed.execute("DELETE FROM sites WHERE id=%s", (made["site"]["id"],))
@@ -117,6 +119,8 @@ def world(monkeypatch, migrated_db_url):
             if u in made:
                 seed.execute("DELETE FROM users WHERE id=%s", (made[u]["id"],))
         if "co" in made:
+            for cid in extra_companies:
+                seed.execute("DELETE FROM companies WHERE id=%s", (cid,))
             seed.execute("DELETE FROM companies WHERE id=%s", (made["co"]["id"],))
             assert seed.execute(
                 "SELECT (SELECT count(*) FROM sites WHERE id=%s), "
@@ -251,8 +255,12 @@ def test_recompute_after_names_turns_null_into_observed_and_stated(world):
                         ("topic_decisions", "Synthetic decision one")):
         assert _live(w, table, text)[2] is None
     # Names land: the recorder on the action's turn (offset within tolerance, not equal),
-    # someone else on the finding's, a tentative name on the decision's.
-    rec_vp = _voiceprint(seed, co_id, w["user"]["id"])
+    # someone else on the finding's, a tentative name on the decision's. The recorder's
+    # profile lives in their HOME company (tenancy P5: an external recorder's own print is
+    # matched from there), while the turn-name rows belong to the site's company.
+    home = companies.create_company(seed, f"Links-W-Home-{uuid.uuid4().hex[:8]}")
+    w["cleanup_companies"].append(home["id"])
+    rec_vp = _voiceprint(seed, home["id"], w["user"]["id"])
     other_vp = _voiceprint(seed, co_id, w["other"]["id"])
     _name(seed, co_id, rec_vp, w["session_base"], 10.2)
     _name(seed, co_id, other_vp, w["session_base"], 20.0)
