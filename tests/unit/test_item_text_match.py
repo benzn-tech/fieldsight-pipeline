@@ -58,3 +58,20 @@ def test_containment_ignores_multiplicity():
 
 def test_rule_version():
     assert itm.RULE_VERSION == "lexical_v1"
+
+
+def test_contraction_fragments_are_not_content():
+    for apos in ("'", "’"):
+        assert itm.overlap(f"Tom{apos}s crane", f"it{apos}s fine")[0] == 0.0
+        toks = itm.tokens(f"Tom{apos}s crane won{apos}t arrive, we{apos}re done")
+        assert toks == ["tom", "crane", "arrive", "done"]
+
+
+def test_single_letter_domain_tokens_survive():
+    assert itm.tokens("Block B") == ["block", "b"]
+    assert itm.tokens("Level 2") == ["level", "2"]
+
+
+def test_spoken_fillers_dropped():
+    toks = itm.tokens("ok yeah so um we just got the crane going right")
+    assert toks == ["crane"]

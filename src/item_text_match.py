@@ -32,7 +32,16 @@ of in on at to for from by with about into onto over under up down off out
 as than then so if or and but not no
 i me my we us our you your he him his she her it its they them their
 this that these those there here
+s t re ll ve d m
+don won isn aren wasn weren didn doesn hasn haven couldn shouldn wouldn
+ok okay yeah yep just get got go going like um uh mm right
 """.split())
+# The last three lines. "s t re ...": apostrophe-contraction fragments. `[a-z0-9]+` splits
+# "Tom's" into "tom" + "s" and "won't" into "won" + "t"; left in, "Tom's crane"
+# matched "it's fine" on "s". Listed explicitly rather than dropping every
+# single letter, because "B" in "Block B" and lone digits are domain-bearing.
+# "don won ...": contraction stems. "ok okay ...": spoken fillers, since
+# turns are speech.
 
 _ASCII_WORD = re.compile(r"[a-z0-9]+")
 
@@ -47,6 +56,10 @@ def tokens(text):
     """ASCII word tokens (stop words dropped) and CJK bigrams, in text order.
 
     Duplicates are kept; `overlap` ignores multiplicity.
+
+    A lone CJK character becomes a unigram, which never equals any bigram, so
+    "楼" in an item does not match "二楼" in a turn. That costs recall, never
+    precision.
     """
     t = unicodedata.normalize("NFKC", text or "")
     t = strip_cjk_spacing(t).lower()
@@ -79,6 +92,10 @@ def overlap(item_text, turn_text):
     Returns (|T(item) & T(turn)| / |T(item)|, sorted matched tokens), with
     multiplicity ignored. An item with no tokens scores 0.0 -- nothing to
     support is not the same as fully supported.
+
+    A tiny item (e.g. digits only, "2") can score 1.0 against any turn that
+    mentions the number; callers apply a minimum item token count before
+    trusting the score.
     """
     item = set(tokens(item_text))
     if not item:
