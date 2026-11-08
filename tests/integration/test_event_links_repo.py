@@ -6,6 +6,7 @@ site delete removes the link rows. All text is synthetic. Skipped without
 TEST_DATABASE_URL -- a skip is NOT a pass.
 """
 import datetime as _dt
+import json
 import uuid
 
 import pytest
@@ -118,7 +119,13 @@ def test_live_supported_by_ignores_superseded_rows(db):
     assert event_links.live_supported_by(db, "action_item", []) == {}
     # the same row, keyed as uuid, gets the same answer
     assert list(event_links.live_supported_by(db, "action_item", [new["id"]])) == [new["id"]]
-    # a deletion tombstone hides it too
+    # a recording tombstone over the live pass's source hides it, revert restores it
+    rec = redactions.create_recording_tombstone(
+        db, s.co["id"], t_new["source_s3_key"].rsplit(".", 1)[0], "gone", None, "worker")
+    assert event_links.live_supported_by(db, "action_item", ids) == {}
+    redactions.revert_redaction(db, rec["id"], s.co["id"])
+    assert list(event_links.live_supported_by(db, "action_item", ids)) == [str(new["id"])]
+    # a topic deletion tombstone hides it too
     s.tombstone(t_new)
     assert event_links.live_supported_by(db, "action_item", ids) == {}
 
@@ -176,16 +183,96 @@ def test_item_link_hidden_when_dst_endpoint_deleted(db):
     assert s.links(question["stable_id"]) == []
 
 
-def test_an_endpoint_with_one_live_carrier_stays_visible(db):
-    """A carried-forward stable_id names two rows; the superseded one must neither hide
-    the link nor crash an endpoint check that assumed one row."""
-    s = Seed(db)
+def _carried(s):
+    """One stable_id on two passes: the old row (later superseded) and its live carrier,
+    each with its own supported_by link."""
     t_old, t_new = s.topic("sid" + "a" * 32), s.topic("sid" + "b" * 32)
     old = s.item("action_item", t_old)
-    s.item("action_item", t_new, stable_id=old["stable_id"])
-    link_id = s.support("action_item", old)
-    db.execute("UPDATE topics SET superseded_at = now() WHERE id = %s", (t_old["id"],))
+    new = s.item("action_item", t_new, stable_id=old["stable_id"])
+    old_link = s.support("action_item", old, stem="stem-old")
+    new_link = s.support("action_item", new, stem="stem-new")
+    return t_old, t_new, old, new, old_link, new_link
+
+
+def _supersede(db, topic):
+    db.execute("UPDATE topics SET superseded_at = now() WHERE id = %s", (topic["id"],))
+
+
+def test_supported_by_shows_the_live_rows_links_not_the_superseded_pass(db):
+    """Spec §5.1: readers take the links of the live row; superseded passes keep theirs
+    as history (the row is still in the table, just not shown)."""
+    s = Seed(db)
+    t_old, _, old, _, old_link, new_link = _carried(s)
+    _supersede(db, t_old)
+    assert [r["id"] for r in s.links(old["stable_id"])] == [new_link]
+    assert _count(db, old_link) == 1
+
+
+@pytest.mark.parametrize("how", ["topic", "recording"])
+def test_a_deleted_pass_never_shows_through_a_live_carrier(db, how):
+    s = Seed(db)
+    t_old, _, old, _, old_link, new_link = _carried(s)
+    if how == "topic":
+        red = s.tombstone(t_old)
+    else:
+        red = redactions.create_recording_tombstone(
+            db, s.co["id"], t_old["source_s3_key"].rsplit(".", 1)[0], "gone", None, "worker")
+    assert [r["id"] for r in s.links(old["stable_id"])] == [new_link]
+    # undelete, but that pass has since been superseded: still history, still hidden
+    _supersede(db, t_old)
+    redactions.revert_redaction(db, red["id"], s.co["id"])
+    assert [r["id"] for r in s.links(old["stable_id"])] == [new_link]
+    assert _count(db, old_link) == 1
+
+
+def test_reader_and_export_agree_on_a_superseded_supported_by_link(db):
+    import company_records_export as cre
+    from tests.unit.export_fakes import FakeS3
+
+    s = Seed(db)
+    t_old, _, old, _, old_link, new_link = _carried(s)
+    _supersede(db, t_old)
+    s3 = FakeS3({}, min_part=1)
+    out = cre.run(db, s3, s.co["id"], export_id=str(uuid.uuid4()), dest_bucket="bkt",
+                  now=_dt.datetime(2026, 11, 1, tzinfo=_dt.timezone.utc))
+    assert out["done"] is True
+    key = f"exports/{s.co['id']}/{out['export_id']}/records/event_links.jsonl"
+    exported = {json.loads(line)["id"] for line in s3.objects[("bkt", key)].decode().splitlines()}
+    shown = {str(r["id"]) for r in s.links(old["stable_id"])}
+    assert exported == shown == {str(new_link)}
+    assert out["tables"]["event_links"]["excluded"] == {"superseded": 1}
+
+
+def test_item_link_endpoint_with_two_carriers_stays_visible(db):
+    """Item -> item links resolve by stable_id: a carried-forward stable_id names two rows,
+    and the superseded one must neither hide the link nor crash a one-row assumption."""
+    s = Seed(db)
+    t_old, t_new = s.topic("sid" + "a" * 32), s.topic("sid" + "b" * 32)
+    old = s.item("decision", t_old)
+    s.item("decision", t_new, stable_id=old["stable_id"])
+    question = s.item("question", t_new)
+    link_id = _item_link(db, s, "resolves", old, "decision", question, "question")
+    _supersede(db, t_old)
     assert [r["id"] for r in s.links(old["stable_id"])] == [link_id]
+
+
+def test_insert_supported_by_rejects_another_sites_row(db):
+    s = Seed(db)
+    other = sites.create_site(db, s.co["id"], f"Links-Other-{s.tag}")
+    item = s.item("finding", s.topic("sid" + "a" * 32))
+    for site_id in (other["id"], uuid.uuid4()):
+        with pytest.raises(ValueError):
+            event_links.insert_supported_by(
+                db, site_id=site_id, src_kind="finding", src_row_id=item["id"],
+                src_stable_id=item["stable_id"], source_s3_key=None, dst_turn=_turn(),
+                score=0.5, rule_version="v-test")
+    with pytest.raises(ValueError):                          # no such row
+        event_links.insert_supported_by(
+            db, site_id=s.site["id"], src_kind="finding", src_row_id=uuid.uuid4(),
+            src_stable_id=item["stable_id"], source_s3_key=None, dst_turn=_turn(),
+            score=0.5, rule_version="v-test")
+    assert db.execute("SELECT count(*) FROM event_links WHERE src_finding_id = %s",
+                      (item["id"],)).fetchone()[0] == 0
 
 
 def test_link_types_validation(db):

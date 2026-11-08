@@ -19,7 +19,8 @@ Deletion reach, both kinds:
   (item_history.find_items made the same choice for the same reason). Setting the
   tombstone's reverted_at brings the links back with no write here.
 
-Endpoint checks are EXISTS over every carrier of a stable_id, never a scalar subquery: after
+A supported_by link follows the exact row its FK names. Item -> item endpoint checks are
+EXISTS over every carrier of a stable_id, never a scalar subquery: after
 one carry-forward a stable_id names two rows (deleted_predicates, Ruling R17).
 """
 import json
@@ -66,15 +67,26 @@ def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id, s
                         dst_turn: dict, score: float, rule_version: str,
                         method="lexical_v1"):
     """Write one item -> turn link; sets the FK column of `src_kind` to `src_row_id`.
-    Returns the new link id."""
-    col = KIND_SRC_COLUMN[_kind(src_kind)]
+    Returns the new link id.
+
+    The link's site is the source row's own site: a `site_id` that differs from it (or a
+    `src_row_id` that names no row of `src_kind`) raises ValueError instead of writing a
+    link another site's reader would resolve."""
+    kind = _kind(src_kind)
+    table, col = KIND_TABLE[kind], KIND_SRC_COLUMN[kind]
     if not isinstance(dst_turn, dict):
         raise ValueError("dst_turn must be a dict")
+    row = conn.execute(f"SELECT site_id::text FROM {table} WHERE id = %s",
+                       (src_row_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no {kind} row {src_row_id}")
+    if str(site_id) != row[0]:
+        raise ValueError(f"site_id {site_id} is not the {kind} row's site {row[0]}")
     return conn.execute(
         f"INSERT INTO event_links (site_id, link_type, src_kind, src_stable_id, {col}, "
         f"source_s3_key, dst_kind, dst_turn, method, score, rule_version) "
         f"VALUES (%s,'supported_by',%s,%s,%s,%s,'turn',%s::jsonb,%s,%s,%s) RETURNING id",
-        (site_id, src_kind, src_stable_id, src_row_id, source_s3_key, json.dumps(dst_turn),
+        (row[0], kind, src_stable_id, src_row_id, source_s3_key, json.dumps(dst_turn),
          method, score, rule_version),
     ).fetchone()[0]
 
@@ -101,6 +113,19 @@ def live_supported_by(conn, src_kind, src_row_ids: list) -> dict:
     return {back[rid]: {"dst_turn": turn, "score": score} for rid, turn, score in rows}
 
 
+def _src_row_visible():
+    """SQL: a supported_by link's source is the exact row its FK names, and that row's
+    topic is visible and live. Spec §5.1: readers take the links of the live row;
+    superseded passes keep theirs as history, and a deleted pass's locators never show
+    through a live carrier of the same stable_id."""
+    live = visible_topics_predicate("vt")
+    return "(" + " OR ".join(
+        f"(e.src_kind = '{kind}' AND EXISTS (SELECT 1 FROM {table} vc "
+        f"JOIN topics vt ON vt.id = vc.topic_id WHERE vc.id = e.{KIND_SRC_COLUMN[kind]} "
+        f"AND {live}))"
+        for kind, table in KIND_TABLE.items()) + ")"
+
+
 def _endpoint_visible(kind_col, stable_col):
     """SQL: the endpoint (kind in `kind_col`, stable id in `stable_col`, both on alias e)
     resolves to at least one visible live row on the link's site."""
@@ -115,8 +140,10 @@ def _endpoint_visible(kind_col, stable_col):
 def links_for_stable_id(conn, *, site_id, stable_id, link_types=None) -> list[dict]:
     """Every link on `site_id` with `stable_id` at either end, oldest first.
 
-    Shown only when each endpoint resolves to a visible live row: the src side through
-    src_stable_id, an item dst through dst_stable_id; a turn dst needs only the src side.
+    Shown only when each endpoint resolves to a visible live row. supported_by: the src
+    is the exact row its FK names (an earlier pass's link is history, not shown here);
+    item -> item links: the src through src_stable_id, the dst through dst_stable_id. A
+    turn dst needs only the src side.
     `link_types` restricts the types; None = all, an empty collection raises."""
     if link_types is not None:
         if isinstance(link_types, str) or not link_types:
@@ -130,7 +157,8 @@ def links_for_stable_id(conn, *, site_id, stable_id, link_types=None) -> list[di
         f"WHERE e.site_id = %(site)s "
         f"AND (e.src_stable_id = %(sid)s OR e.dst_stable_id = %(sid)s) "
         f"AND (%(types)s::text[] IS NULL OR e.link_type = ANY(%(types)s::text[])) "
-        f"AND {_endpoint_visible('src_kind', 'src_stable_id')} "
+        f"AND CASE WHEN e.link_type = 'supported_by' THEN {_src_row_visible()} "
+        f"ELSE {_endpoint_visible('src_kind', 'src_stable_id')} END "
         f"AND (e.dst_kind = 'turn' OR {_endpoint_visible('dst_kind', 'dst_stable_id')}) "
         f"ORDER BY e.created_at ASC, e.id ASC"
     )
