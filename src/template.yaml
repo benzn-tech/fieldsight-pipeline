@@ -1565,6 +1565,19 @@ Parameters:
       them. False (default) answers 404 on /sites/{id}/documents, which is the UI's only
       gate. Set per environment by TEST_PROJECT_DOCUMENTS / PROD_PROJECT_DOCUMENTS.
 
+  # Contact FieldSight (spec 2026-11-08-contact-fieldsight-design). Pinned by
+  # tests/unit/test_template_contact.py: this Parameter -> CONTACT_FIELDSIGHT on
+  # ContactFunction only. Set per environment by TEST_CONTACT_FIELDSIGHT /
+  # PROD_CONTACT_FIELDSIGHT.
+  ContactFieldSight:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, /api/contact/transcribe and /api/contact/messages accept the web
+      Contact window's messages (S3 record + email to sales@). False (default)
+      answers 404 on every /api/contact/* route, and the web falls back to mailto.
+
   # Check done (spec 2026-10-20-check-done-gaps-design, step A). Pinned by
   # tests/unit/test_check_gaps_template.py: this Parameter -> ShouldCheckDoneGaps ->
   # CheckGapsFunction + CheckGapsDbFunction, and the Ask worker's CHECK_GAPS_FUNCTION
@@ -6349,6 +6362,70 @@ Resources:
           Properties:
             RestApiId: !Ref FieldSightApi
             Path: /api/{proxy+}
+            Method: ANY
+
+  # ----------------------------------------------------------
+  # Contact FieldSight (spec 2026-11-08-contact-fieldsight-design)
+  # ----------------------------------------------------------
+  # The web Contact window's backend: POST /api/contact/transcribe and
+  # /api/contact/messages. A more specific resource than ApiFunction's
+  # /api/{proxy+}, so API Gateway routes /api/contact/* here.
+  # OUTSIDE the VPC on purpose (no VpcConfig): it calls SES and ElevenLabs, which
+  # an in-VPC function without NAT cannot reach (CLAUDE.md BUG-36) -- that is why
+  # this is not an org-api route.
+  # Browser preflight: FieldSightApi's Api-level Cors with
+  # AddDefaultAuthorizerToCorsPreflight: false makes SAM add an unauthenticated
+  # MOCK OPTIONS method on this path, exactly as for /api/org/{proxy+}; nothing
+  # extra is declared here. Pinned by tests/unit/test_template_contact.py.
+  ContactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-contact", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_contact.lambda_handler
+      # Below API Gateway's fixed 29 s integration timeout. The transcribe route's
+      # own outer deadline is 25 s (lambda_contact.TRANSCRIBE_DEADLINE_S).
+      Timeout: 28
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONTACT_FIELDSIGHT: !Ref ContactFieldSight
+          S3_BUCKET: !Ref DataBucketName
+          SENDER_EMAIL: !Ref SenderEmail
+          STAGE: !Ref Stage
+          # The Ask key, not the batch recording key (whose credit pool must not
+          # be spent here).
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          # Per attempt; stt_short makes two with a 1 s sleep: 12+1+12 = 25 s < 28.
+          ELEVENLABS_ASK_TIMEOUT_SECONDS: '12'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/contact_messages/*'
+            # Without ListBucket a missing key (the transcribe counter's first
+            # read) answers 403, not 404; and /messages lists the sub's prefix
+            # for idempotency and the rate count.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['contact_messages/*']
+            # Raw email (audio attachment, Reply-To). Resource '*' as every other
+            # SES grant in this template.
+            - Effect: Allow
+              Action: ses:SendRawEmail
+              Resource: '*'
+      Events:
+        ContactProxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref FieldSightApi
+            Path: /api/contact/{proxy+}
             Method: ANY
 
   # ----------------------------------------------------------
