@@ -21,6 +21,8 @@ count; derive enforces that.
 claim_basis holds ids and statuses only -- never a display name, never text.
 """
 
+import time
+
 from psycopg.errors import QueryCanceled
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -148,8 +150,14 @@ def _session_sites(conn, company_id, suffix):
         (company_id, len(suffix), suffix)).fetchall()]
 
 
+# Total wall-clock budget for the all-sites loop: statement_timeout bounds each statement,
+# not their sum, so a session spread over many sites needs a ceiling of its own.
+RECOMPUTE_DEADLINE_S = 20.0
+
+
 def recompute_session(conn, *, company_id, site_id=None, session_base,
-                      statement_timeout=None) -> dict:
+                      statement_timeout=None, deadline_s=RECOMPUTE_DEADLINE_S,
+                      clock=time.monotonic) -> dict:
     """Re-derive claim_type for every live item of one session on `site_id`.
 
     The session's items are the live (visible_topics_predicate) rows that either have a
@@ -163,12 +171,15 @@ def recompute_session(conn, *, company_id, site_id=None, session_base,
     recomputed as above in its OWN savepoint, counts summed, plus `sites: n` and
     `failed: n` / `errors: [exception type names]`. One site's failure rolls back only
     that site. A QueryCanceled (the caller's statement_timeout) stops the loop -- the
-    budget is spent -- and the sites already done stand (`timed_out: True`).
+    budget is spent -- and the sites already done stand (`timed_out: True`). So does a
+    total wall-clock deadline: `deadline_s` seconds (by `clock`) from entry, checked
+    before each site; once it has passed no further site is started (`timed_out: True`).
 
     `statement_timeout` (e.g. "15s"), when given, is set LOCAL to the caller's transaction
     first, so a synchronous caller has a bound on every statement below."""
     if not company_id or not session_base:
         raise ValueError("company_id and session_base are required")
+    started = clock()
     if statement_timeout is not None:
         conn.execute("SELECT set_config('statement_timeout', %s, true)",
                      (str(statement_timeout),))
@@ -177,6 +188,9 @@ def recompute_session(conn, *, company_id, site_id=None, session_base,
                  "timed_out": False,
                  "claim": {c: 0 for c in claim_type.CLAIM_TYPES + ("null",)}}
         for sid in _session_sites(conn, company_id, _session_key_suffix(session_base)):
+            if deadline_s is not None and clock() - started >= deadline_s:
+                total["timed_out"] = True
+                break
             try:
                 with conn.transaction():
                     one = _recompute_site(conn, company_id, sid, session_base)

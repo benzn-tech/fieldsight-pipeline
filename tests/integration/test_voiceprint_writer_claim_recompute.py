@@ -169,7 +169,8 @@ def test_match_names_triggers_one_recompute_per_session(world, monkeypatch):
     assert len(calls) == 1, calls
     kw, counts = calls[0]
     assert kw == {"company_id": str(a["co"]["id"]), "site_id": None,
-                  "session_base": w["session_base"], "statement_timeout": "15s"}
+                  "session_base": w["session_base"], "statement_timeout": "15s",
+                  "deadline_s": 20}
     assert counts["sites"] == 1 and counts["rows"] == 2 and counts["changed"] == 2
     act = _claim(w, a, "action_items", "Synthetic task one")
     fnd = _claim(w, a, "findings", "Synthetic finding one")
@@ -314,6 +315,39 @@ def test_one_sites_failure_does_not_roll_back_the_others(world, monkeypatch, cap
     assert _claim(w, a2, "action_items", "Synthetic task one")[0] == "stated"
     warn = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("1 site(s) failed" in m and "DivisionByZero" in m for m in warn), warn
+
+
+def test_the_wall_clock_deadline_stops_before_the_next_site(world):
+    """Two sites of one company hold the session. An injected clock passes the deadline
+    after the first site: that site stands, the second is never started, timed_out."""
+    w = world
+    a = w["tenant"]("A")
+    w["tenant"]("A2", same_company_as=a)
+    ticks = iter([0.0, 0.0, 25.0])      # entry, before site 1, before site 2
+    conn = get_connection(w["url"])
+    try:
+        with conn:
+            counts = claim_type_store.recompute_session(
+                conn, company_id=str(a["co"]["id"]), session_base=w["session_base"],
+                deadline_s=20, clock=lambda: next(ticks))
+    finally:
+        conn.close()
+    assert counts["timed_out"] is True
+    assert counts["sites"] == 1 and counts["failed"] == 0
+
+
+def test_a_spent_deadline_starts_no_site(world):
+    w = world
+    a = w["tenant"]("A")
+    conn = get_connection(w["url"])
+    try:
+        with conn:
+            counts = claim_type_store.recompute_session(
+                conn, company_id=str(a["co"]["id"]), session_base=w["session_base"],
+                deadline_s=0)
+    finally:
+        conn.close()
+    assert counts["timed_out"] is True and counts["sites"] == 0 and counts["rows"] == 0
 
 
 def test_a_site_with_only_superseded_topics_is_not_visited(world):

@@ -106,6 +106,8 @@ def _require(event, key):
 # The recompute runs on the embedder's synchronous invoke (RequestResponse, 60 s read
 # timeout), so every statement of it is bounded; a cancel is just another logged failure.
 RECOMPUTE_STATEMENT_TIMEOUT = "15s"
+# ...and the whole loop over the session's sites has a wall-clock ceiling under that 60 s.
+RECOMPUTE_DEADLINE_S = 20
 
 
 def _recompute_claims(company_id, session_base):
@@ -121,7 +123,8 @@ def _recompute_claims(company_id, session_base):
         with get_connection() as conn:
             counts = claim_type_store.recompute_session(
                 conn, company_id=company_id, site_id=None, session_base=key,
-                statement_timeout=RECOMPUTE_STATEMENT_TIMEOUT)
+                statement_timeout=RECOMPUTE_STATEMENT_TIMEOUT,
+                deadline_s=RECOMPUTE_DEADLINE_S)
     except Exception as exc:
         logger.warning("claim recompute failed for %s: %s", key, type(exc).__name__)
         return None
@@ -129,6 +132,9 @@ def _recompute_claims(company_id, session_base):
         # Per-site failures the store isolated: types only, never a message.
         logger.warning("claim recompute: %d site(s) failed for %s: %s", counts["failed"],
                        key, ",".join(counts.get("errors") or ()))
+    if counts.get("timed_out"):
+        logger.warning("claim recompute: budget spent for %s after %d site(s)",
+                       key, counts.get("sites", 0))
     logger.info("claim recompute for %s: %d rows on %d site(s), %d changed",
                 key, counts.get("rows", 0), counts.get("sites", 0),
                 counts.get("changed", 0))
