@@ -118,14 +118,18 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
          Jsonb(decisions) if decisions is not None else None),
     ).fetchone()
     tid = topic["id"]
+    # The new action-item ids, in input order (one row per entry, none skipped): the item
+    # writer pairs each with its source child to write that child's supported_by link.
+    topic["action_item_ids"] = []
     for a in (action_items or []):
-        conn.execute(
+        topic["action_item_ids"].append(conn.execute(
             "INSERT INTO action_items (topic_id, site_id, text, responsible, deadline, "
-            "deadline_text, priority, status, item_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "deadline_text, priority, status, item_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "RETURNING id",
             (tid, site_id, a["text"], a.get("responsible"), a.get("deadline"),
              a.get("deadline_text"), a.get("priority"), a.get("status", "open"),
              a.get("item_id")),
-        )
+        ).fetchone()[0])
     for o in (safety or []):
         conn.execute(
             "INSERT INTO safety_observations (topic_id, site_id, observation, risk_level, location, status) "

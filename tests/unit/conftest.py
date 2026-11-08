@@ -61,4 +61,16 @@ def _single_company_world_defaults(request):
             # on which sites; a connection double cannot answer, so: nothing restricted.
             mp.setattr(org, "_session_hider", lambda conn, caller, folder, date: None)
             mp.setattr(org, "_may_see_siteless_of", lambda conn, caller, folder: True)
+        # Claim recompute (Track C Task 8): the voiceprint writer re-derives claim_type after
+        # names land. A connection double cannot answer, so: nothing to recompute. Tests of
+        # the hook override this with their own monkeypatch. The real SQL is proven in
+        # tests/integration/test_voiceprint_writer_claim_recompute.py.
+        try:
+            from repositories import claim_type_store
+        except ImportError:      # psycopg absent; nothing imports the store then either
+            claim_type_store = None
+        if claim_type_store is not None:
+            mp.setattr(claim_type_store, "recompute_session",
+                       lambda conn, **kw: {"rows": 0, "changed": 0, "sites": 0,
+                                           "failed": 0, "claim": {}})
         yield

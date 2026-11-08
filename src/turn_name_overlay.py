@@ -180,7 +180,8 @@ def lookup(index, source_filename, start_sec):
         # `decide_name` hands back the CLUSTER KEY as its name. `C_3` must never render.
         return None
     return {"display_name": row["display_name"], "state": row.get("state"),
-            "source": row.get("source"), "cluster_ref": row.get("cluster_ref")}
+            "source": row.get("source"), "cluster_ref": row.get("cluster_ref"),
+            "voiceprint_id": row.get("voiceprint_id")}
 
 
 def orphans(index):
@@ -210,8 +211,9 @@ def resolve(index, segments):
     when two rows reach the same turn at the same distance.
 
     `segments` are dicts carrying `source_filename` and `chunk_start`. Returns
-    `{segment_index: {display_name, state, source, cluster_ref}}` for the turns that got a
-    name; anything absent simply has none.
+    `{segment_index: {display_name, state, source, cluster_ref, voiceprint_id}}` for the
+    turns that got a name; anything absent simply has none. (`voiceprint_id` is what
+    claim_type_store maps to a user.)
     """
     pairs = []
     for si, seg in enumerate(segments or []):
@@ -233,5 +235,6 @@ def resolve(index, segments):
         index["unmatched"].discard(ri)
         if row.get("display_name"):
             out[si] = {"display_name": row["display_name"], "state": row.get("state"),
-                       "source": row.get("source"), "cluster_ref": row.get("cluster_ref")}
+                       "source": row.get("source"), "cluster_ref": row.get("cluster_ref"),
+                       "voiceprint_id": row.get("voiceprint_id")}
     return out

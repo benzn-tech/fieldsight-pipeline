@@ -54,8 +54,11 @@ class FakeConn:
 
 @pytest.fixture
 def calls(monkeypatch):
-    seen = {"turns": [], "samples": [], "attempts": []}
+    seen = {"turns": [], "samples": [], "attempts": [], "recomputes": []}
     monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    # The post-commit claim recompute (Track C): its SQL is pinned in the integration test.
+    monkeypatch.setattr(vw.claim_type_store, "recompute_session",
+                        lambda conn, **kw: seen["recomputes"].append(kw) or {"rows": 0})
     monkeypatch.setattr(vw, "record_attempt",
                         lambda conn, co, vp, outcome, detail=None:
                         seen["attempts"].append((outcome, detail)))
@@ -64,6 +67,41 @@ def calls(monkeypatch):
     monkeypatch.setattr(vw, "add_sample",
                         lambda conn, company_id, *a, **kw: seen["samples"].append(kw) or {"id": "s"})
     return seen
+
+
+# ---- claim recompute after names land -----------------------------------
+
+
+def test_propagation_recomputes_claims_once_after_the_names(calls):
+    vw.lambda_handler({
+        "op": "propagation", "company_id": CO, "session_base": "sid" + "a" * 32,
+        "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": "C1"},
+                    {"turn_ref": "f.wav@2.0", "state": "confirmed", "cluster_ref": "C1"}]},
+        None)
+    assert calls["recomputes"] == [{"company_id": CO, "site_id": None,
+                                    "session_base": "sid" + "a" * 32,
+                                    "statement_timeout": "15s",
+                                    "deadline_s": 20}]
+
+
+def test_nothing_written_means_no_recompute(calls):
+    vw.lambda_handler({"op": "match_names", "company_id": CO, "session_base": "s1",
+                       "results": [{"turn_ref": "a", "status": "unknown"}]}, None)
+    assert calls["recomputes"] == []
+
+
+def test_recompute_failure_is_logged_by_type_and_the_reply_stands(calls, monkeypatch, caplog):
+    def boom(conn, **kw):
+        raise RuntimeError("Synthetic Person said something")
+    monkeypatch.setattr(vw.claim_type_store, "recompute_session", boom)
+    out = vw.lambda_handler({
+        "op": "match_names", "company_id": CO, "session_base": "s1",
+        "results": [{"turn_ref": "a", "status": "confirmed", "person_key": "vp1",
+                     "display_name": "Synthetic Person"}]}, None)
+    assert out["written"] == 1
+    warn = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("RuntimeError" in m for m in warn), warn
+    assert not any("Synthetic Person" in m for m in warn)
 
 
 # ---- propagation results ------------------------------------------------
@@ -258,14 +296,21 @@ def test_the_names_and_the_sample_land_in_one_transaction(monkeypatch):
                         lambda conn, company_id, **kw: seen.append(("turn", conn)) or {"id": "t"})
     monkeypatch.setattr(vw, "add_sample",
                         lambda conn, company_id, *a, **kw: seen.append(("sample", conn)) or {"id": "s"})
+    # The claim recompute (Track C) is deliberately a SECOND connection, opened only after
+    # the names' one has committed -- it is best-effort and must not share their fate.
+    monkeypatch.setattr(vw.claim_type_store, "recompute_session",
+                        lambda conn, **kw: seen.append(("recompute", conn, conns[0].committed))
+                        or {"rows": 0})
     vw.lambda_handler({
         "op": "propagation", "company_id": CO, "session_base": "s1",
         "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": None,
                      "display_name": "Ben L", "asserted": True}],
         "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
                   "s3_key": "k", "window": [0.0, 15.0]}}, None)
-    assert len(conns) == 1, f"{len(conns)} connections opened; the two halves can differ"
-    assert {c for _, c in seen} == {conns[0]}, "the sample used a different connection"
+    assert len(conns) == 2, f"{len(conns)} connections opened; the two halves can differ"
+    names = [e for e in seen if e[0] != "recompute"]
+    assert {e[1] for e in names} == {conns[0]}, "the sample used a different connection"
+    assert seen[-1] == ("recompute", conns[1], True), "recompute must follow the commit"
 
 
 # ---- a refused enrolment is half a gesture, not none of it ----------------

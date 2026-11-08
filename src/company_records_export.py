@@ -27,6 +27,9 @@ Deletion, the same rules the product applies (and the file export's `Tombstones`
   (fail closed, as the file export's day-level rule: the row's content_sample is derived
   from a row that may belong to the deleted recording).
 * project_documents: deleted_at set.
+* event_links: a supported_by link follows the item row it was written for (its FK): that
+  row's topic deleted -> `deleted`, superseded -> `superseded`, the same as the item itself.
+  The other link types are not written yet; their deletion rule belongs to their writers.
 archived_at on companies' structure (sites, users, memberships) is a state, not a deletion:
 those rows are exported with the column.
 
@@ -87,6 +90,13 @@ _PARENT_SUPERSEDED = ("NOT EXISTS (SELECT 1 FROM topics tl WHERE tl.id = {col} "
                       "AND tl.superseded_at IS NULL)")
 _TOPIC_SITE_CO = ("(SELECT s2.company_id FROM topics t2 JOIN sites s2 ON s2.id = t2.site_id "
                   "WHERE t2.id = {col})")
+# event_links (migration 0098): the topic of the exact item row a supported_by link was
+# written for, through whichever FK column is set; NULL for the other link types (no FK).
+# _PARENT_SUPERSEDED is a NOT EXISTS, true on NULL -- its use below is guarded on link_type.
+_LINK_SRC_TOPIC = ("COALESCE((SELECT la.topic_id FROM action_items la WHERE la.id = x.src_action_item_id), "
+                   "(SELECT lf.topic_id FROM findings lf WHERE lf.id = x.src_finding_id), "
+                   "(SELECT ld.topic_id FROM topic_decisions ld WHERE ld.id = x.src_decision_id), "
+                   "(SELECT lq.topic_id FROM topic_questions lq WHERE lq.id = x.src_question_id))")
 _TASK_SITE_CO = ("(SELECT s3.company_id FROM programme_tasks pt3 "
                  "JOIN programmes p3 ON p3.id = pt3.programme_id "
                  "JOIN sites s3 ON s3.id = p3.site_id WHERE pt3.id = {col})")
@@ -247,6 +257,17 @@ TABLES = [
               keys=(("id", "uuid"),), hidden={"site_co": "s.company_id"},
               check=_owned_by("_fs_site_co"), describe="delay flags raised on tasks",
               owner_rule="programmes on the company's sites"),
+    TableSpec("event_links", "event_links", joins=_SITE_JOIN, where=_SITE_WHERE,
+              keys=(("id", "uuid"),),
+              hidden={"site_co": "s.company_id",
+                      "deleted": _PARENT_DELETED.replace("{col}", _LINK_SRC_TOPIC),
+                      "superseded": "(x.link_type = 'supported_by' AND "
+                                    + _PARENT_SUPERSEDED.format(col=_LINK_SRC_TOPIC) + ")"},
+              check=_owned_by("_fs_site_co"),
+              flags=(("_fs_deleted", "deleted"), ("_fs_superseded", "superseded")),
+              describe="evidence links: which transcript turn each extracted item came "
+                       "from (dst_turn: recording stem, start/end seconds, speaker label)",
+              owner_rule=_SITE_RULE + "; a link is written exactly when its item is"),
     TableSpec("project_documents", "project_documents", joins=_SITE_JOIN, where=_SITE_WHERE,
               keys=(("id", "uuid"),),
               hidden={"site_co": "s.company_id", "deleted": "x.deleted_at IS NOT NULL"},
