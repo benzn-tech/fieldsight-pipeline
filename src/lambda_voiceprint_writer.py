@@ -45,8 +45,9 @@ Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md
 import logging
 import os
 
+import turn_name_overlay
 from db.connection import get_connection
-from repositories import (label_group_candidates, site_attendance,
+from repositories import (claim_type_store, label_group_candidates, site_attendance,
                           speaker_label_groups, speaker_name_proposals)
 from repositories.companies import list_companies, voiceprint_consent_basis
 from repositories.voiceprints import (EnrolmentAfterWithdrawal,
@@ -100,6 +101,28 @@ def _require(event, key):
         raise ValueError(f"{key} is required — an absent one would write rows nobody can "
                          f"scope, and this table is read per company")
     return value
+
+
+def _recompute_claims(company_id, session_base):
+    """Re-derive the session's items' claim_type now that its names have landed.
+
+    Called once per session, AFTER the names' transaction has committed, on a connection
+    of its own: best-effort by construction. A failure here rolls back only the recompute
+    and is logged by exception TYPE (ids and counts only -- never a name or any text); the
+    names already stand. The store resolves the session's sites from its topics, scoped to
+    `company_id`, so this needs no session-to-site lookup."""
+    key = turn_name_overlay.session_base(session_base) or session_base
+    try:
+        with get_connection() as conn:
+            counts = claim_type_store.recompute_session(
+                conn, company_id=company_id, site_id=None, session_base=key)
+    except Exception as exc:
+        logger.warning("claim recompute failed for %s: %s", key, type(exc).__name__)
+        return None
+    logger.info("claim recompute for %s: %d rows on %d site(s), %d changed",
+                key, counts.get("rows", 0), counts.get("sites", 0),
+                counts.get("changed", 0))
+    return counts
 
 
 def _rebind(event):
@@ -298,6 +321,9 @@ def _propagation(event):
 
         inherited = _inherit_labels(conn, company_id, session_base,
                                     event.get("label_map"))
+    # The names' transaction has committed (the `with` above); re-derive claims after it.
+    if written or inherited:
+        _recompute_claims(company_id, session_base)
     # `enrol` is cleared when the embedder refused, so this asks whether anything was
     # actually STORED — not whether the event mentioned an enrolment.
     enrolled = bool(enrol) and enrol_refusal is None
@@ -545,6 +571,9 @@ def _match_names(event):
                 written += 1
         inherited = _inherit_labels(conn, company_id, session_base,
                                     event.get("label_map"))
+    # After the names' commit, in its own transaction; never fails the name write.
+    if written or inherited:
+        _recompute_claims(company_id, session_base)
     logger.info("match: %d names for %s (%d declined to a stronger source)",
                 written, session_base, declined)
     return {"written": written, "declined": declined, "inherited": inherited}

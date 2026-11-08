@@ -136,15 +136,46 @@ def _session_key_suffix(session_base):
     return f"/{session_base}.json"
 
 
-def recompute_session(conn, *, company_id, site_id, session_base) -> dict:
+def _session_sites(conn, company_id, suffix):
+    """The sites of `company_id` that hold a topic of this session (by extraction-key
+    suffix). Scoped through sites.company_id: a same-named session in another company is
+    never returned."""
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT t.site_id::text FROM topics t JOIN sites s ON s.id = t.site_id "
+        "WHERE s.company_id = %s AND right(t.source_s3_key, %s) = %s ORDER BY 1",
+        (company_id, len(suffix), suffix)).fetchall()]
+
+
+def recompute_session(conn, *, company_id, site_id=None, session_base) -> dict:
     """Re-derive claim_type for every live item of one session on `site_id`.
 
     The session's items are the live (visible_topics_predicate) rows that either have a
     supported_by link whose source_s3_key ends `/{session_base}.json` (the best link per
     row, event_links.BEST_LINK_ORDER), or whose topic carries that key and whose last
     claim_basis said `none_close`. The recorder is each row's topic user. Returns
-    `{rows, changed, claim: {type|null: n}}`."""
-    if not company_id or not site_id or not session_base:
+    `{rows, changed, claim: {type|null: n}}`.
+
+    `site_id=None` (the voiceprint writer, which knows the company and session but not
+    the site): every site OF `company_id` holding a topic of the session, each recomputed
+    as above, counts summed, plus `sites: n`."""
+    if not company_id or not session_base:
+        raise ValueError("company_id and session_base are required")
+    if site_id is None:
+        total = {"rows": 0, "changed": 0, "sites": 0,
+                 "claim": {c: 0 for c in claim_type.CLAIM_TYPES + ("null",)}}
+        for sid in _session_sites(conn, company_id, _session_key_suffix(session_base)):
+            one = _recompute_site(conn, company_id, sid, session_base)
+            total["sites"] += 1
+            total["rows"] += one["rows"]
+            total["changed"] += one["changed"]
+            for k, v in one["claim"].items():
+                total["claim"][k] += v
+        return total
+    return _recompute_site(conn, company_id, site_id, session_base)
+
+
+def _recompute_site(conn, company_id, site_id, session_base) -> dict:
+    if not site_id:
         raise ValueError("company_id, site_id and session_base are required")
     owner = conn.execute("SELECT company_id::text FROM sites WHERE id = %s",
                          (site_id,)).fetchone()
