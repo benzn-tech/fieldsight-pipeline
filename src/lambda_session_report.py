@@ -998,7 +998,7 @@ def _walk_sections(walk, template, prose, futures, items, turns, date, name=None
 LOCATIONS_TITLE = "Locations"
 
 
-def _locations_section(artifact, offer, walk):
+def _locations_section(artifact, offer, walk, prose=()):
     """The report's topics under the places he said out loud, as one prose
     section, or None (Track L Task 6; spec 2026-11-09).
 
@@ -1014,10 +1014,17 @@ def _locations_section(artifact, offer, walk):
     `walk` is the worker's local, so a walk demoted to an ordinary report
     (its template has no checklist) gets one like any other.
 
+    A TEMPLATE WITH ITS OWN "Locations" SECTION keeps it and gets no
+    second one: the customer's template owns that heading.
+
     Never raises: a failure is logged and the report goes out without it.
     """
     if walk:
         logger.info("locations: absent (walk report)")
+        return None
+    if any((s.get("title") or "").strip().lower() == LOCATIONS_TITLE.lower()
+           for s in prose or () if isinstance(s, dict)):
+        logger.info("locations: absent (the template has its own Locations section)")
         return None
     markers = (artifact.get("reportFacts") or {}).get("locations")
     if not markers:
@@ -1283,7 +1290,7 @@ def _generate_document(artifact, context=None):
     # after every photograph has been placed -- so it can never catch one --
     # and before the Actions table and the coverage note.
     if os.environ.get("REPORT_LOCATIONS_SECTION", "").lower() == "true":
-        locations = _locations_section(artifact, topic_offer, walk)
+        locations = _locations_section(artifact, topic_offer, walk, prose)
         if locations:
             prose.append(locations)
 

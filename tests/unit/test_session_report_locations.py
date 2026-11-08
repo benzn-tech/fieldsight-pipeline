@@ -363,3 +363,16 @@ def test_test_turns_it_on_and_prod_leaves_it_to_the_owner():
             in _repo_text(".github", "workflows", "deploy.yml"))
     assert ("\"ReportLocationsSection=${{ vars.PROD_REPORT_LOCATIONS_SECTION || 'false' }}\" \\"
             in _repo_text(".github", "workflows", "deploy-prod.yml"))
+
+
+def test_a_template_with_its_own_locations_section_keeps_it_and_gets_no_second(run, caplog):
+    """The customer's template owns the heading: ours is not appended."""
+    caplog.set_level(logging.INFO)
+    body = dict(BODY, sections=BODY["sections"] + [
+        {"key": "loc", "title": "Locations", "purpose": "Where we were."}])
+    answer = ANSWER + "\n### Locations\nOur own words about the places.\n"
+    got = run("true", artifact=_artifact(template=body), answer=answer, capture=True)
+    locs = [s for s in got["sections"] if (s.get("title") or "").strip().lower() == "locations"]
+    assert len(locs) == 1
+    assert locs[0]["paragraphs"][0] == "Our own words about the places."  # (+ the tier-3 caption: it is last)
+    assert "locations: absent (the template has its own Locations section)" in caplog.text
