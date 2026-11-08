@@ -1,4 +1,4 @@
-"""Integration: migration 0097 (event_links, claim_type) enforces its constraints on real Postgres."""
+"""Integration: migration 0098 (event_links, claim_type) enforces its constraints on real Postgres."""
 import datetime as _dt
 import json
 

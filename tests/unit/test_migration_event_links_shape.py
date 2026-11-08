@@ -1,4 +1,4 @@
-"""Unit: migration 0097 has the shape the evidence-chain writers rely on.
+"""Unit: migration 0098 has the shape the evidence-chain writers rely on.
 
 Text checks only -- the SQL is applied for real by
 tests/integration/test_event_links_schema.py. The version guard matters because version
@@ -8,7 +8,7 @@ import os
 import re
 
 MIGRATIONS = os.path.join(os.path.dirname(__file__), "..", "..", "src", "migrations")
-NAME = "0097_event_links.sql"
+NAME = "0098_event_links.sql"
 
 
 def _sql():
@@ -27,8 +27,8 @@ def _create_table():
     return sql[start:end]
 
 
-def test_only_one_migration_uses_0097():
-    assert [f for f in os.listdir(MIGRATIONS) if f.startswith("0097_")] == [NAME]
+def test_only_one_migration_uses_0098():
+    assert [f for f in os.listdir(MIGRATIONS) if f.startswith("0098_")] == [NAME]
 
 
 def test_event_links_has_no_company_id():
