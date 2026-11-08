@@ -48,8 +48,12 @@ class FakeCursor:
 
 
 class FakeExecResult:
-    def __init__(self, rowcount):
+    def __init__(self, rowcount, row=None):
         self.rowcount = rowcount
+        self._row = row
+
+    def fetchone(self):
+        return self._row
 
 
 class FakeConn:
@@ -69,8 +73,12 @@ class FakeConn:
 
     def execute(self, sql, params=None):
         self.calls.append({"sql": sql, "params": params})
-        rowcount = self._results.pop(0) if self._results else 0
-        return FakeExecResult(rowcount)
+        result = self._results.pop(0) if self._results else 0
+        # A tuple entry is the one row a RETURNING statement hands back
+        # (e.g. the action-item INSERT's ("ai-1",)); its rowcount is 1.
+        if isinstance(result, tuple):
+            return FakeExecResult(1, result)
+        return FakeExecResult(result)
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +356,13 @@ def test_upsert_action_items_carry_deadline_text():
         "title": "T", "summary": None, "time_range": None, "participants": None,
         "source": "ai", "created_at": "c0",
     }
-    conn = FakeConn(results=[[inserted_topic], 1])
+    conn = FakeConn(results=[[inserted_topic], ("ai-1",)])
 
-    topics.upsert_topic(
+    topic = topics.upsert_topic(
         conn, "site-1", "2026-07-06", "T",
         action_items=[{"text": "Order tape", "deadline_text": "Tomorrow 08:00"}])
 
+    assert topic["action_item_ids"] == ["ai-1"]
     assert len(conn.calls) == 2
     action_sql, action_params = conn.calls[1]["sql"], conn.calls[1]["params"]
     assert "deadline_text" in action_sql
