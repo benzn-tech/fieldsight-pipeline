@@ -107,4 +107,7 @@ def test_the_writer_attaches_them_after_storing_this_sessions_own():
     built = src.index("final_email_ctx = _final_email_context(")
     attached = src.index("_attach_day_markers(")
     assert stored < built < attached
+    # The real company, never None: for_day reads None as "no company filter".
+    call = " ".join(src[attached:src.index(")", attached)].split())
+    assert call == "_attach_day_markers(conn, final_email_ctx, owner_company_id, user_folder, date", call
     assert "_attach_day_markers" not in inspect.getsource(iw._final_email_context)

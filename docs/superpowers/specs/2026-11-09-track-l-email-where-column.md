@@ -85,6 +85,7 @@ The rule comes from the owner, 2026-10-08. The UI is owned by the UI line. So th
 - Places come from the same day markers. The UI reads them via the timeline's `location_groups`
   (rows whose `topic_ids` include the row's topic), or by a row `at` with the same 30-minute rule.
   The UI line picks one and states it.
+- A row time known only to the minute (`HH:MM`) counts as the END of that minute (the locator's rule); the UI must use the same rule or the two surfaces can disagree on a marker said in that minute.
 - Byte parity with the email's plain-text table is tested on one fixture on both sides.
 
 ## Tests
