@@ -603,14 +603,21 @@ def _final_email_rows(artifact, date):
     already covered a row's topic. §7.1 is now decided by TEXT instead (see
     `lambda_session_finalize._is_represented`), which reads a row's own
     `text` -- already present here -- so nothing downstream reads this field
-    any more."""
+    any more.
+
+    Each row carries `at`, its topic's start ("HH:MM", `_topic_start`), so the
+    email can say where the row was said (Track L Task 7, EMAIL_WHERE_COLUMN).
+    `lambda_session_finalize._clean_todos` already keeps `at`; with the column
+    off nothing renders it."""
     out = []
     for topic in artifact.get("topics") or []:
+        at = _topic_start(topic)
         for item in lambda_ingest._map_action_items(topic.get("action_items"), date):
             text = (item.get("text") or "").strip()
             if text:
                 out.append({"text": text,
                             "responsible": item.get("responsible") or None,
+                            "at": at,
                             # The words, not the resolved column: the column
                             # is a day and has already lost "morning". The email
                             # shows the day AND the part (due_display).
@@ -657,8 +664,35 @@ def _topic_rows(artifact):
             text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
         if text:
             out.append({"text": text, "responsible": None, "due": None,
-                        "kind": "topic"})
+                        "at": _topic_start(topic), "kind": "topic"})
     return out
+
+
+def _topic_start(topic):
+    """The first clock in a topic's `time_range` ("09:05 - 09:12" -> "09:05"),
+    or None. None rather than a guess: a row with no time is left unplaced."""
+    clocks = _CLOCK_RE.findall(topic.get("time_range") or "")
+    return clocks[0] if clocks else None
+
+
+def _attach_day_markers(conn, ctx, company_id, user_folder, date):
+    """Put the day's location markers on a final email request, as
+    `ctx["locationMarkers"]` (Track L Task 7). Called after this session's own
+    markers are stored, so they are among them.
+
+    Fail-open: the email is worth more than its Where column. The read runs in
+    its own savepoint -- a failed SELECT would otherwise abort the transaction
+    the extraction's own writes still have to commit in. On failure, or a day
+    with no markers, the key is absent and the email is exactly as before."""
+    try:
+        with conn.transaction():          # a failed read must not abort the extraction
+            markers = location_markers.for_day(conn, company_id, user_folder, date)
+    except Exception:  # noqa: BLE001 -- see above
+        logger.warning("location markers not attached to the email for %s/%s",
+                       user_folder, date, exc_info=True)
+        return
+    if markers:
+        ctx["locationMarkers"] = markers
 
 
 def _todos_from_topics(artifact):
@@ -1816,6 +1850,12 @@ def write_extraction_items(date, user_folder, extraction_key):
             final_email_ctx = _final_email_context(
                 conn, session_base, extraction, date,
                 follow_up=bool(extraction.get("recovered_after_error")))
+            if final_email_ctx:
+                # The day's places, for the email's Where column. Here, not in
+                # _final_email_context: the connection is live and this
+                # session's markers were stored above.
+                _attach_day_markers(conn, final_email_ctx, owner_company_id,
+                                    user_folder, date)
 
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
             session_group.mark_result(conn, extraction["groupId"], "merged")

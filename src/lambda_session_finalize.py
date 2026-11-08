@@ -290,9 +290,33 @@ def open_link(date):
     return f"{base}/#/timeline?date={date}"
 
 
+def _where_enabled():
+    """EMAIL_WHERE_COLUMN, read at CALL time (not import time) so a deploy that
+    flips it needs no code change and a test needs no reload. Off in TEST and
+    prod until the frontend's Preview & copy renders the same column -- the two
+    surfaces' headers are literal and must match (owner, 2026-10-08)."""
+    return os.environ.get("EMAIL_WHERE_COLUMN", "false").strip().lower() == "true"
+
+
+def _place_rows(todos, location_markers):
+    """Set each row's `where`: the place it was said, or None (Track L Task 7).
+
+    `location_locate.locate` -- the day view's locator, with the same 30-minute
+    carry -- on the row's `at`. A row with no `at`, or said before any place or
+    too long after the last one, has no place; none is invented. The label is
+    whitespace-collapsed (a spoken label can carry a line break). Pure:
+    `location_locate` has no psycopg, which this non-VPC worker does not ship."""
+    import location_locate
+    for t in todos:
+        place = (location_locate.locate(location_markers, t["at"])
+                 if location_markers and t.get("at") else None)
+        t["where"] = " ".join(str(place).split()) or None if place else None
+    return todos
+
+
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
                              summary=None, open_todos=None, checks=None,
-                             open_url=None):
+                             open_url=None, location_markers=None):
     """(subject, body_text, body_html) for the recorder's confirmation email, built
     from the session's still-open to-dos. Pure — no I/O. To-dos with no text are
     dropped; all HTML content is escaped so transcript text can't inject markup. The
@@ -307,10 +331,21 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     chooses between the fresh and the rolling one, and it still reaches the stored
     result — it simply does not appear in the email. A session with no to-dos now
     says so explicitly: with the prose gone it would otherwise be a header and
-    nothing else, which reads as a broken send."""
+    nothing else, which reads as a broken send.
+
+    `location_markers` (Track L Task 7, behind EMAIL_WHERE_COLUMN): the day's
+    markers, from the final request. When the flag is on and at least one row has
+    a place, the table gains a WHERE column after AGENDA ITEM; otherwise the email
+    is byte-identical to one built without them."""
     stamp = " ".join(p for p in (date, time_range) if p)
     subject = "FieldSight — your site notes" + (f" ({stamp})" if stamp else "")
-    todos = _ordered_rows(_clean_todos(open_todos, date))
+    todos = _clean_todos(open_todos, date)
+    if _where_enabled():
+        _place_rows(todos, location_markers)
+    todos = _ordered_rows(todos)
+    # The column appears only when it says something. An empty cell, not "—"
+    # (unassigned) or "N/A" (not a task), for a row with no place.
+    show_where = any(t.get("where") for t in todos)
     no_todos_note = "Nothing was captured for this recording."
     # A topic row is not a task: nobody owes it, so its owner and due date are
     # N/A rather than the em dash an UNASSIGNED action carries. The two mean
@@ -332,14 +367,19 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         # columns and a header separator -- leading AND trailing pipes, exactly
         # as the frontend's Preview & copy renders it, not the old bulleted
         # list. One table shape on both surfaces, one line format.
-        lines += ["", _pipe_row(("AGENDA ITEM", "ASSIGNED", "DUE DATE")), "| --- | --- | --- |"]
+        if show_where:
+            lines += ["", _pipe_row(("AGENDA ITEM", "WHERE", "ASSIGNED", "DUE DATE")),
+                      "| --- | --- | --- | --- |"]
+        else:
+            lines += ["", _pipe_row(("AGENDA ITEM", "ASSIGNED", "DUE DATE")), "| --- | --- | --- |"]
         for t in todos:
             if t["kind"] == "topic":
                 who, due = na, na
             else:
                 who = t["responsible"] or "—"
                 due = t["due"] or "—"
-            lines.append(_pipe_row((t["text"], who, due)))
+            lines.append(_pipe_row((t["text"], t.get("where") or "", who, due) if show_where
+                                   else (t["text"], who, due)))
     else:
         lines += ["", no_todos_note]
     if open_url:
@@ -386,7 +426,10 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             # carried (#864).
             ink = _MUTED if topic else _INK
             bg = f";background:{_ZEBRA}" if i % 2 else ""
+            where = (f'<td style="{td};color:{ink}{bg}">{esc(t.get("where") or "")}</td>'
+                     if show_where else "")
             return (f'<tr><td style="{td};color:{ink}{bg}">{esc(t["text"])}</td>'
+                    + where +
                     f'<td style="{td};color:{ink if (t["responsible"] or topic) else _MUTED}{bg}">{who}</td>'
                     f'<td style="{td};color:{ink if (t["due"] or topic) else _MUTED};white-space:nowrap{bg}">'
                     f"{when}</td></tr>")
@@ -395,13 +438,16 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         # Literal header text (plan §0/§1.1/§2.4): "AGENDA ITEM / ASSIGNED /
         # DUE DATE" on BOTH surfaces -- the email and the frontend's Preview &
         # copy render the same three words. Navy with WHITE text (owner,
-        # 2026-10-08), as on every DOCX report.
+        # 2026-10-08), as on every DOCX report. WHERE (Track L Task 7) joins
+        # them only behind EMAIL_WHERE_COLUMN and only when a row has a place;
+        # the frontend must render the same four words before it is switched on.
         parts.append(
             '<tr><td style="padding:16px 20px 4px">'
             '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
             'style="border-collapse:collapse;width:100%">'
-            f'<thead><tr><th style="{th};width:60%">AGENDA ITEM</th>'
-            f'<th style="{th}">ASSIGNED</th><th style="{th}">DUE DATE</th></tr></thead>'
+            f'<thead><tr><th style="{th};width:{"50%" if show_where else "60%"}">AGENDA ITEM</th>'
+            + (f'<th style="{th}">WHERE</th>' if show_where else "")
+            + f'<th style="{th}">ASSIGNED</th><th style="{th}">DUE DATE</th></tr></thead>'
             f"<tbody>{rows}</tbody></table></td></tr>")
     else:
         parts.append(f'<tr><td style="padding:16px 20px 4px;{_FONT};font-size:14px;color:{_INK}">'
@@ -1080,7 +1126,10 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         subject, text, html = build_confirmation_email(
             date=artifact.get("date"), time_range=artifact.get("timeRange"),
             site_name=artifact.get("siteName"), summary=summary, open_todos=todos,
-            checks=artifact.get("checks"), open_url=open_link(artifact.get("date")))
+            checks=artifact.get("checks"), open_url=open_link(artifact.get("date")),
+            # The day's places (Track L Task 7): only the item-writer's `final`
+            # request carries them; every other kind renders as before.
+            location_markers=artifact.get("locationMarkers"))
     if is_updated:
         # A second email with a different body must not read as a duplicate of
         # the first. The recipient already had one for this meeting.

@@ -1223,6 +1223,17 @@ Parameters:
       brief under session_brief/ for the reader surfaces. Off everywhere until
       a real session has been read end to end.
 
+  EmailWhereColumn:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Track L Task 7: whether the confirmation email's table gains a WHERE
+      column (the place each row was said, from the day's location markers),
+      shown only when at least one row has a place. The header is literal and
+      must match the frontend's Preview & copy, so this stays off in TEST and
+      prod until the UI renders the same column.
+
   EnableGroupMerge:
     Type: String
     Default: 'false'
@@ -4666,6 +4677,9 @@ Resources:
           # difference is that the full brief is also stored under
           # session_brief/ for the reader surfaces to pick up.
           SESSION_BRIEF: !Ref EnableSessionBrief
+          # Track L Task 7: the confirmation email's WHERE column. Read at call
+          # time; off until the frontend's Preview & copy shows the same column.
+          EMAIL_WHERE_COLUMN: !Ref EmailWhereColumn
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
