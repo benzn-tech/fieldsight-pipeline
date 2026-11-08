@@ -148,8 +148,11 @@ def test_flag_on_final_tier_attaches_support(monkeypatch, caplog):
     assert kw == {"floor": 0.5, "margin": 0.1, "nothing_close": 0.2}
     children = list(_children(extraction))
     assert len(children) == 3
+    # One turn inside the topic's time_range carrying every item's words: each must
+    # link through the window path -- proves turns and the session date are passed right.
     for child in children:
-        assert child["support"]["status"] in item_support.STATUSES
+        assert child["support"]["status"] == "linked"
+        assert child["support"]["candidate_path"] == "window"
     written = json.loads(fake_s3.objects[OUT_KEY])
     assert [c["support"] for c in _children(written)] == [c["support"] for c in children]
     assert any(r.getMessage().startswith("item_support: {") for r in caplog.records)
