@@ -1309,6 +1309,17 @@ Parameters:
       morning after. Declared here rather than left to the code default so the
       rollback survives a deploy.
 
+  EmitItemSupport:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Track C. On the final extraction tier only, give each extracted item a
+      `support` object naming the one transcript turn it came from (or why it
+      names none). Off = the extraction artifact is byte-identical. Until the
+      thresholds are calibrated the step refuses to run and the artifact is
+      written without `support`, so turning this on early is harmless.
+
   EvidenceWindowSec:
     Type: String
     Default: '60'
@@ -3923,6 +3934,7 @@ Resources:
           STATUS_SUGGESTIONS: !Ref StatusSuggestions
           STATUS_EVIDENCE_FLOOR_TOKENS: !Ref StatusEvidenceFloorTokens
           EMIT_EVIDENCE: !Ref EmitEvidence
+          EMIT_ITEM_SUPPORT: !Ref EmitItemSupport
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
           EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens

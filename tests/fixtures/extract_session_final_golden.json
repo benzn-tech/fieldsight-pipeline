@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "user_folder": "Benl1",
+  "date": "2026-07-06",
+  "session_base": "Benl1_2026-07-06_10-00-00",
+  "tier": "final",
+  "source_transcripts": [
+    "Benl1_2026-07-06_10-00-00_off0.0_to30.0_srcwav.json"
+  ],
+  "llm_provider": "golden-provider",
+  "llm_model": "golden-model",
+  "speaker_count": 1,
+  "transcript_stats": {
+    "chars": 74,
+    "lines": 1,
+    "lines_omitted": 0,
+    "truncated": false
+  },
+  "device_announcements": {
+    "removed": 0,
+    "texts": [],
+    "agent_turns": {
+      "matched": 0,
+      "answers_with_no_match": 0
+    }
+  },
+  "generation": 0,
+  "extracted_at": "<EXTRACTED_AT>",
+  "declared_site": null,
+  "location_markers": [],
+  "inspections": [],
+  "topics": [
+    {
+      "topic_title": "Scaffold",
+      "time_range": "10:00 – 10:01",
+      "action_items": [
+        {
+          "action": "Fix the scaffold on level two",
+          "responsible": "Sam",
+          "deadline": "Friday",
+          "priority": "high"
+        }
+      ],
+      "findings": [
+        {
+          "observation": "Scaffold on level two is unsafe",
+          "domain": "safety",
+          "severity": "major",
+          "entity": {
+            "name": null,
+            "trade": null
+          },
+          "recommended_action": null
+        }
+      ],
+      "decisions": [
+        "Fix before Friday"
+      ],
+      "questions": [],
+      "safety_flags": [
+        {
+          "observation": "Scaffold on level two is unsafe",
+          "risk_level": "high",
+          "recommended_action": null
+        }
+      ]
+    }
+  ],
+  "speaker_turns": [
+    {
+      "source_filename": "Benl1_2026-07-06_10-00-00_off0.0_to30.0_srcwav.json",
+      "speaker_label": "unknown",
+      "start_sec": 0.0,
+      "end_sec": 11.0
+    }
+  ],
+  "self_introductions": []
+}

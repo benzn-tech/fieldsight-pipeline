@@ -33,6 +33,7 @@ Environment Variables:
     ANTHROPIC_API_KEY / CLAUDE_MODEL - read by claude_utils
 """
 from typing import NamedTuple
+import copy
 import difflib
 import json
 import logging
@@ -53,6 +54,7 @@ from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
 import extraction_pending
 import item_continuity
+import item_support
 import llm_utils
 import batch_stitch
 import chunk_stitch
@@ -296,6 +298,10 @@ EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
 # Spec 2026-09-30 (the extractor says which item continues which). Off: the prompt is byte-identical
 # to before and no item_id is emitted. Wired template -> workflow -> env (fieldsight-unwired-toggle-trap).
 DECLARE_CONTINUITY = os.environ.get('DECLARE_CONTINUITY', 'false').lower() == 'true'
+# Track C: on the FINAL tier only, give each child item a `support` object naming the transcript
+# turn it came from (item_support). Off: the artifact is byte-identical to before. Wired
+# template -> workflow -> env, like the two above.
+EMIT_ITEM_SUPPORT = os.environ.get('EMIT_ITEM_SUPPORT', 'false').lower() == 'true'
 
 # Spec 2026-10-27 (status suggestions from speech, v1 same-session). Rides on the continuity
 # block, so it does nothing unless DECLARE_CONTINUITY is on too and there is a prior pass. Off:
@@ -2563,6 +2569,24 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         except Exception:
             logger.warning("evidence: could not time quotes to the second",
                            exc_info=True)
+
+    # Track C: which turn each final item came from. After verify_evidence, because the
+    # verified quotes are its first candidate path. Final tier only: a live pass is
+    # provisional, and group extractions (extract_group) never come through here.
+    # All or nothing: it runs on a copy and only a complete result replaces the topics, so a
+    # failure (today: thresholds not yet calibrated -> ValueError) writes exactly what the
+    # flag-off path writes. Never fatal. The log carries no item or transcript text.
+    if EMIT_ITEM_SUPPORT and final:
+        try:
+            work = {'topics': copy.deepcopy(parsed_topics)}
+            item_support.attach_support(
+                work, turns, date,
+                floor=item_support.FLOOR, margin=item_support.MARGIN,
+                nothing_close=item_support.NOTHING_CLOSE)
+            parsed_topics[:] = work['topics']
+        except Exception:
+            logger.exception("item_support: attach failed -- "
+                             "the extraction is written without support")
 
     # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
     # the extraction that exists NOW, not the one we read before the LLM call,
