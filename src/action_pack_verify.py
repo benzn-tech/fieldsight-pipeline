@@ -172,7 +172,7 @@ MAX_WORKERS = 8
 MIN_CALL_S = 5.0                 # no verifier call is started with less than this left
 MARGIN_S = 2.0                   # kept back from the verify deadline to assemble the answer
 ATTEMPT_CAP_S = 30.0             # one attempt (the Ask judge's cap): a hang can fall back
-VERIFY_MAX_TOKENS = 200
+VERIFY_MAX_TOKENS = 400          # {label, reason_code, reason<=200 chars} is ~80 tokens; room for a preamble
 FLAGGED = "near_duplicate_flagged"
 REF_MAX_CHARS = 24_000           # one cited ref's text in a prompt (a snapshot can be 200 kB)
 # The archived pages one claim cites share this many characters of its prompt: a claim on
