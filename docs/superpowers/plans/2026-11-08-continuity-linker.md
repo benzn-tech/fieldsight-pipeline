@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Flag `CONTINUITY_LINKER`, env default `'false'`; effective only when `DECLARE_CONTINUITY` is on AND `final=True`.
-- Linker: thinking off; caller tag `continuity_link_final`; `LINKER_MAX_TOKENS = 2000`; `LINKER_CAP_S = 120`; deadline `min(remaining_s - 60, LINKER_CAP_S)`; skip with status `skipped_budget` when that deadline is `< 30`.
+- Linker: thinking off; caller tag `continuity_link_final`; `LINKER_MAX_TOKENS = 4000`; `LINKER_CAP_S = 120`; deadline `min(remaining_s - 60, LINKER_CAP_S)`; skip with status `skipped_budget` when that deadline is `< 30`.
 - `LINKER_QUESTION_SET = "item_continuity_linker:" + sha256(LINKER_INSTRUCTION)[:16]`.
 - `continuity.linker = {"status": "ok"|"error"|"skipped_budget", "ms": int, "dropped": int, "model": str|None}`.
 - A linker failure never raises, never sets `continuity_error`, and `resolve(topics, prior)` still runs.
@@ -138,7 +138,7 @@ def test_linker_status_instruction_rewords_only_the_opening():
 
 **Interfaces:**
 - Consumes: Task 1's `assign_refs`, `render_linker_prompt`, `attach_links`, `LINKER_QUESTION_SET`, `status_suggestions.LINKER_INSTRUCTION`.
-- Produces: module constants `CONTINUITY_LINKER`, `LINKER_MAX_TOKENS = 2000`, `LINKER_CAP_S = 120`; `extract_session(..., remaining_ms=None)` / `_extract_session(..., remaining_ms=None)`; `_run_linker(prior, topics, transcript_text, remaining_ms, started_monotonic) -> dict` returning the `continuity.linker` record and mutating `topics`.
+- Produces: module constants `CONTINUITY_LINKER`, `LINKER_MAX_TOKENS = 4000`, `LINKER_CAP_S = 120`; `extract_session(..., remaining_ms=None)` / `_extract_session(..., remaining_ms=None)`; `_run_linker(prior, topics, transcript_text, remaining_ms, started_monotonic) -> dict` returning the `continuity.linker` record and mutating `topics`.
 
 - [ ] **Step 1: Write the failing tests** in `tests/unit/test_extract_session_linker.py`, following the fixtures/monkeypatch style of `tests/unit/test_extract_session_continuity.py` (stub `call_llm` with a function that records `(prompt, enable_thinking, caller, deadline)` and returns canned JSON per call; stub S3 reads to return a published extraction with item_ids). Tests:
 

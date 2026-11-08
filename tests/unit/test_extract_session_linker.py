@@ -117,7 +117,7 @@ def test_final_with_linker_on_sends_no_block_to_extraction_and_calls_linker_unth
     link = fake.calls[1]
     assert link["caller"] == "continuity_link_final"
     assert link["enable_thinking"] is False
-    assert link["max_tokens"] == les.LINKER_MAX_TOKENS == 2000
+    assert link["max_tokens"] == les.LINKER_MAX_TOKENS == 4000
     assert "<<<NEW_ITEMS>>>" in link["prompt"]
     # STATUS_SUGGESTIONS on -> the linker gets the status rule.
     assert "For an action item you link to an earlier item" in link["prompt"]

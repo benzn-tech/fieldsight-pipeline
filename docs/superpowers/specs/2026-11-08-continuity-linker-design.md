@@ -81,8 +81,8 @@ emitted the claim.
   Unknown ref, duplicate ref, or malformed entry → dropped before `resolve`, counted in
   `continuity.linker.dropped`. `status_suggestion` on a non-action child → dropped (as today).
 - **L6. Model, mode, budget.** Deployed extraction model, **thinking off**, caller tag
-  `continuity_link_final`, `max_tokens = LINKER_MAX_TOKENS` (2000; output is one short line per
-  linked item). **Deadline guard:** `lambda_handler` passes `context.get_remaining_time_in_millis()`
+  `continuity_link_final`, `max_tokens = LINKER_MAX_TOKENS` (4000; output is one short line per
+  linked item, plus status quotes -- a truncated answer fails to parse and loses every carry). **Deadline guard:** `lambda_handler` passes `context.get_remaining_time_in_millis()`
   into `extract_session` (new keyword, default None = no cap); the linker calls `call_llm(...,
   deadline=min(remaining_s − 60, LINKER_CAP_S))` with `LINKER_CAP_S = 120`. If less than 30 s would
   remain, the linker is skipped (`status: "skipped_budget"`). The linker can therefore never cause
@@ -176,3 +176,4 @@ including `done` precision, because `PROD_STATUS_SUGGESTIONS` is on.
 - Minor: refs (L4), linker void rule (§6), missing constants (L3.1, L6).
 - Owner questions, decided by the controller under the owner's standing delegation: (1) final-only
   by default; (2) `done` precision gates prod, not TEST; (3) baseline re-run, not reused.
+- Final code review: LINKER_MAX_TOKENS 2000 → 4000 (truncation risk with status quotes on long sessions).

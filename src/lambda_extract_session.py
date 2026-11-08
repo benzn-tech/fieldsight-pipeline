@@ -305,7 +305,7 @@ STATUS_SUGGESTIONS = os.environ.get('STATUS_SUGGESTIONS', 'false').lower() == 't
 # second, thinking-off call links new items to earlier ones. Needs DECLARE_CONTINUITY. Live
 # passes are untouched. Off: today's final pass byte-for-byte.
 CONTINUITY_LINKER = os.environ.get('CONTINUITY_LINKER', 'false').lower() == 'true'
-LINKER_MAX_TOKENS = 2000
+LINKER_MAX_TOKENS = 4000     # truncated answer = unparseable = every carry lost on long sessions
 LINKER_CAP_S = 120           # the linker call's own deadline ceiling (seconds)
 LINKER_MIN_S = 30            # less than this left for the call -> skip it
 LINKER_RESERVE_S = 60        # Lambda time kept back for the write after the call
