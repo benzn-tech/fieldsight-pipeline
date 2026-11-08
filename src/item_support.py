@@ -17,11 +17,24 @@ Candidate turns come from, in order (only the paths listed in `PATHS`):
 Scores are `item_text_match.overlap` (containment of the item's tokens in the
 turn's), so this agrees with the item-history view about what "same words" is.
 
+A path links its best candidate only if:
+  * the item has at least MIN_ITEM_TOKENS distinct tokens -- a smaller item is
+    refused as `below_floor` whatever it scores;
+  * best >= floor, and best beats the runner-up by >= margin, where the
+    runner-up is taken over the UNION of both paths' candidates (a cited twin
+    must not win over an uncited exact turn in the window);
+  * every digit token and direction word (east/west/north/south/left/right and
+    the CJK six) of the item is in that turn -- else `below_floor` with
+    "guard": "distinguishing_token".
+A path that does not link falls through to the next; the last path's result is
+reported.
+
 The support object carries ids, offsets and scores only -- never item or turn
 text. Pure: no AWS, no DB.
 """
 import logging
 import re
+import unicodedata
 from datetime import datetime, timedelta
 
 from item_continuity import KINDS, normalise_children
@@ -50,6 +63,10 @@ _END_SLACK = timedelta(minutes=1)
 # Absorbs float noise in `best - second >= margin` (0.7 - 0.6 < 0.1 in binary).
 _EPS = 1e-9
 STATUSES = ("linked", "none_close", "ambiguous", "below_floor")
+_KNOWN_PATHS = ("quote", "window")
+# Twin items differ in one of these; the linked turn must contain the item's.
+_ASCII_DIRECTIONS = frozenset({"east", "west", "north", "south", "left", "right"})
+_CJK_DIRECTIONS = "东西南北左右"  # east west south north left right
 
 
 def _evidence_turns(evidence, turns):
@@ -116,15 +133,47 @@ def _window_turns(time_range, session_date, turns):
             if isinstance(t.get("abs_start"), datetime) and start <= t["abs_start"] < end]
 
 
-def _decide(item_text, n_tokens, candidates, turns, floor, margin, nothing_close):
-    """(support, linked?) for one path's candidates. Ties break on turn order."""
-    scored = sorted(((round(overlap(item_text, turns[i].get("text") or "")[0], 4), i)
-                     for i in candidates), key=lambda p: (-p[0], p[1]))
-    best, best_i = scored[0] if scored else (0.0, None)
-    second = scored[1][0] if len(scored) > 1 else 0.0
+def _distinguishing_ok(item_text, turn_text):
+    """Every digit token and direction word in the item must also be in the turn.
+
+    Twin items ("unit 3 ..." / "unit 4 ...", "east block ..." / "west block ...")
+    differ in exactly one such token, and containment scoring alone still gives
+    the wrong twin 0.75-0.8. CJK directions are checked on the normalised text,
+    because tokenising puts them inside bigrams.
+    """
+    item_toks, turn_toks = set(tokens(item_text)), set(tokens(turn_text))
+    for tok in item_toks:
+        if (any(ch.isdigit() for ch in tok) or tok in _ASCII_DIRECTIONS) \
+                and tok not in turn_toks:
+            return False
+    item_n, turn_n = _norm(item_text), _norm(turn_text)
+    return all(ch in turn_n for ch in _CJK_DIRECTIONS if ch in item_n)
+
+
+def _norm(text):
+    return unicodedata.normalize("NFKC", text or "")
+
+
+def _score_all(item_text, idxs, turns):
+    return {i: round(overlap(item_text, turns[i].get("text") or "")[0], 4) for i in idxs}
+
+
+def _decide(item_text, n_tokens, candidates, scores, turns, floor, margin, nothing_close):
+    """(support, linked turn index or None) for one path.
+
+    `best` is over this path's candidates; the runner-up is over `scores`, the
+    union of every path's candidates, so a cited twin cannot win just because
+    the right turn was only in the window. Ties break on turn order.
+    """
+    ranked = sorted(((scores[i], i) for i in candidates), key=lambda p: (-p[0], p[1]))
+    best, best_i = ranked[0] if ranked else (0.0, None)
+    second = max((s for i, s in scores.items() if i != best_i), default=0.0)
     if n_tokens < MIN_ITEM_TOKENS:
         return {"status": "below_floor", "best": best}, None
     if best_i is not None and best >= floor and best - second + _EPS >= margin:
+        if not _distinguishing_ok(item_text, turns[best_i].get("text") or ""):
+            return {"status": "below_floor", "best": best,
+                    "guard": "distinguishing_token"}, None
         return {"status": "linked", "score": best}, best_i
     if best < nothing_close:
         return {"status": "none_close", "best": best}, None
@@ -135,17 +184,15 @@ def _decide(item_text, n_tokens, candidates, turns, floor, margin, nothing_close
 
 def _support_for(item_text, topic, turns, session_date, floor, margin, nothing_close):
     n_tokens = len(set(tokens(item_text)))
-    quote_turns = None
+    # Both paths' candidates are computed whatever PATHS says: the runner-up pool
+    # is their union even when a path is not tried for the link itself.
+    quote_turns = _evidence_turns(topic.get("evidence"), turns)
+    by_path = {"quote": sorted(quote_turns),
+               "window": _window_turns(topic.get("time_range"), session_date, turns)}
+    scores = _score_all(item_text, set(by_path["quote"]) | set(by_path["window"]), turns)
     last = None
     for path in PATHS:
-        if path == "quote":
-            quote_turns = _evidence_turns(topic.get("evidence"), turns)
-            candidates = sorted(quote_turns)
-        elif path == "window":
-            candidates = _window_turns(topic.get("time_range"), session_date, turns)
-        else:
-            continue
-        support, idx = _decide(item_text, n_tokens, candidates, turns,
+        support, idx = _decide(item_text, n_tokens, by_path[path], scores, turns,
                                floor, margin, nothing_close)
         if idx is not None:
             t = turns[idx]
@@ -159,8 +206,6 @@ def _support_for(item_text, topic, turns, session_date, floor, margin, nothing_c
                     "candidate_path": path,
                     "rule_version": RULE_VERSION}
         last = support
-    if last is None:
-        last = {"status": "none_close", "best": 0.0}
     last["rule_version"] = RULE_VERSION
     return last
 
@@ -174,6 +219,8 @@ def attach_support(result, turns, session_date, *, floor, margin, nothing_close)
     """
     if floor is None or margin is None or nothing_close is None:
         raise ValueError("item_support thresholds are uncalibrated (None)")
+    if not PATHS or any(p not in _KNOWN_PATHS for p in PATHS):
+        raise ValueError(f"item_support PATHS must be a non-empty subset of {_KNOWN_PATHS}")
     turns = list(turns or [])
     topics = result.get("topics") if isinstance(result, dict) else None
     normalise_children(topics)
@@ -193,7 +240,6 @@ def attach_support(result, turns, session_date, *, floor, margin, nothing_close)
                 child["support"] = s
                 counts[s["status"]] += 1
                 if s["status"] == "linked":
-                    counts["by_path"][s["candidate_path"]] = \
-                        counts["by_path"].get(s["candidate_path"], 0) + 1
+                    counts["by_path"][s["candidate_path"]] += 1
     logger.info("item_support: %s", counts)
     return counts

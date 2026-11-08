@@ -281,3 +281,77 @@ def test_no_text_in_support_object():
                                        ("linked", "quote", "window", "verified",
                                         "verified_fuzzy", isup.RULE_VERSION))
     assert seen == 4
+
+
+# --- fix round 1: runner-up across paths, distinguishing-token guard ---------
+
+def test_cited_twin_never_beats_uncited_exact_turn_in_window():
+    t3 = _turn("unit 3 pre-line is done", F1, 10.0, 10, 0, 10)
+    t4 = _turn("unit 4 pre-line is done", F1, 20.0, 10, 0, 20)
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "unit 4 pre-line done"}])]}
+    isup.attach_support(result, [t3, t4], DATE, floor=0.5, margin=0.1, nothing_close=0.2)
+    s = result["topics"][0]["findings"][0]["support"]
+    assert not (s["status"] == "linked" and s["start_sec"] == 10.0)
+    assert s["status"] == "linked" and s["candidate_path"] == "window"
+    assert s["start_sec"] == 20.0
+
+
+def test_cited_twin_with_exact_turn_outside_window_is_not_linked():
+    t3 = _turn("unit 3 pre-line is done", F1, 10.0, 10, 0, 10)
+    t4 = _turn("unit 4 pre-line is done", F1, 20.0, 11, 30)   # outside 10:00-10:05
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "unit 4 pre-line done"}])]}
+    isup.attach_support(result, [t3, t4], DATE, floor=0.5, margin=0.1, nothing_close=0.2)
+    s = result["topics"][0]["findings"][0]["support"]
+    assert s["status"] == "below_floor"
+    assert s["guard"] == "distinguishing_token"
+
+
+def test_direction_word_guard_refuses_wrong_side():
+    turns = [_turn("west block slab poured", F1, 10.0, 10, 0, 10)]
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "east block slab poured"}])]}
+    isup.attach_support(result, turns, DATE, **CAL)
+    s = result["topics"][0]["findings"][0]["support"]
+    assert s["status"] == "below_floor" and s["guard"] == "distinguishing_token"
+
+
+def test_cjk_direction_guard_refuses_wrong_side():
+    turns = [_turn("西区楼板已经浇筑", F1, 10.0, 10, 0, 10)]
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "东区楼板已经浇筑"}])]}
+    isup.attach_support(result, turns, DATE, **CAL)
+    s = result["topics"][0]["findings"][0]["support"]
+    assert s["status"] == "below_floor" and s["guard"] == "distinguishing_token"
+
+
+def test_guard_passes_when_turn_has_the_digit():
+    turns = [_turn("level 2 slab is poured", F1, 10.0, 10, 0, 10)]
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "level 2 slab"}])]}
+    isup.attach_support(result, turns, DATE, **CAL)
+    assert result["topics"][0]["findings"][0]["support"]["status"] == "linked"
+
+
+@pytest.mark.parametrize("paths", [(), ("quote", "nearby")])
+def test_bad_paths_refuse(paths):
+    orig = isup.PATHS
+    try:
+        isup.PATHS = paths
+        with pytest.raises(ValueError):
+            isup.attach_support({"topics": []}, [], DATE, **CAL)
+    finally:
+        isup.PATHS = orig
+
+
+def test_union_runner_up_without_guard_tokens():
+    # Letters are not guarded, so this exercises the union runner-up on its own.
+    te = _turn("block e formwork stripped", F1, 10.0, 10, 0, 10)
+    td = _turn("block d formwork stripped", F1, 20.0, 10, 0, 20)
+    result = {"topics": [_topic(evidence=[_ev(F1, 10.0)],
+                                findings=[{"observation": "block d formwork stripped"}])]}
+    isup.attach_support(result, [te, td], DATE, **CAL)
+    s = result["topics"][0]["findings"][0]["support"]
+    assert s["status"] == "linked" and s["candidate_path"] == "window"
+    assert s["start_sec"] == 20.0
