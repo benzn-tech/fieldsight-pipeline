@@ -111,19 +111,24 @@ Net: Tasks 1, 2, 5, 7, 8, 9 unchanged; Task 3 becomes topic placement + one shar
 
 ---
 
-### Task 6: The generated (template) report places sections under locations
+### Task 6: The generated (template) report gains a Locations section
 
-> **Deferred 2026-11-06.** This regroups a customer's template sections under location headings, which changes their fixed layout, and as written it needs a prompt change plus a real-call A/B on TEST. Placing photos on the line that names their place already ships (owner, 2026-10-01). If it is built later, take each section's place from its `[covers:]` refs in code (`location_grouping`), not from a model-written `[at:]`; that needs no prompt change and no A/B. Revisit after the owner has seen Tasks 4–5 on TEST.
+> **Revised 2026-11-09** (owner: "push everything remaining"). Spec:
+> `docs/superpowers/specs/2026-11-09-track-l-task6-locations-in-generated-report.md` (Fable-reviewed; its
+> "Review changes" section overrides). The original `[at:]` prompt route and the regrouping of the
+> customer's template sections are rejected there. Flag `REPORT_LOCATIONS_SECTION`: TEST on, prod off
+> (owner's switch).
 
 **Files:**
-- Modify: `src/report_template.py` (`_covers_block` offers the topic's place beside each ref), `src/lambda_session_report.py` (`_place_photos` and section assembly honour a `[at: Level 1]` line the same way `[covers: t0]` is honoured)
-- Test: extend `tests/unit/test_session_report_covers*.py` (whatever #925 named them) with the location variant
+- Create: `src/location_locate.py` (pure `locate` + helpers, moved from `repositories/location_markers.py`, which re-exports)
+- Modify: `src/location_grouping.py` (import the pure module), `src/report_sections.py` (public `locations_section`), `src/lambda_session_report.py` (append the section), `src/template.yaml`, `.github/workflows/deploy.yml`, `.github/workflows/deploy-prod.yml`
+- Test: `tests/unit/test_session_report_locations.py` (new), `tests/unit/test_location_grouping_no_psycopg.py` (new)
 
-- [ ] **Step 1:** In the offer block, each topic line gains its place when known: `- t0  Level 1  Ductwork above ceiling  (3 photographs)`. The instruction asks each section to end with `[covers: …]` **and**, when the covered topics share a place, `[at: <label>]` copied verbatim from the offer.
-- [ ] **Step 2:** Worker: parse `[at: …]` with the same strip-and-verify shape as `_COVERS_RE`; a label not in the offer is dropped (never invented — #925's rule for refs). Sections carrying `[at:]` are emitted under a location heading in first-visit order; sections without one keep today's order after them. Photos follow their section exactly as today.
-- [ ] **Step 3:** Count and log `sectionsPlacedByLocation` next to `photosPlaced`; a prompt containing the request is not a model that obeyed it.
-- [ ] **Step 4:** Docx test in #925's style: count headings and `<a:blip>` under each location heading on a rendered document. Run the mutation set from that PR plus: `[at:]` label not in offer → dropped; two sections same label → one heading.
-- [ ] **Step 5: A/B on TEST with `scripts/extraction_ab.py`'s discipline** (same config twice): does adding `[at:]` to the prompt change `photosPlaced`? It must not go down.
+- [x] **Step 1: Break the psycopg chain.** Move `locate` to `src/location_locate.py`; re-export from `repositories.location_markers`; `location_grouping` imports the pure module. Test with `psycopg` blocked in `sys.modules`. (done: `CARRY_MINUTES`, `_seconds`, `locate` moved; re-exported; subprocess test blocks psycopg and CALLS `locations_section` -- red before the move with `import of psycopg.rows halted`)
+- [x] **Step 2: Public builder.** `report_sections.locations_section(topics, markers)` = today's `_locations` (day report output unchanged; `_locations` stays as a thin caller). (done: `locations_section(topics, markers, photos=None)` + `NO_PLACE_TITLES`; day-report tests pass unchanged)
+- [x] **Step 3: Worker.** Behind `REPORT_LOCATIONS_SECTION=true`, not for a (non-demoted) walk: build from the offer topics + `reportFacts.locations`; absent when None or when no row has a marker label; convert entries to a prose section `**Place** — titles`; append after `report_facts.insert`, before `generate_prose_document`; fail open; one INFO line. (done: `lambda_session_report._locations_section`; titles joined with the day report's ` · `)
+- [x] **Step 4: Flag plumbing.** template.yaml parameter + env; deploy.yml TEST default true; deploy-prod.yml PROD default false. (done: `ReportLocationsSection` parameter + SessionReportFunction env; CodeUri is `src/`, so `location_locate.py` ships)
+- [x] **Step 5: Tests** per the spec's list (docx headings, `<a:blip>` counts and template heading order equal with flag on/off, walk excluded, before-first-only absent, raising grouping → report still written) and the two mutations (with a tier-3 photo in the fixture). (done: `tests/unit/test_session_report_locations.py`; both mutations turned tests red, then reverted)
 
 ---
 

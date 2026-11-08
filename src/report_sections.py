@@ -484,7 +484,19 @@ _NO_PLACE = {
 }
 
 
+#: Every heading a group WITHOUT a place gets. A row titled anything else is
+#: titled by a marker's own label -- how a caller tells "placed" from not
+#: without a key on the row (the rows are the day report's payload as is).
+NO_PLACE_TITLES = frozenset(_NO_PLACE.values())
+
+
 def _locations(topics, report, photos):
+    """The day report's Locations section: `locations_section` over the
+    markers the caller put on `report["location_markers"]`."""
+    return locations_section(topics, report.get("location_markers"), photos)
+
+
+def locations_section(topics, markers, photos=None):
     """The day's topics and photographs under the places he said out loud, in
     the order he visited them (Track L). None when nobody said where they were.
 
@@ -507,8 +519,10 @@ def _locations(topics, report, photos):
     Locations shows only places with topics: a place where only photos were
     taken does not split it, so it can show fewer groups than the payload's
     `location_groups`.
+
+    Public for the generated (template) report (Track L Task 6), which calls
+    it with its own offer as `topics`, its request's markers and no photos.
     """
-    markers = report.get("location_markers")
     if not markers or not isinstance(markers, list):
         return None
     items = (photos or {}).get("items") or []
@@ -516,9 +530,10 @@ def _locations(topics, report, photos):
     for item in items:
         by_base.setdefault(item["name"].rsplit("/", 1)[-1], item)
     try:
-        # Lazy: location_grouping reaches `repositories.location_markers`, which
-        # imports psycopg, and this module promises callers it does not. Only a
-        # caller that supplies markers pays for it.
+        # Lazy: only a caller that supplies markers pays for the import. It no
+        # longer reaches psycopg (location_locate is pure) -- the generated
+        # report's worker has none, and an ImportError here would make the
+        # section silently absent (tests/unit/test_location_grouping_no_psycopg.py).
         import location_grouping
         groups = location_grouping.group_day(markers, topics, [i["name"] for i in items])
     except Exception:  # noqa: BLE001 - one section, never the report
