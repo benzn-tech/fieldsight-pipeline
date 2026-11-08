@@ -515,6 +515,10 @@ def test_pinned_sessions_keeps_pinned_order_and_reports_missing():
 
 
 def test_sessions_file_overrides_sessions_count_on_dry_run(monkeypatch, tmp_path, capsys):
+    # main() writes these module globals; record them via monkeypatch so teardown restores.
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", False)
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.EXTRA_INSTRUCTION)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", run_mod.LINKER_MODE)
     monkeypatch.setattr(run_mod.llm_utils, "call_llm",
                          lambda *a, **k: (None, "should never run"))
     s1 = {"env": "prod", "user_folder": "u", "date": "2026-09-01", "session_base": "s1",
@@ -691,7 +695,10 @@ def test_step_record_carries_served_model(monkeypatch, tmp_path):
 
 
 def test_sessions_json_marks_linker_treatment(monkeypatch, tmp_path):
-    monkeypatch.setattr(run_mod, "LINKER_MODE", False)  # main() sets it; teardown restores
+    # main() writes these module globals; record them via monkeypatch so teardown restores.
+    monkeypatch.setattr(run_mod.les, "STATUS_SUGGESTIONS", False)
+    monkeypatch.setattr(run_mod, "EXTRA_INSTRUCTION", run_mod.EXTRA_INSTRUCTION)
+    monkeypatch.setattr(run_mod, "LINKER_MODE", run_mod.LINKER_MODE)
     monkeypatch.setattr(run_mod.llm_utils, "call_llm",
                          lambda *a, **k: (None, "should never run"))
     monkeypatch.setattr(run_mod, "load_deployed_llm_env", lambda *a, **k: None)
