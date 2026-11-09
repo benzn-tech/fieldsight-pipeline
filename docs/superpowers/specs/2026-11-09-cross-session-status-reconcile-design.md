@@ -26,7 +26,7 @@ Measured on TEST scripted runs (2026-11-05 to 11-07, 7 sessions): within a sessi
 - Writing any status. A person always confirms (unchanged from v1).
 - Same-session suggestions. Those stay with the extractor and continuity (TrackB).
 - Merging duplicate items, such as the same work assigned twice. That is a later step. Until then, exact duplicates have no distinguishing words, so the anchor guard (§6) **always drops** them. This is a counted miss, not a pass.
-- One statement resolving many items ("level one is all done"). The anchor guard drops it in code (§6), not by asking the prompt to refrain.
+- One statement resolving many items ("level one is all done"). The anchor guard stops it in code (§6), not the prompt. When the quote is verified, it becomes a pick card (§12.2).
 - The case where a session's assignment and status arrive in one pass and the item is written as a finding (video mode, offline backlog). The item never existed as open, so there is nothing to reconcile. Noted for TrackB.
 - Semantic retrieval. Track C's `find_items` is lexical; semantic search is added only if recall measurements need it (§9).
 
@@ -235,8 +235,28 @@ Widen to R2+ only when recall@cap ≥ 0.9 with per-line lexical ranking. Otherwi
 
 **Task numbers and the items tool** (`ask_items.list_items`, `task_no` "#n" on the Tasks page): the device Ask can already list a site's open, in-progress and blocked items. This is the foundation for the active path (§12 Q2). If people report against "#12", resolution needs no text matching at all.
 
-## 12. Open questions for the owner
+## 12. Owner decisions (2026-11-10)
 
-1. Is R0 = same recorder, same day the right first rung, or should v1 start at R1 (any recorder, same day)?
-2. The active path ("walk the open list"): should the morning brief, the device or both list a recorder's open items, so that people report against a known item or number? Proposed as a separate small spec after R0 is measured.
-3. Who may accept a cross-session suggestion: anyone on the project (as v1), or only the assigner / responsible person?
+1. **The first rung is R0** (same recorder, same day). Widen to R1 soon after, because "the supervisor assigns, a worker reports" is the common case.
+
+2. **Uncertain means ask, never pick.** The guards split into two outcomes:
+   - **Drop silently** when the evidence is missing. This covers `shape`, `evidence`, a plan or hearsay, and a quote with no item token at all ("that's all done").
+   - **Show a pick card** when the quote is verified and names something, but the `anchor` or `twin` guard finds 2 or more plausible candidates. The card reads "this line may refer to: #12 … / #15 … / none of these" and the person chooses.
+   - The system never chooses. A pick card does not fit `UNIQUE (stable_id, suggested_status)`, since it holds one statement and many items. It gets its own small store: quote, anchor, status, a candidates jsonb of at most 4, state, and chosen_stable_id. The plan fixes the schema.
+   - Choosing a candidate creates the normal suggestion as already accepted, through the same audited PATCH.
+
+3. **Who confirms: by hierarchy, each person handles their own items.** This is recorded now; it gets built when role and reporting relationships exist.
+   - A card goes to the item's `responsible` person; if there is none, it goes to the assigner, meaning the recorder of the first-seen session.
+   - A report made by someone else about your item still goes to you.
+   - Escalate to the level above when:
+     - the suggested status is `closed` (a cancellation is a decision);
+     - the responsible person has not acted within N days;
+     - it is a pick card (the assigner knows which item they meant).
+   - The level above can always see and act on the level below, but is not notified by default.
+   - Until reporting lines exist, v1 keeps today's rule: anyone on the project can accept.
+
+4. **Active path (separate spec, after R0 is measured).** It walks the open list, the digital version of the site-meeting register.
+   - It lives on the **web** Tasks page and later in the **mobile app**. Email carries only a digest with links. One-click status links in email are unsafe, because link scanners open them.
+   - Items are referred to by **what people already call them**: the item's own words, or the reference from the system they already use (an inspection number for architects and engineers; an Aconex or Procore reference for site staff).
+   - The internal per-site `task_no` (#n, migration 0093) stays a display and back-end key. People are never asked to speak it, to avoid a second numbering layer next to Aconex or Procore.
+   - Matching by external reference needs an external-reference field on items. Nothing exists today; this is for the active-path spec.
