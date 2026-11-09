@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11 Lambdas, psycopg3, Aurora Postgres (local PG16 harness for tests), SAM, GitHub Actions, the `anthropic` SDK for the measurement and the worker.
 
-**Spec:** `docs/superpowers/specs/2026-11-10-nightly-rematch-agent-design.md` (rev 2, pipeline#1272). Read it first; § numbers below refer to it. Parent: `docs/superpowers/specs/2026-11-05-site-decision-loop-design.md`.
+**Spec:** `docs/superpowers/specs/2026-11-10-nightly-rematch-agent-design.md` (rev 2, pipeline#1272). Fable reviewed this plan on 2026-11-10 (5 spec gaps, 7 interface mismatches, 2 wrong code claims, 5 weak steps, 2 cost risks). All are folded in. Read it first; § numbers below refer to it. Parent: `docs/superpowers/specs/2026-11-05-site-decision-loop-design.md`.
 
 ## Phases and blockers
 
@@ -21,6 +21,8 @@
 | 10 | TEST verification | after 3-7 (8-9 when they land) |
 
 A blocked task is skipped, not stubbed. Record the skip in the ledger.
+
+**Not in this plan:** the J2 backfill script for items older than 7 nights (spec §3 J2). It needs its own owner-approved call count; do not stub it.
 
 ## Global Constraints
 
@@ -64,11 +66,11 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `RULE_VERSION = "nightly_turn_pick_v1"`;
   - `METHOD = "nightly_turn_pick_v1"`;
   - `MAX_ITEMS = 60`.
-  - `build_request(items: list[dict], turns: list[dict]) -> dict`.
+  - `build_request(items: list[dict], turns: list[dict], session_date: str) -> dict`.
     - `items` entries: `{stable_id, row_id, kind, text, topic_index, time_range}`, where `time_range` is the topic's own string.
     - `turns` entries: the `assemble_session_turns` shape (`abs_start`, `abs_end`, `text`, `speaker`, `source_filename`, `start_sec`, `end_sec`).
     - Returns `{"items": [{alias "I1"…, stable_id, row_id, kind, text, topic_index}], "topics": {topic_index: [{"n": "T1", "turn_index": i}]}, "skipped": {"no_window": n, "over_cap": n}}`.
-    - Turns are numbered **per topic**, over those whose `[abs_start, abs_end]` overlaps the topic window.
+    - Turns are numbered **per topic**, over exactly the turns `item_support._window_turns(time_range, session_date, turns)` returns (its rule: `abs_start` in `[start, end + 1 min)`, with its midnight shift). Call it; do not re-implement it. The `window` guard uses the same function.
   - `render_prompt(request: dict, turns: list[dict]) -> str`.
     - Constant `INSTRUCTION`, plus one fenced block per topic (`T<n> [HH:MM:SS] <text>`) and one fenced items block (`I<n> <kind>: <text>`).
     - Answer shape: JSON `{"picks": [{"item": "I3", "turn": "T17" | null}]}`.
@@ -77,11 +79,11 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `apply_guards(request: dict, picks: list[dict], turns: list[dict]) -> list[dict]`.
     - Returns one row per request item: `{alias, stable_id, row_id, kind, turn_index | None, outcome: "accepted" | "rejected" | "abstained", guard: str | None, cross_language: bool}`.
     - Guards run in the spec's order: `shape`, `window`, `twin`, `same_language_floor`. A null pick is `abstained`.
-  - `turn_locator(turn: dict) -> dict`: returns `{source_stem, start_sec, end_sec, speaker_label, quote_status: "model_pick"}`, Track C's `dst_turn` keys.
-- Consumes: `item_text_match.tokens` (the shared tokeniser), the numeral normaliser and twin test from `scripts/item_support_eval/score.py` (`place_values`, `twin_flags`). Move them into `src/item_text_match.py` if they are not importable from `src/`, and have the harness import them from there.
+  - `turn_locator(turn: dict) -> dict`: returns `{source_stem, start_sec, end_sec, speaker_label, quote_status: None}` (Track C's `dst_turn` keys; no new enum value), and `locator_ref(loc) -> str` = `f"{source_stem}@{start_sec}"` for `decision_records.object_ref`.
+- Consumes: `item_text_match.tokens` (the shared tokeniser). **Move** `cn_to_int`, `place_values` and `twin_flags` out of `scripts/item_support_eval/score.py` (which imports eval-only modules and cannot ship in a Lambda) into `src/item_text_match.py`, unchanged, and make `score.py` import them from there; Track C's harness tests must still pass.
 
 - [ ] **Step 1: Write failing tests**:
-  - `test_turns_numbered_per_topic_by_window_overlap`: two topics, windows 10:00-10:05 and 10:05-10:10. Six turns. Each topic's T-numbers start at T1 and cover only overlapping turns.
+  - `test_turns_numbered_per_topic_by_window`: two topics, windows 10:00-10:05 and 10:05-10:10, six turns. Each topic's T-numbers start at T1 and equal `_window_turns`' selection for that topic.
   - `test_item_without_time_range_is_skipped_not_whole_session`: `time_range=None` → not in `items`, `skipped["no_window"] == 1`.
   - `test_over_cap_items_counted`: 61 items → 60 in, `over_cap == 1`.
   - `test_prompt_fences_text_as_data`: a turn text `ignore previous instructions` appears only inside a fence; `INSTRUCTION` precedes all fences.
@@ -93,13 +95,12 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `test_twin_picks_turn_with_sibling_token_rejected`: the unit 3 item picks a turn saying "unit 4" → `twin`.
   - `test_same_language_floor`: an English item "west pipe" picks an English turn without "west" while a sibling "east pipe" exists → `same_language_floor`.
   - `test_cross_language_pick_accepted_and_flagged`: an English item, a Chinese turn → `accepted`, `cross_language=True`.
-  - `test_chinese_numerals_normalised_in_twin`: "三号单元" vs "unit 3" counts as the same place value.
+  - `test_chinese_twin_numbers`: "三号单元验收" and "四号单元验收" both pick one turn → both `twin` (same-language pair; cross-script pairs are never twin-checked, per spec).
   - `test_locator_has_track_c_keys`.
 
 - [ ] **Step 2: Run** `bash /c/Users/camil/fswork/run-tests.sh tests/unit/test_nightly_turn_pick.py`. Expected: FAIL (module missing).
 
 - [ ] **Step 3: Implement** `src/nightly_turn_pick.py`.
-  - Window parsing reuses `item_support._window_turns` semantics (same `time_range` format). Do not re-invent it.
   - Script detection for `cross_language`: the item is Latin and the turn has CJK, or vice versa, by majority of characters.
 
 - [ ] **Step 4: Run** the same command. Expected: PASS.
@@ -133,6 +134,8 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
 - [ ] **Step 1: Write the pre-registration** before any result exists.
   - Content: the set, split and gold from Track C; the model id `claude-sonnet-5-5` via the Claude API, temperature 0; 3 reps; the five bars and the "reported" list exactly as spec §7; correctness by `is_link_correct` (Track C's adjacency rule); the fit half used only for prompt wording, at most 2 wording revisions, each logged; the held-out half scored once.
   - Frozen at the first held-out result row; later changes go in dated addenda.
+  - Bar 5's owner sample **is Track C's existing `labels/todo.owner.jsonl`** (45 held-out items, still unlabelled), so the owner labels once for both lines.
+  - Caveat stated up front: the same recordings recur under several session refs, some across halves, and 37 of 59 sessions come from one folder (Track C Task 10).
   - Commit it alone: `docs(nightly): N0 pre-registration`.
 
 - [ ] **Step 2: Write failing tests** (fixtures are synthetic, no customer text):
@@ -154,7 +157,7 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
 - [ ] **Step 5 (after approval):**
   - Fit runs → fix the wording.
   - Held-out run → score it.
-  - Export about 40 held-out items for owner adjudication with `label`-style blind JSONL in the gitignored dir.
+  - Export only the J2-vs-gold disagreements inside the 45-item owner sample for adjudication (blind JSONL in the gitignored dir); the owner's 45 base labels are Track C's file.
   - Commit only `scripts/nightly_turn_pick_eval/results/summary.json` (counts, rates, verdicts) with `docs(nightly): N0 result`.
   - Bar 5 stays "pending" until the owner labels.
 
@@ -173,25 +176,28 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `claim_recompute_failures(company_id uuid not null → companies on delete cascade, session_base text not null, reason text not null check in ('timed_out','failed'), failed_at timestamptz default now(), resolved_at timestamptz, PRIMARY KEY (company_id, session_base))`.
   - Four partial unique indexes on `event_links`, one per `src_<kind>_id` column, `WHERE method LIKE 'nightly_%' AND <col> IS NOT NULL`.
   - All `IF NOT EXISTS`; idempotent.
-- `insert_supported_by(..., decision_record_id=None)` writes the column. Existing callers are unchanged.
+- `insert_supported_by(..., score: float | None, decision_record_id=None, on_conflict="raise")` writes the column. `on_conflict="skip"` adds `ON CONFLICT DO NOTHING` and returns None when nothing was inserted (today `.fetchone()[0]` would TypeError). The site-mismatch `ValueError` is unchanged. Existing callers are unchanged.
 - `repositories/nightly.py`:
   - `sessions_needing_support(conn, *, company_id, site_id, since_utc, limit=20) -> list[dict]`: finals written since `since_utc` on the site, newest first, each `{extraction_key, session_base, user_folder, date, items: [{stable_id, row_id, kind, text, topic_index, time_range}]}`. Only live items with no live `supported_by` link of any method. Sessions with zero such items are omitted.
   - `nightly_support_count_today(conn, company_id, today_nz) -> int`: `decision_records` kind `nightly_support` rows created today. Used by the budget check.
   - `record_reemit(conn, *, site_id, line, n_key, l_key, artifact_key, night) -> bool`: returns False on conflict.
   - `failed_recomputes(conn, *, company_id, limit=50) -> list[dict]`: unresolved rows.
   - `resolve_recompute(conn, company_id, session_base)`.
-- Voiceprint writer: when `recompute_session` returns `timed_out` or `failed > 0`, upsert `claim_recompute_failures`. Logging is unchanged.
+- Voiceprint writer: when `recompute_session` returns `timed_out` or `failed > 0`, **or raises** (today `_recompute_claims` returns None on exception before `counts` exists; restructure so that path marks too), upsert `claim_recompute_failures` in **its own connection and transaction** (a QueryCanceled leaves the caller's aborted). Store the same normalised session key `recompute_session` takes. Logging is unchanged.
+- `claim_one_recompute(conn, company_id) -> dict | None`: `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1` over unresolved rows, so one site's run takes a marker and the others skip it.
 
 - [ ] **Step 1: Write failing tests**:
   - `test_migration_idempotent`;
   - `test_one_nightly_link_per_row` (a second nightly insert on the same row conflicts);
   - `test_nightly_index_ignores_lexical_links` (a lexical plus a nightly link on one row are both allowed);
   - `test_insert_supported_by_writes_decision_record_id`;
+  - `test_insert_supported_by_skip_returns_none_on_conflict`;
   - `test_sessions_needing_support_excludes_linked_and_superseded`;
   - `test_sessions_needing_support_scoped_by_current_company` (a moved site → old company sees nothing);
   - `test_redacted_topic_items_excluded`;
   - `test_record_reemit_unique_per_pair`;
-  - `test_voiceprint_writer_marks_timed_out_recompute`.
+  - `test_voiceprint_writer_marks_timed_out_recompute`;
+  - `test_voiceprint_writer_marks_on_exception`.
 
 - [ ] **Step 2: Run** each file. Expected: FAIL.
 
@@ -229,20 +235,20 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
 - Create: `src/lambda_nightly_turn_pick.py` (non-VPC worker)
 - Create: `src/lambda_nightly_support_writer.py` (in-VPC writer)
 - Create: `src/session_turns.py` (`assemble_session_turns` lifted out of `lambda_extract_session.py` with no psycopg import; the extractor imports it from there). If the status line has already lifted it, import theirs and skip this file.
-- Create: `src/model_registry.py` with `ENTRIES = {"nightly_turn_pick": {"model": "claude-sonnet-5-5", "max_tokens": 4096, "temperature": 0, "prompt_hash": nightly_turn_pick.PROMPT_HASH}}` and `get(task) -> dict`. Use the model Task 2 measured.
+- Create: `src/model_registry.py` with `ENTRIES = {"nightly_turn_pick": {"model": "claude-sonnet-5-5", "max_tokens": 4096, "temperature": 0, "prompt_hash": nightly_turn_pick.PROMPT_HASH, "allow_cross_language": False, "usd_per_mtok_in": None, "usd_per_mtok_out": None}}` and `get(task) -> dict`. Use the model Task 2 measured. `allow_cross_language` becomes True only if Task 2's bar 2 passed (not "insufficient"). With prices None, `cost_usd` is NULL; tokens are always recorded.
 - Test: `tests/unit/test_lambda_nightly_turn_pick.py`, `tests/integration/test_nightly_support_writer.py`
 
 **Interfaces:**
-- Request artifact `nightly_requests/{site_id}/{night}/{sha256(extraction_key)[:16]}.json`: `{site_id, night, run_id, extraction_key, session_base, user_folder, date, transcript_keys: [...], items: [...]}`. Items use Task 3's `sessions_needing_support` shape.
+- Request artifact `nightly_requests/{site_id}/{night}/{sha256(extraction_key)[:16]}.json`: `{site_id, night, run_id, flag, extraction_key, session_base, user_folder, date, items: [...]}`. The **worker** finds the session's transcript keys with the extractor's own key discovery for one session (lift it into `session_turns.py` with `assemble_session_turns`), so chunk (bare `sid…`) sessions resolve as they do in extraction. Items use Task 3's `sessions_needing_support` shape.
 - Worker `lambda_handler(s3_event)`:
-  1. Read the artifact and rebuild turns from `transcript_keys`.
+  1. Read the artifact, discover the session's transcript keys, and rebuild turns.
   2. Run Task 1 `build_request` → `render_prompt` → one model call via the `anthropic` SDK with `model_registry.get("nightly_turn_pick")` → `parse_answer` → `apply_guards`.
   3. Invoke the writer RequestResponse with `{site_id, run_id, extraction_key, question_set: PROMPT_HASH, input_key, rows, usage}`.
   4. Raise on `FunctionError` or a parse error (fail closed).
 - Writer `lambda_handler(event) -> {"written": n, "records": n, "skipped": {"gone": n, "linked": n, "moved_site": n}}`. Per row, in one transaction:
   1. Re-read the row through `deleted_predicates`.
-  2. `decision_records.insert(kind="nightly_support", subject_type=kind, subject_stable_id=stable_id, object_ref=locator string or None, provider="anthropic", model=…, question_set=…, input_key=…, output={"turn": "T<n>" | None, "guard": guard}, auto_outcome=outcome)`.
-  3. When `accepted` and the row is still live and unlinked: `insert_supported_by(..., method=METHOD, score=None, rule_version=RULE_VERSION, decision_record_id=…)` with `ON CONFLICT DO NOTHING` semantics. A conflict is counted as `linked`.
+  2. `decision_records.insert(company_id=<the row's site's company, sites.company_id>, site_id=site_id, kind="nightly_support", subject_type=kind, subject_stable_id=stable_id, object_ref=locator_ref(loc) or None, provider="anthropic", model=…, question_set=…, input_key=…, output={"turn": "T<n>" | None, "guard": guard}, auto_outcome=outcome)`.
+  3. When `accepted` (and, for a `cross_language` row, only if the registry's `allow_cross_language`; otherwise recorded with guard `cross_language_off`, `auto_outcome=rejected`) and the row is still live and unlinked: `insert_supported_by(..., method=METHOD, score=None, rule_version=RULE_VERSION, decision_record_id=…, on_conflict="skip")`. None back is counted as `linked`; a `ValueError` (the row moved site) is caught and counted as `moved_site`.
   4. `event_runs.add_usage(run_id, …)`.
   5. Finally `claim_type_store.recompute_session(conn, company_id=row company, site_id=site_id, session_base=…, statement_timeout="15s")` when `written > 0`. That is J3 for tonight's links.
 
@@ -254,6 +260,8 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `test_writer_skips_superseded_row`;
   - `test_writer_never_touches_lexical_link` (a row already holding a `lexical_v1` link → skipped `linked`, lexical row unchanged);
   - `test_writer_site_mismatch_skipped`;
+  - `test_writer_rejects_cross_language_when_disallowed`;
+  - `test_writer_record_company_is_site_company` (a site owned by company B, recorder in company A → record `company_id` = B);
   - `test_writer_recomputes_claim_type_when_written`;
   - `test_extractor_still_imports_assemble_session_turns` (an import check on `lambda_extract_session`).
 
@@ -270,37 +278,41 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
 
 **Interfaces:**
 - `nightly_rematch.site_local_now(site: dict, now_utc: datetime) -> datetime`: NZ via `nz_time` in v1.
-- `nightly_rematch.due_sites(conn, now_utc, local_hour=1) -> list[dict]`: active sites whose local hour equals `local_hour`.
+- `nightly_rematch.due_sites(conn, now_utc, local_hour=1, last_hour=4) -> list[dict]`: sites not in `tenancy_status.inactive_site_ids` (sites have no status column) whose local hour is in `[local_hour, last_hour]` and that have no `nightly.due` event for that night yet. The range absorbs EventBridge jitter; the dedupe key keeps it to one.
 - `emit_nightly_due(conn, now_utc) -> dict`: one event per due site.
   - Fields: `source="nightly_scan"`, `type="nightly.due"`, `subject_ref=site_id`, `occurred_at=now`, payload `{night}`.
   - The rule's bucket is `payload.night` (the previous local date).
 - Rule `nightly.due`: `run=nightly_rematch.run`, `late_after_days=1`.
+- **Two flags:** the tick and `process` need the hub flag `SITE_DECISION_LOOP` at least `shadow` (P0 skips otherwise and conditions DecisionScanFunction on it); `RunContext.flag` comes from `NIGHTLY_REMATCH`. Run-rules skip `decision_ledger` lookups (their `subject_ref` is a site, not an item). `process(conn, now)` gains `s3_client` and `bucket` to build `RunContext`.
 - `nightly_rematch.run(conn, event, ctx) -> str`:
-  1. **J3 catch-up:** for `failed_recomputes(company)` on this site, call `recompute_session`; on success, `resolve_recompute`.
+  1. **J3 catch-up** (`on` only; in `shadow` count markers): `claim_one_recompute(company)` repeatedly (at most 20), `recompute_session(company_id, site_id=None, session_base)` (all the company's sites, as the voiceprint writer does), `resolve_recompute` on success.
   2. **J2:**
      - Get `sessions_needing_support(since_utc = now − 7 days, limit=20)`.
      - Budget: when `nightly_support_count_today + items > NIGHTLY_MAX_ITEMS_PER_COMPANY_DAY` (env, default 2000), stop and count `budget_paused`.
-     - Write one request artifact per session. In `shadow`, write the artifacts but the worker trigger is not wired.
-  - **Circuit breaker (§6):** before J2, count last night's request artifacts for this site that have no `nightly_support` record (`decision_records.input_key` = the artifact key). If 5 or more, the worker is failing: write no J2 requests tonight, count `j2_breaker_open`, and log one alert line `nightly breaker site=<id> missing=<n>`. Test `test_breaker_opens_after_5_unanswered_requests`.
+     - Skip a session whose artifact key already exists (`head_object`; in-VPC S3 goes through the gateway endpoint) or already has `nightly_support` records with that `input_key`. A hub retry then never re-PUTs a key, so S3 never fires twice for one session.
+     - Write one request artifact per session, stamped with `flag`. In `shadow`, write the artifacts but the worker trigger is not wired.
+  - **Circuit breaker (§6; the worker's errors are not visible in-VPC, so "same error ×5" becomes "5 unanswered requests"):** in `on` only, before J2, count last night's request artifacts for this site **stamped `flag=on`** that have no `nightly_support` record (`decision_records.input_key` = the artifact key). Shadow artifacts never count. If 5 or more, the worker is failing: write no J2 requests tonight, count `j2_breaker_open`, and log one alert line `nightly breaker site=<id> missing=<n>`. Test `test_breaker_opens_after_5_unanswered_requests`.
   3. Return `"nothing"` when there is no work, else `"done"`.
   4. Log one counts line: `nightly site=<id> j2_sessions=n j2_items=n j3_recomputed=n budget_paused=n skipped_no_window=n`.
 - Template:
   - `NightlyRematch` parameter (AllowedValues `off,shadow,on`, default `off`) → env `NIGHTLY_REMATCH` on DecisionScanFunction.
   - An hourly Schedule `{"scan": "nightly_tick"}`, `State` enabled only when `NIGHTLY_REMATCH != off` and `ShouldEnableSchedules`.
-  - `NightlyTurnPickFunction` (non-VPC, timeout 300, `MaximumRetryAttempts: 1`, GetObject/ListBucket on `transcripts/` and `nightly_requests/*`, invoke on the writer, the `ANTHROPIC_API_KEY` secret as the existing Claude callers get it).
+  - `NightlyTurnPickFunction` (non-VPC, timeout 300, `MaximumRetryAttempts: 1`, invoke on the writer, the `ANTHROPIC_API_KEY` secret as the existing Claude callers get it). S3 grants: **the same read grants ExtractSessionFunction uses to rebuild turns** (`transcripts/`, the `audio_segments/` batch maps read by `batch_stitch.map_key_for_transcript`, ListBucket on `voice_ask/{folder}/{date}/` for `agent_turn_filter`), plus GetObject on `nightly_requests/*`. Copy them; check with `simulate-principal-policy`.
   - `NightlySupportWriterFunction` (VPC, DB secret).
   - DecisionScanFunction PutObject on `nightly_requests/*`.
 - Workflows: `TEST_NIGHTLY_REMATCH` / `PROD_NIGHTLY_REMATCH` → the `NightlyRematch` parameter override (memory: SAM keeps previous parameter values, so pass it every deploy).
 - `wire-s3-events.sh`: `nightly_requests/` → NightlyTurnPickFunction. The script line is added but only run by the operator when the flag is `on`.
 
 - [ ] **Step 1: Write failing tests**:
-  - `test_due_sites_at_local_one_am_only` (13:00 UTC in NZDT = 02:00 → not due; 12:00 UTC = 01:00 → due);
+  - `test_due_sites_window` (NZDT: 12:00 UTC = 01:00 → due; 16:00 UTC = 05:00 → not due; 11:00 UTC = 00:00 → not due; already emitted tonight → not due);
   - `test_due_sites_nzst_offset` (winter: 13:00 UTC = 01:00);
   - `test_second_tick_same_night_is_duplicate`;
   - `test_inactive_company_gets_no_requests`;
   - `test_run_returns_nothing_without_new_finals` (no artifact, no model);
   - `test_run_respects_20_sessions_and_budget`;
-  - `test_shadow_writes_artifacts_and_no_db_rows_besides_hub`;
+  - `test_shadow_writes_artifacts_and_no_db_rows_besides_hub` (the fixture plants a `claim_recompute_failures` row and asserts it is still unresolved);
+  - `test_breaker_ignores_shadow_artifacts`;
+  - `test_hub_retry_does_not_rewrite_existing_artifact`;
   - `test_failed_recompute_resolved`;
   - a template check `test_nightly_flag_wired_three_places` (template param, both workflows, env).
 
@@ -330,12 +342,12 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `test_revert_deletes_only_nightly`;
   - `test_revert_recomputes_claim_type`;
   - `test_invariants_clean_on_fixture`;
-  - mutation tests, each planting a fault in a copy of the writer or guards via monkeypatch and asserting that a test or invariant catches it:
-    - drop the site filter;
-    - skip the `window` guard;
-    - skip the twin guard;
-    - let the writer overwrite a non-nightly link;
-    - re-emit one (N, L) twice.
+  - mutation tests, each planting a fault via monkeypatch, asserting the named catcher fails, and **undoing the patch before `invariants()` runs**:
+    - drop the site filter in `sessions_needing_support` → `test_sessions_needing_support_scoped_by_current_company`;
+    - skip the `window` guard → Task 1 `test_turn_from_other_topic_is_shape_drop` plus a window case;
+    - skip the twin guard → Task 1 `test_twin_same_turn_both_rejected`;
+    - let the writer use `on_conflict="raise"` on a lexical-linked row → `test_writer_never_touches_lexical_link`;
+    - make `record_reemit` ignore its conflict → `test_record_reemit_unique_per_pair` and the invariant.
 
 - [ ] **Step 2: Run.** Expected: FAIL. **Step 3: Implement.** **Step 4: Run.** Expected: PASS.
 
@@ -354,7 +366,7 @@ A blocked task is skipped, not stubbed. Record the skip in the ledger.
   - `find_items(...)[i]["first_seen_recorded_at"]` (Track C).
 - `nightly_rematch.stale_pairs(conn, *, company_id, site_id, now_utc) -> list[dict]`, each `{line, n_extraction_key, l_extraction_key}`. The spec §3 J1 rules apply:
   - L final written in the last 24 h;
-  - L recorded before N by `first_seen_recorded_at`, with null meaning unordered and skipped;
+  - L recorded before N by the rule #1273 uses (0e97467c): both `first_seen_recorded_at` (UTC) present → compare them; otherwise `first_date` strictly earlier; a same-date pair without both instants is unordered and skipped;
   - L's final written after N's;
   - L within N's window (reconcile at N's rung; cross-day 28 days).
   - Newest N first, at most 10.
