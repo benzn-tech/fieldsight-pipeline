@@ -14,6 +14,15 @@ Deviation from spec §4.2, recorded in the Task 5 brief: the turn helpers are im
 lambda_extract_session (lazily, inside process_request) instead of being lifted out of it.
 That import graph has no psycopg -- tests/unit/test_reconcile_worker.py pins it.
 
+The prompt's transcript is session_brief.render_turns(turns): raw speaker labels, not the
+names extraction's render_transcript maps in. The quote check (_check_status_quote) runs on
+the same `turns`, so the text and the [HH:MM:SS] clock the model copies from are identical to
+what is verified; only the speaker column differs from the extraction prompt.
+
+The model call is bounded by the Lambda's remaining time (`deadline_s`, from the handler's
+context), not by raising LLM_HTTP_TIMEOUT on the matcher: that would change the programme
+path's calls too.
+
 Logs carry ids and counts only, never quote, transcript or item text.
 """
 import json
@@ -49,12 +58,15 @@ def _parse(raw, n):
     return status_reconcile.parse_hits(json.dumps(data), n)
 
 
-def process_request(req: dict, input_key: str, call=None, bucket=None) -> dict:
+def process_request(req: dict, input_key: str, call=None, bucket=None,
+                    deadline_s=None) -> dict:
     """One reconcile_requests/ artifact body -> {status_suggestions, pick_cards, counts}.
 
     `call` defaults to llm_utils.call_llm, resolved at call time so a monkeypatched
     llm_utils is honoured. `bucket` is the lake bucket the transcripts live in (the
-    matcher's S3_BUCKET); it defaults to the S3_BUCKET env var.
+    matcher's S3_BUCKET); it defaults to the S3_BUCKET env var. `deadline_s` (seconds from
+    now, or None for no bound) is passed to the model call as its `deadline`; a non-positive
+    one raises before the call, so the S3 event retries instead of the runtime killing us.
 
     Each status suggestion / pick card carries the writer's event fields (Task 3), with
     `site_id` from the request and `run = "reconcile:R0:{extracted_at}"`."""
@@ -87,9 +99,12 @@ def process_request(req: dict, input_key: str, call=None, bucket=None) -> dict:
         raise RuntimeError(
             f"reconcile {input_key}: {len(keys)} segment(s) listed but no readable turns")
 
+    if deadline_s is not None and deadline_s <= 0:
+        raise RuntimeError(f"reconcile {input_key}: no time left for the model call "
+                           f"(deadline {deadline_s:.0f}s)")
     prompt = status_reconcile.build_prompt(candidates, session_brief.render_turns(turns))
     raw, error = call(prompt, max_tokens=MAX_TOKENS, force_json=True, enable_thinking=True,
-                      caller=CALLER)
+                      deadline=deadline_s, caller=CALLER)
     if raw is None:
         raise RuntimeError(f"reconcile {input_key}: model call failed: {error}")
 

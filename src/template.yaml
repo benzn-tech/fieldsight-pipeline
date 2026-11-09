@@ -5668,10 +5668,9 @@ Resources:
           # different transcript than extraction did.
           DEVICE_ANNOUNCEMENT_PATTERNS: !Ref DeviceAnnouncementPatterns
           FILTER_AUDIO_EVENT_TAGS: !Ref FilterAudioEventTags
-          # The reconcile call runs thinking ON (the matcher's first thinking-mode call); the
-          # 150s llm_utils default is what killed extract_session's final pass (see its
-          # comment). 540 < LLM_CHAIN_BUDGET_SECONDS 840 < Timeout 900, as there.
-          LLM_HTTP_TIMEOUT: '540'
+          # No LLM_HTTP_TIMEOUT here on purpose: raising it would change the programme
+          # match/impact calls too. The reconcile call is bounded by the Lambda's remaining
+          # time instead (lambda_programme_matcher._reconcile_deadline_s).
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref SuggestionWriterFunction

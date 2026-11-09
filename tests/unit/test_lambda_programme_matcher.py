@@ -855,6 +855,8 @@ def test_dry_run_returns_impacts_without_invoke(monkeypatch):
 # ---------------------------------------------------------------------------
 
 RECONCILE_KEY = "reconcile_requests/site-1/2026-11-10/0123456789abcdef.json"
+# The handler imports reconcile_worker lazily; patching the module object is what it sees.
+reconcile_worker = pytest.importorskip("reconcile_worker")
 _STATUS = {"stable_id": "s-1", "site_id": "site-1", "suggested_status": "done",
            "quote": "q", "segment_key": "audio_segments/u/d/x.wav", "offset_sec": 1.0,
            "run": "reconcile:R0:2026-11-10T10:30:00Z"}
@@ -877,7 +879,7 @@ def _reconcile_setup(monkeypatch, function_error=None, result=None):
         return result if result is not None else {
             "status_suggestions": [_STATUS], "pick_cards": [_PICK], "counts": {"kept": 1}}
 
-    monkeypatch.setattr(lpm.reconcile_worker, "process_request", process_request)
+    monkeypatch.setattr(reconcile_worker, "process_request", process_request)
 
     def no_match_path(*a, **k):
         raise AssertionError("a reconcile record must not reach the programme path")
@@ -937,7 +939,7 @@ def test_reconcile_worker_error_propagates(monkeypatch):
 
     def boom(*a, **k):
         raise RuntimeError("model failed")
-    monkeypatch.setattr(lpm.reconcile_worker, "process_request", boom)
+    monkeypatch.setattr(reconcile_worker, "process_request", boom)
     with pytest.raises(RuntimeError):
         lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
 
@@ -955,7 +957,7 @@ def test_match_requests_path_unchanged(monkeypatch):
 
     def must_not_run(*a, **k):
         raise AssertionError("a match_requests record must not reach reconcile_worker")
-    monkeypatch.setattr(lpm.reconcile_worker, "process_request", must_not_run)
+    monkeypatch.setattr(reconcile_worker, "process_request", must_not_run)
 
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
@@ -966,3 +968,66 @@ def test_match_requests_path_unchanged(monkeypatch):
                                   "verdicts": result["verdicts"]})
     assert "status_suggestions" not in json.loads(payload)
     assert "pick_cards" not in json.loads(payload)
+
+
+class _FakeContext:
+    def __init__(self, ms):
+        self.ms = ms
+
+    def get_remaining_time_in_millis(self):
+        return self.ms
+
+
+def test_reconcile_deadline_from_context(monkeypatch):
+    _req, seen, _fl = _reconcile_setup(monkeypatch)
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), _FakeContext(900_000))
+    assert seen[0][2]["deadline_s"] == pytest.approx(840.0)
+
+
+def test_reconcile_no_context_no_deadline(monkeypatch):
+    _req, seen, _fl = _reconcile_setup(monkeypatch)
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+    assert seen[0][2]["deadline_s"] is None
+
+
+def test_reconcile_deadline_spent_raises_before_the_model(monkeypatch):
+    """End to end through the real worker: 30s left minus the 60s margin is negative, so it
+    raises before any model call (the S3 event retries)."""
+    import lambda_extract_session as les
+    req = {"site_id": "site-1", "date": "2026-11-10", "user_folder": "Ben",
+           "session_base": "sidabc", "extracted_at": "t",
+           "candidates": [{"stable_id": "s", "text": "x"}]}
+    monkeypatch.setattr(lpm, "s3", lambda: FakeS3({RECONCILE_KEY: json.dumps(req)}))
+    monkeypatch.setattr(lpm, "S3_BUCKET", BUCKET)
+    monkeypatch.setattr(les, "gather_session_segments", lambda *a: ["k"])
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda b, k: ([{"abs_start_str": "10:00:00", "speaker": "A",
+                                        "text": "x"}], ["k"], {}))
+
+    def no_call(*a, **k):
+        raise AssertionError("no model call without time left")
+    monkeypatch.setattr(llm_utils, "call_llm", no_call)
+    monkeypatch.setattr(lpm, "lambda_client", lambda: FakeLambdaClient())
+    with pytest.raises(RuntimeError, match="no time left"):
+        lpm.lambda_handler(_match_request_event(RECONCILE_KEY), _FakeContext(30_000))
+
+
+def test_reconcile_prefix_constants_agree():
+    assert lpm.RECONCILE_PREFIX == reconcile_worker.PREFIX
+
+
+def test_match_path_does_not_import_reconcile_worker():
+    """reconcile_worker is imported lazily, so a match_requests/ cold start is unchanged."""
+    import subprocess
+    import sys
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "src")
+    env = dict(os.environ, PYTHONPATH=src, AWS_DEFAULT_REGION="ap-southeast-2",
+               AWS_ACCESS_KEY_ID="x", AWS_SECRET_ACCESS_KEY="x",
+               ANTHROPIC_API_KEY="sk-ant-x", DASHSCOPE_API_KEY="x")
+    code = ("import sys, lambda_programme_matcher; "
+            "print('reconcile_worker' in sys.modules, 'lambda_extract_session' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                         text=True, cwd=src)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False False"

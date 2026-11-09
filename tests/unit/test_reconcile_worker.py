@@ -124,7 +124,7 @@ def test_process_request_happy_path(faked):
     assert len(sent) == 1
     prompt, kw = sent[0]
     assert kw == {"max_tokens": 4000, "force_json": True, "enable_thinking": True,
-                  "caller": "status_reconcile"}
+                  "deadline": None, "caller": "status_reconcile"}
     assert f"[10:00:05] Ben: {QUOTE}" in prompt
     assert "C1: Finish west block scaffold" in prompt
     assert "11111111" not in prompt
@@ -223,3 +223,18 @@ def test_logs_carry_counts_not_text(faked, caplog):
 def test_prefix_matches_the_emitter():
     rr = pytest.importorskip("reconcile_request", reason="requires psycopg (installed in CI)")
     assert rw.PREFIX == rr.PREFIX
+
+
+def test_deadline_reaches_the_call(faked):
+    sent = []
+    rw.process_request(_req(), KEY, call=_call_returning(json.dumps({"hits": []}), sink=sent),
+                       bucket=BUCKET, deadline_s=123.0)
+    assert sent[0][1]["deadline"] == 123.0
+
+
+def test_non_positive_deadline_raises_without_calling(faked):
+    def call(*a, **k):
+        raise AssertionError("no model call without time left")
+    for d in (0, -5.0):
+        with pytest.raises(RuntimeError):
+            rw.process_request(_req(), KEY, call=call, bucket=BUCKET, deadline_s=d)

@@ -128,7 +128,6 @@ import boto3
 
 import llm_utils
 import dashscope_utils
-import reconcile_worker
 from repositories import programme
 
 logger = logging.getLogger()
@@ -923,7 +922,22 @@ def _process_impacts(topic, topic_findings, finding_vecs, cands, task_vecs, prog
     return impacts, verdict_records
 
 
-def lambda_handler(event, _context):
+#: reconcile_worker.PREFIX (and reconcile_request.PREFIX), repeated so routing needs no
+#: import; tests pin the three equal.
+RECONCILE_PREFIX = "reconcile_requests/"
+#: Seconds kept back from the Lambda's remaining time for the writer invoke and teardown.
+RECONCILE_DEADLINE_MARGIN_S = 60
+
+
+def _reconcile_deadline_s(context):
+    """Seconds the reconcile model call may take, or None without a Lambda context."""
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining is None:
+        return None
+    return remaining() / 1000 - RECONCILE_DEADLINE_MARGIN_S
+
+
+def lambda_handler(event, context):
     event = event or {}
     dry_run = bool(event.get("dry_run"))
 
@@ -945,10 +959,14 @@ def lambda_handler(event, _context):
         # json.loads/json.dumps might reformat it.
         input_hash = hashlib.sha256(body).hexdigest()
         req = json.loads(body.decode("utf-8"))
-        if key.startswith(reconcile_worker.PREFIX):
-            # Raises on a model error / unparseable answer (fail closed: the S3
-            # event retries). Logs counts only.
-            out = reconcile_worker.process_request(req, key, bucket=S3_BUCKET)
+        if key.startswith(RECONCILE_PREFIX):
+            # Lazy: the match_requests/ cold start never loads the reconcile
+            # graph (lambda_extract_session and friends).
+            import reconcile_worker
+            # Raises on a model error / unparseable answer / no time left
+            # (fail closed: the S3 event retries). Logs counts only.
+            out = reconcile_worker.process_request(
+                req, key, bucket=S3_BUCKET, deadline_s=_reconcile_deadline_s(context))
             status_suggestions.extend(out["status_suggestions"])
             pick_cards.extend(out["pick_cards"])
             continue
