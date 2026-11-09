@@ -16,12 +16,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
-import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from item_text_match import tokens
+from item_text_match import cn_to_int, place_values, tokens, twin_flags  # noqa: F401
 
 from scripts.item_support_eval import store
 
@@ -125,62 +123,6 @@ def is_link_correct(linked, gold, turns, item_text):
 # ---------------------------------------------------------------------------------------
 # Bar 2's mechanical twin check
 # ---------------------------------------------------------------------------------------
-
-_EN_CLASS = {"unit": "unit", "level": "level", "floor": "level", "lot": "lot",
-             "room": "room", "block": "block"}
-_EN_NUM = re.compile(r"\b(unit|level|lot|room|block|floor)s?\s*(?:no\.?|number|#)?\s*"
-                     r"(\d+)([a-z]?)(?:st|nd|rd|th)?\b", re.IGNORECASE)
-# A single capital letter (Block C). "I" is left out: "the unit I checked".
-_EN_LETTER = re.compile(r"\b((?i:unit|level|lot|room|block|floor))\s+([A-HJ-Z])\b")
-_EN_DIR = re.compile(r"\b(east|west|north|south)(?:ern)?\b", re.IGNORECASE)
-_ZH_DIR = {"东": "east", "西": "west", "南": "south", "北": "north"}
-_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
-              "八": 8, "九": 9}
-_ZH_NUM = re.compile(r"([0-9]+|[一二三四五六七八九十两]+)\s*(号|楼|层|区|栋)")
-_ZH_CLASS = {"楼": "level", "层": "level", "区": "block", "栋": "block", "号": "number"}
-
-
-def cn_to_int(s):
-    """Arabic digits, or a Chinese numeral up to 99 (十二, 二十, 两); None if unreadable."""
-    if s.isdigit():
-        return int(s)
-    if "十" in s:
-        head, _, tail = s.partition("十")
-        if "十" in tail:
-            return None
-        tens = _CN_DIGITS.get(head, None) if head else 1
-        ones = _CN_DIGITS.get(tail, None) if tail else 0
-        return None if tens is None or ones is None else tens * 10 + ones
-    if len(s) == 1:
-        return _CN_DIGITS.get(s)
-    return None
-
-
-def place_values(text):
-    """{class: set of values} for the place tokens in `text`."""
-    t = unicodedata.normalize("NFKC", text or "")
-    out = defaultdict(set)
-    for m in _EN_NUM.finditer(t):
-        out[_EN_CLASS[m.group(1).lower()]].add(f"{int(m.group(2))}{m.group(3).lower()}")
-    for m in _EN_LETTER.finditer(t):
-        out[_EN_CLASS[m.group(1).lower()]].add(m.group(2).lower())
-    for m in _EN_DIR.finditer(t):
-        out["direction"].add(m.group(1).lower())
-    for ch, val in _ZH_DIR.items():
-        if ch in t:
-            out["direction"].add(val)
-    for m in _ZH_NUM.finditer(t):
-        n = cn_to_int(m.group(1))
-        out[_ZH_CLASS[m.group(2)]].add(str(n) if n is not None else m.group(1))
-    return dict(out)
-
-
-def twin_flags(item_text, turn_text):
-    """Sorted class names where item and turn both carry a value and some pair differs."""
-    a, b = place_values(item_text), place_values(turn_text)
-    return sorted(c for c in a.keys() & b.keys()
-                  if any(x != y for x in a[c] for y in b[c]))
-
 
 def flag_id(row):
     return f"{row['item_ref']}|{row['turn']}"
