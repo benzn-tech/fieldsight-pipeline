@@ -1884,15 +1884,9 @@ def write_extraction_items(date, user_folder, extraction_key):
             # before anyone is emailed about them.
             member_contexts = _resolve_member_contexts(conn, extraction)
 
-        # Task numbers ("#69", action packs spec §14 D1) for this pass's NEW action items --
-        # after carry-forward (a carried row already wears its predecessor's numbered
-        # stable_id) and as the LAST write of the transaction, so the per-site lock it takes
-        # comes after the source and day locks and is held only for the commit. Own
-        # SAVEPOINT; skipped before migration 0093; never fatal (number_new_items).
-        carry_forward_apply.number_new_items(conn, new_topic_ids, site["id"], extraction_key)
-
-        # Cross-session status reconcile R0: a read, after every write, in its own savepoint
-        # (reconcile_request.build) so a failure can never abort this transaction. A group
+        # Cross-session status reconcile R0: a read, after the item writes and BEFORE the
+        # task numbering below (whose per-site lock must be held only for the commit), in its
+        # own savepoint (reconcile_request.build) so a failure never aborts this transaction. A group
         # member is skipped in R0: the merge replaces its record, and group passes (tier
         # "group") are not reconciled either.
         # The SITE's company, never the recorder's home one -- find_items answers [] otherwise.
@@ -1901,6 +1895,13 @@ def write_extraction_items(date, user_folder, extraction_key):
             reconcile_body = reconcile_request.build(
                 conn, extraction, extraction_key, site, owner_company_id,
                 user_folder=user_folder, date=date, session_base=session_base)
+
+        # Task numbers ("#69", action packs spec §14 D1) for this pass's NEW action items --
+        # after carry-forward (a carried row already wears its predecessor's numbered
+        # stable_id) and as the LAST write of the transaction, so the per-site lock it takes
+        # comes after the source and day locks and is held only for the commit. Own
+        # SAVEPOINT; skipped before migration 0093; never fatal (number_new_items).
+        carry_forward_apply.number_new_items(conn, new_topic_ids, site["id"], extraction_key)
 
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
