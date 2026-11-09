@@ -89,9 +89,9 @@ DB write time. Today `find_items.first_seen` is the first row's `created_at` (th
 Wednesday looks newer than Tuesday's, so (a) re-emitting Tuesday's request would drop Monday's
 items again, and (b) Monday's own request can link Monday → Tuesday, an edge reversed in site time.
 (b) is a defect in the cross-day line independent of this design and is reported to TrackB.
-`find_items` already returns the recording date (`first_date` = the topic's `report_date`); the
-recording instant is that date plus the session's start time. **J1 is not built until both lines
-compare recording time.** If they decline, J1 is dropped and only J2-J4 ship.
+`find_items` already returns the recording date (`first_date` = the topic's `report_date`) and
+`source.session_base`, which encodes the session start (`Benl1_2026-03-20_12-18-34[_sid…]`, parsed by
+`transcript_utils.extract_base_time_from_filename`; naive, device-local NZ; None = unknown). Both lines accepted recording-time ordering on 2026-11-10 (§8); J1 is built on their rev-3 builders.
 
 **Detection**, per site and night: a session L whose final was written in the last 24 h, and an
 earlier-written session N on the same site where:
@@ -116,10 +116,10 @@ artifact_key, night, created_at, `UNIQUE (line, n_extraction_key, l_extraction_k
 `decision_records`, whose `subject_stable_id` is NOT NULL and item-keyed (0073); a re-emit has no
 item subject. The unique key is the "never twice for one (N, L)" invariant.
 
-**Deferred: dropped requests.** A request whose S3 retries ran out cannot be told apart today from
-one the model answered with zero claims: zero-candidate requests are never written, and cross-day
-records one row per claim. Detecting it needs both lines to record "processed, n claims" per
-request. That is proposed to them (§8) and not in v1.
+**Dropped requests: after both lines' per-request records land.** Today a request whose retries ran
+out looks like one with zero claims. Both lines agreed (§8) to record per request: cross-day an
+`item_continuity_xday_run` record, reconcile a `reconcile_results/` file. Once both exist, J1 also
+re-emits a request older than 6 h with no such record, once, counted in `nightly_reemits` (L = null).
 
 ### J2 Evidence repair: turn pick (model)
 
@@ -321,16 +321,17 @@ with AllowedValues, workflow variables `TEST_NIGHTLY_REMATCH` / `PROD_NIGHTLY_RE
 
 | Line | Nightly needs | That line keeps |
 |---|---|---|
-| jev TrackB (cross-day) | (1) **compare recording time, not `created_at`**, in candidate selection (X5) and the write-time check (X8). This is a defect in its own right (§3 J1). (2) the planned `_build_xday_request(conn, *, site, company_id, extraction, extraction_key, date)` made public, plus an optional `nonce` folded into `run_hash`; `"trigger"` in the artifact logged only. (3) later: a per-request "processed, n claims" record for dropped-request detection | prompt, guards, writer, `continues` rows, bars |
-| Status line (reconcile) | (1) the same recording-time ordering for "earlier"; (2) the candidate-building block in item_writer extracted into a function callable with an extraction artifact; (3) later: the per-request record, as above | the same |
+| jev TrackB (cross-day) | **Accepted 2026-11-10, spec/plan rev 3 in pipeline#1273.** (1) X5/X8 order by recording time: `first_date`, then session start on the same date; unknown start on the same date = unordered, dropped; `created_at` never orders. (2) public `build_xday_request(conn, *, site, company_id, extraction, extraction_key, date, nonce=None, trigger="final")`, `run_hash = sha1(key + extracted_at + (nonce or ""))[:16]`; `trigger` in the artifact only. (3) the link writer writes one `item_continuity_xday_run` record per invocation ("processed, n claims"), deduped on (input_key, input_hash) | prompt, guards, writer, `continues` rows, bars |
+| Status line (reconcile) | **Accepted 2026-11-10.** (1) recording-time ordering; it is also an R0 gap (a 14:00 item could absorb a 10:00 "done"). (2) `reconcile_request.build(conn, extraction, extraction_key, site, owner_company_id) -> dict \| None` and `reconcile_request.emit(s3, bucket, body)` (R0 Task 4); overwrite is safe: same S3 event, suggestions unique on (stable_id, suggested_status), pick cards on (segment_key, offset_sec, suggested_status). Caveat: a suggestion the person dismissed stays dismissed even when a re-run brings new evidence (0090). (3) later: `reconcile_results/<same key>.json` with counts after a successful writer invoke; no file = not processed | the same |
 | Track C | `find_items`, `insert_supported_by` gaining `decision_record_id`, `recompute_session`; agreement that J2 vs the prompt-index option is decided by measurement, and that J2 is a fallback writer if both ever run | `event_links` schema, `item_support`, its harness and gold |
 | P0 backend line | the hub's emit function and handler registration | the hub |
 
 **Proposal to the status line (not a ruling):** reconcile §12.2 gives pick cards their own small
 store. A pick card is a parent-design `choose` card. Storing it as `decision_cards` (purpose
 `choose`, options = the ≤4 candidates plus "none of these") would give it the inbox, quiet hours,
-recipients and the ≤3-per-day cap, and avoid a second card system. The status line decides; it can
-start with its own store and move once P1's inbox exists.
+recipients and the ≤3-per-day cap, and avoid a second card system. **Accepted as the target (2026-11-10):** R0 ships its own `status_pick_cards`
+table, shaped 1:1 (≤4 candidates + "none"; pending / chosen / none), and moves once `decision_cards`
+exists. This line pings the status line then.
 
 ## 9. Phasing
 
@@ -359,7 +360,7 @@ judgement.
 5. Nightly runs as a hub handler; this plan builds the minimal model-call-layer slice for J2 (§4.2).
 6. 01:00 site-local, NZ-only in v1, with one seam function for later time zones (§4.1).
 7. Re-emits are recorded in `nightly_reemits`, not `decision_records`; J2 records are per item.
-8. Dropped-request re-emits are deferred until the owning lines record per-request outcomes.
+8. Dropped-request re-emits wait for the owning lines' per-request records (both agreed).
 9. J4 has one fact in v1 and waits for real `continues` chains.
 10. Brake values in §6 are starting values; the pick-card proposal (§8) is a proposal only.
 
