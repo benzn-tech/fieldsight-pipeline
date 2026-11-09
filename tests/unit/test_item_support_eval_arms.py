@@ -188,6 +188,8 @@ def test_run_writes_four_files_per_session_with_the_frozen_prompt_sha(tmp_path):
         assert f["manifest_digest"] == digest
         assert f["emit_evidence"] is False and f["error"] is None
         assert f["n_segments"] == 1
+        assert f["status_evidence_floor_tokens"] == les.STATUS_EVIDENCE_FLOOR_TOKENS
+        assert f["evidence_window_sec"] == les.EVIDENCE_WINDOW_SEC
         assert f["usage"] == {"prompt_tokens": 100, "completion_tokens": 10}
         assert isinstance(f["latency_s"], float) and isinstance(f["shown"], list)
     assert arms.prompt_sha(True) != arms.prompt_sha(False)

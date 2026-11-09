@@ -121,7 +121,14 @@ def prompt_settings(emit_evidence):
     try:
         yield {"emit_evidence": les.EMIT_EVIDENCE,
                "transcript_text_limit": les.TRANSCRIPT_TEXT_LIMIT,
-               "truncation_head_share": les.TRUNCATION_HEAD_SHARE}
+               "truncation_head_share": les.TRUNCATION_HEAD_SHARE,
+               # Read from os.environ at import, not copied by load_deployed_llm_env: they
+               # decide verify_evidence and the side set's quote check (dropped_by.weak).
+               # Export the deployed values before the run; recorded so a mismatch shows.
+               "evidence_window_sec": les.EVIDENCE_WINDOW_SEC,
+               "evidence_floor_tokens": les.EVIDENCE_FLOOR_TOKENS,
+               "evidence_fuzzy": les.EVIDENCE_FUZZY,
+               "status_evidence_floor_tokens": les.STATUS_EVIDENCE_FLOOR_TOKENS}
     finally:
         les.EMIT_EVIDENCE = old
 
@@ -265,9 +272,9 @@ def run_arm(sessions, arm, rep, *, dry_run, call=None, stage="fit",
 
 
 def run_stage(stage, *, call, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR,
-              emit_evidence):
+              emit_evidence, digest=None):
     sessions = stage_sessions(stage, data_dir)
-    digest = stage_digest(stage, data_dir)
+    digest = digest or stage_digest(stage, data_dir)
     rows = []
     for s, arm, rep in jobs(sessions):
         rows.extend(run_arm([s], arm, rep, dry_run=False, call=call, stage=stage,
@@ -334,9 +341,10 @@ def main(argv=None, *, call=None, load_env=None):
               f"(got {a.confirm_count}).", file=sys.stderr)
         raise SystemExit(2)
     store.require_eval_dir(a.runs)
+    digest = stage_digest(a.stage, a.data)   # a missing manifest refuses before the config read
     copied = (load_env or _default_load_env)(a.function, profile=a.profile, region=a.region)
     rows = run_stage(a.stage, call=call or _default_call, data_dir=a.data, runs_dir=a.runs,
-                     emit_evidence=emit)
+                     emit_evidence=emit, digest=digest)
     out = {"stage": a.stage, "calls": sum(1 for x in rows if not x.get("skipped")),
            "errors": sum(1 for x in rows if x.get("error")),
            "skipped_existing": sum(1 for x in rows if x.get("skipped")),
