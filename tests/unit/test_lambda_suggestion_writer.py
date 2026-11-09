@@ -328,14 +328,17 @@ class FakeTxConn(FakeConn):
         return FakeConn()
 
 
+ST_SITE = "0b5e7c1a-2f3d-4c6b-9a8e-7d6c5b4a3f21"   # site ids are compared as uuids
+
+
 def _status(**overrides):
-    s = dict(stable_id="sid-1", site_id="site-1", suggested_status="done",
+    s = dict(stable_id="sid-1", site_id=ST_SITE, suggested_status="done",
              quote="that one is done", segment_key="seg-1", offset_sec=12.0, run="final:x")
     s.update(overrides)
     return s
 
 
-def _live(stable_id="sid-1", site_id="site-1", status="open", company_id="co-1"):
+def _live(stable_id="sid-1", site_id=ST_SITE, status="open", company_id="co-1"):
     return {"stable_id": stable_id, "site_id": site_id, "status": status,
             "company_id": company_id}
 
@@ -364,7 +367,7 @@ def test_status_only_payload_opens_connection(monkeypatch):
     result = sw.lambda_handler({"status_suggestions": [_status()]}, None)
 
     assert len(opened) == 1
-    assert inserted == [("co-1", "site-1", "sid-1", "done")]
+    assert inserted == [("co-1", ST_SITE, "sid-1", "done")]
     assert opened[0].transactions == 1, "each status insert runs in its own savepoint"
     assert result == {"written": 0, "status_written": 1,
                       "status_skipped": {"gone": 0, "moved_site": 0, "terminal": 0,
@@ -377,11 +380,11 @@ def test_pick_only_payload_opens_connection(monkeypatch):
     monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", lambda conn, *a: {"id": "p"})
 
     result = sw.lambda_handler({"pick_cards": [{
-        "site_id": "site-1", "suggested_status": "done", "quote": "q", "segment_key": "k",
+        "site_id": ST_SITE, "suggested_status": "done", "quote": "q", "segment_key": "k",
         "offset_sec": 1.0, "candidates": ["a", "b"], "run": "final:x"}]}, None)
 
     assert result == {"written": 0, "picks_written": 1,
-                      "picks_skipped": {"gone": 0, "duplicate": 0, "failed": 0}}
+                      "picks_skipped": _picks_skipped()}
 
 
 def test_old_payload_response_unchanged(monkeypatch):
@@ -407,3 +410,84 @@ def test_old_payload_response_unchanged(monkeypatch):
         {"written": 1, "impacts_applied": 1}
     assert sw.lambda_handler({"status_suggestions": [], "pick_cards": None}, None) == \
         {"written": 0}
+
+
+def _picks_skipped(**over):
+    d = {"gone": 0, "moved_site": 0, "terminal": 0, "same": 0, "too_many": 0,
+         "duplicate": 0, "failed": 0}
+    d.update(over)
+    return d
+
+
+def _card(candidates, site_id="site-1"):
+    return {"site_id": site_id, "suggested_status": "done", "quote": "q",
+            "segment_key": "k", "offset_sec": 1.0, "candidates": candidates, "run": "final:x"}
+
+
+SITE = "6f1c2b9e-3d4a-4e5f-8a7b-1c2d3e4f5a6b"
+
+
+def test_pick_card_with_more_than_four_survivors_is_skipped_not_truncated(monkeypatch):
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeTxConn())
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id",
+                        lambda conn, sid: _live(sid, site_id=SITE))
+
+    def _boom(*a, **k):
+        raise AssertionError("a card with >4 survivors must never be inserted (or truncated)")
+
+    monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", _boom)
+    result = sw.lambda_handler({"pick_cards": [_card(list("abcde"), SITE)]}, None)
+    assert result["picks_written"] == 0
+    assert result["picks_skipped"] == _picks_skipped(too_many=1)
+
+
+def test_site_ids_compare_canonically(monkeypatch):
+    """An uppercase site uuid on the event matches the row's lowercase one, on both paths."""
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeTxConn())
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id",
+                        lambda conn, sid: _live(sid, site_id=SITE))
+    monkeypatch.setattr(sw.status_suggestions, "insert_suggestion", lambda conn, *a: {"id": 1})
+    monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", lambda conn, *a: {"id": 2})
+    result = sw.lambda_handler({
+        "status_suggestions": [_status(site_id=SITE.upper())],
+        "pick_cards": [_card(["a", "b"], SITE.upper())]}, None)
+    assert result["status_written"] == 1
+    assert result["picks_written"] == 1
+
+
+def test_malformed_event_site_is_moved_site_not_an_exception(monkeypatch):
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeTxConn())
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id",
+                        lambda conn, sid: _live(sid, site_id=SITE))
+
+    def _boom(*a, **k):
+        raise AssertionError("nothing may be inserted for a malformed site id")
+
+    monkeypatch.setattr(sw.status_suggestions, "insert_suggestion", _boom)
+    monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", _boom)
+    result = sw.lambda_handler({
+        "status_suggestions": [_status(site_id="not-a-uuid"), _status(site_id=None)],
+        "pick_cards": [_card(["a", "b"], "not-a-uuid")]}, None)
+    assert result["status_skipped"]["moved_site"] == 2
+    assert result["picks_skipped"] == _picks_skipped(moved_site=1)
+
+
+def test_pick_card_insert_failure_counts_failed(monkeypatch):
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeTxConn())
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id",
+                        lambda conn, sid: _live(sid, site_id=SITE))
+
+    def _raise(*a, **k):
+        raise RuntimeError("check violation")
+
+    monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", _raise)
+    result = sw.lambda_handler({"pick_cards": [_card(["a", "b"], SITE)]}, None)
+    assert result == {"written": 0, "picks_written": 0,
+                      "picks_skipped": _picks_skipped(failed=1)}
+
+
+def test_verdicts_only_payload_response_unchanged(monkeypatch):
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeTxConn())
+    monkeypatch.setattr(sw, "_record_verdict", lambda conn, entry, cache: True)
+    result = sw.lambda_handler({"verdicts": [{"kind": "programme_match"}]}, None)
+    assert result == {"written": 0, "verdicts_recorded": 1, "verdicts_failed": 0}

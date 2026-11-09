@@ -324,8 +324,8 @@ def test_pick_card_requires_all_candidates_live_on_site(seeded):
         _pick(seeded, [s["Send drawings"], ghost, s["Book crane"], s["Other site item"],
                        s["Order rebar"]], offset=5.0),
         _pick(seeded, [s["Pour slab"], ghost, s["Other site item"]], offset=6.0)]}, None)
-    assert r == {"written": 0, "picks_written": 1,
-                 "picks_skipped": {"gone": 1, "duplicate": 0, "failed": 0}}
+    # Card 2: the ghost leaves 2 possible; the other-site drop takes it below 2 -> moved_site.
+    assert r == {"written": 0, "picks_written": 1, "picks_skipped": _pskipped(moved_site=1)}
     rows = _picks(seeded)
     assert len(rows) == 1
     assert rows[0][0] == [s["Send drawings"], s["Book crane"], s["Order rebar"]]
@@ -373,9 +373,41 @@ def test_failed_status_insert_does_not_abort_batch(seeded, monkeypatch):
 
     assert r == {"written": 1, "status_written": 1, "status_skipped": _skipped(failed=1),
                  "picks_written": 1,
-                 "picks_skipped": {"gone": 0, "duplicate": 0, "failed": 0}}
+                 "picks_skipped": _pskipped()}
     assert seeded.seed.execute(
         "SELECT count(*) FROM programme_progress_suggestions WHERE site_id=%s",
         (seeded.site["id"],)).fetchone()[0] == 1, "the programme suggestion must commit"
     assert [row[0] for row in _stored(seeded)] == [s["Book crane"]]
     assert len(_picks(seeded)) == 1
+
+
+def _pskipped(**over):
+    d = {"gone": 0, "moved_site": 0, "terminal": 0, "same": 0, "too_many": 0,
+         "duplicate": 0, "failed": 0}
+    d.update(over)
+    return d
+
+
+def test_pick_card_drops_terminal_and_same_candidates(seeded):
+    """Choosing a closed candidate from a stale card would PATCH a hand-closed item back open;
+    a candidate already at the card's status is a no-op choice. Both are dropped."""
+    s = seeded.stable
+    seeded.seed.execute("UPDATE action_items SET status='closed' WHERE stable_id=%s",
+                        (s["Send drawings"],))
+    seeded.seed.execute("UPDATE action_items SET status='blocked' WHERE stable_id=%s",
+                        (s["Pour slab"],))
+    blocked_card = dict(_pick(seeded, [s["Pour slab"], s["Order rebar"]], offset=9.0),
+                        suggested_status="blocked")
+    r = lambda_suggestion_writer.lambda_handler({"pick_cards": [
+        # Suggested blocked; Pour slab is already blocked -> below 2 -> same.
+        blocked_card,
+        # 2 candidates, one closed -> below 2 because of the closed one -> terminal.
+        _pick(seeded, [s["Book crane"], s["Send drawings"]], offset=7.0),
+        # 3 candidates, one closed -> written with the other 2.
+        _pick(seeded, [s["Book crane"], s["Send drawings"], s["Order rebar"]], offset=8.0),
+    ]}, None)
+    assert r == {"written": 0, "picks_written": 1, "picks_skipped": _pskipped(terminal=1, same=1)}
+    rows = _picks(seeded)
+    assert len(rows) == 1
+    assert rows[0][0] == [s["Book crane"], s["Order rebar"]]
+    assert rows[0][3] == 8.0
