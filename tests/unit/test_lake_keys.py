@@ -82,6 +82,7 @@ CASES = [
     ("voice/%s/%s/a_b.m4a" % (U, S), dict(scope="tenant", kind="voice", company_id=U, site_id=S)),
     ("voiceprint_requests/%s/base1/r.json" % U, dict(scope="tenant", kind="voiceprint", company_id=U, session_base="base1")),
     ("match_requests/%s/%s/h.json" % (S, D), dict(scope="tenant", kind="match", site_id=S, day=D)),
+    ("reconcile_requests/%s/%s/h.json" % (S, D), dict(scope="tenant", kind="reconcile", site_id=S, day=D)),
     ("weather/%s/%s/actual.json" % (S, D), dict(scope="tenant", kind="weather", site_id=S, site_slug=None, day=D)),
     ("weather/tower-a/%s/actual.json" % D, dict(scope="tenant", kind="weather", site_id=None, site_slug="tower-a", day=D)),
     ("programmes/%s/programme.json" % S, dict(scope="tenant", kind="programme", site_id=S, site_slug=None)),
