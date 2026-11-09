@@ -26,6 +26,7 @@ RUNS_DIR = PACKAGE_DIR / "runs"
 LABELS_DIR = PACKAGE_DIR / "labels"
 RESULTS_DIR = PACKAGE_DIR / "results"
 _GUARDED = ("data", "runs", "labels")
+SIDE_SUBDIR = "side"   # data/side/: the status line's six sessions (locator spec section 6)
 _DT = "$dt"
 
 SPLIT_SEED = "item-support-eval-2026-11-09"
@@ -102,6 +103,13 @@ def encode_turn(turn):
 
 def decode_turn(turn):
     return _dec(turn)
+
+
+def locator_run_path(arm, rep, ref, *, side=False, runs_dir=RUNS_DIR):
+    """runs/locator/<arm>/<rep>/<ref>.json; the side set under runs/locator/side/ (a side
+    session can also be in the main set, and runs with a different prompt)."""
+    base = Path(runs_dir, "locator", *((SIDE_SUBDIR,) if side else ()))
+    return Path(base, arm, str(rep), f"{ref}.json")
 
 
 def session_key(folder, date, base):
