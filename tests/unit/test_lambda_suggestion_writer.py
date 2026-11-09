@@ -309,3 +309,101 @@ def test_suggestions_and_impacts_same_transaction(monkeypatch):
 
     assert result == {"written": 1, "impacts_applied": 1}
     assert len(connections) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-session status reconcile r0, Task 3: status_suggestions + pick_cards
+# ---------------------------------------------------------------------------
+
+class FakeTxConn(FakeConn):
+    """FakeConn plus a no-op conn.transaction() -- the status/pick inserts each run in their
+    own savepoint. A fake cannot show a psycopg aborted transaction; the real savepoint is
+    proven in tests/integration/test_status_suggestions_writer.py."""
+
+    def __init__(self):
+        self.transactions = 0
+
+    def transaction(self):
+        self.transactions += 1
+        return FakeConn()
+
+
+def _status(**overrides):
+    s = dict(stable_id="sid-1", site_id="site-1", suggested_status="done",
+             quote="that one is done", segment_key="seg-1", offset_sec=12.0, run="final:x")
+    s.update(overrides)
+    return s
+
+
+def _live(stable_id="sid-1", site_id="site-1", status="open", company_id="co-1"):
+    return {"stable_id": stable_id, "site_id": site_id, "status": status,
+            "company_id": company_id}
+
+
+def test_status_only_payload_opens_connection(monkeypatch):
+    """suggestions/impacts/verdicts all absent, status_suggestions non-empty: the guard must
+    still let it through to the DB."""
+    opened = []
+
+    def fake_get_connection(*a, **k):
+        conn = FakeTxConn()
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sw, "get_connection", fake_get_connection)
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id", lambda conn, sid: _live(sid))
+    inserted = []
+
+    def fake_insert(conn, company_id, site_id, stable_id, status, quote, segment_key,
+                    offset_sec, run):
+        inserted.append((company_id, site_id, stable_id, status))
+        return {"id": "s-1"}
+
+    monkeypatch.setattr(sw.status_suggestions, "insert_suggestion", fake_insert)
+
+    result = sw.lambda_handler({"status_suggestions": [_status()]}, None)
+
+    assert len(opened) == 1
+    assert inserted == [("co-1", "site-1", "sid-1", "done")]
+    assert opened[0].transactions == 1, "each status insert runs in its own savepoint"
+    assert result == {"written": 0, "status_written": 1,
+                      "status_skipped": {"gone": 0, "moved_site": 0, "terminal": 0,
+                                         "same": 0, "duplicate": 0, "failed": 0}}
+
+
+def test_pick_only_payload_opens_connection(monkeypatch):
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeTxConn())
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id", lambda conn, sid: _live(sid))
+    monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", lambda conn, *a: {"id": "p"})
+
+    result = sw.lambda_handler({"pick_cards": [{
+        "site_id": "site-1", "suggested_status": "done", "quote": "q", "segment_key": "k",
+        "offset_sec": 1.0, "candidates": ["a", "b"], "run": "final:x"}]}, None)
+
+    assert result == {"written": 0, "picks_written": 1,
+                      "picks_skipped": {"gone": 0, "duplicate": 0, "failed": 0}}
+
+
+def test_old_payload_response_unchanged(monkeypatch):
+    """An old matcher's payload (and one with the new keys present but EMPTY) answers with
+    exactly today's keys: no status_* / picks_* key appears, and neither new repo is
+    touched."""
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeConn())
+    monkeypatch.setattr(sw.programme_suggestions, "upsert_suggestion",
+                        lambda conn, **kw: {"id": "sugg-1"})
+    monkeypatch.setattr(sw.findings, "apply_impact",
+                        lambda conn, finding_id, **kw: {"id": finding_id})
+
+    def _boom(*a, **k):
+        raise AssertionError("the new repos must not be touched for an old payload")
+
+    monkeypatch.setattr(sw.action_items, "get_live_by_stable_id", _boom)
+    monkeypatch.setattr(sw.status_suggestions, "insert_suggestion", _boom)
+    monkeypatch.setattr(sw.status_pick_cards, "insert_pick_card", _boom)
+
+    old = {"suggestions": [_suggestion()], "impacts": [_impact()]}
+    assert sw.lambda_handler(old, None) == {"written": 1, "impacts_applied": 1}
+    assert sw.lambda_handler(dict(old, status_suggestions=[], pick_cards=[]), None) == \
+        {"written": 1, "impacts_applied": 1}
+    assert sw.lambda_handler({"status_suggestions": [], "pick_cards": None}, None) == \
+        {"written": 0}
