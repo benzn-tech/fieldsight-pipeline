@@ -33,6 +33,11 @@ def check_by_at(quote, at):
             "offset_sec": float(h * 3600 + m * 60 + s), "quote": quote}
 
 
+def _assert_accounted(out):
+    c = out.counts
+    assert c["offered"] == c["kept"] + c["picks"] + sum(c["dropped_by"].values())
+
+
 WEST = cand("sid-west", "Order copper pipe for the west block")
 EAST = cand("sid-east", "Order PVC pipe for the east block")
 
@@ -40,6 +45,9 @@ EAST = cand("sid-east", "Order PVC pipe for the east block")
 def test_numeral_normalisation():
     assert sr.normalise_numerals("unit four, level one, 三楼") == "unit 4, level 1, 3楼"
     assert sr.normalise_numerals("一起去统一") == "一起去统一"
+    # compound numerals are never half-rewritten
+    for text in ("一百零一号", "一千零二楼", "十二楼", "三万零五号"):
+        assert sr.normalise_numerals(text) == text
 
 
 def test_pronoun_one_is_not_a_number():
@@ -116,7 +124,12 @@ def test_twin_wrong_side_is_dropped():
     out = sr.judge([hit("C2", q)], [WEST, EAST], check)
     assert all(s["stable_id"] != "sid-east" for s in out.suggestions)
     assert out.suggestions == []
-    assert len(out.picks) == 1 or out.counts["dropped_by"].get("twin") == 1
+    # The card would be [west, east]; east contradicts the quote's "west" (label_conflict),
+    # leaving one candidate, so the hit is dropped -- never a 1-candidate card, never east.
+    assert (len(out.picks) == 1 or out.counts["dropped_by"].get("twin") == 1
+            or out.counts["dropped_by"].get("label_conflict") == 1)
+    assert all("sid-east" not in p["candidates"] or len(p["candidates"]) >= 2
+               for p in out.picks)
 
 
 def test_generic_token_goes_to_pick_card():
@@ -163,6 +176,7 @@ def test_one_anchor_two_candidates_becomes_pick():
     assert len(out.picks) == 1
     assert sorted(out.picks[0]["candidates"]) == ["skip", "slab"]
     assert out.picks[0]["offset_sec"] == 36000.0
+    _assert_accounted(out)
 
 
 def test_latest_status_wins_per_candidate():
@@ -199,3 +213,93 @@ def test_pick_caps_at_four():
     assert out.suggestions == []
     assert len(out.picks) == 1
     assert len(out.picks[0]["candidates"]) == 4
+
+
+SKIP = cand("sid-skip", "Order skip bin")
+
+
+def test_contradicting_level_number_dropped():
+    cands = [cand("l1", "Pour level 1 slab"), SKIP]
+    for q in ("Level 2 slab pour is done", "level two slab pour is done"):
+        out = sr.judge([hit("C1", q)], cands, check)
+        assert out.suggestions == [] and out.picks == []
+        assert out.counts["dropped_by"] == {"label_conflict": 1}
+
+
+def test_contradicting_direction_dropped():
+    out = sr.judge([hit("C1", "the pipe in the east bathroom is done")], [WEST, SKIP], check)
+    assert out.suggestions == [] and out.picks == []
+    assert out.counts["dropped_by"] == {"label_conflict": 1}
+
+
+def test_absent_label_is_not_a_conflict():
+    out = sr.judge([hit("C1", "The copper pipe is done now")], [WEST, SKIP], check)
+    assert [(s["stable_id"], s["suggested_status"]) for s in out.suggestions] == [
+        ("sid-west", "done")]
+
+
+def test_cjk_label_conflict():
+    out = sr.judge([hit("C1", "三楼的防水膜订好了")], [cand("f2", "二楼防水膜订购")], check)
+    assert out.suggestions == [] and out.picks == []
+    assert out.counts["dropped_by"] == {"label_conflict": 1}
+
+
+def test_card_and_suggestion_on_same_anchor_merge():
+    """Spec §6: one anchor -> at most one candidate. C1 alone would be a suggestion on west and
+    C2 a card over [west, east]; grouped by anchor they can never yield both.
+
+    With label_conflict applied per card candidate (fix round 1, point 4), east contradicts
+    the quote's "west", the merged card is left with one candidate and is dropped -- so this
+    exact input gives no card either. test_card_and_suggestion_merge_into_one_card shows the
+    merge producing one card where no label conflicts."""
+    q = "west block copper pipe done"
+    out = sr.judge([hit("C1", q), hit("C2", q)], [WEST, EAST], check)
+    assert out.suggestions == []
+    assert out.picks == []
+    assert out.counts["dropped_by"] == {"label_conflict": 2}
+    _assert_accounted(out)
+
+
+def test_card_and_suggestion_merge_into_one_card():
+    cands = [cand("bin", "Order skip bin"), cand("lid", "Order skip bin lid")]
+    q = "The skip bin lid order is done"
+    alone = sr.judge([hit("C2", q)], cands, check)
+    assert [s["stable_id"] for s in alone.suggestions] == ["lid"]      # C2 alone: suggestion
+    out = sr.judge([hit("C2", q), hit("C1", q)], cands, check)          # C1 alone: a card
+    assert out.suggestions == []
+    assert len(out.picks) == 1
+    assert sorted(out.picks[0]["candidates"]) == ["bin", "lid"]
+    assert out.counts["dropped_by"] == {"duplicate_card": 1}
+    _assert_accounted(out)
+
+
+def test_identical_cards_are_counted_once():
+    cands = [cand("leak", "Fix west pipe leak under slab"),
+             cand("fit", "Order pipe fittings for level 2")]
+    q = "The pipe's all done mate, finished it"
+    out = sr.judge([hit("C1", q), hit("C2", q)], cands, check)
+    assert len(out.picks) == 1
+    assert out.counts["dropped_by"] == {"duplicate_card": 1}
+    _assert_accounted(out)
+
+
+def test_card_drops_candidates_already_at_status():
+    q = "The pipe job is all done now"
+    three = [cand("a", "Pipe job alpha", status="done"), cand("b", "Pipe job bravo"),
+             cand("c", "Pipe job charlie")]
+    out = sr.judge([hit("C2", q)], three, check)
+    assert len(out.picks) == 1
+    assert sorted(out.picks[0]["candidates"]) == ["b", "c"]
+    two = [cand("a", "Pipe job alpha", status="done"), cand("b", "Pipe job bravo")]
+    out = sr.judge([hit("C2", q)], two, check)
+    assert out.suggestions == [] and out.picks == []
+    assert out.counts["dropped_by"] == {"same_status": 1}
+
+
+def test_card_drops_label_conflicting_candidates():
+    cands = [cand("l1", "Pipe job level 1"), cand("l2", "Pipe job level 2"),
+             cand("x", "Pipe job annex")]
+    out = sr.judge([hit("C3", "The level 2 pipe job is done")], cands, check)
+    assert out.suggestions == []
+    assert len(out.picks) == 1
+    assert sorted(out.picks[0]["candidates"]) == ["l2", "x"]

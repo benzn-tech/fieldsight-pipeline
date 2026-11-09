@@ -38,10 +38,12 @@ _EN_LABEL = re.compile(
     r"\b(%s)(\s+)(%s)\b" % ("|".join(_UNIT_NOUNS), "|".join(_EN_NUMBERS)), re.IGNORECASE)
 
 # Single-digit numerals and digit-by-digit runs ("二零三号" -> "203号") before a measure word.
-# Compound numerals with 十/百 ("十二楼") are left alone, never half-rewritten. 两 is a count
-# ("两栋" = two buildings), not a label, so it is not a numeral here.
+# Compound numerals ("十二楼", "一百零一号", "一千零二楼") are left alone, never half-rewritten:
+# a run whose left neighbour is 十/百/千/万/零 is the tail of one. 两 is a count ("两栋" = two
+# buildings), not a label, so it is not a numeral here.
+_CN_MEASURE = ("单元", "楼", "层", "号", "栋", "期")
 _CN_DIGITS = {ch: str(i) for i, ch in enumerate("零一二三四五六七八九")}
-_CN_LABEL = re.compile(r"(?<![十百])([零一二三四五六七八九]+)(?=单元|楼|层|号|栋|期)")
+_CN_LABEL = re.compile(r"(?<![十百千万零])([零一二三四五六七八九]+)(?=%s)" % "|".join(_CN_MEASURE))
 
 
 def normalise_numerals(text: str) -> str:
@@ -53,6 +55,44 @@ def normalise_numerals(text: str) -> str:
 
 def _toks(text):
     return set(item_text_match.tokens(normalise_numerals(text)))
+
+
+# --- labels (label_conflict) ----------------------------------------------------------------
+_EN_NUM_LABEL = re.compile(r"\b(%s)\s+(\d+)\b" % "|".join(_UNIT_NOUNS))
+_CN_NUM_LABEL = re.compile(r"(\d+)\s*(%s)" % "|".join(_CN_MEASURE))
+_DIRECTIONS_EN = frozenset(
+    "north south east west upper lower front back left right".split())
+_DIRECTIONS_CJK = frozenset("东南西北上下前后左右")
+
+
+def _number_labels(text):
+    """{unit noun or measure word: {number, ...}} after numeral normalisation."""
+    t = normalise_numerals(text).lower()
+    out = {}
+    for noun, num in _EN_NUM_LABEL.findall(t):
+        out.setdefault(noun, set()).add(str(int(num)))
+    for num, noun in _CN_NUM_LABEL.findall(t):
+        out.setdefault(noun, set()).add(str(int(num)))
+    return out
+
+
+def _directions(text):
+    t = (text or "").lower()
+    return ({w for w in re.findall(r"[a-z]+", t) if w in _DIRECTIONS_EN}
+            | {ch for ch in t if ch in _DIRECTIONS_CJK})
+
+
+def _label_conflict(quote, item_text):
+    """True when the quote names a label that contradicts the item's: the same unit noun with
+    a different number ("level 2" vs "Level 1 slab"), or a side the item lacks while the item
+    names a side the quote lacks ("east bathroom" vs "west block"). A label merely absent from
+    the quote is not a conflict."""
+    q_nums, i_nums = _number_labels(quote), _number_labels(item_text)
+    for noun, nums in q_nums.items():
+        if noun in i_nums and not (i_nums[noun] & nums):
+            return True
+    q_dirs, i_dirs = _directions(quote), _directions(item_text)
+    return bool(q_dirs - i_dirs) and bool(i_dirs - q_dirs)
 
 
 # --- prompt ---------------------------------------------------------------------------------
@@ -170,7 +210,10 @@ def _order(indices, candidates, quote, overlaps, pick=None):
 
 
 def _anchor_and_twin(pick, candidates, quote):
-    """('ok', None) | ('drop', reason) | ('card', [candidate index, ...])."""
+    """('ok', None) | ('drop', reason) | ('card', [candidate index, ...]).
+
+    A card's indices are unordered and uncapped here: _anchor_card filters, orders and caps
+    them once per anchor."""
     q = _toks(quote)
     ctoks = [_toks(c.get("text") or "") for c in candidates]
     overlaps = [len(q & t) for t in ctoks]
@@ -184,8 +227,7 @@ def _anchor_and_twin(pick, candidates, quote):
     others = set().union(*(ctoks[i] for i in range(len(candidates)) if i != pick))
     unique = (q & ctoks[pick]) - others
     if len(leaders) > 1 or pick not in leaders or not unique:
-        card = _order(plausible, candidates, quote, overlaps, pick)
-        return ("card", card) if len(card) >= 2 else ("drop", "anchor")
+        return ("card", plausible) if len(plausible) >= 2 else ("drop", "anchor")
 
     # twin: against every other plausible candidate, the quote must name one of the pick's
     # distinguishing words and none of the other's ("west... no wait, the east one").
@@ -197,13 +239,14 @@ def _anchor_and_twin(pick, candidates, quote):
         if not (q & d_pick) or (q & d_other):
             offending.append(i)
     if offending:
-        rest = _order(offending, candidates, quote, overlaps)[:PICK_CAP - 1]
-        return "card", [pick] + rest
+        return "card", [pick] + offending
     return "ok", None
 
 
 def judge(hits, candidates, check) -> Outcome:
     """Run every hit through the guards (spec §6; the first failure names the drop).
+
+    Order: shape -> evidence -> anchor -> twin -> label_conflict -> one_to_one -> same_status.
 
     `check(quote, at)` is _check_status_quote's shape: {status, segment_key, offset_sec,
     quote}; it must not raise. Returns Outcome(suggestions, picks, counts):
@@ -211,26 +254,20 @@ def judge(hits, candidates, check) -> Outcome:
       pick       {suggested_status, quote, segment_key, offset_sec, candidates: [stable_id]}
                  (2..4 stable_ids, best first)
       counts     {offered, kept, picks, dropped_by: {reason: n}}
-    A hit that loses to a later hit on the same candidate counts as `superseded`."""
+
+    Every hit is accounted for once: offered == kept + picks + sum(dropped_by). Extra hits
+    folded into one anchor's card count as `duplicate_card`; a hit that loses to a later hit
+    on the same candidate counts as `superseded`."""
     hits = hits or []
     n = len(candidates)
     dropped = {}
-    picks, seen_cards = [], set()
 
     def drop(reason, k=1):
         dropped[reason] = dropped.get(reason, 0) + k
 
-    def add_card(status, quote, r, indices):
-        sids = [candidates[i]["stable_id"] for i in indices]
-        key = (r.get("segment_key"), r.get("offset_sec"), status, tuple(sids))
-        if key in seen_cards:
-            return
-        seen_cards.add(key)
-        picks.append({"suggested_status": status, "quote": quote,
-                      "segment_key": r.get("segment_key"), "offset_sec": r.get("offset_sec"),
-                      "candidates": sids})
-
-    survivors = []      # (candidate index, hit, check result)
+    # Per hit: shape, evidence, anchor, twin, label_conflict. What passes evidence and is not
+    # dropped is either a suggestion-to-be ("ok") or a card ("card"), keyed by its anchor.
+    passed = []         # (verdict, candidate indices, hit, check result, quote)
     for h in hits:
         if not _shape_ok(h, n):
             drop("shape")
@@ -246,48 +283,79 @@ def judge(hits, candidates, check) -> Outcome:
         if verdict == "drop":
             drop(detail)
         elif verdict == "card":
-            add_card(h["status"], quote, r, detail)
+            passed.append(("card", detail, h, r, quote))
+        elif _label_conflict(quote, candidates[pick].get("text") or ""):
+            drop("label_conflict")
         else:
-            survivors.append((pick, h, r))
+            passed.append(("ok", [pick], h, r, quote))
 
-    # one_to_one, part 1: one verified anchor -> at most one candidate and one status.
+    # one_to_one, part 1: one verified anchor -> at most one candidate and one status. Every
+    # hit that passed evidence is grouped, cards included, before suggestion vs card is decided.
     groups = {}
-    for s in survivors:
-        groups.setdefault((s[2].get("segment_key"), s[2].get("offset_sec")), []).append(s)
-    single = []
+    for p in passed:
+        groups.setdefault((p[3].get("segment_key"), p[3].get("offset_sec")), []).append(p)
+    picks, single = [], []
     for group in groups.values():
-        statuses = {h["status"] for _i, h, _r in group}
-        indices = list(dict.fromkeys(i for i, _h, _r in group))
-        if len(statuses) > 1:
+        if len({p[2]["status"] for p in group}) > 1:
             drop("conflict", len(group))
-        elif len(indices) > 1:
-            first = min(group, key=lambda s: _at_key(s[1]["at"]))
-            add_card(first[1]["status"], first[2].get("quote") or first[1]["quote"], first[2],
-                     indices[:PICK_CAP])
+            continue
+        union = list(dict.fromkeys(i for p in group for i in p[1]))
+        if any(p[0] == "card" for p in group) or len(union) > 1:
+            card = _anchor_card(group, union, candidates)
+            if isinstance(card, str):
+                drop(card, len(group))
+            else:
+                picks.append(card)
+                if len(group) > 1:
+                    drop("duplicate_card", len(group) - 1)
         else:
             single.extend(group)
 
     # one_to_one, part 2: one candidate -> its latest status.
     latest = {}
-    for s in single:
-        cur = latest.get(s[0])
-        if cur is None or _at_key(s[1]["at"]) >= _at_key(cur[1]["at"]):
-            latest[s[0]] = s
-    drop_superseded = len(single) - len(latest)
-    if drop_superseded:
-        drop("superseded", drop_superseded)
+    for p in single:
+        i = p[1][0]
+        cur = latest.get(i)
+        if cur is None or _at_key(p[2]["at"]) >= _at_key(cur[2]["at"]):
+            latest[i] = p
+    if len(single) > len(latest):
+        drop("superseded", len(single) - len(latest))
 
     suggestions = []
-    for i, h, r in sorted(latest.values(), key=lambda s: s[0]):
+    for i, p in sorted(latest.items()):
+        _v, _ix, h, r, quote = p
         c = candidates[i]
         if c.get("status") == h["status"]:
             drop("same_status")
             continue
         suggestions.append({"stable_id": c["stable_id"], "suggested_status": h["status"],
-                            "quote": r.get("quote") or h["quote"],
-                            "segment_key": r.get("segment_key"),
+                            "quote": quote, "segment_key": r.get("segment_key"),
                             "offset_sec": r.get("offset_sec")})
 
     counts = {"offered": len(hits), "kept": len(suggestions), "picks": len(picks),
               "dropped_by": dropped}
     return Outcome(suggestions, picks, counts)
+
+
+def _anchor_card(group, union, candidates):
+    """One card for an anchor, or the drop reason when fewer than 2 candidates survive.
+
+    The earliest-`at` hit gives the card its quote and status. Candidates are the union over
+    the anchor, best first against that quote; label_conflict and then same_status remove
+    candidates one by one, and a card left with 1 is dropped (never a 1-candidate card)."""
+    _v, _ix, h, r, quote = min(group, key=lambda p: _at_key(p[2]["at"]))
+    status = h["status"]
+    rows = [c.get("text") or "" for c in candidates]
+    q = _toks(quote)
+    overlaps = [len(q & _toks(t)) for t in rows]
+    indices = [i for i in union if not _label_conflict(quote, rows[i])]
+    if len(indices) < 2:
+        return "label_conflict"
+    indices = [i for i in indices if candidates[i].get("status") != status]
+    if len(indices) < 2:
+        return "same_status"
+    indices = _order(indices, candidates, quote, overlaps, _alias_index(h["alias"],
+                                                                         len(candidates)))
+    return {"suggested_status": status, "quote": quote, "segment_key": r.get("segment_key"),
+            "offset_sec": r.get("offset_sec"),
+            "candidates": [candidates[i]["stable_id"] for i in indices]}
