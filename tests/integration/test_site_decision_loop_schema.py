@@ -102,6 +102,38 @@ def test_ledger_supersession_is_a_new_row(db):
     assert new[3] == []                # evidence defaults to an empty list
 
 
+def test_ledger_rejects_truncate(db):
+    co, site = _seed(db)
+    _ledger(db, co, site)
+    with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+        with db.transaction():
+            db.execute("TRUNCATE decision_ledger")
+
+
+def test_run_events_carry_tenancy_not_null(db):
+    cols = dict(db.execute(
+        "SELECT column_name, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = 'run_events'").fetchall())
+    assert cols["company_id"] == "NO" and cols["site_id"] == "NO"
+    co, site = _seed(db)
+    ev = _event(db, co, site, dedupe_key="dk-rt-" + uuid.uuid4().hex)
+    run = db.execute(
+        "INSERT INTO event_runs (company_id, site_id, handler) VALUES (%s,%s,'h') "
+        "RETURNING run_id", (co, site)).fetchone()[0]
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        with db.transaction():
+            db.execute("INSERT INTO run_events (run_id, event_id) VALUES (%s,%s)", (run, ev))
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        with db.transaction():
+            db.execute("INSERT INTO run_events (run_id, event_id, company_id, site_id) "
+                       "VALUES (%s,%s,%s,%s)", (run, ev, uuid.uuid4(), site))
+
+
+def test_decision_cards_event_index_exists(db):
+    assert db.execute("SELECT to_regclass('idx_decision_cards_event') IS NOT NULL"
+                      ).fetchone()[0]
+
+
 def test_dedupe_index_allows_duplicate_rows_only_as_duplicate(db):
     co, site = _seed(db)
     _event(db, co, site, dedupe_key="dk-same")
@@ -147,10 +179,12 @@ def test_run_events_join_and_scan_seen(db):
         "VALUES (%s,%s,1,'checklist.gap','done') RETURNING run_id, model_calls",
         (co, site)).fetchone()
     assert run[1] == 0
-    db.execute("INSERT INTO run_events (run_id, event_id) VALUES (%s,%s)", (run[0], ev))
+    ins = ("INSERT INTO run_events (run_id, event_id, company_id, site_id) "
+           "VALUES (%s,%s,%s,%s)")
+    db.execute(ins, (run[0], ev, co, site))
     with pytest.raises(psycopg.errors.UniqueViolation):
         with db.transaction():
-            db.execute("INSERT INTO run_events (run_id, event_id) VALUES (%s,%s)", (run[0], ev))
+            db.execute(ins, (run[0], ev, co, site))
     rid = uuid.uuid4()
     db.execute("INSERT INTO decision_scan_seen (report_id, result_key) VALUES (%s,'r1')", (rid,))
     with pytest.raises(psycopg.errors.UniqueViolation):

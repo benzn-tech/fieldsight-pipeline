@@ -10,14 +10,18 @@
 --
 -- The stack has a single DB role (see 0092/0093/0095 "No GRANT"), so a REVOKE cannot make the
 -- ledger append-only: it is append-only by trigger (decision_ledger_append_only rejects every
--- UPDATE and DELETE). Changing one's mind is a new row with supersedes_entry_id.
+-- UPDATE and DELETE; decision_ledger_no_truncate rejects TRUNCATE). Changing one's mind is
+-- a new row with supersedes_entry_id.
 --
 -- Dedupe: one site_events row per dedupe_key among rows that are not 'duplicate' (partial
 -- unique index); one OPEN card per card_key (partial unique index), so a superseded or
 -- answered card frees the key.
 --
--- Tenancy: every table carries company_id + site_id; repositories write company_id from
--- sites.company_id, never from the caller. FKs to companies/sites/users are plain (no
+-- Tenancy: site_events, event_runs, run_events, decision_cards and decision_ledger carry
+-- company_id + site_id (NOT NULL); repositories write company_id from sites.company_id,
+-- never from the caller. decision_scan_seen is the one exemption: an internal scan cursor
+-- keyed on checklist_reports.id, never read by an API, holding no customer content, and a
+-- report can resolve to 0..n sites, so it has no single site to carry. FKs to companies/sites/users are plain (no
 -- CASCADE), as in 0095: the ledger is an archive, and a CASCADE into it would be rejected by
 -- the trigger anyway. Rows that belong to a parent (run_events) cascade with it.
 --
@@ -77,8 +81,10 @@ CREATE TABLE IF NOT EXISTS event_runs (
 );
 
 CREATE TABLE IF NOT EXISTS run_events (
-  run_id    uuid NOT NULL REFERENCES event_runs(run_id) ON DELETE CASCADE,
-  event_id  uuid NOT NULL REFERENCES site_events(event_id) ON DELETE CASCADE,
+  run_id      uuid NOT NULL REFERENCES event_runs(run_id) ON DELETE CASCADE,
+  event_id    uuid NOT NULL REFERENCES site_events(event_id) ON DELETE CASCADE,
+  company_id  uuid NOT NULL REFERENCES companies(id),
+  site_id     uuid NOT NULL REFERENCES sites(id),
   PRIMARY KEY (run_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_run_events_event ON run_events (event_id);
@@ -124,6 +130,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS decision_cards_one_open_per_key
   ON decision_cards (card_key) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_decision_cards_site_status
   ON decision_cards (company_id, site_id, status);
+CREATE INDEX IF NOT EXISTS idx_decision_cards_event ON decision_cards (event_id);
 
 -- decided_by is NULL for source 'timeout_default' (nobody decided; the default applied).
 CREATE TABLE IF NOT EXISTS decision_ledger (
@@ -155,3 +162,9 @@ DROP TRIGGER IF EXISTS decision_ledger_append_only ON decision_ledger;
 CREATE TRIGGER decision_ledger_append_only
   BEFORE UPDATE OR DELETE ON decision_ledger
   FOR EACH ROW EXECUTE FUNCTION decision_ledger_reject_change();
+
+-- TRUNCATE skips row triggers, so it needs its own statement-level guard.
+DROP TRIGGER IF EXISTS decision_ledger_no_truncate ON decision_ledger;
+CREATE TRIGGER decision_ledger_no_truncate
+  BEFORE TRUNCATE ON decision_ledger
+  FOR EACH STATEMENT EXECUTE FUNCTION decision_ledger_reject_change();
