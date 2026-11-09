@@ -334,7 +334,7 @@ The gate is new, in `action_pack_stages`. Every rejection is counted in
 `raised_on`, which is today. Nothing is added, and the action is still marked assumed. The
 rule is the owner's: the raised date, never today+N.
 
-Closing follows the same rule. A `status` of `done`/`closed` needs a stated value or evidence
+Closing follows the same rule (see §7.2.1: a close resting only on the user's word is labelled `weak` by the verifier). A `status` of `done`/`closed` needs a stated value or evidence
 that the work is finished.
 
 **Rule 4: deadline sanity.**
@@ -791,8 +791,61 @@ It is kept so that the later flagging mode can separate "no evidence" from "evid
 **New inputs.**
 - A **user-values block** in the prompt, fenced as data like everything else: the instruction
   plus Plan's `stated_values`. It carries the rule that a value the user stated for that item
-  and field counts as evidence for that field.
+  and field counts as evidence for that field. Amended 2026-11-09 (§7.2.1): only a value the
+  instruction's own words give, and only as evidence of the user's decision, not of site facts.
 - **Ref dates and `said_on`**, from §6.2.
+
+### 7.2.1 Amendment (2026-11-09, E4 tuning round): what a stated value proves
+
+**Measured (v2_r1, the Task 7.5 full run, draft labels with the owner's S4 rule applied).**
+Shown fabrication was 6.2% (5/81); the gate is 5%. Three of the five come from the user-values
+rule above:
+- **U3** ("#56 says '21st'. Make that a real date."). Plan stored deadline = 2026-11-21 as a
+  stated value, resolving a date the instruction only quotes from the item against today.
+  Rule 3's `user` source then forced that value, and the verifier counted it as evidence and
+  answered `supported` (the conclusion line repeated it). The records give 2026-09-21.
+- **C5** ("Grid C edge cover got fixed before the pour. Close #52."). No record shows the fix.
+  The verifier counted the stated status as evidence and answered `supported`. The owner's
+  gold note allows at most a weak close on the user's word.
+
+**Change (prompt wording only, the E4 lever).**
+- `PLAN_PROMPT`: stated values are values the user gives in their own words. A value the
+  instruction repeats from an item or a record and asks to be worked out is not a stated value;
+  it is left out and resolved from the records (Rule 3 `evidence`, Rule 4 `said_on`). A record's
+  value the user adopts as their decision ("Mike said end of the month, put that on #9") is
+  still stated.
+- `USER_RULE` (verifier): a stated value counts as evidence only when the instruction's own
+  words give it ("14 Nov", "next Friday" count; "#56 says '21st'" does not and is checked like
+  any value). The user's word is evidence of their decision (the value, or that the item should
+  be closed), not of site facts: a close resting only on the user saying the work was done,
+  with no evidence showing it done, is `weak` (`partly_stated`, whose definition gains "or the
+  user's word carries the decision but no record shows the fact").
+- The user-values block header says the values are the ones Plan recorded as stated, to be
+  checked against the instruction's words.
+
+**Unchanged, and what wording cannot fix.** Rule 3's code (a stated `status` still lets a
+close through the gate; the label decides how it is shown), the gate codes, the hide policy.
+- If Plan still records a quoted value, Rule 3 writes it over any evidence-sourced writer value;
+  the verifier can hide the action but not correct it (it gets no `today`, so it catches 11-21
+  only by reading the '21st' record against its `said_on`). The wording lowers the chance Plan
+  does this; it does not remove the path. The mechanism fix (the `user` source yields to an
+  evidence-sourced writer value, or Plan stores the quote unresolved) is deferred.
+- A relative date the user states ("next Friday") is still trusted as resolved by Plan; the
+  verifier cannot check the resolution (pre-existing).
+- Known regression mode: a legitimate close whose writer sources `status` as `user` and cites
+  only the item ref now drops to `weak`. If the Check finds this, the fix is the writer's
+  citation, not this wording.
+- The two S4 "3.5mm long" lines (an ASR error repeated as the record's wording) are not
+  addressed in this round.
+
+**Check** (the two E4 success runs, plan Task E4, besides the §1.4 gates):
+- U3: the plan has no deadline `stated_value` (trace `plan_stated_values` 0, or the action's
+  deadline source is `evidence`), and the shown value is 2026-09-21 or nothing (nothing still
+  costs recall).
+- C5: no `supported` close of #52.
+- Closes/updates whose `status` or field source was `user`: count supported->weak flips against
+  v2_r1 and attribute each one (wording vs the regression mode above). Other flips are judged
+  against run-to-run noise, not as failures by themselves.
 
 **Relaxed `parse_label`.** These forms are accepted, in order:
 1. A JSON object anywhere in the text: whole, fenced, or brace-sliced, through the same logic

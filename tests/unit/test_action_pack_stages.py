@@ -963,6 +963,17 @@ def test_plan_prompt_states_the_v2_keys():
         assert f'"{key}"' in prompt, key
 
 
+def test_plan_prompt_a_quoted_item_value_is_not_stated():
+    # v2_r1 U3: "#56 says '21st'. Make that a real date." was stored as a stated deadline
+    # resolved against today (2026-11-21); the date belongs to the records (2026-09-21).
+    model = Model()
+    st.run(make_ctx(), deps(model=model))
+    prompt = next(c["prompt"] for c in model.calls if c["caller"] == "action_plan")
+    assert "values the user gave in their own words" in prompt
+    assert "repeats from an item or a record and asks to be worked out" in prompt
+    assert "is not a stated value: leave it out" in prompt
+
+
 # ---- PR-3 Task 3.3: target lookups in round 1 (spec 2026-11-05 §3.2.2, §11) --------------
 
 SID_DONE = "44444444-5555-4666-8777-888888888883"
