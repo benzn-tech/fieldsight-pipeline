@@ -92,8 +92,8 @@ Email (decided 2026-11-08 on the owner's behalf: the audio is attached, not link
 - Sent with `boto3` `ses.send_raw_email` directly from the new module, as a MIME message: To `sales@fieldsightai.com`, From `SenderEmail`, Reply-To the claim email. It does not go through `email_sender.get_sender()`, so the stack's global `EmailSender` has no effect and no other line's TEST behaviour changes. The only recipient is our own inbox.
 - Subject: `[TEST] ` on TEST + `FieldSight message from {name} ({company})`, with CR/LF stripped.
 - Body (plain text, plus an escaped HTML part):
-  - the text
-  - "Transcript (machine, before the person edited it)", only when it differs from the text
+  - "Message:" and the text the person sent
+  - no machine transcript (changed 2026-11-09 by the owner: next to the edited text it read as two overlapping versions). A details line says it is in the S3 record; the recording is attached.
   - email, sub, project, page, env, time in NZ
   - the S3 record key
 - Attachment: the audio file (`message.webm` or `message.m4a`), when there is one.
