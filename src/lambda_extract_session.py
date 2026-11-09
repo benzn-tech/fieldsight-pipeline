@@ -1442,7 +1442,10 @@ def _schema_block(locator=False):
         return EXTRACTION_SCHEMA
     schema = EXTRACTION_SCHEMA
     for anchor, sep in _LOCATOR_ANCHORS:
-        assert schema.count(anchor) == 1, anchor
+        if schema.count(anchor) != 1:
+            # Names the anchor's key only, never schema text.
+            raise ValueError("locator schema anchor not found exactly once: "
+                             + anchor.split(":")[0])
         schema = schema.replace(anchor, anchor + sep + _LOCATOR_SCHEMA_LINE)
     return schema
 

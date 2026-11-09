@@ -1,27 +1,26 @@
 """Item quote locator, Task 2: the gated `said_at` prompt block (spec 2026-11-10 §4.1).
 
-With the locator off, every extraction prompt -- live, final and group -- must equal today's,
-byte for byte. The golden strings under fixtures/locator_prompt_golden/ were captured from the
-prompt builders BEFORE the locator parameter existed (synthetic text only). Regenerate them only
-on purpose, with `python tests/unit/test_extraction_locator_prompt.py --write-golden`, and only
-when a prompt change unrelated to the locator lands.
+With the locator off, every extraction prompt -- live, final and group -- must equal today's.
+That was proven once, against full-prompt goldens captured from develop, at the commit that added
+the block. Those goldens were removed on purpose: they pinned text other lines own (the schema,
+rules 0-7, the status-suggestion instruction, the continuity block). What stays are invariants
+scoped to the locator: off is the schema constant plus the untouched seam where rule 8 would sit,
+on is off plus exactly the block, and the group and live prompts never move with the flag.
 """
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-if __name__ == "__main__":   # golden capture outside pytest: mirror conftest's path setup
-    sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
-
 import item_continuity as ic
 import lambda_extract_session as les
 import status_suggestions
 
-GOLDEN_DIR = Path(__file__).resolve().parent / "fixtures" / "locator_prompt_golden"
+ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "src" / "template.yaml"
 DEPLOY_TEST = ROOT / ".github" / "workflows" / "deploy.yml"
 DEPLOY_PROD = ROOT / ".github" / "workflows" / "deploy-prod.yml"
@@ -61,9 +60,8 @@ def _group_sources():
 
 
 def _build(name, **locator_kw):
-    """One named prompt. `locator_kw` is empty for the golden capture (the parameter did not
-    exist yet) and `locator=...` afterwards. The module flags are set explicitly so the result
-    does not depend on the environment the test runs in."""
+    """One named prompt. The module flags are set explicitly so the result does not depend on
+    the environment the test runs in."""
     les.DECLARE_CONTINUITY = False
     if name == "live":
         # A live pass with a prior pass and status suggestions: the richest live prompt.
@@ -88,12 +86,9 @@ def _build(name, **locator_kw):
     raise KeyError(name)
 
 
-GOLDEN_NAMES = ("live", "final", "final_no_evidence", "group")
-
-
-def _golden(name):
-    # Normalise line endings: a Windows checkout with autocrlf rewrites the fixture.
-    return (GOLDEN_DIR / f"{name}.txt").read_text(encoding="utf-8").replace("\r\n", "\n")
+SOLO_NAMES = ("live", "final", "final_no_evidence")
+# Where rule 8 goes: the end of rule 7, then the separator into the output-format section.
+OFF_SEAM = "   declared_site MUST be null.\n\n## Output Format\n"
 
 
 @pytest.fixture(autouse=True)
@@ -120,18 +115,51 @@ def _schema_kind_slices(prompt):
 
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", GOLDEN_NAMES)
-def test_locator_off_prompts_are_byte_identical(name):
-    assert _build(name) == _golden(name)
-    if name != "group":
-        assert _build(name, locator=False) == _golden(name)
+def test_locator_off_schema_is_the_constant():
+    assert les._schema_block(False) is les.EXTRACTION_SCHEMA
+    assert les._schema_block() is les.EXTRACTION_SCHEMA
+
+
+def test_missing_schema_anchor_raises_naming_the_key(monkeypatch):
+    monkeypatch.setattr(les, "EXTRACTION_SCHEMA",
+                        les.EXTRACTION_SCHEMA.replace('"priority": "high | medium | low"', ""))
+    with pytest.raises(ValueError, match='"priority"$'):
+        les._schema_block(True)
+
+
+@pytest.mark.parametrize("name", SOLO_NAMES)
+def test_locator_off_prompts_are_untouched(name):
+    default = _build(name)
+    off = _build(name, locator=False)
+    assert off == default
+    assert les.EXTRACTION_SCHEMA in off
+    assert off.count(OFF_SEAM) == 1, "the seam where rule 8 would sit changed"
+    assert "said_at" not in off and "SAID_AT" not in off
+
+
+def _flag_in_fresh_process(value):
+    """EMIT_ITEM_LOCATOR as a fresh import parses it, with the env var unset (value None) or set.
+    A subprocess rather than importlib.reload: reloading the module would undo monkeypatches
+    other tests installed on it."""
+    env = {k: v for k, v in os.environ.items() if k != "EMIT_ITEM_LOCATOR"}
+    env.setdefault("AWS_ACCESS_KEY_ID", "testing")
+    env.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+    env.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
+    if value is not None:
+        env["EMIT_ITEM_LOCATOR"] = value
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import lambda_extract_session as m; print(repr(m.EMIT_ITEM_LOCATOR))"],
+        cwd=str(ROOT / "src"), env=env, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return out.stdout.strip().splitlines()[-1]
 
 
 def test_locator_off_is_the_default():
-    import os
-    if "EMIT_ITEM_LOCATOR" not in os.environ:
-        assert les.EMIT_ITEM_LOCATOR is False
     assert les.LOCATOR_FIELD == "said_at"
+    assert _flag_in_fresh_process(None) == "False"
+    assert _flag_in_fresh_process("false") == "False"
+    assert _flag_in_fresh_process("TRUE") == "True"
 
 
 @pytest.mark.parametrize("name", ("live", "final", "final_no_evidence"))
@@ -148,10 +176,12 @@ def test_locator_on_adds_said_at_to_all_four_kinds(name):
     assert prompt[start:end].count('"said_at"') == 4
 
 
-def test_locator_on_only_adds_the_block():
+@pytest.mark.parametrize("name", SOLO_NAMES)
+def test_locator_on_only_adds_the_block(name):
     """On = off plus the schema lines and the one numbered rule; nothing else moves."""
-    off = _build("final")
-    on = _build("final", locator=True)
+    off = _build(name)
+    on = _build(name, locator=True)
+    assert on.count("\n8. SAID_AT.") == 1
     removed = re.sub(r',\n          "said_at": "[^"\n]*"', "", on)
     removed = removed.replace(
         ', "said_at": "HH:MM:SS of the line where this item was FIRST raised, or null"', "")
@@ -180,10 +210,14 @@ def test_locator_block_independent_of_evidence():
 
 
 def test_group_prompt_never_has_locator(monkeypatch):
+    monkeypatch.setattr(les, "EMIT_ITEM_LOCATOR", False)
+    off = _build("group")
     monkeypatch.setattr(les, "EMIT_ITEM_LOCATOR", True)
-    prompt = _build("group")
-    assert "said_at" not in prompt
-    assert prompt == _golden("group")
+    on = _build("group")
+    assert on == off
+    assert "said_at" not in on and "SAID_AT" not in on
+    assert les.EXTRACTION_SCHEMA in on
+    assert on.count(OFF_SEAM) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +288,3 @@ def test_flag_wired():
     # must always pass it, with an explicit false fallback.
     assert "EmitItemLocator=${{ vars.TEST_EMIT_ITEM_LOCATOR || 'false' }}" in test
     assert "EmitItemLocator=${{ vars.PROD_EMIT_ITEM_LOCATOR || 'false' }}" in prod
-
-
-if __name__ == "__main__" and "--write-golden" in sys.argv:
-    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    for _name in GOLDEN_NAMES:
-        (GOLDEN_DIR / f"{_name}.txt").write_text(_build(_name), encoding="utf-8", newline="\n")
-        print("wrote", _name)
