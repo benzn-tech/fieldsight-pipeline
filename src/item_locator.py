@@ -27,6 +27,7 @@ import re
 from datetime import datetime, timedelta
 
 from item_continuity import KINDS
+from topic_window import _topic_window
 from turn_name_overlay import _stem
 
 RULE_VERSION = "locator_v1"
@@ -35,7 +36,7 @@ STATUSES = ("linked", "no_locator", "unparseable", "not_shown", "no_line",
             "ambiguous_stamp", "outside_topic")
 
 _STAMP = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})")
-# Each side of the topic's range, on top of `item_support`'s inclusive end minute.
+# Each side of the topic's range, on top of `topic_window`'s inclusive end minute.
 _RANGE_WIDEN = timedelta(minutes=1)
 
 
@@ -58,8 +59,6 @@ def _refuse(status, **extra):
 
 def _in_topic(turn, topic, turns, session_date):
     """True / False for the widened range check, None when it cannot be checked."""
-    # Imported here: item_support will import this module to run the locator path.
-    from item_support import _topic_window
     window = _topic_window(topic.get("time_range") if isinstance(topic, dict) else None,
                            session_date, turns)
     at = turn.get("abs_start")

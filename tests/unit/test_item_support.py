@@ -372,3 +372,110 @@ def test_union_runner_up_without_guard_tokens():
     s = result["topics"][0]["findings"][0]["support"]
     assert s["status"] == "linked" and s["candidate_path"] == "window"
     assert s["start_sec"] == 20.0
+
+
+# ---------------------------------------------------------------------------
+# Locator path (spec 2026-11-10 4.3): runs alone, never consults the lexical constants.
+# ---------------------------------------------------------------------------
+
+import item_locator  # noqa: E402
+
+
+def _stamped(text, fname, start, hh, mm, ss=0, speaker="spk_0"):
+    t = _turn(text, fname, start, hh, mm, ss, speaker)
+    t["abs_start_str"] = t["abs_start"].strftime("%H:%M:%S")
+    return t
+
+
+def _locator_sample():
+    turns = [_stamped("synthetic line alpha", F1, 10.0, 10, 0, 10),
+             _stamped("synthetic line bravo", F1, 20.0, 10, 0, 20)]
+    result = {"topics": [_topic(
+        action_items=[{"action": "synthetic action", "said_at": "10:00:10"}],
+        findings=[{"observation": "synthetic finding", "said_at": "10:00:20"}],
+        decisions=["synthetic decision"],
+        questions=[{"question": "synthetic question?", "said_at": "garbage"}])]}
+    return result, turns
+
+
+def test_attach_locator_runs_with_none_constants():
+    result, turns = _locator_sample()
+    counts = isup.attach_support(result, turns, DATE, floor=None, margin=None,
+                                 nothing_close=None, shown={0, 1}, locator=True)
+    topic = result["topics"][0]
+    a, f = topic["action_items"][0], topic["findings"][0]
+    d, q = topic["decisions"][0], topic["questions"][0]
+    assert a["support"]["status"] == "linked" and a["support"]["start_sec"] == 10.0
+    assert f["support"]["status"] == "linked" and f["support"]["start_sec"] == 20.0
+    assert a["support"]["method"] == a["support"]["rule_version"] == "locator_v1"
+    assert d["support"]["status"] == "no_locator"     # plain string normalised, no stamp
+    assert q["support"]["status"] == "unparseable"
+    assert counts["linked"] == 2 and counts["no_locator"] == 1 and counts["unparseable"] == 1
+    assert counts["by_path"] == {"locator": 2}
+    # Left for the extractor to strip: attach_support only reads it.
+    assert a["said_at"] == "10:00:10"
+
+
+def test_attach_locator_never_consults_lexical_rule(monkeypatch):
+    # Even an invalid PATHS and a broken scorer do not matter on the locator path.
+    monkeypatch.setattr(isup, "PATHS", ())
+    monkeypatch.setattr(isup, "_support_for",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("lexical")))
+    result, turns = _locator_sample()
+    isup.attach_support(result, turns, DATE, floor=None, margin=None, nothing_close=None,
+                        shown={0, 1}, locator=True)
+
+
+def test_attach_locator_shown_none_means_nothing_shown():
+    result, turns = _locator_sample()
+    isup.attach_support(result, turns, DATE, floor=None, margin=None, nothing_close=None,
+                        locator=True)
+    assert result["topics"][0]["action_items"][0]["support"]["status"] == "not_shown"
+
+
+def test_attach_lexical_still_raises_on_none():
+    result, turns = _locator_sample()
+    with pytest.raises(ValueError):
+        isup.attach_support(result, turns, DATE, floor=None, margin=None,
+                            nothing_close=None, shown={0, 1}, locator=False)
+    with pytest.raises(ValueError):   # the default is the lexical rule
+        isup.attach_support(result, turns, DATE, floor=None, margin=None,
+                            nothing_close=None)
+    assert "support" not in result["topics"][0]["action_items"][0]
+
+
+def test_counts_cover_every_locator_status(monkeypatch):
+    statuses = list(item_locator.STATUSES)
+    result = {"topics": [_topic(action_items=[{"action": f"synthetic {i}"}
+                                              for i in range(len(statuses))])]}
+    seq = iter(statuses)
+    monkeypatch.setattr(item_locator, "resolve",
+                        lambda *a, **k: {"status": next(seq), "method": "locator_v1"})
+    counts = isup.attach_support(result, [], DATE, floor=None, margin=None,
+                                 nothing_close=None, shown=set(), locator=True)
+    for s in statuses:
+        assert counts[s] == 1
+
+
+def test_known_paths_include_locator_but_lexical_paths_do_not():
+    assert "locator" in isup.KNOWN_PATHS
+    assert "locator" not in isup.PATHS
+
+
+def test_topic_window_names_still_exported_for_eval_scripts():
+    import topic_window
+    assert isup._TIME_RANGE is topic_window._TIME_RANGE
+    assert isup._topic_window is topic_window._topic_window
+    assert item_locator._topic_window is topic_window._topic_window
+
+
+@pytest.mark.parametrize("order", [("item_support", "item_locator"),
+                                   ("item_locator", "item_support")])
+def test_import_order_has_no_cycle(order):
+    import subprocess
+    import sys
+    from pathlib import Path
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    code = f"import sys; sys.path.insert(0, {src!r}); import {order[0]}; import {order[1]}"
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr

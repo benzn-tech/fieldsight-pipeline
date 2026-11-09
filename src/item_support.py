@@ -33,17 +33,20 @@ The support object carries ids, offsets and scores only -- never item or turn
 text. Pure: no AWS, no DB.
 """
 import logging
-import re
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime
 
+import item_locator
 from item_continuity import KINDS, normalise_children
 from item_text_match import RULE_VERSION, overlap, tokens
+# Re-exported: the eval scripts read `item_support._TIME_RANGE`.
+from topic_window import _END_SLACK, _TIME_RANGE, _topic_window  # noqa: F401
 from turn_name_overlay import TOLERANCE_SEC, _stem
 
 logger = logging.getLogger(__name__)
 
-# Paths tried, in order. Task 9 may drop one on the fit half.
+# Lexical paths tried, in order. Task 9 may drop one on the fit half. The "locator" path
+# is not listed here: it is chosen by `attach_support(locator=True)` and runs alone.
 PATHS = ("quote", "window")
 
 # Uncalibrated until Task 9 fits them; attach_support refuses None.
@@ -57,13 +60,12 @@ MIN_ITEM_TOKENS = 2
 
 _QUOTE_STATUSES = ("verified", "verified_fuzzy")
 _STATUS_RANK = {"verified": 2, "verified_fuzzy": 1}
-_TIME_RANGE = re.compile(r"(\d{1,2}):(\d{2})\s*[–—-]\s*(\d{1,2}):(\d{2})")
-# `time_range` is minute-granular, so its end minute is inclusive.
-_END_SLACK = timedelta(minutes=1)
 # Absorbs float noise in `best - second >= margin` (0.7 - 0.6 < 0.1 in binary).
 _EPS = 1e-9
 STATUSES = ("linked", "none_close", "ambiguous", "below_floor")
 _KNOWN_PATHS = ("quote", "window")
+# Every path `attach_support` can report a link under, lexical or locator.
+KNOWN_PATHS = _KNOWN_PATHS + ("locator",)
 # Twin items differ in one of these; the linked turn must contain the item's.
 _ASCII_DIRECTIONS = frozenset({"east", "west", "north", "south", "left", "right"})
 _CJK_DIRECTIONS = "东西南北左右"  # east west south north left right
@@ -103,36 +105,6 @@ def _evidence_turns(evidence, turns):
         if prev is None or _STATUS_RANK[status] > _STATUS_RANK[prev]:
             out[best_i] = status
     return out
-
-
-def _topic_window(time_range, session_date, turns):
-    """(start, end) of the topic's `time_range` as the half-open [start, end + 1 min), or
-    None when it does not parse.
-
-    Naive local datetimes on `session_date`, as `_parse_at` builds them, compared
-    with the turns' naive local abs_start. A range whose end is before its start
-    crosses midnight; the whole range takes the day nearest the session's middle
-    turn, the same rule `_parse_at` applies to a quote anchor. Shared with
-    `item_locator`'s range check.
-    """
-    m = _TIME_RANGE.search(str(time_range or ""))
-    if not m:
-        return None
-    h1, m1, h2, m2 = (int(g) for g in m.groups())
-    try:
-        start = datetime.strptime(f"{session_date} {h1:02d}:{m1:02d}", "%Y-%m-%d %H:%M")
-        end = datetime.strptime(f"{session_date} {h2:02d}:{m2:02d}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        return None
-    if end < start:
-        end += timedelta(days=1)
-    anchored = [t.get("abs_start") for t in turns if isinstance(t.get("abs_start"), datetime)]
-    if anchored:
-        mid = anchored[len(anchored) // 2]
-        shift = min((timedelta(0), timedelta(days=1), timedelta(days=-1)),
-                    key=lambda s: abs((start + s - mid).total_seconds()))
-        start, end = start + shift, end + shift
-    return start, end + _END_SLACK
 
 
 def _window_turns(time_range, session_date, turns):
@@ -223,13 +195,22 @@ def _support_for(item_text, topic, turns, session_date, floor, margin, nothing_c
     return last
 
 
-def attach_support(result, turns, session_date, *, floor, margin, nothing_close):
+def attach_support(result, turns, session_date, *, floor, margin, nothing_close,
+                   shown=None, locator=False):
     """Give every child of every topic a `support` object (mutates `result`).
 
     Plain-string decisions/questions are first turned into dicts (as
     `item_continuity.normalise_children` does) so they can carry the object.
     Returns counts per status plus `by_path` counts of links.
+
+    `locator=True` runs the locator path alone: each child's `support` is
+    `item_locator.resolve` of its `said_at` against the turns whose indices are in
+    `shown` (the rendered ones; None means none). The lexical thresholds are not
+    consulted, so None is fine there. `locator=False` is the lexical rule, which
+    refuses to run uncalibrated.
     """
+    if locator:
+        return _attach_locator(result, turns, session_date, set(shown or ()))
     if floor is None or margin is None or nothing_close is None:
         raise ValueError("item_support thresholds are uncalibrated (None)")
     if not PATHS or any(p not in _KNOWN_PATHS for p in PATHS):
@@ -254,5 +235,30 @@ def attach_support(result, turns, session_date, *, floor, margin, nothing_close)
                 counts[s["status"]] += 1
                 if s["status"] == "linked":
                     counts["by_path"][s["candidate_path"]] += 1
+    logger.info("item_support: %s", counts)
+    return counts
+
+
+def _attach_locator(result, turns, session_date, shown):
+    """The locator path of `attach_support`: `support` from `item_locator.resolve`.
+
+    Leaves `said_at` on the children; the extractor strips it from the artifact."""
+    turns = list(turns or [])
+    topics = result.get("topics") if isinstance(result, dict) else None
+    normalise_children(topics)
+    counts = {s: 0 for s in item_locator.STATUSES}
+    counts["by_path"] = {"locator": 0}
+    for topic in topics if isinstance(topics, list) else []:
+        if not isinstance(topic, dict):
+            continue
+        for list_name in KINDS:
+            for child in topic.get(list_name) or []:
+                if not isinstance(child, dict):
+                    continue
+                s = item_locator.resolve(child, topic, turns, shown, session_date)
+                child["support"] = s
+                counts[s["status"]] = counts.get(s["status"], 0) + 1
+                if s["status"] == "linked":
+                    counts["by_path"]["locator"] += 1
     logger.info("item_support: %s", counts)
     return counts

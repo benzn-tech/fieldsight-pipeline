@@ -54,6 +54,7 @@ from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
 import extraction_pending
 import item_continuity
+import item_locator
 import item_support
 import llm_utils
 import batch_stitch
@@ -2216,6 +2217,8 @@ def extract_group(bucket, artifact):
                 if isinstance(child, dict):
                     child.pop("continues", None)
                     child.pop(status_suggestions.FIELD, None)   # no prior, no carry, no clock
+    # Same reason: the group prompt never asks for `said_at`, but a stray one must not ship.
+    item_locator.strip(topics)
 
     merged = dict(parsed)
     merged.update({
@@ -2724,18 +2727,28 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     # All or nothing: it runs on a copy and only a complete result replaces the topics, so a
     # failure (today: thresholds not yet calibrated -> ValueError) writes exactly what the
     # flag-off path writes. Never fatal. The log carries no item or transcript text.
+    # With EMIT_ITEM_LOCATOR on, the locator path runs alone: each child's `said_at` is checked
+    # against the turns the model was actually shown.
     if EMIT_ITEM_SUPPORT and final:
         try:
             work = {'topics': copy.deepcopy(parsed_topics)}
             item_support.attach_support(
                 work, turns, date,
                 floor=item_support.FLOOR, margin=item_support.MARGIN,
-                nothing_close=item_support.NOTHING_CLOSE)
+                nothing_close=item_support.NOTHING_CLOSE,
+                shown=set(transcript_stats.get('shown') or ()),
+                locator=EMIT_ITEM_LOCATOR)
             parsed_topics[:] = work['topics']
         except Exception as e:
             # Type name only: a traceback or message could carry item/transcript text.
             logger.error("item_support: attach failed (%s) -- written without support",
                          type(e).__name__)
+
+    # Spec 2026-11-10 4.2: `said_at` is a model-facing stamp, never stored. Popped in place on
+    # every final and live artifact whatever the flags say (a model can volunteer it), and only
+    # here: after continuity resolve / fallback and the linker (refs number children by
+    # position, so lists are never rebuilt or reordered) and after attach_support read it.
+    item_locator.strip(parsed_topics)
 
     # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
     # the extraction that exists NOW, not the one we read before the LLM call,
