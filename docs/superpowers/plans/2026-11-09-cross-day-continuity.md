@@ -14,7 +14,7 @@
 
 - Flag `CROSS_DAY_CONTINUITY` ∈ `off` (default) | `shadow` | `on`; template AllowedValues exactly those three; workflow vars `TEST_CROSS_DAY_CONTINUITY` / `PROD_CROSS_DAY_CONTINUITY` default `'off'`.
 - Kinds: `action_items`, `questions`, `findings` only (never decisions). Max 40 new items and 40 candidates per kind.
-- Window: `since = date − 28 days`, `until = date`; candidate first-seen strictly earlier than the new item's.
+- Window: `since = date − 28 days`, `until = date`; candidate **recorded** strictly earlier than the new item: `first_date` (recording date), then session start time on the same date; same date with either start unknown → dropped. Never `first_seen` (DB write time).
 - Candidates: union of recency top 20 and per-new-item lexical top 5 (`find_items(query=text)`), capped 40 per kind; statuses action items `open|in_progress|blocked`, questions `open`, findings unfiltered; chains collapsed to their newest member.
 - No exact-text auto-accept. Guards: existence, kind, echo (unique prefix, min `min(4, len)` tokens), one-to-one both directions, fuse (> half of a request's new items linked → drop all).
 - Link rows: `link_type='continues'`, `method='llm_echo'`, `rule_version='xday_v1'`, src FK column set, `source_s3_key` = extraction key; insert `ON CONFLICT DO NOTHING` on a partial unique index.
@@ -60,8 +60,8 @@
 - Produces:
   - `XDAY_KINDS = ("action_items", "questions", "findings")`, `CAP_PER_KIND = 40`, `WINDOW_DAYS = 28`, `RULE_VERSION = "xday_v1"`, `DECISION_KIND = "item_continuity_xday"`.
   - `XDAY_INSTRUCTION: str`, `XDAY_QUESTION_SET: str` (`"item_continuity_xday:" + sha256[:16]`).
-  - `select_candidates(recency: list[dict], lexical: dict[str, list[dict]], new_first_seen: dict[str, str], chains: dict[str, str]) -> list[dict]` — one kind; input dicts in `find_items` shape; `lexical` maps new stable_id → its top-5; `chains` maps a stable_id to its chain's newest stable_id; returns ≤ 40, deduped by stable_id after chain collapse, recency first then lexical, dropping candidates whose first_seen is not earlier than EVERY new item's first_seen (use the earliest new item's first_seen of that kind).
-  - `build_request(*, site_id, company_id, extraction_key, extracted_at, date, new_items: dict[kind, list[dict]], candidates: dict[kind, list[dict]], precap_counts: dict[kind, int]) -> dict` — JSON-able; `run_hash` = sha1(key + extracted_at)[:16]; aliases assigned here (`A1…`, `F1…`, `Q1…` per kind) and refs `N1…` across kinds.
+  - `select_candidates(recency: list[dict], lexical: dict[str, list[dict]], new_first_seen: dict[str, str], chains: dict[str, str]) -> list[dict]` — one kind; input dicts in `find_items` shape; `lexical` maps new stable_id → its top-5; `chains` maps a stable_id to its chain's newest stable_id; returns ≤ 40, deduped by stable_id after chain collapse, recency first then lexical, dropping candidates not recorded earlier than EVERY new item (use the earliest new item of that kind); `new_first_seen` carries recording order keys `(date, start_time | None)`, not `created_at`. Add `test_select_candidates_orders_by_recording_time_not_write_time` (a candidate written later but recorded earlier is kept; written earlier but recorded later is dropped; same date, unknown start → dropped).
+  - `build_request(*, site_id, company_id, extraction_key, extracted_at, date, new_items: dict[kind, list[dict]], candidates: dict[kind, list[dict]], precap_counts: dict[kind, int]) -> dict` — JSON-able; `run_hash` = sha1(key + extracted_at + (nonce or ""))[:16], optional `nonce=None`; aliases assigned here (`A1…`, `F1…`, `Q1…` per kind) and refs `N1…` across kinds.
   - `render_prompt(request: dict) -> str` — instruction, earlier items one JSON line each `{"alias","kind","first_seen","text"}` in a fence, new items `{"ref","kind","text"}` in a fence; texts scrubbed.
   - `judge(request: dict, parsed) -> tuple[list[dict], dict]` — returns (accepted links `[{src_stable_id, src_item_id, src_kind, dst_stable_id}]`, claim records `[{src_stable_id, dst_stable_id, alias, outcome, guard}]` + counts incl. `fuse_tripped`).
 
@@ -97,7 +97,7 @@
 
 **Interfaces:**
 - Consumes: Task 2 `select_candidates`, `build_request`, `XDAY_KINDS`, `WINDOW_DAYS`, `CAP_PER_KIND`; `find_items`.
-- Produces: `_build_xday_request(conn, *, site, company_id, extraction, extraction_key, date) -> dict | None` in the item writer; the S3 artifact at `continuity_xday_requests/{site_id}/{date}/{run_hash}.json` with the `build_request` shape.
+- Produces: public `build_xday_request(conn, *, site, company_id, extraction, extraction_key, date, nonce=None, trigger="final") -> dict | None` in the item writer (the nightly re-match agent calls it; `trigger` is written to the artifact only); locate where the session start time lives for X5's same-date order and read it here; the S3 artifact at `continuity_xday_requests/{site_id}/{date}/{run_hash}.json` with the `build_request` shape.
 
 - [ ] **Step 1: Tests:**
   - unit: `key_for` format; lake_keys classifies the key as site-scoped with the right `site_id`.
@@ -125,7 +125,8 @@
   - a valid link inserts one `continues` row (src FK set, `source_s3_key` set) and one record whose `decision_record_id` the row carries;
   - re-delivery of the same payload → still one row and one record;
   - src re-carried: the request's src stable_id no longer live but its `item_id` is → resolved and linked; `item_id` null → skipped `src_gone`;
-  - dst not live on the site → skipped `dst_gone`; dst first-seen not earlier → skipped `time_order`;
+  - dst not live on the site → skipped `dst_gone`; dst not recorded earlier (X5 order) → skipped `time_order`;
+  - every invocation writes one `item_continuity_xday_run` record ("processed, n claims"), deduped on (`input_key`, `input_hash`);
   - a rejected claim → record only, no link;
   - `delete_topics_for_source(src key)` removes the link (cascade check).
 - [ ] **Step 2:** Run — FAIL.
