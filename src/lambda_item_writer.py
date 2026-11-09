@@ -1228,7 +1228,12 @@ def _write_item_support(conn, items, *, company_id, site_id, session_base, key,
 
 
 _SUPPORT_METRIC = {"linked": "SupportLinked", "none_close": "SupportNoneClose",
-                   "ambiguous": "SupportAmbiguous", "below_floor": "SupportBelowFloor"}
+                   "ambiguous": "SupportAmbiguous", "below_floor": "SupportBelowFloor",
+                   # locator refusals (locator spec §4.3)
+                   "no_locator": "SupportNoLocator", "unparseable": "SupportUnparseable",
+                   "not_shown": "SupportNotShown", "no_line": "SupportNoLine",
+                   "ambiguous_stamp": "SupportAmbiguousStamp",
+                   "outside_topic": "SupportOutsideTopic"}
 _CLAIM_METRIC = {"observed": "ClaimObserved", "stated": "ClaimStated",
                  "inferred": "ClaimInferred", "null": "ClaimNull"}
 

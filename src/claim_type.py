@@ -1,13 +1,19 @@
 """claim_type: who said the words an item stands on, derived from its transcript link.
 
-Spec: docs/superpowers/specs/2026-11-08-track-c-item-history-and-evidence-chain-design.md §5.4.
-Derived, never self-reported. Rule v1:
+Spec: docs/superpowers/specs/2026-11-08-track-c-item-history-and-evidence-chain-design.md §5.4;
+rule v2: docs/superpowers/specs/2026-11-10-item-quote-locator-design.md §4.4.
+Derived, never self-reported. Rule v2 (one rule version for every support, lexical or
+locator):
 
-  * `none_close` (no link, nothing close in the topic's turns)        -> 'inferred'
   * `linked`, the turn's CONFIRMED name is the recorder's user        -> 'observed'
   * `linked`, the turn's CONFIRMED name is a different (known) user   -> 'stated'
+  * `no_locator` (locator: the model said no single line raises it)   -> 'inferred' only
+    when INFERRED_FROM_NO_LOCATOR (set from the measured precision bar), else None
+  * `none_close` (lexical: no link, nothing close in the topic's turns) -> 'inferred'
+    (kept from v1; the locator slice never produces it)
   * everything else (no name, tentative name, a name with no user, an
-    unknown recorder, ambiguous/below_floor, no support at all)       -> None (unknown)
+    unknown recorder, ambiguous/below_floor, every locator refusal, no
+    support at all)                                                   -> None (unknown)
 
 'observed' means only "the recorder said it themselves", never "true".
 
@@ -15,7 +21,11 @@ Derived, never self-reported. Rule v1:
 never item or transcript text. Pure: no DB, no AWS.
 """
 
-RULE_VERSION = "claim_v1"
+RULE_VERSION = "claim_v2"
+
+# Locator spec §4.4 / §6 bar 6: `no_locator` counts as `inferred` only once the measured
+# precision of that mapping passes. A code constant, never an env flag.
+INFERRED_FROM_NO_LOCATOR = False
 
 CLAIM_TYPES = ("observed", "stated", "inferred")
 
@@ -30,6 +40,8 @@ def derive(support, named, recorder_user_id):
     basis = {"rule_version": RULE_VERSION, "support_status": status}
     if status == "none_close":
         return "inferred", basis
+    if status == "no_locator":
+        return ("inferred" if INFERRED_FROM_NO_LOCATOR else None), basis
     if status != "linked":
         return None, basis
     if support.get("link_id") is not None:
