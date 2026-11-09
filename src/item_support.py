@@ -29,6 +29,9 @@ A path links its best candidate only if:
 A path that does not link falls through to the next; the last path's result is
 reported.
 
+With `attach_support(locator=True)` none of the above runs: each child's `support`
+comes from `item_locator.resolve` of the model's `said_at` stamp instead.
+
 The support object carries ids, offsets and scores only -- never item or turn
 text. Pure: no AWS, no DB.
 """
