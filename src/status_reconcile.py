@@ -59,10 +59,19 @@ def _toks(text):
 
 # --- labels (label_conflict) ----------------------------------------------------------------
 _EN_NUM_LABEL = re.compile(r"\b(%s)\s+(\d+)\b" % "|".join(_UNIT_NOUNS))
-_CN_NUM_LABEL = re.compile(r"(\d+)\s*(%s)" % "|".join(_CN_MEASURE))
-_DIRECTIONS_EN = frozenset(
-    "north south east west upper lower front back left right".split())
-_DIRECTIONS_CJK = frozenset("东南西北上下前后左右")
+# 号 is a label only in an address ("3号楼", "5号房"); "11号" alone is usually a date.
+_CN_NUM_LABEL = re.compile(
+    r"(\d+)\s*(?:(单元|楼|层|栋|期)|号(?=楼|房|栋|单元|室|门|库))")
+# Sides. north/south/east/west always count; the other words are everyday English ("I'm back",
+# "right, ...", "nothing left") and count only before a place noun ("left wing", "back yard").
+_COMPASS_EN = frozenset("north south east west".split())
+_SIDES_EN = frozenset("upper lower front back left right".split())
+_PLACE_NOUNS_EN = frozenset(
+    "block wing side wall yard unit room bathroom bedroom door fence deck level floor stair "
+    "stairs".split())
+# A CJK side counts only directly before a place character ("北面", "西区"), never inside an
+# ordinary word ("上午", "东西", "然后", "下单", "上传").
+_SIDE_CJK = re.compile(r"([东南西北上下前后左右])(?=[面边侧区栋楼部门墙院])")
 
 
 def _number_labels(text):
@@ -72,14 +81,16 @@ def _number_labels(text):
     for noun, num in _EN_NUM_LABEL.findall(t):
         out.setdefault(noun, set()).add(str(int(num)))
     for num, noun in _CN_NUM_LABEL.findall(t):
-        out.setdefault(noun, set()).add(str(int(num)))
+        out.setdefault(noun or "号", set()).add(str(int(num)))
     return out
 
 
 def _directions(text):
     t = (text or "").lower()
-    return ({w for w in re.findall(r"[a-z]+", t) if w in _DIRECTIONS_EN}
-            | {ch for ch in t if ch in _DIRECTIONS_CJK})
+    words = re.findall(r"[a-z]+", t)
+    out = {w for w in words if w in _COMPASS_EN}
+    out |= {w for w, nxt in zip(words, words[1:]) if w in _SIDES_EN and nxt in _PLACE_NOUNS_EN}
+    return out | set(_SIDE_CJK.findall(t))
 
 
 def _label_conflict(quote, item_text):

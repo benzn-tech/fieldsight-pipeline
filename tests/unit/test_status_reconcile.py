@@ -7,6 +7,8 @@ becomes a pick card; everything else is dropped by name. The system never choose
 """
 import json
 
+import pytest
+
 import status_reconcile as sr
 
 ANCHOR_KEY = "audio_segments/u/d/b.wav"
@@ -303,3 +305,36 @@ def test_card_drops_label_conflicting_candidates():
     assert out.suggestions == []
     assert len(out.picks) == 1
     assert sorted(out.picks[0]["candidates"]) == ["l2", "x"]
+
+
+@pytest.mark.parametrize("item, quote", [
+    ("Order copper pipe for the west block", "I'm back from the merchant, copper pipe is ordered"),
+    ("Order copper pipe for the west block", "Right, the copper pipe is ordered, done"),
+    ("Order copper pipe for the west block", "nothing left on the copper pipe, done"),
+    ("Order copper pipe for the west block", "up front: copper pipe ordered, done"),
+    ("北面围栏安装", "围栏上午装完了"),
+    ("北面围栏安装", "围栏的东西都装完了"),
+    ("西区排水管", "排水管然后弄好了"),
+    ("钢筋下单", "北面的钢筋订好了"),
+    ("图纸上传", "东边的图纸都弄好了"),
+])
+def test_incidental_direction_words_are_not_labels(item, quote):
+    """A side word inside ordinary speech ("I'm back", "上午", "下单") is not a location label,
+    so it cannot contradict the item's side (fix round 2)."""
+    out = sr.judge([hit("C1", quote)], [cand("it", item), SKIP], check)
+    assert out.picks == []
+    assert [(s["stable_id"], s["suggested_status"]) for s in out.suggestions] == [("it", "done")]
+
+
+def test_hao_date_is_not_a_label():
+    """"11号" on its own is a date; only 号 before 楼/房/栋/单元/室/门/库 is an address."""
+    out = sr.judge([hit("C1", "外墙涂料11号弄好了")], [cand("it", "3号楼外墙涂料"), SKIP], check)
+    assert [s["stable_id"] for s in out.suggestions] == ["it"]
+    out = sr.judge([hit("C1", "5号楼外墙涂料弄好了")], [cand("it", "3号楼外墙涂料"), SKIP], check)
+    assert out.suggestions == [] and out.counts["dropped_by"] == {"label_conflict": 1}
+
+
+def test_side_word_before_a_place_noun_is_a_label():
+    out = sr.judge([hit("C1", "the left wing handrail is done")],
+                   [cand("it", "Fix handrail on the right wing"), SKIP], check)
+    assert out.suggestions == [] and out.counts["dropped_by"] == {"label_conflict": 1}
