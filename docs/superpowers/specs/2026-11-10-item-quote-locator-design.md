@@ -98,8 +98,9 @@ quotes. **This design measures a line locator instead:** each final child item c
   - a numbered instruction says to copy the stamp printed on the one line where the item was first
     raised, exactly as printed, hour included. Use null when no single line raises it (it combines
     several lines, or is your own conclusion). It is a stamp, not a quote: never copy words into it.
-    It is not `status_suggestion.at`, which marks where a status was reported, usually later. The two
-    instructions say so explicitly. `status_suggestions.INSTRUCTION` itself is not edited.
+    It is not `status_suggestion.at`, which marks where a status was reported, usually later. The new
+    rule states that contrast; `status_suggestions.INSTRUCTION` itself is not edited (the status
+    line's request, 2026-11-10).
   - The existing evidence rule "Do NOT put evidence inside action_items or findings" stays. The new
     wording must not read as contradicting it.
 - Independent of `EMIT_EVIDENCE`: stamps are printed whether or not evidence is requested.
