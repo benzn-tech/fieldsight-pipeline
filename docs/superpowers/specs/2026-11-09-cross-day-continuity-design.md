@@ -79,8 +79,11 @@ exist. It also leaves the just-measured same-session linker untouched.
   - drop candidates not **recorded** strictly earlier than the new item. Order is recording
     time, never DB write time (`find_items.first_seen` is `created_at`, so a device uploading
     Monday's recording on Wednesday would otherwise look newer than Tuesday): compare
-    `first_date` (the recording date), and on the same date the session start time; a same-date
-    pair whose start times are not both known is not ordered and is dropped (a missed link costs
+    `find_items.first_seen_recorded_at` (UTC recording start; Track C's one shared
+    implementation: `meeting_session.opened_at` by sid, else the transcript-stem timestamp) when
+    both sides have it; otherwise `first_date` (the recording date) strictly earlier; a same-date
+    pair without both instants is not ordered and is dropped. Never parse `session_base`: chunk
+    sessions' keys are a bare `sid<32hex>` (a missed link costs
     nothing that exists today);
   - **collapse chains**: candidates already joined by `continues` edges are shown once, as the
     newest member of the chain; a link to it is a link to the chain.
