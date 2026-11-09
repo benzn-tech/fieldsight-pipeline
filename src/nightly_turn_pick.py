@@ -15,11 +15,14 @@ Guards, in order; the first failure names the drop:
                         that item's topic
   window                the turn's own abs_start is still inside the topic window
   twin                  two same-script items that differ only by place value may not
-                        pick the same turn, nor a turn carrying the twin's value, nor any
-                        turn whose place values disagree with the item's
-  same_language_floor   same script: the item's distinguishing tokens and place values
-                        must appear in the turn
-A cross-script item/turn pair skips twin and floor and is flagged `cross_language`.
+                        pick the same turn (whatever the turn's script); and, unless the
+                        pick is cross-language, may not pick a turn carrying the twin's
+                        value, nor any turn whose place values disagree with the item's
+  same_language_floor   unless cross-language: the item's distinguishing tokens and place
+                        values must appear in the turn
+A pick is cross-language only when item and turn scripts are both known and differ; it
+skips twin (b)/(c) and the floor and is flagged `cross_language`. An unknown script (no
+letters, or a tie) is not cross-language and gets every guard.
 """
 from __future__ import annotations
 
@@ -258,29 +261,25 @@ def apply_guards(request, picks, turns):
             continue
         label, idx = live[a]
         item_text, turn_text = it["text"], turns[idx].get("text") or ""
-        item_script, turn_script = script_of(item_text), script_of(turn_text)
-        if _cross_language(item_script, turn_script):
-            rows[a] = _row(it, turn=label, turn_index=idx, outcome="accepted",
-                           cross_language=True)
-            continue
-        same_script = item_script == turn_script != "unknown"
+        cross = _cross_language(script_of(item_text), script_of(turn_text))
         guard = None
-        if same_script:
-            turn_pv = _pv_pairs(turn_text)
-            mine = _pv_pairs(item_text)
-            for b in twins[a]:
-                if b in live and live[b][1] == idx:
-                    guard = "twin"
-                    break
-                if (_pv_pairs(by_alias[b]["text"]) - mine) & turn_pv:
-                    guard = "twin"
-                    break
-            if guard is None and twin_flags(item_text, turn_text):
+        # (a) twins (a same-script item pair) may not share a turn, whatever its script.
+        if any(b in live and live[b][1] == idx for b in twins[a]):
+            guard = "twin"
+        # Only a pick whose scripts are both known and differ skips the rest. An
+        # "unknown"-script side (no letters, or a tie) gets the same-script guards.
+        if guard is None and not cross:
+            mine, turn_pv = _pv_pairs(item_text), _pv_pairs(turn_text)
+            # (b) the turn carries a twin's distinguishing place value; (c) place values
+            # in item and turn disagree.
+            if any((_pv_pairs(by_alias[b]["text"]) - mine) & turn_pv for b in twins[a]) \
+                    or twin_flags(item_text, turn_text):
                 guard = "twin"
-            if guard is None and not _floor_ok(item_text, turn_text):
+            elif not _floor_ok(item_text, turn_text):
                 guard = "same_language_floor"
         rows[a] = _row(it, turn=label, turn_index=idx,
-                       outcome="rejected" if guard else "accepted", guard=guard)
+                       outcome="rejected" if guard else "accepted", guard=guard,
+                       cross_language=cross)
 
     out = [rows[it["alias"]] for it in items]
     for p in unknown:

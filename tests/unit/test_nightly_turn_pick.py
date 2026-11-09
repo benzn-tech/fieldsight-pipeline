@@ -279,6 +279,63 @@ def test_chinese_twin_numbers():
         assert (r["outcome"], r["guard"], r["cross_language"]) == ("rejected", "twin", False)
 
 
+def test_lone_item_picks_turn_with_other_place_value_is_twin():
+    # clause (c): no sibling item; the item's and turn's place values disagree
+    turns = [_turn(10, 1, 0, "unit 4 pre-line done")]
+    req = ntp.build_request([_item(1, "unit 3 pre-line done")], turns, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}], turns)
+    assert (rows[0]["outcome"], rows[0]["guard"]) == ("rejected", "twin")
+
+
+def test_twins_both_pick_cross_script_turn_rejected():
+    turns = [_turn(10, 1, 0, "预埋线今天都做完了")]
+    items = [_item(1, "unit 3 pre-line done"), _item(2, "unit 4 pre-line done")]
+    req = ntp.build_request(items, turns, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}, {"item": "I2", "turn": "T1"}],
+                            turns)
+    for alias in ("I1", "I2"):
+        r = _row(rows, alias)
+        assert (r["outcome"], r["guard"], r["cross_language"]) == ("rejected", "twin", True)
+
+
+def test_cross_script_turn_one_twin_accepted():
+    turns = [_turn(10, 1, 0, "三号单元的预埋线已经完成了"), _turn(10, 2, 0, "unit 4 pre-line done")]
+    items = [_item(1, "unit 3 pre-line done"), _item(2, "unit 4 pre-line done")]
+    req = ntp.build_request(items, turns, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}, {"item": "I2", "turn": "T2"}],
+                            turns)
+    assert [(r["outcome"], r["cross_language"]) for r in rows] == \
+        [("accepted", True), ("accepted", False)]
+
+
+def test_unknown_script_gets_same_script_guards():
+    # floor: a digits-only turn is not cross-language, so the floor applies
+    turns = [_turn(10, 1, 0, "4")]
+    req = ntp.build_request([_item(1, "level 2 pipe leaking")], turns, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}], turns)
+    assert (rows[0]["outcome"], rows[0]["guard"], rows[0]["cross_language"]) == \
+        ("rejected", "same_language_floor", False)
+    # twin (c): a tie-script turn (4 CJK, 4 Latin letters) carrying another unit number
+    tie = [_turn(10, 1, 0, "单元单元 unit 4")]
+    assert ntp.script_of(tie[0]["text"]) == "unknown"
+    req = ntp.build_request([_item(1, "unit 3 pre-line done")], tie, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}], tie)
+    assert (rows[0]["outcome"], rows[0]["guard"], rows[0]["cross_language"]) == \
+        ("rejected", "twin", False)
+    # floor on a tie-script turn with no place value at all
+    tie = [_turn(10, 1, 0, "单元 ab")]
+    assert ntp.script_of(tie[0]["text"]) == "unknown"
+    req = ntp.build_request([_item(1, "unit 3 pre-line done")], tie, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}], tie)
+    assert (rows[0]["outcome"], rows[0]["guard"]) == ("rejected", "same_language_floor")
+    # twin (a): both twins pick the tie-script turn
+    items = [_item(1, "unit 3 pre-line done"), _item(2, "unit 4 pre-line done")]
+    req = ntp.build_request(items, tie, DATE)
+    rows = ntp.apply_guards(req, [{"item": "I1", "turn": "T1"}, {"item": "I2", "turn": "T1"}],
+                            tie)
+    assert [(r["outcome"], r["guard"]) for r in rows] == [("rejected", "twin")] * 2
+
+
 def test_script_of():
     assert ntp.script_of("unit 3 pre-line") == "latin"
     assert ntp.script_of("三号单元验收") == "cjk"
