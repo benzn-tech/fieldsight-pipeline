@@ -129,6 +129,18 @@ def test_generic_token_goes_to_pick_card():
     assert out.picks[0]["suggested_status"] == "done"
 
 
+def test_argmax_without_a_word_of_its_own_goes_to_pick_card():
+    """Anchor (b): the pick leads on overlap, but every word it shares with the quote is also
+    in some other candidate -- so the quote does not name it alone."""
+    cands = [cand("l1slab", "Level 1 slab"), cand("l1rail", "Level 1 handrail"),
+             cand("pour", "Slab pour")]
+    out = sr.judge([hit("C1", "Level 1 slab is all done")], cands, check)
+    assert out.suggestions == []
+    assert len(out.picks) == 1
+    assert out.picks[0]["candidates"][0] == "l1slab"
+    assert sorted(out.picks[0]["candidates"]) == ["l1rail", "l1slab", "pour"]
+
+
 def test_no_item_word_is_silent_drop():
     out = sr.judge([hit("C1", "Yeah that's all done now, good job")], [WEST, EAST], check)
     assert out.suggestions == [] and out.picks == []
@@ -162,6 +174,7 @@ def test_latest_status_wins_per_candidate():
     assert out.picks == []
     assert [(s["stable_id"], s["suggested_status"]) for s in out.suggestions] == [
         ("sid-west", "done")]
+    assert out.counts["dropped_by"] == {"superseded": 1}
 
 
 def test_same_status_dropped():
