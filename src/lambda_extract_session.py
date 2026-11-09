@@ -1387,8 +1387,19 @@ def render_transcript(turns, limit=None, names=None):
              f"{names.get((t.get('source_filename'), t.get('speaker')), t['speaker'])}: "
              f"{t['text']}"
              for t in turns]
-    return elide_middle(lines, limit,
-                                head_share=TRUNCATION_HEAD_SHARE)
+    text, stats = elide_middle(lines, limit, head_share=TRUNCATION_HEAD_SHARE)
+    # Which turns the model actually saw, as indices into `turns`. A stamp the
+    # model quotes back can only be trusted if its line was in the prompt; the
+    # elided middle is a hole, not a region the model may cite.
+    n = len(turns)
+    stats["shown"] = (list(range(stats["head_lines"]))
+                     + list(range(n - stats["tail_lines"], n)))
+    return text, stats
+
+
+# The `transcript_stats` keys written to the extraction artifact. `render_transcript`
+# returns more (`head_lines`, `tail_lines`, `shown`) for in-process use.
+_PERSISTED_TRANSCRIPT_STATS = ("chars", "lines", "lines_omitted", "truncated")
 
 
 _PROMPT_HEAD = (
@@ -2730,7 +2741,10 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # What the model was actually shown. `truncated` true means this
         # extraction does not cover the whole session — the previous version of
         # this code dropped 53% of a 2-hour meeting and recorded nothing.
-        'transcript_stats': transcript_stats,
+        # Only the original four keys are persisted: `shown` (one index per turn)
+        # and the head/tail counts are in-process inputs for the locator, and the
+        # flag-off artifact is pinned byte-identical by a golden test.
+        'transcript_stats': {k: transcript_stats[k] for k in _PERSISTED_TRANSCRIPT_STATS},
         # What the filter removed, and the exact phrases. The recorders' prompt
         # wording is not settled, so this is how the real strings get known
         # without guessing at them.

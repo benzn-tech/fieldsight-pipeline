@@ -165,9 +165,14 @@ def test_the_gap_note_sits_with_the_transcript_not_after_the_rules():
 def test_the_extraction_records_what_the_model_was_shown():
     import inspect
     src = inspect.getsource(les)
-    assert "'transcript_stats': transcript_stats" in src, (
+    # The artifact persists a fixed subset of the render stats (the in-process
+    # `shown` index list is left out); the subset must still say whether, and
+    # how much, the transcript was cut.
+    assert ("'transcript_stats': {k: transcript_stats[k] for k in "
+            "_PERSISTED_TRANSCRIPT_STATS}") in src, (
         "an extraction covering half a session must be distinguishable from one "
         "covering all of it")
+    assert {"truncated", "lines_omitted"} <= set(les._PERSISTED_TRANSCRIPT_STATS)
 
 
 # --- the shared helper, and the two other callers of it --------------------
