@@ -32,7 +32,7 @@
 2. **The recorder works on another company's project** (project-owned tenancy). `find_items` must receive the site's company, or it silently returns `[]`. Test in Task 4 (`test_reconcile_uses_owner_company_id`).
 3. **A status-only writer payload** (no programme suggestions, impacts or verdicts) must still open a connection and write. Test in Task 3 (`test_status_only_payload_opens_connection`).
 4. **The target moved between request and write** (superseded, deleted recording, closed by hand, moved site). Expect it skipped and counted, never written. Tests in Task 3 (`test_reread_skips_*`).
-5. **Number words vs digits and 中文 twins**: "unit four" vs "unit 4"; "二楼防水" vs "三楼防水". The twin guard must pick correctly or send a pick card. Tests in Task 1 (`test_numeral_normalisation`, `test_cjk_twins`).
+5. **Number words vs digits, the pronoun "one", self-corrections and 中文 twins**: "unit four" vs "unit 4"; "that one's done" (must stay subject-less); "west… no wait, the east one, done"; "二楼防水" vs "三楼防水". The anchor and twin guards must pick correctly or send a pick card. Tests in Task 1: `test_numeral_normalisation`, `test_pronoun_one_is_not_a_number`, `test_quote_naming_both_twins_goes_to_pick_card`, `test_cjk_twins`.
 
 ---
 
@@ -59,7 +59,11 @@
     - counts: `{"offered": n, "kept": n, "picks": n, "dropped_by": {reason: n}}`.
 
 - [ ] **Step 1: Write the failing tests** in `tests/unit/test_status_reconcile.py`. Use a helper `cand(sid, text, status="open")` and a fake `check` that returns `{"status": "verified", "segment_key": "audio_segments/u/d/b.wav", "offset_sec": 12.0, "quote": q}`, with the anchor keyed off the quote.
-  - `test_numeral_normalisation`: `normalise_numerals("unit four, level one, 三楼") == "unit 4, level 1, 3楼"`.
+  - `test_numeral_normalisation`: `normalise_numerals("unit four, level one, 三楼") == "unit 4, level 1, 3楼"`. Also: `normalise_numerals("一起去统一") == "一起去统一"` (unchanged).
+  - `test_pronoun_one_is_not_a_number`: candidates "Pour level 1 slab" / "Order skip bin"; quote "Yeah that one's done now mate, all good". No suggestion and no pick; `dropped_by["no_anchor"] == 1`.
+  - `test_quote_naming_both_twins_goes_to_pick_card`: west/east pipe candidates; quote "The west block copper pipe, no wait, the east one, that's done". Zero suggestions, one pick over both.
+  - `test_one_candidate_card_is_dropped`: the model picks "Order skip bin for site", but the quote is about the west copper pipe (candidates: west copper pipe, skip bin). No pick card with fewer than 2 entries; drop as `anchor`.
+  - `test_conflicting_statuses_same_anchor_dropped`: two hits on the same anchor with different statuses are both dropped as `conflict`.
   - `test_prompt_aliases_in_order`: `"C1"` and `"C2"` appear with each candidate's text. No stable_id appears in the prompt.
   - `test_parse_rejects_unknown_alias`: a hit with `"C9"` when n=2 is dropped as `shape`. Invalid JSON returns `None`.
   - `test_clear_match_becomes_suggestion`: candidates "Order copper pipe for the west block" and "Order PVC pipe for the east block"; quote "The copper pipe for the west block is ordered, that's done", status `done`. One suggestion on the west item; `counts["kept"] == 1`.
@@ -67,7 +71,7 @@
   - `test_generic_token_goes_to_pick_card`: "Fix west pipe leak under slab" / "Order pipe fittings for level 2"; quote "The pipe's all done mate, finished it". Zero suggestions, one pick with both stable_ids.
   - `test_no_item_word_is_silent_drop`: quote "Yeah that's all done now, good job" gives no suggestion, no pick, and `dropped_by["no_anchor"] == 1`.
   - `test_unverified_quote_dropped`: `check` returns `{"status": "weak"}`, so the hit is dropped as `weak`.
-  - `test_one_anchor_two_candidates_becomes_pick`: two hits share `(segment_key, offset_sec)`. One pick, zero suggestions.
+  - `test_one_anchor_two_candidates_becomes_pick`: two hits with the same status share `(segment_key, offset_sec)`. One pick, zero suggestions. For this test the fake `check` is keyed on `at`, so that different quotes can share an anchor.
   - `test_latest_status_wins_per_candidate`: two hits on the same alias, `at` 10:00:00 `in_progress` and 10:05:00 `done`. One suggestion, `done`.
   - `test_same_status_dropped`: the candidate's status is `blocked` and the hit says `blocked`, so it is dropped as `same_status`.
   - `test_cjk_twins`: "二楼防水膜订购" / "三楼防水膜订购"; quote "二楼的防水膜已经订好了". One suggestion on 二楼.
@@ -93,10 +97,18 @@ if len(top) > 1 or pick not in top or not unique:      -> pick card over the can
                                                           with overlap > 0, best first, ≤ 4
 ```
 
-  - Twin, applied after the anchor passes. Siblings are candidates `c` with `containment(pick.text, c.text) >= best - AMBIGUITY_MARGIN`.
-    - For each sibling, `d_pick = toks(pick) - toks(sib)` and `d_sib = toks(sib) - toks(pick)`.
-    - Require `Q & d_pick` and `not (Q & d_sib)`. Otherwise, a pick card over `[pick, sib...]`.
-  - `one_to_one` groups surviving suggestions by `(segment_key, offset_sec)`. A group holding more than one stable_id becomes one pick card. Then, per stable_id, keep the hit with the latest `at`.
+  - Any card set with fewer than 2 entries is dropped as `anchor`. It is never a 1-candidate card.
+  - Twin, applied after the anchor passes, against **every other candidate with overlap > 0**, not only containment-siblings. For each such `c`:
+    - `d_pick = toks(pick) - toks(c)` and `d_c = toks(c) - toks(pick)`;
+    - require `Q & d_pick` and `not (Q & d_c)`;
+    - otherwise, a pick card over `[pick] + offending c's`, at most 4.
+    - (`containment` / `AMBIGUITY_MARGIN` are only used to order the card, best first.) This is what catches "west… no wait, the east one".
+  - `normalise_numerals` rewrites number words **only after a unit noun**: `unit`, `level`, `block`, `floor`, `stage`, `lot`, `house`, `room`, `apartment`. Chinese numerals are rewritten **only before a measure word**: `楼`, `层`, `号`, `栋`, `单元`, `期`. A bare "one" or "一起" is untouched.
+  - `one_to_one` groups surviving hits by `(segment_key, offset_sec)`:
+    - same status and more than one stable_id → one pick card with that status;
+    - different statuses → drop all of them as `conflict`.
+
+    Then, per stable_id, keep the hit with the latest `at`.
 
 - [ ] **Step 4: Run the tests and confirm they pass.** Same command. Expected: all pass.
 
@@ -138,7 +150,7 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
     - `chosen_stable_id uuid`, `resolved_by uuid REFERENCES users(id)`, `resolved_at timestamptz`, `created_at timestamptz NOT NULL DEFAULT now()`.
   - Constraint: `UNIQUE (segment_key, offset_sec, suggested_status)`.
   - Index on `(site_id) WHERE state='pending'`.
-  - Write the repo with `ON CONFLICT DO NOTHING RETURNING *`, mirroring `repositories/status_suggestions.insert_suggestion`.
+  - Write the repo with `ON CONFLICT DO NOTHING RETURNING *`, mirroring `repositories/status_suggestions.insert_suggestion`. Bind `candidates` with `psycopg.types.json.Jsonb(list_of_str)`, as `repositories/decision_records.insert` passes jsonb. A bare list does not bind.
 - [ ] **Step 4: Run the tests and confirm they pass.** Also run `tests/integration/test_migrations_apply.py` on its own.
 - [ ] **Step 5: Commit** the migration, the repo and the test, by name.
 
@@ -147,7 +159,7 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
 ### Task 3: suggestion_writer accepts `status_suggestions` and `pick_cards`
 
 **Files:**
-- Modify: `src/lambda_suggestion_writer.py`: the docstring event shape, the empty-batch guard (lines 158–168), and a new loop inside the existing transaction.
+- Modify: `src/lambda_suggestion_writer.py`: the docstring event shape, the empty-batch guard (lines 160–168), and a new loop inside the existing transaction.
 - Test: `tests/unit/test_lambda_suggestion_writer.py` (extend) and `tests/integration/test_status_suggestions_writer.py` (extend).
 
 **Interfaces:**
@@ -175,6 +187,7 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
     - skip by the reasons above;
     - insert with `row["company_id"]`, `row["site_id"]`.
   - For a pick card, re-read every candidate, then insert with the company of the first surviving row (all of them must share the site).
+  - **Wrap each status or pick insert in its own `with conn.transaction():` savepoint**, as `_record_verdict` does (Ruling R14, lines 118–150). One failed insert is then counted under `failed` and does not abort the batch's programme suggestions. Add the unit test `test_failed_status_insert_does_not_abort_batch`.
 - [ ] **Step 4: Run the tests and confirm they pass**, plus the existing `tests/unit/test_lambda_suggestion_writer.py`.
 - [ ] **Step 5: Commit.**
 
@@ -190,12 +203,12 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
   - emit after the block, next to `match_request.emit` (around line 1914).
 - Modify: `src/template.yaml`:
   - ItemWriter: env `RECONCILE_STATUS: !Ref ReconcileStatus` (a new parameter, default `'false'`), `RECONCILE_CANDIDATE_CAP: '40'`, and `s3:PutObject` on `${IngestBucketName}/reconcile_requests/*`, mirroring lines 5150–5154.
-  - MatcherFunction:
-    - `s3:GetObject` on `reconcile_requests/*` and `transcripts/*`;
-    - `s3:ListBucket` on the ingest bucket for prefixes `transcripts/*`, `reconcile_requests/*` and the agent-filter prefix that `agent_turn_filter` lists (read its constant);
+  - MatcherFunction, mirroring ExtractSessionFunction's grants (template around lines 4035, 4051 and 4090–4102):
+    - `s3:GetObject` on `reconcile_requests/*`, `transcripts/*`, `voice_ask/*` (for `agent_turn_filter`) and `audio_segments/*` (for `_batch_map.json` via `_rebase_batch_turns`). A denied batch-map read is swallowed and silently shifts the anchors;
+    - `s3:ListBucket` on the ingest bucket for prefixes `transcripts/*`, `voice_ask/*` and `reconcile_requests/*`;
     - env `EVIDENCE_WINDOW_SEC`, `STATUS_EVIDENCE_FLOOR_TOKENS`, `EVIDENCE_FUZZY_THRESHOLD`, with the same `!Ref`s or values as ExtractSessionFunction.
 - Modify: `scripts/wire-s3-events.sh`: add `{"Id":"fs-status-reconcile", same matcher ARN, prefix "reconcile_requests/", suffix ".json"}` beside `fs-programme-match`.
-- Modify: `.github/workflows/deploy-test.yml`: pass `ReconcileStatus` from repo var `TEST_RECONCILE_STATUS`. Follow how other TEST flags are passed.
+- Modify: `.github/workflows/deploy.yml` (the TEST deploy; there is no deploy-test.yml): add `"ReconcileStatus=${{ vars.TEST_RECONCILE_STATUS || 'false' }}"` beside `StatusSuggestions` (around lines 440–442). The `|| 'false'` stops SAM from keeping a stale value. `deploy-prod.yml` needs nothing, because the new parameter's Default is `'false'`. Extend `tests/unit/test_template_workflow_parameter_wiring.py` if it enumerates the parameters.
 - Test:
   - `tests/unit/test_reconcile_request.py`
   - `tests/unit/test_lambda_item_writer.py` (extend)
@@ -203,10 +216,14 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
 
 **Interfaces:**
 - Consumes: `item_history.find_items(conn, *, company_id, site_id, kinds, statuses, since, until, recorded_by, exclude_source_keys, limit)`.
-- Produces: the artifact `reconcile_requests/{site_id}/{date}/{sha256(extraction_key)[:16]}.json` with body `{site_id, date, user_folder, session_base, extraction_key, rung: "R0", candidates: [...]}`. Candidates use the Global Constraints field list, with `first_seen_date = source["date"]`.
+- Produces: the artifact `reconcile_requests/{site_id}/{date}/{sha256(extraction_key)[:16]}.json` with body `{site_id, date, user_folder, session_base, extraction_key, extracted_at, rung: "R0", candidates: [...]}`.
+  - `extracted_at` comes from the extraction item_writer already holds, so the worker never reads `extractions/`.
+  - Candidates use the Global Constraints field list, with `first_seen_date = source["date"]`.
+  - **Coerce to JSON types** in the candidate builder: `stable_id` → `str`, `deadline` / `first_seen_date` → `isoformat()` or None. `find_items` returns `uuid.UUID` and `date`.
 
 - [ ] **Step 1: Write the failing tests.**
   - `test_emit_key_deterministic_and_fields_whitelisted`: there is no `origin` and no `company_id` in the body.
+  - `test_candidates_serialise_uuid_and_date`: the fake `find_items` rows carry a real `uuid.UUID` and a real `datetime.date`, and the emitted body round-trips through `json.loads`.
   - `test_emit_none_on_empty`.
   - item_writer tests, with `find_items` monkeypatched and recording its kwargs:
     - `test_reconcile_uses_owner_company_id`: the site belongs to company B and the recorder's home is A, so it is called with B;
@@ -216,7 +233,7 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
 - [ ] **Step 2: Run them and confirm they fail.**
 - [ ] **Step 3: Implement.**
   - Log `reconcile site=<id> candidates=<n>` when the flag is on.
-  - Any exception from `find_items` is logged and swallowed. Reconcile must never fail the item write; the write is already the authority.
+  - Run `find_items` **inside its own `with conn.transaction():` savepoint**. On any exception, log it and use `candidates = []`. A failed statement without a savepoint leaves the psycopg transaction aborted, and every later item write would fail ("current transaction is aborted"). Reconcile must never fail the item write. Add the test `test_find_items_error_does_not_abort_item_write`; use the integration harness, since a fake connection cannot show the abort.
 - [ ] **Step 4: Run the tests and confirm they pass**, plus all of `tests/unit/test_lambda_item_writer.py` and `cfn-lint` at the pinned version (see the CI workflow).
 - [ ] **Step 5: Commit.**
 
@@ -236,7 +253,7 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
 - Consumes:
   - from `lambda_extract_session`, imported lazily inside `process_request`: `gather_session_segments(bucket, user_folder, date, session_base)`, `assemble_session_turns(bucket, keys) -> (turns, source_filenames, stats)`, `_check_status_quote(quote, at, turns, date, user_folder)`, and `session_brief.render_turns(turns)` for the `[HH:MM:SS] speaker: text` lines;
   - Task 1's `build_prompt`, `parse_hits` and `judge`.
-- Produces: `{"status_suggestions": [...], "pick_cards": [...], "counts": {...}}`. Each entry carries the Task 3 event fields, with `site_id` taken from the request and `run = f"reconcile:R0:{extracted_at}"`, where `extracted_at` is read from the extraction JSON at `extraction_key`.
+- Produces: `{"status_suggestions": [...], "pick_cards": [...], "counts": {...}}`. Each entry carries the Task 3 event fields, with `site_id` taken from the request and `run = f"reconcile:R0:{req['extracted_at']}"`. `extracted_at` comes from the artifact envelope; there is no `extractions/` read.
 
 **Deviation from spec §4.2, recorded:**
 - R0 imports these helpers from `lambda_extract_session` instead of lifting them. That file is TrackB-adjacent and 2.4k lines long; lifting it is a separate refactor.
@@ -264,7 +281,7 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
 - Modify: this plan file. Tick the boxes and record the TEST results at the bottom.
 
 - [ ] **Step 1:** Open a PR to `develop` with Tasks 1–5. Wait for CI green, then merge (it is my own develop PR). Wait for the TEST deploy.
-- [ ] **Step 2:** Ask the owner to set the repo var `TEST_RECONCILE_STATUS=true` and re-run deploy-test, or do it myself if the var is TEST-only and allowed. Run `scripts/wire-s3-events.sh` for TEST. Verify:
+- [ ] **Step 2:** Ask the owner to set the repo var `TEST_RECONCILE_STATUS=true` and re-run the TEST deploy (`deploy.yml`), or do it myself if the var is TEST-only and allowed. Run `scripts/wire-s3-events.sh` for TEST. Verify:
   - `aws s3api get-bucket-notification-configuration` lists `fs-status-reconcile`;
   - the ItemWriter env shows `RECONCILE_STATUS=true`.
 - [ ] **Step 3:** The owner records scripts A and B from `Dropbox/FieldSight-录音脚本/2026-11-10_跨录音对账脚本.md` on the same site and day. Verify in this order:
