@@ -1,0 +1,91 @@
+"""Site events: the decision loop's event hub (migration 0099, spec 2026-11-05 §5).
+
+One row per event a source emits for a site; `seq` is the replay order. Dedupe is a partial
+unique index on dedupe_key among rows that are not 'duplicate': a repeat is still stored, as
+its own 'duplicate' row, so nothing a source said is lost. Every read and write is scoped by
+company_id and site_id except claim_due, the hub's global queue pop."""
+import uuid
+
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+_COLS = ("event_id, seq, company_id, site_id, source, type, subject_ref, bucket, occurred_at, "
+         "received_at, summary, link, payload, chain_id, chain_depth, dedupe_key, status, "
+         "rule_id, attempts, not_before, last_error")
+
+# set_status may change only these columns besides status. Names are never taken from the
+# caller into SQL: an unknown key is a ValueError before anything runs.
+_UPDATABLE = ("rule_id", "attempts", "not_before", "last_error")
+
+_INSERT = (
+    "INSERT INTO site_events (event_id, company_id, site_id, source, type, subject_ref, bucket, "
+    "occurred_at, received_at, summary, link, payload, chain_id, chain_depth, dedupe_key, "
+    "status, rule_id, attempts, not_before, last_error) "
+    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ")
+
+
+def _params(ev, event_id, dedupe_key, status):
+    payload = ev.get("payload")
+    return (event_id, ev["company_id"], ev["site_id"], ev["source"], ev["type"],
+            ev["subject_ref"], ev.get("bucket") or "", ev.get("occurred_at"),
+            ev["received_at"], ev.get("summary"), ev.get("link"),
+            Jsonb(payload) if payload is not None else None, ev.get("chain_id"),
+            ev.get("chain_depth") or 0, dedupe_key, status, ev.get("rule_id"),
+            ev.get("attempts") or 0, ev.get("not_before"), ev.get("last_error"))
+
+
+def insert(conn, ev):
+    """(row, is_new). The caller supplies every field, including status, dedupe_key, bucket and
+    a tz-aware received_at/occurred_at; event_id is generated when absent. A dedupe_key that a
+    live row already holds is stored again as status 'duplicate' with dedupe_key
+    '<key>|dup|<event_id>', and is_new is False."""
+    event_id = ev.get("event_id") or uuid.uuid4()
+    cur = conn.cursor(row_factory=dict_row)
+    row = cur.execute(
+        _INSERT + "ON CONFLICT (dedupe_key) WHERE status <> 'duplicate' DO NOTHING "
+        f"RETURNING {_COLS}",
+        _params(ev, event_id, ev["dedupe_key"], ev["status"])).fetchone()
+    if row is not None:
+        return row, True
+    row = cur.execute(
+        _INSERT + f"RETURNING {_COLS}",
+        _params(ev, event_id, f"{ev['dedupe_key']}|dup|{event_id}", "duplicate")).fetchone()
+    return row, False
+
+
+def claim_due(conn, now, limit=50):
+    """Pop up to `limit` queued events whose not_before is NULL or <= now, lowest seq first,
+    and mark them 'running'. FOR UPDATE SKIP LOCKED: a concurrent claimer skips rows another
+    transaction holds rather than waiting. attempts is NOT touched (the caller counts
+    failures). Rows come back in seq order."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "UPDATE site_events SET status = 'running' "
+        "WHERE event_id IN (SELECT event_id FROM site_events "
+        "  WHERE status = 'queued' AND (not_before IS NULL OR not_before <= %s) "
+        "  ORDER BY seq LIMIT %s FOR UPDATE SKIP LOCKED) "
+        f"RETURNING {_COLS}",
+        (now, limit)).fetchall()
+    return sorted(rows, key=lambda r: r["seq"])
+
+
+def set_status(conn, event_id, company_id, site_id, status, **fields):
+    """Set status (and any of rule_id, attempts, not_before, last_error). Returns the updated
+    row, or None when no row of that tenant has that event_id. ValueError on any other key."""
+    bad = sorted(set(fields) - set(_UPDATABLE))
+    if bad:
+        raise ValueError(f"set_status: fields not updatable: {bad}")
+    names = [n for n in _UPDATABLE if n in fields]
+    sets = ", ".join(["status = %s"] + [f"{n} = %s" for n in names])
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE site_events SET {sets} "
+        f"WHERE event_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",
+        (status, *[fields[n] for n in names], event_id, company_id, site_id)).fetchone()
+
+
+def queued_same_subject(conn, company_id, site_id, type, subject_ref):
+    """Queued events of this tenant with the same type and subject, in seq order."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM site_events "
+        "WHERE company_id = %s AND site_id = %s AND type = %s AND subject_ref = %s "
+        "AND status = 'queued' ORDER BY seq",
+        (company_id, site_id, type, subject_ref)).fetchall()
