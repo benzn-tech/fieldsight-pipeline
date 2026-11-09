@@ -108,7 +108,7 @@ is an item missing from a parsed answer.
 `en`.
 
 **Not linked without a call slot.** Items with no or unparsable `time_range` count as `no_window`.
-Items beyond 60 in a session count as `over_cap`.
+Items beyond 60 in a session count as `over_cap`. Items whose text is empty or blank count as `no_text`.
 
 The writer's `already_linked` recheck needs a database and is out of scope offline.
 
@@ -160,7 +160,7 @@ pooled: they are not independent, and pooling would triple n and fake a tighter 
      by `is_link_correct`.
    - (c) **Pair:** both items of a twin pair accepted on the same turn. This should be 0 by
      construction, and is checked anyway.
-4. **Rep agreement.** Counted over items that got a prompt slot (not `no_window` or `over_cap`).
+4. **Rep agreement.** Counted over items that got a prompt slot (not `no_window`, `over_cap` or `no_text`).
    - An item agrees when its **raw model pick** is the same in all 3 reps: the same turn index, or
      null in all 3. This is before the guards.
    - A failed call is its own value: it agrees only with another failed call.
@@ -202,7 +202,7 @@ pooled: they are not independent, and pooling would triple n and fake a tighter 
   - per kind;
   - per language (`zh` / `en`);
   - for the mixed stratum (cross-language accepted links / items).
-- **Counts:** outcomes per guard; `no_window`, `over_cap`, failed calls, unknown-script picks.
+- **Counts:** outcomes per guard; `no_window`, `over_cap`, `no_text`, failed calls, unknown-script picks.
 - **Lexical-unlinked split.** The lexical linker has no fitted constants, because Track C's fit had
   no feasible point.
   - "Left unlinked by the lexical linker" therefore means unlinked by
