@@ -156,14 +156,21 @@ def test_reply_to_is_claim_email():
     assert msg["From"] == "sales@fieldsightai.com"
 
 
-def test_transcript_section_only_when_edited():
-    marker = "Transcript (machine, before the person edited it)"
-    assert marker not in _plain(_build(_record(transcript="")))
-    assert marker not in _plain(_build(_record(text=" hello ", transcript="hello")))
-    body = _plain(_build(_record(text="hello there", transcript="hello their")))
-    assert marker in body and "hello their" in body
-    # text first
-    assert body.index("hello there") < body.index(marker)
+def test_email_carries_only_the_sent_text_never_the_machine_transcript():
+    # Owner, 2026-11-09: two overlapping versions confused the reader. The text the
+    # person sent is the message; the recording is attached; the machine transcript
+    # stays in the S3 record only.
+    msg = _build(_record(text="hello there", transcript="hello their"))
+    body = _plain(msg)
+    html = msg.get_body(preferencelist=("html",)).get_content()
+    for part in (body, html):
+        assert "hello there" in part
+        assert "hello their" not in part
+        assert "Transcript (machine" not in part
+    assert body.replace("\r\n", "\n").startswith("Message:\nhello there")
+    # the reader is told where the unedited transcript lives
+    assert "Machine transcript: in the S3 record" in body
+    assert "Machine transcript" not in _plain(_build(_record(transcript="")))
 
 
 def test_plain_body_carries_who_and_where():

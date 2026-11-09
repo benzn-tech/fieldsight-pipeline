@@ -161,20 +161,19 @@ def _subject(context, stage, claim_name=None):
     return _one_line(f"{prefix}FieldSight message from {name} ({company})")
 
 
-def _show_transcript(text, transcript):
-    t = (transcript or "").strip()
-    return bool(t) and t != (text or "").strip()
-
-
 def build_email(*, record, audio, ext, sender, to, stage, now_nz_label):
     """The raw MIME bytes for ses.send_raw_email.
 
     multipart/mixed: [multipart/alternative: text/plain, text/html] + the audio
-    as message.webm / message.m4a when there is one. The plain text comes first."""
+    as message.webm / message.m4a when there is one. The plain text comes first.
+
+    The body is the text the person sent and nothing else. The machine transcript
+    is never in the email: next to the edited text it read as two overlapping
+    versions of one message (owner, 2026-11-09). The recording is attached, and
+    the unedited transcript stays in the S3 record."""
     ctx = record.get("context") or {}
     text = record.get("text") or ""
-    transcript = record.get("transcript") or ""
-    show_t = _show_transcript(text, transcript)
+    has_transcript = bool((record.get("transcript") or "").strip())
 
     details = [
         ("Email", record.get("email") or ""),
@@ -191,11 +190,11 @@ def build_email(*, record, audio, ext, sender, to, stage, now_nz_label):
     ]
     if audio:
         details.append(("Recording", f"attached as message.{ext}"))
+    if has_transcript:
+        details.append(("Machine transcript", "in the S3 record (not shown here)"))
 
-    plain = [text.strip() or "(no typed text; see the attached recording)", ""]
-    if show_t:
-        plain += ["Transcript (machine, before the person edited it):",
-                  transcript.strip(), ""]
+    message = text.strip() or "(no typed text; see the attached recording)"
+    plain = ["Message:", message, ""]
     plain.append("---")
     plain += [f"{k}: {v}" for k, v in details]
     plain_body = "\n".join(plain) + "\n"
@@ -204,11 +203,8 @@ def build_email(*, record, audio, ext, sender, to, stage, now_nz_label):
         return html.escape(s).replace("\n", "<br>")
 
     h = ["<html><body style=\"font-family:sans-serif\">",
-         f"<p>{para(text.strip() or '(no typed text; see the attached recording)')}</p>"]
-    if show_t:
-        h += ["<p><b>Transcript (machine, before the person edited it):</b><br>",
-              f"{para(transcript.strip())}</p>"]
-    h.append("<hr><table>")
+         f"<p><b>Message:</b><br>{para(message)}</p>",
+         "<hr><table>"]
     h += [f"<tr><td><b>{html.escape(k)}</b></td><td>{html.escape(str(v))}</td></tr>"
           for k, v in details]
     h.append("</table></body></html>")
