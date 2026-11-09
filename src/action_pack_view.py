@@ -229,7 +229,10 @@ def payload_shape_error(payload):
     for claim in payload.get("conclusion") or []:
         if not isinstance(claim, dict) or not isinstance(claim.get("text"), str) or (
                 claim.get("refs") is not None and not _str_list(claim["refs"])) or (
-                claim.get("confidence") not in (None, "supported", "uncertain")):
+                claim.get("confidence") not in (None, "supported", "uncertain")) or (
+                claim.get("verifier_detail") is not None
+                and not isinstance(claim["verifier_detail"], dict)) or (
+                "hidden" in claim and not isinstance(claim["hidden"], bool)):
             return "conclusion_shape"
     for s in payload.get("sources") or []:
         if not isinstance(s, dict):
@@ -490,13 +493,15 @@ def visible_conclusion(pack, removed_refs) -> list:
     """S13 for the conclusion: a claim citing only removed sources is left out, and so is
     every UNCITED claim (kept as uncertain, never model-checked against a source) once any
     non-web source of the pack is removed for this reader -- it may have been written
-    from that source."""
+    from that source. A line stored `hidden: true` (the verifier found it unsupported,
+    spec 2026-11-05 §7.2) is never shown; a line without the key is shown."""
     removed_refs = set(removed_refs or ())
     non_web_removed = any(isinstance(s, dict) and s.get("ref") in removed_refs
                           and s.get("provenance") != "web"
                           for s in pack.get("sources") or [])
     return [c for c in (pack.get("conclusion") or [])
-            if isinstance(c, dict) and not cites_only_removed(c.get("refs"), removed_refs)
+            if isinstance(c, dict) and c.get("hidden") is not True
+            and not cites_only_removed(c.get("refs"), removed_refs)
             and not (non_web_removed and not c.get("refs"))]
 
 
@@ -522,6 +527,22 @@ def visible_sub_tasks(pack, conclusion, action_seqs):
         e["actions"] = [s for s in e.get("actions") or [] if s in action_seqs]
         out.append(e)
     return out
+
+
+def public_verifier_detail(detail):
+    """verifier_detail as GET shows it (spec 2026-11-05 §9.2): everything but `served`.
+    None for an action stored without one (an old pack)."""
+    if not isinstance(detail, dict):
+        return None
+    return {k: x for k, x in detail.items() if k != "served"}
+
+
+def _conclusion_out(c):
+    """A stored conclusion line as GET shows it: a copy, its verifier_detail without
+    `served` (the stored dict stays, visible_sub_tasks maps by its identity)."""
+    if "verifier_detail" not in c:
+        return c
+    return dict(c, verifier_detail=public_verifier_detail(c["verifier_detail"]))
 
 
 def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id,
@@ -563,12 +584,14 @@ def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id,
         # see the live item -- the same S13 rule as a source.
         out["target_snapshot"] = (a.get("target_snapshot") if target.get("visible")
                                   else None)
+        out["verifier_detail"] = public_verifier_detail(a.get("verifier_detail"))
         actions.append(out)
     return {
         "id": str(pack["id"]), "site_id": str(pack["site_id"]), "site_name": site_name,
         "title": pack.get("title"), "instruction": pack.get("instruction"),
         "reading": pack.get("reading"), "state": pack.get("state"),
-        "failure": pack.get("failure"), "conclusion": conclusion,
+        "failure": pack.get("failure"),
+        "conclusion": [_conclusion_out(c) for c in conclusion],
         "as_of": pack.get("as_of"), "created_at": pack.get("created_at"),
         "updated_at": pack.get("updated_at"),
         "archived": pack.get("archived_at") is not None,

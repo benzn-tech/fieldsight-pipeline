@@ -190,9 +190,10 @@ class Verify:
         self.label, self.model, self.calls = label, model, []
 
     def __call__(self, draft, *, registry, items, sources, ctx, writer_model, deadline,
-                 writer_served=None):
+                 writer_served=None, user_values=None):
         self.calls.append({"draft": draft, "sources": sources, "writer_model": writer_model,
-                           "deadline": deadline, "registry": registry})
+                           "deadline": deadline, "registry": registry,
+                           "user_values": user_values})
         return {"conclusion": [{"index": i, "confidence": c["confidence"]}
                                for i, c in enumerate(draft["conclusion"])],
                 "actions": [{"index": i, "verifier": self.label}
@@ -1773,3 +1774,90 @@ def test_write_prompt_lists_sub_tasks_and_the_rule():
     model = Model()
     st.run(make_ctx(), deps(model=model))
     assert "Sub-tasks (" not in _write_prompt(model)
+
+
+# ---- the verifier's user values (spec 2026-11-05 §7.2, Task 7.2) ----------------------------
+
+def test_run_passes_the_instruction_and_stated_values_to_the_verifier():
+    stated = [{"target": "t1", "field": "deadline", "value": "2026-11-13"},
+              {"target": "t2", "field": "priority", "value": "high"},
+              {"target": None, "field": "responsible", "value": "Mike"}]
+    verify = Verify()
+    model = Model(plan=[plan_obj(targets=TARGETS2, stated_values=stated)])
+    st.run(make_ctx(instruction="Push task 2 to the 13th"),
+           deps(model=model, tools=TargetTools(), verify=verify))
+    uv = verify.calls[0]["user_values"]
+    assert uv["instruction"] == "Push task 2 to the 13th"
+    # a resolved target carries its item's stable id; the verifier renders that item
+    assert uv["stated_values"] == [
+        {"target": "t1", "field": "deadline", "value": "2026-11-13",
+         "target_stable_id": SID2},
+        {"target": "t2", "field": "priority", "value": "high",
+         "target_stable_id": SID_DONE},
+        {"target": None, "field": "responsible", "value": "Mike",
+         "target_stable_id": None}]
+
+
+
+class HideVerify(Verify):
+    """Labels every element; conclusion lines in `hide` come back hidden (an unsupported
+    line, spec 2026-11-05 §7.2), with a detail."""
+
+    def __init__(self, hide=()):
+        super().__init__()
+        self.hide = set(hide)
+
+    def __call__(self, draft, **kw):
+        out = super().__call__(draft, **kw)
+        for c in out["conclusion"]:
+            if c["index"] in self.hide:
+                c.update(confidence="uncertain", hidden=True,
+                         detail={"model": VERIFIER, "served": None, "attempt": 1,
+                                 "reason_code": "not_in_evidence", "reason": "No."})
+        return out
+
+
+def test_a_hidden_conclusion_line_is_stored_but_answers_no_sub_task():
+    write = write_obj(conclusion=[{"text": "Hidden one.", "refs": ["R1"],
+                                   "confidence": "supported"},
+                                  {"text": "The pour was done.", "refs": ["R1"],
+                                   "confidence": "supported"}],
+                      actions=[_close1()],
+                      sub_tasks=[_sub("s1", "done", conclusion=[0]),
+                                 _sub("s2", "done", actions=[0], conclusion=[0, 1])])
+    model = Model(plan=[plan_obj(targets=NAMED_T1, sub_tasks=PLAN_SUBS)], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=HideVerify(hide={0})))
+    assert [(c["text"], c.get("hidden", False)) for c in payload["conclusion"]] == [
+        ("Hidden one.", True), ("The pour was done.", False)]
+    assert payload["conclusion"][0]["verifier_detail"]["reason_code"] == "not_in_evidence"
+    # s1 rested only on the hidden line: not done, as when the line was dropped
+    assert [(s["id"], s["status"], s["reason_code"], s["conclusion"])
+            for s in payload["sub_tasks"]] == [
+        ("s1", "not_done", "dropped_by_checks", []), ("s2", "done", None, [1])]
+    assert payload["run_trace"]["conclusion"] == 1
+    assert action_pack_view.payload_shape_error(payload) is None
+
+
+def test_apply_verdicts_carries_hidden_and_rejects_a_non_bool():
+    draft = {"conclusion": [{"text": "c", "refs": ["R1"], "confidence": "supported"}],
+             "actions": []}
+    conclusion, *_rest, ignored = st.apply_verdicts(draft, {
+        "conclusion": [{"index": 0, "confidence": "uncertain", "hidden": True}],
+        "actions": [], "model": VERIFIER})
+    assert conclusion[0]["hidden"] is True and ignored["fields"] == 0
+    with pytest.raises(agent.StageError):
+        st.apply_verdicts(draft, {"conclusion": [{"index": 0, "confidence": "uncertain",
+                                                  "hidden": "yes"}],
+                                  "actions": [], "model": VERIFIER})
+
+
+def test_sources_cited_only_by_a_hidden_line_are_not_in_the_pack():
+    # review of #1254: GET sources and refs_cited follow the shown lines only
+    write = write_obj(conclusion=[{"text": "Hidden one.", "refs": ["R2"],
+                                   "confidence": "supported"},
+                                  {"text": "The pour was done.", "refs": ["R1"],
+                                   "confidence": "supported"}], actions=[])
+    model = Model(plan=[plan_obj()], write=[write])
+    payload = st.run(make_ctx(), deps(model=model, verify=HideVerify(hide={0})))
+    assert payload["conclusion"][0].get("hidden") is True
+    assert {s["ref"] for s in payload["sources"]} == {"R1"}

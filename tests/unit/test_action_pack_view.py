@@ -202,3 +202,72 @@ def test_sub_task_positions_follow_the_reader_visible_conclusion():
     assert view["sub_tasks"][0]["conclusion"] == [0]
     assert view["sub_tasks"][0]["actions"] == [1]
     assert subs[0]["conclusion"] == [0, 1]          # the stored pack is not mutated
+
+
+
+# ---- verifier_detail on GET (spec 2026-11-05 §7.2, §9.2; Task 7.3) -----------------------
+
+_DETAIL = {"model": "claude-opus-5-5", "served": "claude-opus-5-5-20261001", "attempt": 2,
+           "reason_code": "partly_stated", "reason": "Only the wall is named."}
+
+
+def test_get_omits_served():
+    pack = _pack(sub_tasks=[{"id": "s1", "ask": "x", "kind": "close", "status": "done",
+                             "actions": [1], "conclusion": [1], "reason_code": None,
+                             "reason": None}])
+    pack["actions"][0]["verifier_detail"] = dict(_DETAIL)
+    pack["conclusion"][1]["verifier_detail"] = dict(_DETAIL)
+    view = v.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
+                        applicable={}, viewer_id="u")
+    public = {k: x for k, x in _DETAIL.items() if k != "served"}
+    assert view["actions"][0]["verifier_detail"] == public
+    assert view["actions"][1]["verifier_detail"] is None        # an old pack's action
+    assert view["conclusion"][1]["verifier_detail"] == public
+    assert "verifier_detail" not in view["conclusion"][0]
+    assert "claude-opus-5-5-20261001" not in json.dumps(view, default=str)
+    # the stored pack is untouched and the sub-task still points at its line
+    assert pack["actions"][0]["verifier_detail"]["served"] == _DETAIL["served"]
+    assert pack["conclusion"][1]["verifier_detail"]["served"] == _DETAIL["served"]
+    assert view["sub_tasks"][0]["conclusion"] == [1]
+
+
+def test_payload_shape_checks_a_conclusion_lines_verifier_detail():
+    p = _store_payload(conclusion=[{"text": "c", "refs": ["R1"], "confidence": "uncertain",
+                                    "verifier_detail": dict(_DETAIL)}])
+    assert v.payload_shape_error(p) is None
+    p["conclusion"][0]["verifier_detail"] = "weak"
+    assert v.payload_shape_error(p) == "conclusion_shape"
+
+
+
+# ---- hidden conclusion lines (spec 2026-11-05 §7.2, §9.2; Task 7.4) ----------------------
+
+def test_payload_shape_allows_a_boolean_hidden_on_a_conclusion_line():
+    for hidden in (True, False):
+        p = _store_payload(conclusion=[{"text": "c", "refs": ["R1"],
+                                        "confidence": "uncertain", "hidden": hidden}])
+        assert v.payload_shape_error(p) is None
+    for bad in ("true", 1, None):
+        p = _store_payload(conclusion=[{"text": "c", "refs": ["R1"],
+                                        "confidence": "uncertain", "hidden": bad}])
+        assert v.payload_shape_error(p) == "conclusion_shape", bad
+
+
+def test_get_omits_hidden_lines_and_remaps_sub_task_positions():
+    # Stored conclusion [visible, hidden, visible]; a sub-task points at positions 1 and 2:
+    # GET shows two lines and the sub-task's position 2 is now 1; the hidden one is gone.
+    conclusion = [{"text": "first", "refs": ["R1"], "confidence": "supported"},
+                  {"text": "HIDDEN-LINE", "refs": ["R1"], "confidence": "uncertain",
+                   "hidden": True},
+                  {"text": "third", "refs": ["R1"], "confidence": "uncertain",
+                   "hidden": False}]
+    subs = [{"id": "s1", "ask": "x", "kind": "close", "status": "done", "actions": [],
+             "conclusion": [1, 2], "reason_code": None, "reason": None}]
+    pack = _pack(conclusion=conclusion, sub_tasks=subs)
+    view = v.shape_pack(pack, removed_refs=set(), site_name=None, targets={},
+                        applicable={}, viewer_id="u")
+    assert [c["text"] for c in view["conclusion"]] == ["first", "third"]
+    assert view["sub_tasks"][0]["conclusion"] == [1]
+    assert "HIDDEN-LINE" not in v.render_markdown(view)
+    # an old pack's line has no `hidden`: shown
+    assert [c["text"] for c in v.visible_conclusion(_pack(), set())] == ["gone", "kept"]
