@@ -5663,6 +5663,15 @@ Resources:
           STATUS_EVIDENCE_FLOOR_TOKENS: !Ref StatusEvidenceFloorTokens
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
+          # The worker's turns come from assemble_session_turns, which applies these two at
+          # import: the same values as ExtractSessionFunction, or the reconcile model reads a
+          # different transcript than extraction did.
+          DEVICE_ANNOUNCEMENT_PATTERNS: !Ref DeviceAnnouncementPatterns
+          FILTER_AUDIO_EVENT_TAGS: !Ref FilterAudioEventTags
+          # The reconcile call runs thinking ON (the matcher's first thinking-mode call); the
+          # 150s llm_utils default is what killed extract_session's final pass (see its
+          # comment). 540 < LLM_CHAIN_BUDGET_SECONDS 840 < Timeout 900, as there.
+          LLM_HTTP_TIMEOUT: '540'
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref SuggestionWriterFunction

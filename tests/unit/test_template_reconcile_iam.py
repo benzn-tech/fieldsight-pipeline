@@ -73,3 +73,16 @@ def test_reconcile_status_parameter_defaults_off():
     assert seg, "no ReconcileStatus parameter"
     assert "Default: 'false'" in seg.group(1)
     assert "AllowedValues: ['true', 'false']" in seg.group(1)
+
+
+def test_matcher_mirrors_extract_sessions_turn_and_timeout_env():
+    """The worker renders turns with assemble_session_turns, which reads the announcement and
+    audio-tag knobs at import; a value set only on ExtractSessionFunction would let the
+    reconcile model see a different transcript than extraction did. LLM_HTTP_TIMEOUT: the
+    reconcile call is the matcher's first thinking-mode call, which outlives the 150s default."""
+    matcher, extract = _block("MatcherFunction"), _block("ExtractSessionFunction")
+    for name in ("DEVICE_ANNOUNCEMENT_PATTERNS", "FILTER_AUDIO_EVENT_TAGS", "LLM_HTTP_TIMEOUT"):
+        want = re.search(rf"\n\s*{name}: (.+)\n", extract).group(1).strip()
+        got = re.search(rf"\n\s*{name}: (.+)\n", matcher)
+        assert got, f"MatcherFunction lacks {name}"
+        assert got.group(1).strip() == want, name

@@ -847,3 +847,122 @@ def test_dry_run_returns_impacts_without_invoke(monkeypatch):
     assert len(result["suggestions"]) == 1
     assert len(result["impacts"]) == 1
     assert fake_lambda.invoke_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-session status reconcile R0 (Task 5): reconcile_requests/ records route
+# to reconcile_worker; match_requests/ records are untouched.
+# ---------------------------------------------------------------------------
+
+RECONCILE_KEY = "reconcile_requests/site-1/2026-11-10/0123456789abcdef.json"
+_STATUS = {"stable_id": "s-1", "site_id": "site-1", "suggested_status": "done",
+           "quote": "q", "segment_key": "audio_segments/u/d/x.wav", "offset_sec": 1.0,
+           "run": "reconcile:R0:2026-11-10T10:30:00Z"}
+_PICK = {"site_id": "site-1", "suggested_status": "done", "quote": "q2",
+         "segment_key": "audio_segments/u/d/x.wav", "offset_sec": 2.0,
+         "candidates": ["s-2", "s-3"], "run": "reconcile:R0:2026-11-10T10:30:00Z"}
+
+
+def _reconcile_setup(monkeypatch, function_error=None, result=None):
+    req = {"site_id": "site-1", "date": "2026-11-10", "user_folder": "Ben",
+           "session_base": "sidabc", "extraction_key": "extractions/Ben/2026-11-10/sidabc.json",
+           "extracted_at": "2026-11-10T10:30:00Z", "rung": "R0", "candidates": [{"x": 1}]}
+    fake_s3 = FakeS3({RECONCILE_KEY: json.dumps(req)})
+    monkeypatch.setattr(lpm, "s3", lambda: fake_s3)
+    monkeypatch.setattr(lpm, "S3_BUCKET", BUCKET)
+    seen = []
+
+    def process_request(r, input_key, **kw):
+        seen.append((r, input_key, kw))
+        return result if result is not None else {
+            "status_suggestions": [_STATUS], "pick_cards": [_PICK], "counts": {"kept": 1}}
+
+    monkeypatch.setattr(lpm.reconcile_worker, "process_request", process_request)
+
+    def no_match_path(*a, **k):
+        raise AssertionError("a reconcile record must not reach the programme path")
+    monkeypatch.setattr(lpm, "_process_topic", no_match_path)
+    fake_lambda = FakeLambdaClient(function_error=function_error)
+    monkeypatch.setattr(lpm, "lambda_client", lambda: fake_lambda)
+    return req, seen, fake_lambda
+
+
+def test_reconcile_record_routes_and_invokes_writer(monkeypatch):
+    req, seen, fake_lambda = _reconcile_setup(monkeypatch)
+
+    result = lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+
+    assert len(seen) == 1
+    assert seen[0][0] == req and seen[0][1] == RECONCILE_KEY
+    assert seen[0][2].get("bucket") == BUCKET
+    assert result["status_suggestions"] == [_STATUS]
+    assert result["pick_cards"] == [_PICK]
+    assert len(fake_lambda.invoke_calls) == 1
+    call = fake_lambda.invoke_calls[0]
+    assert call["InvocationType"] == "RequestResponse"
+    assert json.loads(call["Payload"]) == {
+        "suggestions": [], "impacts": [], "verdicts": [],
+        "status_suggestions": [_STATUS], "pick_cards": [_PICK]}
+
+
+def test_reconcile_picks_only_still_invokes_writer(monkeypatch):
+    _req, _seen, fake_lambda = _reconcile_setup(
+        monkeypatch, result={"status_suggestions": [], "pick_cards": [_PICK], "counts": {}})
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+    assert len(fake_lambda.invoke_calls) == 1
+    assert json.loads(fake_lambda.invoke_calls[0]["Payload"])["pick_cards"] == [_PICK]
+
+
+def test_reconcile_zero_hits_skips_writer(monkeypatch):
+    _req, _seen, fake_lambda = _reconcile_setup(
+        monkeypatch, result={"status_suggestions": [], "pick_cards": [], "counts": {}})
+    result = lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+    assert fake_lambda.invoke_calls == []
+    assert result["status_suggestions"] == [] and result["pick_cards"] == []
+
+
+def test_reconcile_dry_run_returns_new_lists_without_invoking(monkeypatch):
+    _req, _seen, fake_lambda = _reconcile_setup(monkeypatch)
+    event = _match_request_event(RECONCILE_KEY)
+    event["dry_run"] = True
+    result = lpm.lambda_handler(event, None)
+    assert fake_lambda.invoke_calls == []
+    assert result["dry_run"] is True
+    assert result["status_suggestions"] == [_STATUS]
+    assert result["pick_cards"] == [_PICK]
+
+
+def test_reconcile_worker_error_propagates(monkeypatch):
+    _reconcile_setup(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("model failed")
+    monkeypatch.setattr(lpm.reconcile_worker, "process_request", boom)
+    with pytest.raises(RuntimeError):
+        lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+
+
+def test_writer_function_error_raises(monkeypatch):
+    _reconcile_setup(monkeypatch, function_error="Unhandled")
+    with pytest.raises(RuntimeError):
+        lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+
+
+def test_match_requests_path_unchanged(monkeypatch):
+    """A match_requests/ record never reaches the worker, and the writer payload is exactly
+    the three keys it always was -- no empty status_suggestions/pick_cards keys appear."""
+    req_key, fake_lambda = _clean_match_setup(monkeypatch)
+
+    def must_not_run(*a, **k):
+        raise AssertionError("a match_requests record must not reach reconcile_worker")
+    monkeypatch.setattr(lpm.reconcile_worker, "process_request", must_not_run)
+
+    result = lpm.lambda_handler(_match_request_event(req_key), None)
+
+    assert len(fake_lambda.invoke_calls) == 1
+    payload = fake_lambda.invoke_calls[0]["Payload"]
+    assert payload == json.dumps({"suggestions": result["suggestions"],
+                                  "impacts": result["impacts"],
+                                  "verdicts": result["verdicts"]})
+    assert "status_suggestions" not in json.loads(payload)
+    assert "pick_cards" not in json.loads(payload)

@@ -128,6 +128,7 @@ import boto3
 
 import llm_utils
 import dashscope_utils
+import reconcile_worker
 from repositories import programme
 
 logger = logging.getLogger()
@@ -929,6 +930,10 @@ def lambda_handler(event, _context):
     suggestions = []
     impacts = []
     verdicts = []
+    # Cross-session status reconcile R0: reconcile_requests/ records go to
+    # reconcile_worker and produce these two lists; match_requests/ never does.
+    status_suggestions = []
+    pick_cards = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])
         obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
@@ -940,6 +945,13 @@ def lambda_handler(event, _context):
         # json.loads/json.dumps might reformat it.
         input_hash = hashlib.sha256(body).hexdigest()
         req = json.loads(body.decode("utf-8"))
+        if key.startswith(reconcile_worker.PREFIX):
+            # Raises on a model error / unparseable answer (fail closed: the S3
+            # event retries). Logs counts only.
+            out = reconcile_worker.process_request(req, key, bucket=S3_BUCKET)
+            status_suggestions.extend(out["status_suggestions"])
+            pick_cards.extend(out["pick_cards"])
+            continue
         for topic in req.get("topics") or []:
             suggestion, topic_impacts, topic_verdicts = _process_topic(req, topic, key, input_hash)
             if suggestion is not None:
@@ -948,13 +960,22 @@ def lambda_handler(event, _context):
             verdicts.extend(topic_verdicts)
 
     if dry_run:
-        return {"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts, "dry_run": True}
+        return {"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts,
+                "status_suggestions": status_suggestions, "pick_cards": pick_cards,
+                "dry_run": True}
 
-    if suggestions or impacts or verdicts:
+    if suggestions or impacts or verdicts or status_suggestions or pick_cards:
+        payload = {"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts}
+        # Added only when non-empty, so a match_requests/ payload stays
+        # byte-identical to what it was before reconcile existed.
+        if status_suggestions:
+            payload["status_suggestions"] = status_suggestions
+        if pick_cards:
+            payload["pick_cards"] = pick_cards
         resp = lambda_client().invoke(
             FunctionName=SUGGESTION_WRITER_FUNCTION,
             InvocationType="RequestResponse",
-            Payload=json.dumps({"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts}),
+            Payload=json.dumps(payload),
         )
         # A crashed writer comes back as a 200 with FunctionError set --
         # never treat that as "written" (fail-closed: raise so the S3
@@ -964,4 +985,5 @@ def lambda_handler(event, _context):
                 f"suggestion-writer invoke failed: {resp.get('FunctionError')}"
             )
 
-    return {"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts}
+    return {"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts,
+            "status_suggestions": status_suggestions, "pick_cards": pick_cards}
