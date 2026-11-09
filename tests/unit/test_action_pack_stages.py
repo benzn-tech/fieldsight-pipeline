@@ -970,7 +970,7 @@ def test_plan_prompt_a_quoted_item_value_is_not_stated():
     st.run(make_ctx(), deps(model=model))
     prompt = next(c["prompt"] for c in model.calls if c["caller"] == "action_plan")
     assert "values the user gave in their own words" in prompt
-    assert "only quotes from an item or a record" in prompt
+    assert "repeats from an item or a record and asks to be worked out" in prompt
     assert "is not a stated value: leave it out" in prompt
 
 
