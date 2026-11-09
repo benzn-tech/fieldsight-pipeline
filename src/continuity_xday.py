@@ -130,7 +130,8 @@ def select_candidates(recency, lexical, new_first_seen, chains):
     rows not recorded strictly earlier than EVERY new item of the kind are dropped (as are this
     session's own stable_ids); chains collapse to their newest member (`chains[sid]` -> newest
     stable_id) -- the head row if it survived, else the first surviving member stands for the
-    chain; deduped; at most CAP_PER_KIND.
+    chain, and a chain whose head is one of this session's new items is not shown at all;
+    deduped; at most CAP_PER_KIND.
 
     `new_first_seen` maps a new stable_id to its order key `(first_date, recorded_at | None)`."""
     new_keys = list((new_first_seen or {}).values())
@@ -156,7 +157,9 @@ def select_candidates(recency, lexical, new_first_seen, chains):
     out, shown = [], set()
     for sid in order:
         head = chains.get(sid, sid)
-        if head in shown:
+        if head in shown or head in own:
+            # head in `own`: this session already continues the chain (a re-run); showing an
+            # older member would let another new item branch it
             continue
         shown.add(head)
         out.append(survivors.get(head, survivors[sid]))

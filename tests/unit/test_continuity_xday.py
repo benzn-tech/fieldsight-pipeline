@@ -57,10 +57,16 @@ def test_select_candidates_collapses_chain_to_newest_member():
     got = cx.select_candidates([old, mid], {"n1": [head]}, {"n1": NEW_KEY}, chains)
     assert [c["stable_id"] for c in got] == ["head"]
 
-    # the head is not in the pool (or is this session's own item on a re-run): the first
-    # surviving member stands for the chain, once
-    got = cx.select_candidates([old, mid], {}, {"n1": NEW_KEY}, {"old": "n1", "mid": "n1"})
+    # the head is not in the pool: the first surviving member stands for the chain, once
+    got = cx.select_candidates([old, mid], {}, {"n1": NEW_KEY}, {"old": "gone", "mid": "gone"})
     assert [c["stable_id"] for c in got] == ["old"]
+
+    # the head is one of THIS session's new items (a re-run): the chain is not shown at all,
+    # so no other new item can branch it; an unrelated candidate is unaffected
+    other = _cand("other", first_date="2026-10-25")
+    got = cx.select_candidates([old, mid, other], {}, {"n1": NEW_KEY, "n2": NEW_KEY},
+                               {"old": "n1", "mid": "n1"})
+    assert [c["stable_id"] for c in got] == ["other"]
 
     # the head survives the pool but not the order filter: an earlier member stands in
     late_head = _cand("head", first_date="2026-11-10")
