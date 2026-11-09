@@ -174,14 +174,14 @@ def test_malformed_turn_label_is_shape_drop():
 def test_unknown_alias_is_shape_drop():
     turns, items = _two_topics()
     req = ntp.build_request(items, turns, DATE)
-    rows = ntp.apply_guards(req, [{"item": "I9", "turn": "T1"}], turns)
-    # request items keep one row each, in request order, and are abstained (no pick)
-    assert [r["alias"] for r in rows[:2]] == ["I1", "I2"]
-    assert all(r["outcome"] == "abstained" and r["guard"] is None for r in rows[:2])
-    # the unknown alias is reported as a shape drop with no item behind it
-    extra = _row(rows, "I9")
-    assert (extra["outcome"], extra["guard"]) == ("rejected", "shape")
-    assert extra["stable_id"] is None and extra["row_id"] is None and extra["turn_index"] is None
+    rows = ntp.apply_guards(req, [{"item": "I9", "turn": "T1"}, {"item": "I2", "turn": "T1"}],
+                            turns)
+    # exactly one row per request item, in request order; the unknown alias adds no row
+    assert [r["alias"] for r in rows] == ["I1", "I2"]
+    assert all(r["stable_id"] is not None for r in rows)
+    # I1's only pick was absent: abstained, never accepted via the unknown alias
+    assert (rows[0]["outcome"], rows[0]["guard"], rows[0]["turn_index"]) == ("abstained", None, None)
+    assert rows[1]["outcome"] == "accepted"
 
 
 def test_duplicate_alias_is_shape_drop():

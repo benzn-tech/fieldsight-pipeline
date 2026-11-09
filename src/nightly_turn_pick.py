@@ -216,7 +216,10 @@ def _row(it, *, turn=None, turn_index=None, outcome, guard=None, cross_language=
 
 
 def apply_guards(request, picks, turns):
-    """One row per request item, in request order, then one `shape` row per unknown alias.
+    """Exactly one row per request item, in request order.
+
+    A pick naming an unknown alias produces no row (callers count those from
+    `parse_answer`'s output); an item it might have meant stays abstained.
 
     Row: {alias, stable_id, row_id, kind, turn, turn_index, outcome, guard, cross_language};
     `turn` is the label as answered, `turn_index` the session-wide index into `turns`.
@@ -225,12 +228,10 @@ def apply_guards(request, picks, turns):
     by_alias = {it["alias"]: it for it in items}
     session_date = request.get("session_date")
 
-    answered, unknown = {}, []
+    answered = {}
     for p in picks:
         if p["item"] in by_alias:
             answered.setdefault(p["item"], []).append(p.get("turn"))
-        else:
-            unknown.append(p)
 
     rows = {}
     live = {}   # alias -> (turn label, turn_index) for picks past shape + window
@@ -281,12 +282,7 @@ def apply_guards(request, picks, turns):
                        outcome="rejected" if guard else "accepted", guard=guard,
                        cross_language=cross)
 
-    out = [rows[it["alias"]] for it in items]
-    for p in unknown:
-        out.append({"alias": p["item"], "stable_id": None, "row_id": None, "kind": None,
-                    "turn": p.get("turn"), "turn_index": None, "outcome": "rejected",
-                    "guard": "shape", "cross_language": False})
-    return out
+    return [rows[it["alias"]] for it in items]
 
 
 # ---------------------------------------------------------------------------------------
