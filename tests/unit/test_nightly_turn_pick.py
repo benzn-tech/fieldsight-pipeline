@@ -46,7 +46,7 @@ def test_turns_numbered_per_topic_by_window():
     req = ntp.build_request(items, turns, DATE)
     for topic, tr in ((0, "10:00-10:05"), (1, "10:05-10:10")):
         expected = item_support._window_turns(tr, DATE, turns)
-        got = req["topics"][topic]
+        got = req["topics"][str(topic)]
         assert [e["n"] for e in got] == [f"T{k}" for k in range(1, len(expected) + 1)]
         assert [e["turn_index"] for e in got] == expected
     assert req["session_date"] == DATE
@@ -62,6 +62,18 @@ def test_item_without_time_range_is_skipped_not_whole_session():
     assert [i["stable_id"] for i in req["items"]] == ["s2"]
     assert req["skipped"]["no_window"] == 1
     assert req["skipped"]["over_cap"] == 0
+    assert req["skipped"]["no_text"] == 0
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t", None])
+def test_blank_item_text_is_skipped(blank):
+    turns = _six_turns()
+    items = [_item(1, "x"), _item(2, "y")]
+    items[0]["text"] = blank
+    req = ntp.build_request(items, turns, DATE)
+    assert [i["stable_id"] for i in req["items"]] == ["s2"]
+    assert req["items"][0]["alias"] == "I1"
+    assert req["skipped"] == {"no_window": 0, "over_cap": 0, "no_text": 1}
 
 
 def test_over_cap_items_counted():
@@ -155,6 +167,17 @@ def test_accepted_pick_maps_to_session_turn_index():
     assert r1["cross_language"] is False
 
 
+def test_guards_survive_json_round_trip():
+    turns, items = _two_topics()
+    req = ntp.build_request(items, turns, DATE)
+    picks = [{"item": "I1", "turn": "T1"}, {"item": "I2", "turn": "T1"}]
+    direct = ntp.apply_guards(req, picks, turns)
+    trip = json.loads(json.dumps(req))
+    assert ntp.apply_guards(trip, picks, turns) == direct
+    assert [r["outcome"] for r in direct] == ["accepted", "accepted"]
+    assert ntp.render_prompt(trip, turns) == ntp.render_prompt(req, turns)
+
+
 def test_turn_from_other_topic_is_shape_drop():
     turns, items = _two_topics()
     req = ntp.build_request(items, turns, DATE)
@@ -171,7 +194,7 @@ def test_malformed_turn_label_is_shape_drop():
     assert (_row(rows, "I1")["outcome"], _row(rows, "I1")["guard"]) == ("rejected", "shape")
 
 
-def test_unknown_alias_is_shape_drop():
+def test_unknown_alias_adds_no_row():
     turns, items = _two_topics()
     req = ntp.build_request(items, turns, DATE)
     rows = ntp.apply_guards(req, [{"item": "I9", "turn": "T1"}, {"item": "I2", "turn": "T1"}],

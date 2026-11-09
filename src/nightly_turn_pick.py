@@ -70,11 +70,17 @@ _CJK_PLACE_CHARS = set("〇零一二三四五六七八九十百两东西南北")
 def build_request(items, turns, session_date):
     """Alias items I1.. (at most MAX_ITEMS) and number each topic's window turns T1..Tn.
 
-    Items whose window is empty are counted as `no_window` before the cap is applied.
+    Items with blank text are counted as `no_text`, items whose window is empty as
+    `no_window`; both before the cap is applied. `topics` is keyed by
+    `str(topic_index)` so the request survives a JSON round trip unchanged.
     """
-    kept, no_window, over_cap = [], 0, 0
+    kept, no_text, no_window, over_cap = [], 0, 0, 0
     topics = {}
     for it in items:
+        text = (it.get("text") or "").strip()
+        if not text:
+            no_text += 1
+            continue
         window = _window_turns(it.get("time_range"), session_date, turns)
         if not window:
             no_window += 1
@@ -85,13 +91,18 @@ def build_request(items, turns, session_date):
         topic = it.get("topic_index")
         kept.append({"alias": f"I{len(kept) + 1}", "stable_id": it.get("stable_id"),
                      "row_id": it.get("row_id"), "kind": it.get("kind"),
-                     "text": it.get("text") or "", "topic_index": topic,
+                     "text": text, "topic_index": topic,
                      "time_range": it.get("time_range")})
-        if topic not in topics:
-            topics[topic] = [{"n": f"T{k}", "turn_index": i}
-                             for k, i in enumerate(window, start=1)]
+        key = _topic_key(topic)
+        if key not in topics:
+            topics[key] = [{"n": f"T{k}", "turn_index": i}
+                           for k, i in enumerate(window, start=1)]
     return {"items": kept, "topics": topics, "session_date": session_date,
-            "skipped": {"no_window": no_window, "over_cap": over_cap}}
+            "skipped": {"no_window": no_window, "over_cap": over_cap, "no_text": no_text}}
+
+
+def _topic_key(topic_index):
+    return str(topic_index)
 
 
 def _flat(text):
@@ -245,7 +256,8 @@ def apply_guards(request, picks, turns):
             rows[a] = _row(it, outcome="rejected", guard="shape")
             continue
         label = got[0]
-        numbered = {e["n"]: e["turn_index"] for e in request["topics"].get(it["topic_index"], [])}
+        sent = request["topics"].get(_topic_key(it["topic_index"]), [])
+        numbered = {e["n"]: e["turn_index"] for e in sent}
         if not _TURN_LABEL.fullmatch(label) or label not in numbered:
             rows[a] = _row(it, turn=label, outcome="rejected", guard="shape")
             continue
