@@ -445,6 +445,7 @@ jobs:
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "ReportLocationsSection=${{ vars.TEST_REPORT_LOCATIONS_SECTION || 'true' }}" \
               "EmitItemSupport=${{ vars.TEST_EMIT_ITEM_SUPPORT || 'false' }}" \
+              "EmitItemLocator=${{ vars.TEST_EMIT_ITEM_LOCATOR || 'false' }}" \
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \

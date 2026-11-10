@@ -151,14 +151,95 @@ def build(*, since=DEFAULT_SINCE, limit=None, out_dir=store.DATA_DIR,
             "resolved_quotes": sum(m["resolved_quotes"] for m in manifest), "skipped": skipped}
 
 
+# Locator spec section 6, side set: six TEST sessions with known status reports (the status
+# line's request). The spec names each by its date and session-base prefix; build resolves each
+# prefix to exactly one published extraction and refuses otherwise.
+SIDE_FOLDER = "Ben_Lin_test2"
+SIDE_SESSIONS = (("2026-11-06", "sidc415ad"), ("2026-11-06", "sidf39bb7"),
+                 ("2026-11-06", "sid926509"), ("2026-11-06", "sidda4287"),
+                 ("2026-11-07", "sida8cf83"), ("2026-11-07", "sidbdfd62"))
+
+
+def build_side(*, out_dir=store.DATA_DIR, profile=DEFAULT_PROFILE, region=DEFAULT_REGION,
+               s3c=None, bucket=TEST_BUCKET):
+    """Fetch the six side-set sessions into data/side/: turns rebuilt with the extractor's own
+    gather + assemble (every filter), `n_segments` = the extractor's len(source_filenames), and
+    the prior offered to the arms = `item_continuity.prior_items` over the extraction published
+    NOW (the final itself: S3 keeps only the latest, not the live pass the final read). The
+    published final's own `status_suggestions` counts and continuity `question_set` are kept
+    as the comparison baseline. Read-only; every prefix must resolve to exactly one key before
+    anything is written."""
+    import json
+
+    import item_continuity
+
+    if s3c is None:
+        import boto3
+        os.environ.setdefault("AWS_PROFILE", profile)
+        os.environ.setdefault("AWS_DEFAULT_REGION", region)
+        s3c = boto3.Session(profile_name=profile, region_name=region).client("s3")
+    import lambda_extract_session as les
+
+    out_dir = store.require_eval_dir(out_dir)
+    resolved = []
+    for date, prefix in SIDE_SESSIONS:
+        listing = f"{les.EXTRACTIONS_PREFIX}{SIDE_FOLDER}/{date}/"
+        hits = []
+        for page in s3c.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=listing):
+            for obj in page.get("Contents", []):
+                parsed = parse_extraction_key(obj["Key"], les.EXTRACTIONS_PREFIX)
+                if parsed and parsed[2].startswith(prefix):
+                    hits.append((obj["Key"], parsed))
+        if len(hits) != 1:
+            raise SystemExit(f"Refusing: side session {date} {prefix}* matched {len(hits)} "
+                             f"extraction(s), expected exactly 1.")
+        resolved.append(hits[0])
+
+    fetched = []
+    for key, (folder, date, base) in resolved:
+        extraction = json.loads(s3c.get_object(Bucket=bucket, Key=key)["Body"].read()
+                                .decode("utf-8"))
+        keys = les.gather_session_segments(bucket, folder, date, base)
+        turns, files, _ann = les.assemble_session_turns(bucket, keys)
+        if not turns:
+            raise SystemExit(f"Refusing: side session {date} {base[:9]}* has no turns.")
+        fetched.append((folder, date, base, extraction, turns, files))
+
+    rows = []
+    for folder, date, base, extraction, turns, files in fetched:
+        rec = session_record(folder, date, base, extraction, turns, "side")
+        rec.update({
+            "n_segments": len(files),
+            "prior": [p._asdict() for p in item_continuity.prior_items(extraction)],
+            "prior_source": "published_current",
+            "published_tier": extraction.get("tier"),
+            "published_status_suggestions": extraction.get("status_suggestions"),
+            "published_question_set": (extraction.get("continuity") or {}).get("question_set"),
+        })
+        store.write_json(Path(out_dir, store.SIDE_SUBDIR, "sessions", f"{rec['ref']}.json"), rec)
+        rows.append({"ref": rec["ref"], "date": date, "base": base, "n_turns": len(turns),
+                     "n_segments": len(files), "n_prior": len(rec["prior"]),
+                     "published_status_suggestions": rec["published_status_suggestions"]})
+    rows.sort(key=lambda r: r["ref"])
+    store.write_json(Path(out_dir, store.SIDE_SUBDIR, "manifest.json"),
+                     {"bucket": bucket, "folder": SIDE_FOLDER, "sessions": rows})
+    return {"sessions": len(rows), "prior_items": sum(r["n_prior"] for r in rows)}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--side", action="store_true",
+                   help="Fetch the locator side set (six status-line sessions) into data/side/.")
     p.add_argument("--since", default=DEFAULT_SINCE)
     p.add_argument("--limit", type=int, default=None, help="Smoke test only: first N sessions.")
     p.add_argument("--out", default=str(store.DATA_DIR))
     p.add_argument("--profile", default=DEFAULT_PROFILE)
     p.add_argument("--region", default=DEFAULT_REGION)
     a = p.parse_args(argv)
+    if a.side:
+        counts = build_side(out_dir=a.out, profile=a.profile, region=a.region)
+        print(store.dumps(counts))
+        return counts
     counts = build(since=a.since, limit=a.limit, out_dir=a.out, profile=a.profile,
                    region=a.region)
     print(store.dumps(counts))

@@ -10,16 +10,27 @@ session id, a folder name, item text or turn text.
 
     python -m scripts.item_support_eval.score fit
     python -m scripts.item_support_eval.score summary --run-a runs/heldout_a --run-b runs/heldout_b
+
+Locator measurement (spec 2026-11-10 section 6), over Task 6's run files and the locator's own
+labels; writes runs/locator/summary.<stage>.json (gitignored, counts only):
+
+    python -m scripts.item_support_eval.score locator --stage fit    # the fit gate
+    python -m scripts.item_support_eval.score locator --stage all    # bars 1-8, pooled + halves
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from item_text_match import cn_to_int, place_values, tokens, twin_flags  # noqa: F401
+import item_locator
+from evidence_match import is_cjk
+from item_continuity import KINDS
+from item_text_match import cn_to_int, overlap, place_values, tokens, twin_flags  # noqa: F401
 
 from scripts.item_support_eval import store
 
@@ -458,6 +469,564 @@ def build_summary(*, run_a, run_b, out_path, both_paths_run=None, data_dir=store
     return summary
 
 
+# ---------------------------------------------------------------------------------------
+# Locator measurement (item quote locator spec 2026-11-10 section 6)
+# ---------------------------------------------------------------------------------------
+#
+# Runs are Task 6's run files (A = locator off, B = on; reps 1 and 2). Gold is the locator's
+# own label set (labels/*.locator.*), never Task 10's. Every number below is the spec's.
+
+REPORTED_ONLY, PENDING_OWNER = "reported_only", "pending_owner"
+MATCH_S = 0.5                  # bar 1: s = max(overlap(a, b), overlap(b, a)) >= 0.5
+ADMISSION_SLACK = 0.05         # bar 1: A1-B1 and A2-B2 >= A1-A2 share - 5 points
+ITEM_COUNT_BAND = 0.10         # bar 1: B's mean items per session within +-10% of A's
+MIN_NO_LOCATOR = 29            # bar 6: 0 of 29 gives a CP upper bound of 9.8%
+NO_LOCATOR_ERROR_BAR = 0.10
+STABILITY_BAR = 0.90           # bar 7
+RUN_KEYS = ("A1", "A2", "B1", "B2")
+_EPS = 1e-9                    # inclusive boundaries, safe against float noise
+_KIND_ORDER = {k: i for i, k in enumerate(KINDS)}
+LOCATOR_REFUSALS = tuple(s for s in item_locator.STATUSES if s not in ("linked", "no_locator"))
+
+
+def run_items(rec):
+    """Items of one locator run file, in `store.iter_items` order (children normalised in
+    place first, for A and B alike): item_ref, kind, text, support, the model's raw
+    `said_at` (B only) and the topic."""
+    topics = rec.get("topics") if isinstance(rec, dict) else None
+    if not isinstance(topics, list):
+        return []
+    raw = {r.get("item"): r.get("said_at") for r in rec.get("_raw_said_at") or []
+           if isinstance(r, dict)}
+    out = []
+    for ti, ln, ci, child, topic in store.iter_items(topics):
+        sup = child.get("support")
+        out.append({"item_ref": store.item_ref(rec["ref"], ti, ln, ci), "kind": ln,
+                    "text": store.item_text(ln, child),
+                    "support": sup if isinstance(sup, dict) else None,
+                    "said_at": raw.get(f"{ti}:{ln}:{ci}"), "topic": topic})
+    return out
+
+
+def item_status(row):
+    return (row.get("support") or {}).get("status") or "no_support"
+
+
+def linked_turn(support, turns):
+    """Whole-session index of the turn a `linked` support names (Task 10's mapping)."""
+    from scripts.item_support_eval.run import linked_turn_index
+    return linked_turn_index(support, turns)
+
+
+def locator_link_correct(turn, gold):
+    """Spec section 6: the linked turn is gold's turn or one of gold's `several`. No adjacency
+    or shared-token allowance (it is vacuously true across languages)."""
+    return turn is not None and gold_supported(gold) and turn in gold["turns"]
+
+
+def match_items(xs, ys):
+    """Bar 1's matching: greedy one to one, same kind, s >= 0.5, by s descending, ties broken
+    by kind, then item position. xs/ys: [{"kind", "text"}]. Returns sorted (i, j) pairs."""
+    cand = []
+    for i, a in enumerate(xs):
+        for j, b in enumerate(ys):
+            if a["kind"] != b["kind"]:
+                continue
+            s = max(overlap(a["text"], b["text"])[0], overlap(b["text"], a["text"])[0])
+            if s >= MATCH_S:
+                cand.append((-s, _KIND_ORDER.get(a["kind"], len(_KIND_ORDER)), i, j))
+    cand.sort()
+    used_x, used_y, out = set(), set(), []
+    for _s, _k, i, j in cand:
+        if i in used_x or j in used_y:
+            continue
+        used_x.add(i)
+        used_y.add(j)
+        out.append((i, j))
+    return sorted(out)
+
+
+def script_of(text):
+    """'zh' if CJK characters outnumber Latin letters, 'en' if not, 'none' if neither."""
+    cjk = sum(1 for ch in text or "" if is_cjk(ch))
+    latin = sum(1 for ch in text or "" if ch.isalpha() and not is_cjk(ch)
+                and unicodedata.name(ch, "").startswith("LATIN"))
+    if not cjk and not latin:
+        return "none"
+    return "zh" if cjk > latin else "en"
+
+
+def score_admission(per_session):
+    """Bar 1. per_session: [{"A1": items, "A2": .., "B1": .., "B2": ..}]. Shares pooled as
+    sum(matched pairs) / sum(mean(|X|, |Y|)) over the sessions."""
+    pairs = {"A1_A2": ("A1", "A2"), "A1_B1": ("A1", "B1"), "A2_B2": ("A2", "B2")}
+    matched = {k: 0 for k in pairs}
+    denom = {k: 0.0 for k in pairs}
+    for runs in per_session:
+        for k, (x, y) in pairs.items():
+            matched[k] += len(match_items(runs[x], runs[y]))
+            denom[k] += (len(runs[x]) + len(runs[y])) / 2
+    share = {k: (matched[k] / denom[k] if denom[k] else None) for k in pairs}
+    n = len(per_session)
+    mean_a = sum(len(r["A1"]) + len(r["A2"]) for r in per_session) / (2 * n) if n else None
+    mean_b = sum(len(r["B1"]) + len(r["B2"]) for r in per_session) / (2 * n) if n else None
+    delta = (mean_b - mean_a) / mean_a if mean_a else None
+    if not n or share["A1_A2"] is None or not mean_a:
+        verdict = INSUFFICIENT
+    else:
+        floor = share["A1_A2"] - ADMISSION_SLACK
+        ok_share = all(share[k] is not None and share[k] >= floor - _EPS
+                       for k in ("A1_B1", "A2_B2"))
+        ok_count = abs(mean_b - mean_a) <= ITEM_COUNT_BAND * mean_a + _EPS
+        verdict = PASS if ok_share and ok_count else FAIL
+    return {"sessions": n, "matched": matched, "share": share,
+            "items_per_session": {"A": mean_a, "B": mean_b}, "item_delta": delta,
+            "verdict": verdict}
+
+
+def score_coverage(items, linked):
+    """Bar 5: linked / B1 final items (every item, refusals included) >= 60%."""
+    cov = linked / items if items else None
+    verdict = INSUFFICIENT if cov is None else (PASS if cov >= COVERAGE_LINE - _EPS else FAIL)
+    return {"items": items, "linked": linked, "coverage": cov, "verdict": verdict}
+
+
+def score_no_locator(rows, missing_gold=0):
+    """Bar 6. rows: [{"supported": bool}] per `no_locator` item with gold. Fewer than 29 items
+    -> reported only and `inferred` stays off. `inferred_on` is the section 4.4 decision."""
+    n = len(rows) + missing_gold
+    sup = sum(1 for r in rows if r["supported"])
+    ub = cp_upper(sup, len(rows)) if rows else None
+    if n < MIN_NO_LOCATOR:
+        verdict = REPORTED_ONLY
+    elif missing_gold:
+        verdict = INSUFFICIENT
+    else:
+        verdict = PASS if ub <= NO_LOCATOR_ERROR_BAR else FAIL
+    return {"no_locator": n, "supported": sup, "missing_gold": missing_gold, "cp_upper": ub,
+            "verdict": verdict, "inferred_on": verdict == PASS}
+
+
+def score_stability(pairs):
+    """Bar 7. pairs: [(B1 turn, B2 turn)] over matched items both runs linked."""
+    n = len(pairs)
+    same = sum(1 for a, b in pairs if a is not None and a == b)
+    share = same / n if n else None
+    verdict = INSUFFICIENT if not n else (PASS if share >= STABILITY_BAR - _EPS else FAIL)
+    return {"pairs": n, "same_turn": same, "share": share, "verdict": verdict}
+
+
+def score_owner_agreement(pairs, missing_owner, missing_agent=0):
+    """Bar 8: agent vs owner on the owner sample. Any owner answer still owed (or no sample)
+    -> pending_owner, never pass. An item the owner answered but the agent did not is
+    `missing_agent` (the labeller's gap, not the owner's) -> insufficient."""
+    base = {"n": len(pairs), "missing_owner": missing_owner, "missing_agent": missing_agent}
+    if missing_owner or not (pairs or missing_agent):
+        return {**base, "agreement": None, "verdict": PENDING_OWNER}
+    if missing_agent:
+        return {**base, "agreement": None, "verdict": INSUFFICIENT}
+    return {**base, **score_agreement(pairs)}
+
+
+def combine_locator(verdicts):
+    """fail > insufficient > pending_owner > pass; reported bars are not gated."""
+    vs = {v for v in verdicts if v not in (REPORTED, REPORTED_ONLY)}
+    for v in (FAIL, INSUFFICIENT, PENDING_OWNER):
+        if v in vs:
+            return v
+    return PASS
+
+
+def primary_model(runs):
+    """The most common `model` over the A1 runs (ties: the alphabetically first); None when
+    no A1 run reports one. runs: {ref: {"A1": rec, ..}}."""
+    c = Counter(r["A1"].get("model") for r in runs.values()
+                if isinstance(r.get("A1"), dict) and not r["A1"].get("error")
+                and r["A1"].get("model") is not None)
+    return sorted(c.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0] if c else None
+
+
+def session_status(four, primary):
+    """eligible, or why the session is out of the paired bars: missing (a run file absent),
+    errored, model_unknown (a run reports no model while A1 runs do), fallback (a run was
+    answered by a model other than the primary)."""
+    recs = [four.get(k) for k in RUN_KEYS]
+    if any(r is None for r in recs):
+        return "missing"
+    if any(r.get("error") or not isinstance(r.get("topics"), list) for r in recs):
+        return "errored"
+    if primary is not None:
+        if any(r.get("model") is None for r in recs):
+            return "model_unknown"
+        if any(r.get("model") != primary for r in recs):
+            return "fallback"
+    return "eligible"
+
+
+def locator_flags(sessions, runs):
+    """Bar 4 candidates: every B1 link (non-errored B1 run) whose item and linked turn carry
+    the same place class with different values (`twin_flags`). Holds texts: for the owner's
+    flag file only, never for the summary."""
+    out = []
+    for s in sessions:
+        rec = (runs.get(s["ref"]) or {}).get("B1")
+        if not isinstance(rec, dict) or rec.get("error"):
+            continue
+        for row in run_items(rec):
+            t = linked_turn(row["support"], s["turns"])
+            if t is None:
+                continue
+            turn_text = s["turns"][t].get("text") or ""
+            classes = twin_flags(row["text"], turn_text)
+            if classes:
+                out.append({"flag_id": f"{row['item_ref']}|{t}", "item_ref": row["item_ref"],
+                            "classes": classes, "item_text": row["text"],
+                            "turn_text": turn_text})
+    return out
+
+
+def _bars(sessions, runs, status, gold, decisions):
+    """Bars 1-7 over one set of sessions. 1/2/3/5/6/7 read eligible sessions only; bar 4
+    reads every non-errored B1 link (more links can only add flags)."""
+    elig = [s for s in sessions if status[s["ref"]] == "eligible"]
+    items = {s["ref"]: {k: run_items(runs[s["ref"]][k]) for k in RUN_KEYS} for s in elig}
+    b1_rows = [(s, row) for s in elig for row in items[s["ref"]]["B1"]]
+    statuses = Counter(item_status(r) for _s, r in b1_rows)
+
+    with_said = [r for _s, r in b1_rows if r["said_at"] is not None]
+    n_ws_linked = sum(1 for r in with_said if item_status(r) == "linked")
+    b2 = {"items": len(b1_rows), "with_said_at": len(with_said), "linked": n_ws_linked,
+          "share": n_ws_linked / len(with_said) if with_said else None,
+          "refusals": {k: statuses[k] for k in LOCATOR_REFUSALS if statuses.get(k)},
+          "no_locator": statuses.get("no_locator", 0),
+          "no_support": statuses.get("no_support", 0),
+          "verdict": REPORTED}
+
+    link_rows, missing = [], 0
+    for s, r in b1_rows:
+        if item_status(r) != "linked":
+            continue
+        g = gold.get(r["item_ref"])
+        if g is None:
+            missing += 1
+            continue
+        link_rows.append({"correct": locator_link_correct(linked_turn(r["support"], s["turns"]),
+                                                          g)})
+    b3 = score_link_precision(link_rows, missing)
+    b3["linked"] = len(link_rows) + missing
+
+    b4 = score_twins([{"flag_id": f["flag_id"], "confirmed": decisions.get(f["flag_id"])}
+                      for f in locator_flags(sessions, runs)])
+    b5 = score_coverage(len(b1_rows), statuses.get("linked", 0))
+
+    nl = [gold.get(r["item_ref"]) for _s, r in b1_rows if item_status(r) == "no_locator"]
+    b6 = score_no_locator([{"supported": gold_supported(g)} for g in nl if g is not None],
+                          sum(1 for g in nl if g is None))
+
+    pairs = []
+    for s in elig:
+        x, y = items[s["ref"]]["B1"], items[s["ref"]]["B2"]
+        for i, j in match_items(x, y):
+            if item_status(x[i]) == "linked" and item_status(y[j]) == "linked":
+                pairs.append((linked_turn(x[i]["support"], s["turns"]),
+                              linked_turn(y[j]["support"], s["turns"])))
+    b7 = score_stability(pairs)
+    return {"admission": score_admission(list(items.values())), "follow_through": b2,
+            "link_precision": b3, "twin_hard_negatives": b4, "coverage": b5,
+            "inferred_precision": b6, "stability": b7}
+
+
+def _cov(rows):
+    n, k = len(rows), sum(1 for r in rows if item_status(r) == "linked")
+    return {"items": n, "linked": k, "coverage": k / n if n else None}
+
+
+def _num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _mean(xs):
+    xs = [x for x in xs if _num(x)]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _out_tokens(rec):
+    u = rec.get("usage")
+    if not isinstance(u, dict):
+        return None
+    v = u.get("completion_tokens")
+    if not _num(v):
+        v = u.get("output_tokens")
+    return v if _num(v) else None
+
+
+def _paired_delta(elig, runs, value):
+    """Mean over sessions of (mean B value - mean A value), sessions with both only."""
+    deltas, a_all, b_all = [], [], []
+    for s in elig:
+        four = runs[s["ref"]]
+        a = _mean([value(four[k]) for k in ("A1", "A2")])
+        b = _mean([value(four[k]) for k in ("B1", "B2")])
+        if a is None or b is None:
+            continue
+        deltas.append(b - a)
+        a_all.append(a)
+        b_all.append(b)
+    return {"sessions": len(deltas), "mean_a": _mean(a_all), "mean_b": _mean(b_all),
+            "delta_b_minus_a": _mean(deltas)}
+
+
+def locator_diagnostics(sessions, runs, status):
+    """Spec section 6 "Reported, not gated", over eligible sessions' B1 items. The script pair
+    is the item's script -> the linked turn's, or for an unlinked item the majority script of
+    its topic's labeller view (`label.view_indices`)."""
+    from scripts.item_support_eval import label as label_mod   # label imports this module
+
+    elig = [s for s in sessions if status[s["ref"]] == "eligible"]
+    rows, by_pair, by_kind = [], defaultdict(list), defaultdict(list)
+    ev_total = ev_seconds = 0
+    for s in elig:
+        rec = runs[s["ref"]]["B1"]
+        for topic in rec["topics"]:
+            for ev in (topic.get("evidence") if isinstance(topic, dict) else None) or []:
+                if isinstance(ev, dict) and ev.get("at") is not None:
+                    ev_total += 1
+                    ev_seconds += item_locator._parse_stamp(str(ev["at"])) is not None
+        view_script = {}
+        for r in run_items(rec):
+            t = linked_turn(r["support"], s["turns"])
+            if t is not None:
+                turn_script = script_of(s["turns"][t].get("text") or "")
+            else:
+                key = id(r["topic"])
+                if key not in view_script:
+                    idx = label_mod.view_indices(r["topic"], s["turns"], s["date"])
+                    view_script[key] = script_of(" ".join(s["turns"][i].get("text") or ""
+                                                          for i in idx))
+                turn_script = view_script[key]
+            rows.append(r)
+            by_kind[r["kind"]].append(r)
+            by_pair[f"{script_of(r['text'])}->{turn_script}"].append(r)
+
+    linked = [r for r in rows if item_status(r) == "linked"]
+
+    def rate(count, of):
+        return {"count": count, "of": of, "rate": count / of if of else None}
+
+    copied = 0
+    with_said = [r for r in linked if r["said_at"] is not None]
+    for r in with_said:
+        stamp = item_locator._parse_stamp(r["said_at"])
+        ats = {item_locator._parse_stamp(str(ev.get("at")))
+               for ev in r["topic"].get("evidence") or [] if isinstance(ev, dict)}
+        copied += stamp is not None and stamp in ats - {None}
+    stray = [rec.get("status_suggestions_stripped") for s in elig
+             for rec in (runs[s["ref"]]["B1"], runs[s["ref"]]["B2"])]
+    stray = [x for x in stray if _num(x)]
+    return {
+        "coverage": {"all": _cov(rows),
+                     "by_kind": {k: _cov(v) for k, v in sorted(by_kind.items())},
+                     "by_script_pair": {k: _cov(v) for k, v in sorted(by_pair.items())}},
+        "rates": {
+            "ambiguous_stamp": rate(sum(1 for r in rows if item_status(r) == "ambiguous_stamp"),
+                                    len(rows)),
+            "not_shown": rate(sum(1 for r in rows if item_status(r) == "not_shown"), len(rows)),
+            "range_checked_false": rate(sum(1 for r in linked
+                                            if r["support"].get("range_checked") is False),
+                                        len(linked))},
+        # The final schema asks for HH:MM:SS evidence stamps; a stamp without seconds can
+        # never match, so the share is read beside how many stamps carry seconds.
+        "said_at_equals_evidence_at": {"links": len(with_said), "equal": copied,
+                                       "share": copied / len(with_said) if with_said else None,
+                                       "evidence_stamps": ev_total,
+                                       "evidence_stamps_with_seconds": ev_seconds},
+        "output_tokens": _paired_delta(elig, runs, _out_tokens),
+        "latency_s": _paired_delta(elig, runs, lambda rec: rec.get("latency_s")),
+        "stray_status_suggestions_on_b": {"count": sum(stray), "runs_reporting": len(stray)},
+    }
+
+
+def side_table(side_runs):
+    """Side set (reported only): status suggestions offered / kept / dropped_by per arm and
+    rep, the mean kept per run under each arm, and a flag when kept drops under B."""
+    per = {f"{a}{r}": {"runs": 0, "offered": 0, "kept": 0, "dropped_by": {}, "no_counts": 0}
+           for a in ("A", "B") for r in (1, 2)}
+    kept = {"A": [], "B": []}
+    for rec in side_runs:
+        key = f"{rec.get('arm')}{rec.get('rep')}"
+        if key not in per:
+            continue
+        p = per[key]
+        p["runs"] += 1
+        c = rec.get("status_suggestions")
+        if rec.get("error") or not isinstance(c, dict) or c.get("error") \
+                or not _num(c.get("kept")):
+            p["no_counts"] += 1
+            continue
+        p["offered"] += int(c.get("offered") or 0)
+        p["kept"] += int(c["kept"])
+        for reason, n in (c.get("dropped_by") or {}).items():
+            p["dropped_by"][reason] = p["dropped_by"].get(reason, 0) + int(n or 0)
+        kept[rec["arm"]].append(c["kept"])
+    mean = {a: _mean(v) for a, v in kept.items()}
+    delta = mean["B"] - mean["A"] if mean["A"] is not None and mean["B"] is not None else None
+    return {"per_run": per, "mean_kept": mean, "kept_delta_b_minus_a": delta,
+            "kept_drops_under_b": delta is not None and delta < 0}
+
+
+def _session_counts(sessions, status, primary):
+    c = Counter(status[s["ref"]] for s in sessions)
+    return {"scored": len(sessions), "eligible": c.get("eligible", 0),
+            "fallback_excluded": c.get("fallback", 0),
+            "model_unknown_excluded": c.get("model_unknown", 0),
+            "errored_excluded": c.get("errored", 0), "missing_excluded": c.get("missing", 0),
+            "primary_model": primary}
+
+
+def score_locator(sessions, runs, *, gold, owner_gold=None, owner_todo=None,
+                  flag_decisions=None, side_runs=None, stage="all", primary=None):
+    """Bars 1-8, the fit gate, pooled and per-half figures and the reported diagnostics.
+
+    sessions: session dicts (ref, split, date, decoded turns); runs: {ref: {"A1": rec, ..}};
+    gold: the blind agent's answers {item_ref: gold}; owner_gold: the owner's blind answers on
+    the sample (they win over the agent's for bars 3 and 6); owner_todo: the owner sample
+    rows; flag_decisions: {flag_id: bool}. stage "fit" scores the fit half and its gate only.
+    Paired bars (1, 7) and B1's bars 2/3/5/6 read eligible sessions only (`session_status`).
+    `primary` (the fallback test's model) defaults to the mode over every A1 run in `runs`
+    (all stages on disk), so the fit gate, the halves and the owner sample share one
+    exclusion set. Bar 6 never gates the verdict: it sets `inferred_on` only."""
+    owner_gold = owner_gold or {}
+    merged = merge_gold(gold, owner_gold)
+    decisions = flag_decisions or {}
+    scored = [s for s in sessions if stage == "all" or s["split"] == stage]
+    primary = primary_model(runs) if primary is None else primary
+    status = {s["ref"]: session_status(runs.get(s["ref"]) or {}, primary) for s in scored}
+    halves = {h: [s for s in scored if s["split"] == h]
+              for h in (("fit", "heldout") if stage == "all" else (stage,))}
+    per_half = {h: _bars(ss, runs, status, merged, decisions) for h, ss in halves.items()}
+    pooled = _bars(scored, runs, status, merged, decisions)
+
+    fit = per_half.get("fit") or _bars([], runs, status, merged, decisions)
+    gate_bars = {k: fit[k]["verdict"] for k in ("admission", "link_precision",
+                                                 "twin_hard_negatives")}
+    links = fit["link_precision"]["linked"]
+    gate = INSUFFICIENT if links < MIN_LINKS else combine_locator(gate_bars.values())
+    fit_gate = {"links": links, "bars": gate_bars, "verdict": gate}
+
+    summary = {"stage": stage, "fit_gate": fit_gate, "bars": pooled, "per_half": per_half,
+               "sessions": {**_session_counts(scored, status, primary),
+                            "per_half": {h: _session_counts(ss, status, primary)
+                                         for h, ss in halves.items()}},
+               "reported": locator_diagnostics(scored, runs, status),
+               "side_set": side_table(side_runs) if side_runs else None}
+    if stage != "all":
+        summary["verdict"] = gate
+        return summary
+
+    todo = owner_todo or []
+    refs = [t["item_ref"] for t in todo]
+    pairs = [(gold[r], owner_gold[r]) for r in refs if r in gold and r in owner_gold]
+    pooled["agent_owner_agreement"] = score_owner_agreement(
+        pairs, sum(1 for r in refs if r not in owner_gold),
+        sum(1 for r in refs if r in owner_gold and r not in gold))
+    gated = [pooled[k]["verdict"] for k in ("admission", "link_precision",
+                                            "twin_hard_negatives", "coverage", "stability",
+                                            "agent_owner_agreement")]
+    if any(not summary["sessions"]["per_half"][h]["eligible"] for h in halves):
+        gated.append(INSUFFICIENT)
+    summary["verdict"] = combine_locator(gated)
+    summary["inferred_on"] = pooled["inferred_precision"]["inferred_on"]
+    return summary
+
+
+# ---------------------------------------------------------------------------------------
+# Locator glue over the real files
+# ---------------------------------------------------------------------------------------
+
+def load_locator_runs(sessions, runs_dir=store.RUNS_DIR):
+    """{ref: {"A1": rec, ..}} for the run files that exist."""
+    out = {}
+    for s in sessions:
+        four = {}
+        for key in RUN_KEYS:
+            p = store.locator_run_path(key[0], int(key[1]), s["ref"], runs_dir=runs_dir)
+            if p.exists():
+                four[key] = store.read_json(p)
+        out[s["ref"]] = four
+    return out
+
+
+def file_sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def require_frozen_runs(runs, digest):
+    """Refuse runs made on another manifest, or an arm whose runs carry two prompt shas."""
+    shas = defaultdict(set)
+    for four in runs.values():
+        for key, rec in four.items():
+            if rec.get("manifest_digest") != digest:
+                raise SystemExit(f"Refusing: a {key} run was made on manifest "
+                                 f"{rec.get('manifest_digest')}, data/ now holds {digest}.")
+            if rec.get("prompt_sha") is not None:
+                shas[key[0]].add(rec["prompt_sha"])
+    mixed = sorted(arm for arm, s in shas.items() if len(s) > 1)
+    if mixed:
+        raise SystemExit(f"Refusing: arm(s) {mixed} carry more than one prompt_sha; the prompt "
+                         f"is frozen (a change is a dated addendum and a complete new run).")
+
+
+def require_labels_on_b1(todo_rows, runs_dir=store.RUNS_DIR):
+    """Labels are on B1 items, which exist only in one B1 output: refuse a todo row whose
+    recorded B1 run sha differs from the B1 run file now on disk (a retried run)."""
+    current = {}
+    for row in todo_rows:
+        ref = row["item_ref"].split(":")[0]
+        if ref not in current:
+            p = store.locator_run_path("B", 1, ref, runs_dir=runs_dir)
+            current[ref] = file_sha(p) if p.exists() else None
+        if row.get("run_sha") != current[ref]:
+            raise SystemExit("Refusing: locator labels were made on another B1 run than the "
+                             "one on disk; re-export and relabel that session.")
+
+
+def _side_runs(data_dir, runs_dir):
+    base = Path(runs_dir, "locator", store.SIDE_SUBDIR)
+    recs = [store.read_json(p) for p in sorted(base.glob("*/*/*.json"))]
+    if not recs:
+        return None
+    m = Path(data_dir, store.SIDE_SUBDIR, "manifest.json")
+    digest = file_sha(m) if m.exists() else None
+    if any(r.get("manifest_digest") != digest for r in recs):
+        raise SystemExit("Refusing: side runs were made on another side manifest.")
+    return recs
+
+
+def locator_summary(stage, *, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR,
+                    labels_dir=store.LABELS_DIR, out_path=None):
+    """Score the locator runs -> runs/locator/summary.<stage>.json (counts only)."""
+    if stage not in ("fit", "all"):
+        raise SystemExit(f"Unknown stage {stage!r}")
+    digest = store.manifest_digest(data_dir)
+    sessions = store.load_sessions(data_dir)      # all stages: one primary, one exclusion set
+    runs = load_locator_runs(sessions, runs_dir)
+    require_frozen_runs(runs, digest)
+    store.require_labels_on_manifest(labels_dir, data_dir, store.LOCATOR_LABEL_FILES)
+    d = Path(labels_dir)
+    agent_todo = store.read_jsonl(d / "todo.locator.agent.jsonl")
+    owner_todo = store.read_jsonl(d / "todo.owner.locator.jsonl")
+    require_labels_on_b1(agent_todo + owner_todo, runs_dir)
+    summary = score_locator(
+        sessions, runs, gold=gold_by_ref(store.read_jsonl(d / "done.locator.agent.jsonl")),
+        owner_gold=gold_by_ref(store.read_jsonl(d / "done.owner.locator.jsonl")),
+        owner_todo=owner_todo,
+        flag_decisions=flag_decisions(store.read_jsonl(d / "done.flags.owner.locator.jsonl")),
+        side_runs=_side_runs(data_dir, runs_dir), stage=stage)
+    summary["manifest_digest"] = digest
+    store.write_json(out_path or Path(runs_dir, "locator", f"summary.{stage}.json"), summary)
+    return summary
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -472,9 +1041,18 @@ def main(argv=None):
                    help='TEST-invoke latency, e.g. {"p50_ms": .., "p95_ms": .., "n": ..}')
     s.add_argument("--claim-type-json", default=None,
                    help="claim_type counts from TEST, if measured in-VPC")
+    lo = sub.add_parser("locator")
+    lo.add_argument("--stage", required=True, choices=("fit", "all"))
+    lo.add_argument("--data", default=str(store.DATA_DIR))
+    lo.add_argument("--runs", default=str(store.RUNS_DIR))
+    lo.add_argument("--labels", default=str(store.LABELS_DIR))
+    lo.add_argument("--out", default=None)
     a = p.parse_args(argv)
     if a.cmd == "fit":
         out = fit(a.grid)
+    elif a.cmd == "locator":
+        out = locator_summary(a.stage, data_dir=a.data, runs_dir=a.runs, labels_dir=a.labels,
+                              out_path=a.out)
     else:
         out = build_summary(run_a=a.run_a, run_b=a.run_b, out_path=a.out,
                             both_paths_run=a.both_paths_run,

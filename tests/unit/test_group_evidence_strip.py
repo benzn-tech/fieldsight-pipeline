@@ -137,3 +137,49 @@ def test_a_group_write_ships_no_continues_claim(monkeypatch):
     topic = body["topics"][0]
     assert "continues" not in topic["findings"][0]
     assert "continues" not in topic["action_items"][0]
+
+
+def test_a_group_write_ships_no_said_at(monkeypatch):
+    """The group prompt never asks for the item quote locator's `said_at` stamp (spec
+    2026-11-10 4.2), but a model could volunteer one; extract_group strips it defensively,
+    on every child kind, without touching the rest of the child."""
+    GID = "d" * 32
+
+    class _S3:
+        def __init__(self):
+            self.puts = []
+
+        def put_object(self, Bucket=None, Key=None, Body=None, ContentType=None):
+            self.puts.append((Key, json.loads(Body)))
+
+    s3 = _S3()
+    monkeypatch.setattr(ex, "s3", lambda: s3)
+    monkeypatch.setattr(ex, "gather_session_segments",
+                        lambda b, f, d, sb: [f"transcripts/{f}/{d}/{sb}_c0.json"])
+    monkeypatch.setattr(ex, "assemble_group_turns", lambda b, kbs: (
+        [{"session_id": sb, "turns": [{"speaker": "spk_0", "text": "hello",
+                                       "abs_start_str": "10:00:00"}]}
+         for sb in sorted(kbs)],
+        ["f1.json"]))
+    group_result = {"topics": [{
+        "topic_title": "Concrete pour",
+        "findings": [{"observation": "Pour scheduled Monday", "said_at": "10:00:00"}],
+        "action_items": [{"action": "Confirm the pour", "said_at": "10:00:00"}],
+        "decisions": [{"decision": "Pour Monday", "said_at": "10:00:00"}],
+        "questions": [{"question": "Who books the pump?", "said_at": None}],
+    }]}
+    monkeypatch.setattr(ex.llm_utils, "call_llm",
+                        lambda *a, **k: (json.dumps(group_result), None))
+    monkeypatch.setattr(ex.llm_utils, "extract_json", lambda r: json.loads(r))
+
+    artifact = {"groupId": GID, "leadSessionId": GID,
+                "members": [{"userFolder": "Ben_UCPK", "date": "2026-08-12",
+                            "sessionBase": "sid" + GID}],
+                "mergedKey": f"extractions/Ben_UCPK/2026-08-12/grp{GID}.json"}
+    assert ex.extract_group("bkt", artifact) is not None
+
+    _, body = s3.puts[0]
+    topic = body["topics"][0]
+    for list_name in ("findings", "action_items", "decisions", "questions"):
+        assert "said_at" not in topic[list_name][0]
+    assert topic["action_items"][0] == {"action": "Confirm the pour"}

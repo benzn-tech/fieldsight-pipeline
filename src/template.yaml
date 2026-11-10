@@ -1361,6 +1361,17 @@ Parameters:
       thresholds are calibrated the step refuses to run and the artifact is
       written without `support`, so turning this on early is harmless.
 
+  EmitItemLocator:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Item quote locator. On the final extraction tier only, the prompt asks
+      each extracted item for `said_at`, the stamp of the transcript line where
+      it was first raised. Changes the extraction PROMPT, so prod is the
+      owner's switch. Off = every extraction prompt is byte-identical. Passed
+      on every deploy: SAM keeps a parameter's previous value otherwise.
+
   EvidenceWindowSec:
     Type: String
     Default: '60'
@@ -3979,6 +3990,7 @@ Resources:
           STATUS_EVIDENCE_FLOOR_TOKENS: !Ref StatusEvidenceFloorTokens
           EMIT_EVIDENCE: !Ref EmitEvidence
           EMIT_ITEM_SUPPORT: !Ref EmitItemSupport
+          EMIT_ITEM_LOCATOR: !Ref EmitItemLocator
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
           EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens

@@ -28,6 +28,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 import claim_type
+import item_locator
 import turn_name_overlay
 from deleted_predicates import visible_topics_predicate
 from repositories import event_links, voiceprints
@@ -35,7 +36,10 @@ from repositories import event_links, voiceprints
 # dst_turn keys (migration 0098's column comment). Locators and labels only.
 DST_TURN_KEYS = ("source_stem", "start_sec", "end_sec", "speaker_label", "quote_status")
 
-SUPPORT_STATUSES = ("linked", "none_close", "ambiguous", "below_floor")
+# Lexical statuses (slice 1) plus the locator's (locator spec §4.3), so a refusal is
+# counted instead of dropped.
+SUPPORT_STATUSES = (("linked", "none_close", "ambiguous", "below_floor")
+                    + tuple(s for s in item_locator.STATUSES if s != "linked"))
 
 
 
@@ -126,7 +130,8 @@ def write_pass(conn, *, company_id, site_id, session_base, source_s3_key,
                 conn, site_id=site_id, src_kind=kind, src_row_id=row_id, src_stable_id=None,
                 source_s3_key=source_s3_key,
                 dst_turn={k: support.get(k) for k in DST_TURN_KEYS},
-                score=support.get("score"), rule_version=support.get("rule_version"))
+                score=support.get("score"), rule_version=support.get("rule_version"),
+                method=support.get("method") or "lexical_v1")
             counts["links"] += 1
             named = names.get(_turn_key(support))
         ct, basis = claim_type.derive(basis_in, named, recorder_user_id)
