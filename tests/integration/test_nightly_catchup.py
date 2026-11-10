@@ -220,8 +220,8 @@ def test_l_older_than_window_or_written_long_ago_is_not_stale(db, lines_on):
     # recorded 29 days before N: outside cross-day's 28-day window
     s.session(TUE - dt.timedelta(days=29), written=NOW - dt.timedelta(hours=2),
               opened_at=_at(TUE - dt.timedelta(days=29), 9))
-    # final written 25 h ago: not a late arrival tonight
-    s.session(MON, written=NOW - dt.timedelta(hours=25), opened_at=_at(MON, 9))
+    # final written 73 h ago: outside the 72 h look-back, not a late arrival tonight
+    s.session(MON, written=NOW - dt.timedelta(hours=73), opened_at=_at(MON, 9))
     assert s.pairs() == []
 
 
@@ -345,3 +345,61 @@ def test_shadow_counts_without_put(db, lines_on):
     assert s.s3.under(XDAY) == [] and s.s3.under(RECON) == [] and s.s3.gets == []
     after = {t: db.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in before}
     assert after == before
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_detection_raising_puts_no_j2_artifact(db, lines_on, monkeypatch):
+    """J1 detection runs before any J2 put: a DB error there fails the attempt while no
+    J2 artifact exists (the J2 artifacts stay the run's last writes)."""
+    s = Seed(db)
+    s.session(TUE, written=NOW - dt.timedelta(hours=3), opened_at=_at(TUE, 9))
+
+    def boom(*a, **k):
+        raise RuntimeError("detection failed")
+    monkeypatch.setattr(nightly, "site_finals", boom)
+    with pytest.raises(RuntimeError):
+        nr.run_counts(db, s.event(), s.ctx("on"))
+    assert s.s3.under(nr.PREFIX) == [] and s.j1_puts() == []
+    # without the fault the same run writes its J2 request
+    monkeypatch.undo()
+    monkeypatch.setenv("CROSS_DAY_CONTINUITY", "on")
+    monkeypatch.setenv("RECONCILE_STATUS", "true")
+    nr.run_counts(db, s.event(), s.ctx("on"))
+    assert len(s.s3.under(nr.PREFIX)) == 1
+
+
+def test_over_cap_pair_is_reemitted_the_next_night(db, lines_on):
+    s = Seed(db)
+    start = MON - dt.timedelta(days=12)
+    s.session(start, written=NOW - dt.timedelta(hours=2), opened_at=_at(start, 9),
+              items=("synthetic formwork strip",))
+    ns = [s.session(start + dt.timedelta(days=i), written=NOW - dt.timedelta(hours=20),
+                    opened_at=_at(start + dt.timedelta(days=i), 9),
+                    items=(f"synthetic formwork strip level {i}",))
+          for i in range(1, 13)]
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("on"))
+    assert counts["j1_reemitted"] == 10 and counts["j1_over_cap"] == 2
+    first = set(s.s3.under(XDAY))
+
+    nxt, nxt_night = NOW + dt.timedelta(hours=24), NIGHT + dt.timedelta(days=1)
+    outcome, counts = nr.run_counts(db, s.event(nxt_night, nxt), s.ctx("on", now=nxt))
+    assert counts["j1_stale"] == 2 and counts["j1_reemitted"] == 2
+    assert counts["j1_over_cap"] == 0
+    second = [k for k in s.s3.under(XDAY) if k not in first]
+    # the two oldest N, never one of the ten already recorded
+    assert {s.s3.body(k)["extraction_key"] for k in second} == {ns[0]["key"], ns[1]["key"]}
+    assert len(s.reemits()) == 12
+    assert sorted(r[4] for r in s.reemits()) == [NIGHT] * 10 + [nxt_night] * 2
+
+
+def test_line_in_shadow_is_not_reemitted(db, monkeypatch):
+    """Only a line whose own flag is exactly on: a shadow line would consume the pair."""
+    monkeypatch.setenv("CROSS_DAY_CONTINUITY", "shadow")
+    monkeypatch.setenv("RECONCILE_STATUS", "true")
+    s = Seed(db)
+    s.session(TUE, written=NOW - dt.timedelta(hours=20), opened_at=_at(TUE, 9))
+    s.session(MON, written=NOW - dt.timedelta(hours=2), opened_at=_at(MON, 9))
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("on"))
+    assert counts["j1_stale"] == 1 and counts["j1_line_off"] == 1
+    assert s.s3.gets == [] and s.j1_puts() == [] and s.reemits() == []

@@ -26,8 +26,9 @@ with a RunContext. `run` does, for the event's site:
      LAST, after every read that can raise, each stamped with the flag. In shadow the
      worker is not wired, so nothing reads them.
 
-  4. J1 catch-up for late arrivals (spec §3 J1), LAST. `stale_pairs`: a session L whose
-     final was written in the last 24 h makes an earlier-written final N stale when L was
+  4. J1 catch-up for late arrivals (spec §3 J1), after the J2 plan and BEFORE the J2 puts
+     (the J2 artifacts stay the run's last writes). `stale_pairs`: a session L whose
+     final was written in the last 72 h makes an earlier-written final N stale when L was
      RECORDED before N (continuity_xday.recorded_earlier, the #1273 rule) and inside N's
      window on a line (reconcile: same recorder and NZ date; cross-day: 28 days). `on`: per
      stale (line, N), newest N first, at most J1_MAX: record_reemit per L FIRST (a pair
@@ -37,7 +38,7 @@ with a RunContext. `run` does, for the event's site:
      savepoint: a failed read or build, or a builder answering None, rolls the record back,
      so a nightly_reemits row always names an artifact that was put. A line whose own flag
      is off (CROSS_DAY_CONTINUITY / RECONCILE_STATUS, the item writer's) is never
-     re-emitted. `shadow`: count the stale pairs only (no record, no S3). Nightly builds no
+     re-emitted, nor one in shadow (exactly "on" only). `shadow`: count the stale pairs only (no record, no S3). Nightly builds no
      prompt and writes no continues/status rows; the owning lines do.
 
 Returns "nothing" when there was no work, else "done". One counts line per run (ids,
@@ -88,7 +89,10 @@ _SID = re.compile(r"^sid([0-9a-f]{32})$")
 # J1 (spec §3, §6): re-emits per site per night, look-back for late finals, and the oldest
 # recording a late arrival may be (cross-day's own window).
 J1_MAX = 10
-J1_LATE_HOURS = 24
+# 72 h, not 24: pairs over the cap (and drift between run times, the 25 h DST night) wait
+# for the next night (spec §6); the unique key and the detection-time exclusion of recorded
+# pairs make the overlap safe.
+J1_LATE_HOURS = 72
 J1_WINDOW_DAYS = continuity_xday.WINDOW_DAYS
 
 COUNT_KEYS = ("j2_sessions", "j2_items", "j3_recomputed", "j3_failed", "j3_pending",
@@ -175,16 +179,20 @@ def run_counts(conn, event, ctx, *, clock=time.monotonic):
         # The budget across sites (in the run's transaction; shadow writes nothing extra).
         nightly.add_requested_items(conn, site_id=site_id, company_id=company_id,
                                     night=night, items=sum(len(b["items"]) for _, b in planned))
-    # Last: nothing below can be undone by a later raise for these sessions.
+
+    # J1 BEFORE the J2 puts: its detection reads can raise (a failed hub attempt), and must
+    # do so while no J2 artifact exists yet. Its re-emits each run in their own savepoint
+    # (put last) and never raise out of the run.
+    groups = _stale_groups(conn, company_id=company_id, site_id=site_id,
+                           now_utc=ctx.now_utc)
+    _j1_catch_up(conn, ctx, night, groups, counts, started, clock)
+
+    # Last: the J2 artifacts. Nothing below can be undone by a later raise.
     for key, body in planned:
         lake_put(ctx.bucket, key, json.dumps(body, ensure_ascii=False), client=ctx.s3_client,
                  owner_hint={"site_id": str(site_id)}, ContentType="application/json")
     counts["j2_sessions"] = len(planned)
     counts["j2_items"] = sum(len(b["items"]) for _, b in planned)
-
-    # J1 after the J2 puts: each re-emit is its own savepoint with its put as its last step,
-    # and nothing it does raises out of the run.
-    _j1_catch_up(conn, ctx, night, counts, started, clock)
 
     logger.info(
         "nightly site=%s j2_sessions=%d j2_items=%d j3_recomputed=%d budget_paused=%d "
@@ -448,10 +456,12 @@ def stale_pairs(conn, *, company_id, site_id, now_utc, limit=J1_MAX) -> list[dic
 
 
 def _line_mode(line):
-    """The owning line's own flag, as the item writer reads it: None = the line is off."""
+    """"on" when the owning line's own flag (as the item writer reads it) is exactly on,
+    else None. A line in shadow is not re-emitted: the pair would be consumed (recorded)
+    while the line acts on nothing."""
     if line == "xday":
         mode = (os.environ.get("CROSS_DAY_CONTINUITY") or "off").strip().lower()
-        return mode if mode in ("shadow", "on") else None
+        return "on" if mode == "on" else None
     on = (os.environ.get("RECONCILE_STATUS") or "false").strip().lower() == "true"
     return "on" if on else None
 
@@ -464,9 +474,8 @@ class _NothingToEmit(Exception):
         self.reason = reason
 
 
-def _j1_catch_up(conn, ctx, night, counts, started, clock):
-    groups = _stale_groups(conn, company_id=ctx.company_id, site_id=ctx.site_id,
-                           now_utc=ctx.now_utc)
+def _j1_catch_up(conn, ctx, night, groups, counts, started, clock):
+    """`groups` from _stale_groups, read by the caller before any J2 put."""
     counts["j1_stale"] = sum(len(g["l_keys"]) for g in groups)
     if ctx.flag != "on" or not groups:
         return
