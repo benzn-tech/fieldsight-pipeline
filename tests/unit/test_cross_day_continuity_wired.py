@@ -35,11 +35,13 @@ def test_parameter_exists_defaults_off_and_is_constrained():
 
 def test_only_the_item_writer_and_the_xday_linker_receive_the_flag():
     text = TEMPLATE.read_text(encoding="utf-8")
-    for fn in ("ItemWriterFunction", "ContinuityXdayLinkerFunction"):
+    # DecisionScanFunction reads it too (nightly J1 catch-up, spec 2026-11-10 §3): it
+    # re-emits a cross-day request only when this line is on, and stamps its mode.
+    for fn in ("ItemWriterFunction", "ContinuityXdayLinkerFunction", "DecisionScanFunction"):
         assert "CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity" in _block(text, fn), (
             f"{fn} does not receive CROSS_DAY_CONTINUITY -- it would silently take "
             "the code default")
-    assert text.count("CROSS_DAY_CONTINUITY:") == 2, "CROSS_DAY_CONTINUITY is set elsewhere too"
+    assert text.count("CROSS_DAY_CONTINUITY:") == 3, "CROSS_DAY_CONTINUITY is set elsewhere too"
 
 
 def test_linker_reads_the_same_env_name_and_defaults_off():
