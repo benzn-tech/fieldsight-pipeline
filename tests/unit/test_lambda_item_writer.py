@@ -1590,3 +1590,19 @@ def test_a_named_person_survives_even_with_one_voice(wired):
     items = _run_with(wired, speaker_count=1, responsible="Daniel")
     assert items[0]["responsible"] == "Daniel"
 
+
+
+def test_handler_passes_the_contexts_remaining_time(monkeypatch):
+    """Cross-day continuity's build is bounded by the invocation's remaining time."""
+    seen = []
+    monkeypatch.setattr(iw, "write_extraction_items",
+                        lambda date, user_folder, key, **kw: seen.append(kw) or {})
+    monkeypatch.setattr(iw.pipeline_trace, "flush", lambda s3, bucket: None)
+
+    class Ctx:
+        def get_remaining_time_in_millis(self):
+            return 1234
+
+    iw.lambda_handler({"Records": [{"s3": {"object": {
+        "key": "extractions/Ada/2026-11-09/sid" + "a" * 32 + ".json"}}}]}, Ctx())
+    assert len(seen) == 1 and seen[0]["remaining_ms"]() == 1234

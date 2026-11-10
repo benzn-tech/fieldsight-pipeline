@@ -1295,6 +1295,8 @@ _XDAY_LEXICAL = 5
 # One recency read per kind fetches the whole window (find_items ranks in Python over every
 # live row anyway), so its length is the pre-cap count; at this ceiling it is a lower bound.
 _XDAY_POOL_LIMIT = 1000
+# Seconds of the invocation kept back from the build for the put and the return.
+_XDAY_RESERVE_S = 10.0
 
 
 def _xday_recorded_at(conn, session_base):
@@ -1385,12 +1387,13 @@ def _xday_chains(conn, site_id, rows_by_sid, own_sids):
 
 
 def build_xday_request(conn, *, site, company_id, extraction, extraction_key, date,
-                       nonce=None, trigger="final"):
+                       nonce=None, trigger="final", deadline=None):
     """Hop 1's request for one session's final pass, or None (skip, counted in the log).
 
     Public: the item writer calls it inside its connection block (after number_new_items,
     so stable_ids are final) and the nightly re-match agent calls it with a `nonce`;
-    `trigger` is written into the artifact only. Runs no SQL when it skips on its inputs
+    `trigger` is written into the artifact only. `deadline` (time.monotonic()) bounds the
+    lexical queries: past it the rest are skipped and counted in `lexical_skipped_budget`. Runs no SQL when it skips on its inputs
     (no site, not a final, an incomplete final). Logs counts and keys, never item text."""
     def skip(reason, **counts):
         logger.info("xday request skipped: %s key=%s %s", reason, extraction_key,
@@ -1419,7 +1422,7 @@ def build_xday_request(conn, *, site, company_id, extraction, extraction_key, da
     # `-r{n}` names only the per-round request/brief/result markers, never the extraction.
     exclude = [extraction_key]
 
-    calls = 0
+    calls = skipped_budget = 0
     pools, precap, rows_by_sid = {}, {}, {}
     own_all = {}
     for ln in continuity_xday.XDAY_KINDS:
@@ -1446,6 +1449,9 @@ def build_xday_request(conn, *, site, company_id, extraction, extraction_key, da
         for n in news:
             if not (n.get("text") or "").strip():
                 continue
+            if deadline is not None and time.monotonic() >= deadline:
+                skipped_budget += 1
+                continue
             calls += 1
             hits = item_history.find_items(conn, **base, query=n["text"], limit=_XDAY_LEXICAL)
             # zero overlap is no lexical match: those rows would only be older recency
@@ -1460,19 +1466,55 @@ def build_xday_request(conn, *, site, company_id, extraction, extraction_key, da
                   for ln, (recency, lexical, own) in pools.items()}
     n_cand = sum(len(v) for v in candidates.values())
     if not n_cand:
-        return skip("no_candidates", new=n_new, queries=calls)
+        return skip("no_candidates", new=n_new, queries=calls,
+                    lexical_skipped_budget=skipped_budget)
     request = continuity_xday.build_request(
         site_id=site_id, company_id=company_id, extraction_key=extraction_key,
         extracted_at=extraction.get("extracted_at"), date=day, new_items=new_items,
         candidates=candidates, precap_counts=precap, nonce=nonce)
     request["trigger"] = trigger
-    logger.info("xday request built: key=%s new=%d candidates=%d precap=%s queries=%d",
-                extraction_key, n_new, n_cand,
-                ",".join(str(precap.get(ln, 0)) for ln in continuity_xday.XDAY_KINDS), calls)
+    request["lexical_skipped_budget"] = skipped_budget
+    logger.info("xday request built: key=%s new=%d candidates=%d precap=%s queries=%d "
+                "lexical_skipped_budget=%d", extraction_key, n_new, n_cand,
+                ",".join(str(precap.get(ln, 0)) for ln in continuity_xday.XDAY_KINDS), calls,
+                skipped_budget)
     return request
 
 
-def write_extraction_items(date, user_folder, extraction_key):
+def _xday_deadline(remaining_ms):
+    """A time.monotonic() deadline for the build, or None (no budget: tests, the nightly)."""
+    if remaining_ms is None:
+        return None
+    try:
+        left = float(remaining_ms()) / 1000.0
+    except Exception:  # noqa: BLE001 -- no budget known: build unbounded
+        return None
+    return time.monotonic() + left - _XDAY_RESERVE_S
+
+
+def _emit_xday_request(*, site, company_id, extraction, extraction_key, date, remaining_ms):
+    """Build on a fresh connection, then put. Never raises (X10); logs the stage and the
+    exception type only -- a message could carry item text."""
+    stage = "build"
+    try:
+        with get_connection() as conn:
+            request = build_xday_request(
+                conn, site=site, company_id=company_id, extraction=extraction,
+                extraction_key=extraction_key, date=date,
+                deadline=_xday_deadline(remaining_ms))
+        if request is None:
+            return
+        request["mode"] = CROSS_DAY_CONTINUITY
+        stage = "emit"
+        continuity_xday_request.emit(s3(), S3_BUCKET, request)
+    except Exception as e:  # noqa: BLE001 -- never fails the write (X10)
+        logger.warning("xday request failed: stage=%s key=%s error=%s", stage,
+                       extraction_key, type(e).__name__)
+
+
+def write_extraction_items(date, user_folder, extraction_key, remaining_ms=None):
+    # `remaining_ms`: the Lambda context's get_remaining_time_in_millis (None outside a
+    # Lambda); it only bounds the cross-day continuity build at the end.
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
 
@@ -1499,8 +1541,6 @@ def write_extraction_items(date, user_folder, extraction_key):
     # here; Task 4 reads it to carry stable ids and human edits from a retired row to the
     # row that replaced it.
     retired_topics = []
-    # Cross-day continuity's hop-1 request: built inside the block, put after the commit.
-    xday_request = None
 
     with get_connection() as conn:
         # I-3: serialize concurrent writers on this extraction key. Delete-
@@ -2080,23 +2120,6 @@ def write_extraction_items(date, user_folder, extraction_key):
         # SAVEPOINT; skipped before migration 0093; never fatal (number_new_items).
         carry_forward_apply.number_new_items(conn, new_topic_ids, site["id"], extraction_key)
 
-        # Cross-day continuity, hop 1 (spec 2026-11-09 X2): after carry-forward and the task
-        # numbers, so the new items' stable_ids are final. Reads only, in its OWN savepoint: a
-        # failed statement must not abort the transaction and lose the pass (X10). Off: not
-        # entered, no SQL. Gated here on tier/incomplete too, so a live pass costs nothing.
-        if (CROSS_DAY_CONTINUITY in _XDAY_MODES and extraction.get("tier") == "final"
-                and not extraction.get("incomplete")):
-            try:
-                with conn.transaction():
-                    xday_request = build_xday_request(
-                        conn, site=site, company_id=owner_company_id, extraction=extraction,
-                        extraction_key=extraction_key, date=date)
-            except Exception as e:  # noqa: BLE001 -- never fails the write (X10)
-                xday_request = None
-                # type only: a message could carry item text
-                logger.warning("xday request not built for %s: %s", extraction_key,
-                               type(e).__name__)
-
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
     # The updated email, AFTER the connection block commits: the merged topics
@@ -2139,14 +2162,6 @@ def write_extraction_items(date, user_folder, extraction_key):
     if collected_topics:
         match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
 
-    # Cross-day continuity request (X3): post-commit like the matcher artifact above -- the
-    # stable_ids it names must be durable before the linker acts on them. Never fatal (X10).
-    if xday_request is not None:
-        try:
-            continuity_xday_request.emit(s3(), S3_BUCKET, xday_request)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("xday request not put for %s: %s", extraction_key, type(e).__name__)
-
     # Search index request: post-commit like the matcher artifact above, for the same reason
     # (the topic ids it names must be durable). Emitted even when topics_n == 0 -- a session
     # of windows only must still index its turns, and a re-extraction that now yields no
@@ -2187,6 +2202,14 @@ def write_extraction_items(date, user_folder, extraction_key):
     _request_match(owner_company_id, session_base, extraction,
                    site_id=(site or {}).get("id"),
                    home_company_id=company["id"], recorder_user_id=user_id)
+
+    # Cross-day continuity, hop 1 (spec 2026-11-09 X2/X3), LAST: after the commit, on a fresh
+    # read with no lock held (the stable_ids are final once committed), bounded by the time the
+    # invocation has left, so it can never cost the pass or the post-commit steps above.
+    if (CROSS_DAY_CONTINUITY in _XDAY_MODES and extraction.get("tier") == "final"
+            and not extraction.get("incomplete")):
+        _emit_xday_request(site=site, company_id=owner_company_id, extraction=extraction,
+                           extraction_key=extraction_key, date=date, remaining_ms=remaining_ms)
 
     return {"skipped": False, "topics": topics_n,
             **({"reason": placeholder_kept} if placeholder_kept else {})}
@@ -2401,7 +2424,10 @@ def lambda_handler(event, context):
         pipeline_trace.begin("item-writer", user_folder=user_folder, date=date,
                              session=session_base)
         try:
-            results.append(write_extraction_items(date, user_folder, key))
+            # the invocation's remaining time bounds the cross-day build (only when known)
+            remaining = getattr(context, "get_remaining_time_in_millis", None)
+            results.append(write_extraction_items(date, user_folder, key, **(
+                {"remaining_ms": remaining} if remaining is not None else {})))
         finally:
             pipeline_trace.flush(s3, S3_BUCKET)
     return {"results": results}

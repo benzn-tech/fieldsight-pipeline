@@ -110,11 +110,12 @@ def world(monkeypatch, migrated_db_url):
             return keys.setdefault((date, name),
                                    f"extractions/{folder}/{date}/sid{uuid.uuid4().hex}.json")
 
-        def write(date, name, artifact, mode="off"):
+        def write(date, name, artifact, mode="off", remaining_ms=None):
             monkeypatch.setattr(lambda_item_writer, "CROSS_DAY_CONTINUITY", mode)
             key = key_for(date, name)
             fake_s3.objects[key] = json.dumps(artifact)
-            return lambda_item_writer.write_extraction_items(date, folder, key)
+            return lambda_item_writer.write_extraction_items(date, folder, key,
+                                                             remaining_ms=remaining_ms)
 
         def committed_today():
             key = keys.get((DATE, "today"))
@@ -179,12 +180,23 @@ def test_shadow_builds_and_puts_the_request_after_commit(world, monkeypatch):
     w = world
     early = _seed_earlier(w)
     calls = _spy_find_items(monkeypatch)
+    built_after_commit = []
+    real_build = lambda_item_writer.build_xday_request
+
+    def spy_build(conn, **kw):
+        # the build reads on a fresh connection once the pass has COMMITTED, so the writer's
+        # transaction (and every xact lock it took) is gone by now
+        built_after_commit.append(w["s3"].probe())
+        return real_build(conn, **kw)
+
+    monkeypatch.setattr(lambda_item_writer, "build_xday_request", spy_build)
     res = w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY),
                      mode="shadow")
     assert res["skipped"] is False
     key = w["key_for"](DATE, "today")
     assert len(w["s3"].puts) == 1, w["s3"].puts
     put = w["s3"].puts[0]
+    assert built_after_commit == [True], "the request was built before the pass committed"
     assert put["committed"] is True, "the request was put before the pass committed"
     body = put["body"]
     assert put["key"] == f"{PREFIX}{w['site']['id']}/{DATE}/{body['run_hash']}.json"
@@ -192,6 +204,8 @@ def test_shadow_builds_and_puts_the_request_after_commit(world, monkeypatch):
     assert body["company_id"] == str(w["co"]["id"])
     assert body["extraction_key"] == key and body["date"] == DATE
     assert body["trigger"] == "final"
+    assert body["mode"] == "shadow"
+    assert body["lexical_skipped_budget"] == 0
     assert body["extracted_at"] == "2026-11-09T11:00:00Z"
 
     news = {n["kind"]: n for n in body["new_items"]}
@@ -231,6 +245,31 @@ def test_on_also_emits_the_request(world):
     _seed_earlier(w)
     w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY), mode="on")
     assert len(w["s3"].puts) == 1
+    assert w["s3"].puts[0]["body"]["mode"] == "on"
+
+
+def test_out_of_budget_skips_the_lexical_queries_and_counts_them(world, monkeypatch):
+    """No time left (remaining time inside the reserve): the recency reads still run, every
+    lexical query is skipped and counted, and the request still goes out."""
+    w = world
+    early = _seed_earlier(w)
+    calls = _spy_find_items(monkeypatch)
+    w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY),
+               mode="shadow", remaining_ms=lambda: 5000)
+    assert [kw for kw in calls if kw.get("query")] == []
+    body = w["s3"].puts[-1]["body"]
+    assert body["lexical_skipped_budget"] == 3
+    assert {c["stable_id"] for c in body["candidates"]} == set(early.values())
+
+
+def test_with_time_left_no_lexical_query_is_skipped(world, monkeypatch):
+    w = world
+    _seed_earlier(w)
+    calls = _spy_find_items(monkeypatch)
+    w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY),
+               mode="shadow", remaining_ms=lambda: 100000)
+    assert len([kw for kw in calls if kw.get("query")]) == 3
+    assert w["s3"].puts[-1]["body"]["lexical_skipped_budget"] == 0
 
 
 def test_this_sessions_earlier_pass_is_never_a_candidate(world):
@@ -341,8 +380,8 @@ def test_no_site_builds_nothing_and_runs_no_sql():
 
 
 def test_a_failing_build_never_fails_the_write(world, monkeypatch):
-    """The build poisons the transaction with a real SQL error and raises: the savepoint
-    takes the error, the pass still commits, nothing is put."""
+    """The build hits a real SQL error and raises: it runs after the commit on its own
+    connection, so the pass is already durable; nothing is put and the write returns ok."""
     w = world
     _seed_earlier(w)
 
