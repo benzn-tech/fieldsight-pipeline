@@ -58,18 +58,32 @@ def insert(conn, ev):
     return row, False
 
 
-def claim_due(conn, now, limit=50):
+def claim_due(conn, now, limit=50, *, only_types=None, exclude_types=None):
     """Pop up to `limit` queued events whose not_before is NULL or <= now, lowest seq first,
     and mark them 'running'. FOR UPDATE: a concurrent claimer skips rows another
     transaction holds rather than waiting. attempts is NOT touched (the caller counts
-    failures). Rows come back in seq order."""
+    failures). Rows come back in seq order.
+
+    only_types / exclude_types (sequences of event types) narrow the pop: the hub claims
+    run-rule events one per transaction and every other event in batches. An empty
+    only_types claims nothing; an empty exclude_types excludes nothing."""
+    if only_types is not None and not list(only_types):
+        return []
+    where, args = "", [now]
+    if only_types is not None:
+        where += " AND type = ANY(%s)"
+        args.append(list(only_types))
+    if exclude_types:
+        where += " AND NOT (type = ANY(%s))"
+        args.append(list(exclude_types))
+    args.append(limit)
     rows = conn.cursor(row_factory=dict_row).execute(
         "UPDATE site_events SET status = 'running' "
         "WHERE event_id IN (SELECT event_id FROM site_events "
-        "  WHERE status = 'queued' AND (not_before IS NULL OR not_before <= %s) "
+        "  WHERE status = 'queued' AND (not_before IS NULL OR not_before <= %s)" + where +
         "  ORDER BY seq LIMIT %s FOR UPDATE SKIP LOCKED) "
         f"RETURNING {_COLS}",
-        (now, limit)).fetchall()
+        args).fetchall()
     return sorted(rows, key=lambda r: r["seq"])
 
 

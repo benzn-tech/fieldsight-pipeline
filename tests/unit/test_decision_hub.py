@@ -61,8 +61,15 @@ def _gap(report_date=date(2026, 11, 2), received_at=None, payload=None, **kw):
 def test_modules_import_only_stdlib_and_nz_time():
     allowed = {"nz_time", "decision_hub", "decision_rules", "dataclasses",
                "datetime", "typing", "__future__"}
+    # A run-rule's handler is imported inside the function that calls it (call time, never
+    # module load), so importing the rules still needs no database driver.
+    lazy_ok = {"decision_rules.py": {"nightly_rematch"}}
     for name in ("decision_hub.py", "decision_rules.py"):
         tree = ast.parse((SRC / name).read_text(encoding="utf-8"))
+        in_function = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                in_function |= {id(n) for n in ast.walk(fn)}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 mods = [a.name.split(".")[0] for a in node.names]
@@ -71,6 +78,8 @@ def test_modules_import_only_stdlib_and_nz_time():
             else:
                 continue
             for m in mods:
+                if id(node) in in_function and m in lazy_ok.get(name, set()):
+                    continue
                 assert m in allowed, f"{name} imports {m}"
 
 
@@ -316,8 +325,9 @@ def test_rule_requires_exactly_one_of_run_or_build_card():
         Rule(**common, build_card=lambda e: None, run=lambda c, e, ctx: "done")
     assert Rule(**common, run=lambda c, e, ctx: "done").build_card is None
     assert Rule(**common, build_card=lambda e: None).run is None
-    # the production rules are all card rules
-    assert all(r.build_card is not None and r.run is None for r in RULES.values())
+    # the production rules are card rules, except the nightly handler (plan Task 6)
+    assert {t for t, r in RULES.items() if r.run is not None} == {"nightly.due"}
+    assert all(r.build_card is not None for t, r in RULES.items() if t != "nightly.due")
 
 
 def test_run_context_is_frozen():

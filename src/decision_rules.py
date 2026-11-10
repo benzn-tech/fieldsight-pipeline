@@ -112,6 +112,20 @@ def _build_gap(event: Event) -> CardDraft:
     )
 
 
+# --- nightly.due (run-rule) ---------------------------------------------------
+
+def _run_nightly(conn, event: Event, ctx: RunContext) -> str:
+    """The nightly re-match handler. Imported here, at call time, so this module stays pure
+    at import (the replay judge and the unit tests import it without a database driver)."""
+    import nightly_rematch
+    return nightly_rematch.run(conn, event, ctx)
+
+
+def _night_bucket(event: Event, today_nz: date) -> str:
+    """The night the tick computed (the site's previous local date), not today."""
+    return _text((event.payload or {}).get("night"))[:10]
+
+
 RULES = {
     "checklist.gap": Rule(
         rule_id="checklist.gap",
@@ -126,5 +140,12 @@ RULES = {
         late_after_days=None,
         purpose="overdue",
         build_card=_build_overdue,
+    ),
+    "nightly.due": Rule(
+        rule_id="nightly.due",
+        bucket=_night_bucket,
+        late_after_days=1,
+        purpose="nightly",
+        run=_run_nightly,
     ),
 }

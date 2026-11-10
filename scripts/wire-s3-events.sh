@@ -18,6 +18,8 @@
 #   Ingest      ← project_doc_vectors/**.json  (project-doc worker output, in-VPC Aurora apply)
 #   ActionAgent ← action_pack_requests/**.json (org-api's request to run one action pack)
 #   ContinuityXdayLinker ← continuity_xday_requests/**.json (item-writer's cross-day continuity request)
+#   NightlyTurnPick ← nightly_requests/**.json (the nightly hub handler's J2 request; ONLY with
+#                     WIRE_NIGHTLY_TURN_PICK=true -- see the NOTE below)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -59,6 +61,7 @@ TEMPLATE_DIGITISE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}
 PROJECT_DOC_INDEX_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-project-doc-index"
 ACTION_AGENT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-action-agent"
 XDAY_LINKER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-continuity-xday-linker"
+NIGHTLY_TURN_PICK_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-nightly-turn-pick"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe ContinuityXdayLinker=${PREFIX}-continuity-xday-linker"
 
@@ -357,6 +360,40 @@ else
   echo "NOTE: ${PREFIX}-action-agent not deployed — skipping action-agent trigger"
 fi
 
+# NOTE(nightly re-match J2, spec 2026-11-10 §4.2/§4.3): the non-VPC turn-pick worker triggers
+# on nightly_requests/*.json -- the request the in-VPC hub handler (DecisionScanFunction,
+# nightly.due) writes. The worker writes nothing to S3 (its result travels in the
+# RequestResponse invoke of the in-VPC writer), so there is no output prefix and no BUG-13
+# loop; the prefix is disjoint from every other wired prefix.
+#
+# NightlyTurnPickFunction exists whenever NightlyRematch is not off -- in shadow too, and in
+# shadow the worker must NOT be wired (every TEST deploy runs this script with --apply). So
+# the rule is ADDED only when the operator sets WIRE_NIGHTLY_TURN_PICK=true, after setting
+# the flag to on; anywhere else an existing fs-nightly-turn-pick rule is KEPT (carried over
+# below), so a later deploy without the variable does not silently unwire an "on" stack. The
+# worker also idles on any artifact whose flag is not "on". Operator command (test):
+#   WIRE_NIGHTLY_TURN_PICK=true bash scripts/wire-s3-events.sh <lake bucket> test ap-southeast-2 --apply
+# If the function is gone (flag off) the rule is dropped (S3 refuses a config naming a
+# missing fn).
+nightly_turn_pick_mode() {  # -> add | keep
+  if [ "${WIRE_NIGHTLY_TURN_PICK:-}" = "true" ]; then echo add; else echo keep; fi
+}
+NIGHTLY_TURN_PICK_MODE=skip
+if fn_exists "${PREFIX}-nightly-turn-pick"; then
+  NIGHTLY_TURN_PICK_MODE="$(nightly_turn_pick_mode)"
+  if [ "$NIGHTLY_TURN_PICK_MODE" = "add" ]; then
+    WIRE_FNS+=("${PREFIX}-nightly-turn-pick")
+    DESIRED=$(jq -c --arg arn "$NIGHTLY_TURN_PICK_ARN" '. + [
+    {"Id":"fs-nightly-turn-pick","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"nightly_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+  else
+    echo "NOTE: ${PREFIX}-nightly-turn-pick not added (operator step: WIRE_NIGHTLY_TURN_PICK=true once NightlyRematch=on); an existing fs-nightly-turn-pick rule is kept"
+  fi
+else
+  echo "NOTE: ${PREFIX}-nightly-turn-pick not deployed — skipping nightly-turn-pick trigger"
+fi
+
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')
 # A bucket with NO notification config returns EMPTY stdout (success) — not JSON.
 [ -n "$CURRENT" ] || CURRENT='{}'
@@ -365,6 +402,13 @@ CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --o
 if [ "$ACTION_AGENT_MODE" = "keep" ]; then
   DESIRED=$(jq -c --argjson cur "$CURRENT" \
     '. + [($cur.LambdaFunctionConfigurations // [])[] | select(.Id == "fs-action-agent")]' \
+    <<<"$DESIRED")
+fi
+
+# Carry an operator-wired fs-nightly-turn-pick rule over (see the nightly NOTE above).
+if [ "$NIGHTLY_TURN_PICK_MODE" = "keep" ]; then
+  DESIRED=$(jq -c --argjson cur "$CURRENT" \
+    '. + [($cur.LambdaFunctionConfigurations // [])[] | select(.Id == "fs-nightly-turn-pick")]' \
     <<<"$DESIRED")
 fi
 

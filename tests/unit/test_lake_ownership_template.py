@@ -307,6 +307,8 @@ LAKE_PUT_CALLERS = {
     # operator tasks puts a tenant object, but the rule is "imports a caller", not "has
     # been seen calling".
     "LakeOpsFunction": "lambda_org_api and everything it imports",
+    # The nightly handler's J2 request artifacts (nightly_rematch, nightly re-match Task 6).
+    "DecisionScanFunction": "nightly_rematch (nightly_requests/ via lake_put)",
 }
 
 
@@ -325,12 +327,10 @@ IMPORTS_BUT_NEVER_WRITES = {
     "SessionActivityFunction": "imports helpers; calls none of the writers",
     "RecordingSegmentsFunction": "reads transcripts only; its own test forbids PutObject",
     "SpeakerEmbedFunction": "reads a raw window via batch_seal; never seals",
+    "NightlyTurnPickFunction": ("imports transcript_utils via session_turns to rebuild "
+                                "turns; writes nothing to S3 (its result rides the invoke)"),
     "CheckGapsFunction": ("reads transcripts via extract_session's gather/assemble; "
                           "read-only by spec (check done 2026-10-20)"),
-    "DecisionScanFunction": ("imports pipeline_trace (and lambda_org_api lazily) via "
-                             "checklist_reports; calls only read_result_status, "
-                             "unseen_reports and mark_seen -- S3 read-only by spec "
-                             "(site decision loop P0, 2026-11-05)"),
 }
 
 

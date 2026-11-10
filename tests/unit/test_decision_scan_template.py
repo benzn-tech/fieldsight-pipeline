@@ -99,19 +99,24 @@ def test_function_exists_only_under_condition(doc):
     assert {"VPCAccessPolicy": {}} in p["Policies"]
 
 
-def test_two_schedules_with_inputs(doc):
-    # Two, not three: the handler runs process() after each emit in the same invocation,
-    # so no schedule wakes Aurora every few minutes (test_sweep_cadence_vs_autopause).
-    # {"scan": "process"} stays valid for a manual invoke but has no schedule.
+def test_three_schedules_with_inputs(doc):
+    # No process schedule: the handler runs process() after each emit in the same
+    # invocation, so no schedule wakes Aurora every few minutes
+    # (test_sweep_cadence_vs_autopause). {"scan": "process"} stays valid for a manual invoke.
+    # The third, the hourly nightly tick, is enabled only while NightlyRematch is not off
+    # (tests/unit/test_nightly_rematch.py).
     events = _props(doc, FN)["Events"]
     got = {}
     for ev in events.values():
         assert ev["Type"] == "Schedule"
         pr = ev["Properties"]
-        assert pr["State"] == {"If": ["ShouldEnableSchedules", "ENABLED", "DISABLED"]}
-        got[json.loads(pr["Input"])["scan"]] = pr["Schedule"]
+        scan = json.loads(pr["Input"])["scan"]
+        cond = "ShouldScheduleNightlyTick" if scan == "nightly_tick" else "ShouldEnableSchedules"
+        assert pr["State"] == {"If": [cond, "ENABLED", "DISABLED"]}
+        got[scan] = pr["Schedule"]
     assert got == {"checklist_gap": "rate(30 minutes)",
-                   "todo_overdue": "cron(30 18 * * ? *)"}
+                   "todo_overdue": "cron(30 18 * * ? *)",
+                   "nightly_tick": "rate(1 hour)"}
 
 
 def test_no_ses_or_invoke_permission(doc):
@@ -119,7 +124,12 @@ def test_no_ses_or_invoke_permission(doc):
         for a in _as_list(st["Action"]):
             assert not a.lower().startswith("ses:"), a
             assert a != "lambda:InvokeFunction", a
-            assert a in ("s3:GetObject", "s3:ListBucket"), a
+            assert a in ("s3:GetObject", "s3:ListBucket", "s3:PutObject"), a
+            if a == "s3:PutObject":
+                # the nightly handler's J2 requests (+ lake_put's manifest line), nothing else
+                assert {_sub(r) for r in _as_list(st["Resource"])} <= {
+                    LAKE + "/nightly_requests/*", LAKE + "/lake_manifest/*",
+                    "arn:aws:s3:::${DataBucketName}/lake_manifest/*"}
     # No SAM policy templates that grant SES or invoke either.
     for pol in _props(doc, FN)["Policies"]:
         if isinstance(pol, dict) and "Statement" not in pol:
@@ -127,6 +137,7 @@ def test_no_ses_or_invoke_permission(doc):
 
 
 def test_s3_scope_is_session_report_results_with_listbucket(doc):
+    # plus nightly_requests/ for the nightly handler (head before put, breaker reads)
     gets, lists = set(), set()
     for st in _statements(doc, FN):
         assert st["Effect"] == "Allow"
@@ -134,11 +145,12 @@ def test_s3_scope_is_session_report_results_with_listbucket(doc):
             if a == "s3:ListBucket":
                 assert [_sub(r) for r in _as_list(st["Resource"])] == [LAKE]
                 lists |= set(_as_list(st["Condition"]["StringLike"]["s3:prefix"]))
-            else:
-                assert a == "s3:GetObject"
+            elif a == "s3:GetObject":
                 gets |= {_sub(r) for r in _as_list(st["Resource"])}
-    assert gets == {LAKE + "/session_report_results/*"}
-    assert lists == {"session_report_results/*"}
+            else:
+                assert a == "s3:PutObject"
+    assert gets == {LAKE + "/session_report_results/*", LAKE + "/nightly_requests/*"}
+    assert lists == {"session_report_results/*", "nightly_requests/*"}
 
 
 def test_org_api_gets_the_flag(doc):

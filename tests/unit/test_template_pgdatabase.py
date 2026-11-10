@@ -54,9 +54,11 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # in-VPC writer cloned from SuggestionWriterFunction, PGDATABASE !If-guarded like it.
     # 23 with DecisionScanFunction (site decision loop P0, spec 2026-11-05): in-VPC,
     # PGDATABASE !If-guarded like CheckGapsDbFunction's it copies.
+    # 24 with NightlySupportWriterFunction (nightly re-match J2 hop 3, spec 2026-11-10):
+    # in-VPC writer cloned from ContinuityLinkWriterFunction, PGDATABASE !If-guarded like it.
     #
     # The count is the point: a new in-VPC function is meant to make this test fail, so
     # that whoever adds one has to look at whether they guarded PGDATABASE rather than
     # discovering months later that test writes went to the prod database.
-    assert guarded == 23, f"expected 23 guarded PGDATABASE, found {guarded}"
+    assert guarded == 24, f"expected 24 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"

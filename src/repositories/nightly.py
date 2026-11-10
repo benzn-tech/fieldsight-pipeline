@@ -187,3 +187,33 @@ def resolve_recompute(conn, company_id, session_base):
         "UPDATE claim_recompute_failures SET resolved_at = now() "
         "WHERE company_id = %s AND session_base = %s AND resolved_at IS NULL",
         (company_id, session_base))
+
+
+def answered_input_keys(conn, company_id, site_id, keys) -> set:
+    """The subset of request `keys` that already have at least one `nightly_support`
+    record of this company and site (the writer stamps the request key as input_key).
+    Serves the handler's "never re-PUT an answered request" skip and the circuit breaker."""
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT input_key FROM decision_records WHERE company_id = %s "
+        "AND site_id = %s AND kind = %s AND input_key = ANY(%s)",
+        (company_id, site_id, NIGHTLY_SUPPORT_KIND, keys)).fetchall()
+    return {r[0] for r in rows}
+
+
+FINAL_MEETING_STATUSES = ("sent", "failed")
+
+
+def live_session_ids(conn, session_ids) -> set:
+    """The subset of meeting_session ids (32 hex, no `sid` prefix) whose row exists and is
+    not final yet (status not in sent/failed): the soft "final" gate. A session with no
+    meeting_session row is not live (legacy and whole-file sessions have none)."""
+    ids = [s for s in (session_ids or []) if s]
+    if not ids:
+        return set()
+    rows = conn.execute(
+        "SELECT session_id FROM meeting_session WHERE session_id = ANY(%s) "
+        "AND status <> ALL(%s)", (ids, list(FINAL_MEETING_STATUSES))).fetchall()
+    return {r[0] for r in rows}

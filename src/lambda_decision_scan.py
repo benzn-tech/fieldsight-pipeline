@@ -3,7 +3,7 @@ Lambda: decision-scan -- the site decision loop's emitters and hub loop (P0, sha
 
 Spec docs/superpowers/specs/2026-11-05-site-decision-loop-design.md (rev 5), plan Task 4.
 
-Event:  {"scan": "checklist_gap" | "todo_overdue" | "process"}
+Event:  {"scan": "checklist_gap" | "todo_overdue" | "nightly_tick" | "process"}
 Result: {"emitted", "duplicates", "skipped_ambiguous_site", "skipped_pending", "processed",
          "cards", "faults", "errors"}  (counts), or {"skipped": "flag off"} when
          SITE_DECISION_LOOP is not "shadow" -- returned before any DB connection.
@@ -15,6 +15,10 @@ checklist_gap  every checklist_reports row of the last 48 h not yet seen under i
                gone, and marks the report seen in the same transaction.
 todo_overdue   one todo.overdue event per live open action item past its deadline (bucket =
                the scan's NZ day, so one event per item per day).
+nightly_tick   one nightly.due event per site whose local time is 01:00-04:59 and whose
+               night (the previous local date) has none yet (nightly_rematch.due_sites);
+               bucket = the night, so a second tick or an EventBridge retry is a
+               duplicate. The hourly schedule exists only while NIGHTLY_REMATCH != off.
 process        claims due queued events (FOR UPDATE SKIP LOCKED) and runs them through the
                hub: auth -> too_deep -> match -> late -> merge -> ledger -> open card.
                A run-rule (Rule.run, e.g. the nightly job) skips the ledger and the card:
@@ -38,7 +42,10 @@ Transactions: never conn.commit() here. Each unit of work is `with conn.transact
 under the handler's connection that is a real BEGIN/COMMIT, under a caller's open
 transaction a savepoint. process() claims and handles a batch in ONE transaction, each
 event in its own savepoint; a Lambda crash rolls the whole batch back, so no row is ever
-left 'running'.
+left 'running'. Run-rule events are the exception: each is claimed and run in its OWN
+transaction (claim limit 1), before the batches, so a timeout mid-way never rolls back a
+site whose run already finished -- and whose S3 request artifacts, which no rollback
+undoes, are already written.
 
 Hub functions are imported BY NAME and called unqualified: mutation tests patch
 `lambda_decision_scan.<name>`.
@@ -48,6 +55,8 @@ import os
 from datetime import datetime, time, timedelta, timezone
 
 import checklist_reports
+import decision_rules
+import nightly_rematch
 import nz_time
 import tenancy_status
 from db.connection import get_connection
@@ -68,6 +77,11 @@ RESULT_KEYS = ("emitted", "duplicates", "skipped_ambiguous_site", "skipped_pendi
 
 BATCH = 50          # events claimed per transaction
 MAX_BATCHES = 20    # per invocation; the next schedule picks up the rest
+MAX_RUN_EVENTS = 200       # run-rule events per invocation, one transaction each
+# Start no new run-rule event this long after process() began: the Lambda Timeout is 120 s and
+# one nightly run is bounded by nightly_rematch.RUN_BUDGET_S (45 s).
+RUN_EVENTS_WINDOW_S = 30.0
+NIGHTLY_TYPE = nightly_rematch.EVENT_TYPE
 GAP_TYPE = "checklist.gap"
 OVERDUE_TYPE = "todo.overdue"
 
@@ -137,6 +151,30 @@ def _emit_overdue_item(conn, item, today_nz, now, out):
         out["emitted"] += 1
     else:
         out["duplicates"] += 1
+
+
+def emit_nightly_due(conn, now):
+    """One nightly.due event per due site (nightly_rematch.due_sites): source nightly_scan,
+    subject_ref = the site id, occurred_at = received_at = now, payload {night}; the rule's
+    bucket is the night. Each site in its own savepoint: one bad site is counted in errors."""
+    out = _counts()
+    today_nz = nz_time.to_nz(now).date()
+    for due in nightly_rematch.due_sites(conn, now):
+        try:
+            with conn.transaction():
+                ev = _new_event(due["company_id"], due["site_id"], nightly_rematch.SOURCE,
+                                NIGHTLY_TYPE, str(due["site_id"]), now, now,
+                                {"night": due["night"].isoformat()})
+                if _insert_event(conn, ev, today_nz):
+                    out["emitted"] += 1
+                else:
+                    out["duplicates"] += 1
+        except Exception as exc:  # noqa: BLE001 - one bad site never stops the tick
+            out["errors"] += 1
+            logger.warning("decision-scan nightly: site %s not emitted: %r",
+                           due.get("site_id"), exc)
+    logger.info("decision-scan nightly_tick %s", out)
+    return out
 
 
 def _report_midnight_utc(report_date):
@@ -430,15 +468,35 @@ def _process_one(conn, row, now, out, job=(None, None, None)):
         _fail(conn, row, ev, exc, now, out)
 
 
-def process(conn, now, *, s3_client=None, bucket=None):
-    """Claim due events and run each through the hub. One transaction per batch; each
-    event in its own savepoint. Returns counts (processed, cards, faults). s3_client and
-    bucket only reach run-rules (RunContext); NIGHTLY_REMATCH is read once per call."""
+def _run_types():
+    """Event types whose rule is a run-rule (read at call time: tests register rules)."""
+    return sorted(t for t, r in decision_rules.RULES.items() if r.run is not None)
+
+
+def process(conn, now, *, s3_client=None, bucket=None, clock=None):
+    """Claim due events and run each through the hub. Run-rule events first, one per
+    transaction; then the rest, one transaction per batch, each event in its own
+    savepoint. Returns counts (processed, cards, faults). s3_client and bucket only reach
+    run-rules (RunContext); NIGHTLY_REMATCH is read once per call."""
+    import time
+    clock = clock or time.monotonic
     out = _counts()
     job = (os.environ.get(RUN_FLAG), s3_client, bucket)
+    run_types = _run_types()
+    started = clock()
+    for _ in range(MAX_RUN_EVENTS if run_types else 0):
+        if clock() - started > RUN_EVENTS_WINDOW_S:
+            break
+        with conn.transaction():
+            rows = site_events.claim_due(conn, now, 1, only_types=run_types)
+            for row in rows:
+                out["processed"] += 1
+                _process_one(conn, row, now, out, job)
+        if not rows:
+            break
     for _ in range(MAX_BATCHES):
         with conn.transaction():
-            rows = site_events.claim_due(conn, now, BATCH)
+            rows = site_events.claim_due(conn, now, BATCH, exclude_types=run_types)
             for row in rows:
                 out["processed"] += 1
                 _process_one(conn, row, now, out, job)
@@ -465,10 +523,10 @@ def lambda_handler(event, context):
     if os.environ.get(FLAG) != "shadow":
         return {"skipped": "flag off"}
     scan = (event or {}).get("scan")
-    if scan not in ("checklist_gap", "todo_overdue", "process"):
+    if scan not in ("checklist_gap", "todo_overdue", "nightly_tick", "process"):
         raise ValueError(f"decision-scan: unknown scan {scan!r}")
     bucket = os.environ.get("LAKE_BUCKET", "")
-    if scan == "checklist_gap" and not bucket:
+    if scan in ("checklist_gap", "nightly_tick") and not bucket:
         # Fail loudly once, not as a per-report error on every scan forever.
         raise RuntimeError("decision-scan: LAKE_BUCKET is not set")
     now = datetime.now(timezone.utc)
@@ -477,6 +535,8 @@ def lambda_handler(event, context):
         runs = []
         if scan == "todo_overdue":
             runs.append(emit_todo_overdue(conn, now))
+        elif scan == "nightly_tick":
+            runs.append(emit_nightly_due(conn, now))
         elif scan == "checklist_gap":
             runs.append(emit_checklist_gaps(
                 conn, lambda key: checklist_reports.read_result_status(key, _s3(), bucket),
