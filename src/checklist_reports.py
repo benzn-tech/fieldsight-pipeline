@@ -460,3 +460,92 @@ def recent_for_folder(conn, company_id, folder, since_date):
         "WHERE company_id = %s AND user_folder = %s AND report_date >= %s "
         "ORDER BY created_at DESC LIMIT 50",
         (str(company_id), folder, since_date)).fetchall()
+
+
+# --- The worker's result of one report (shared by org-api and the decision scan) -------
+#
+# Moved from lambda_org_api (_checklist_gaps / _checklist_report_status) so the decision
+# scan Lambda can read the same result the same way without importing org-api. org-api
+# keeps its two names as thin wrappers, so its responses are unchanged.
+
+#: S3 error codes that mean "not written yet" (ListBucket is granted on the prefix, so a
+#: missing key is a 404, never a 403). Same tuple as lambda_org_api._LAKE_NOT_FOUND_CODES.
+NOT_FOUND_CODES = ("NoSuchKey", "404")
+
+
+def checklist_gaps(result):
+    """What the inspector did not do, summed over the report's checklists
+    (owner, 2026-10-16), or None when the result says nothing about it.
+
+    {"notCovered": [...], "failed": [...], "checklists": [titles]}: each gap is
+    the worker's dict with `checklist` (its title) added; `checklists` names
+    every checklist whose gaps are KNOWN, including one with no gap left (the
+    decision scan supersedes that checklist's old cards). org-api strips it.
+
+    None, never two empty lists, unless at least one checklist carries `gaps`:
+    a result from before gaps were recorded, or `checklists: {}`, must not read
+    as "all items covered". Never raises -- a malformed result only loses its
+    gaps, never its status."""
+    try:
+        checklists = result.get("checklists")
+        if not isinstance(checklists, dict):
+            return None
+        out, known = {"notCovered": [], "failed": [], "checklists": []}, False
+        for title, rep in checklists.items():
+            gaps = rep.get("gaps") if isinstance(rep, dict) else None
+            if not isinstance(gaps, dict):
+                continue
+            nc, failed = gaps.get("not_covered"), gaps.get("failed")
+            if not isinstance(nc, list) or not isinstance(failed, list):
+                continue
+            known = True
+            out["checklists"].append(title)
+            out["notCovered"] += [dict(g, checklist=title) for g in nc if isinstance(g, dict)]
+            out["failed"] += [dict(g, checklist=title) for g in failed if isinstance(g, dict)]
+        return out if known else None
+    except Exception:
+        logger.exception("checklist gaps unreadable")
+        return None
+
+
+def read_result_status(result_key, s3_client, bucket):
+    """(status, error, gaps) of one auto report -- status pending | done | error,
+    read off the worker's result. A key not written yet is ("pending", None,
+    None); any other S3 error, or a body that is not JSON, RAISES (the caller
+    decides: org-api fails the request, the decision scan counts an error)."""
+    from botocore.exceptions import ClientError
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in NOT_FOUND_CODES:
+            return "pending", None, None
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    status = result.get("status") or "pending"
+    return status, result.get("error"), (checklist_gaps(result) if status == "done" else None)
+
+
+# --- Decision scan cursor (migration 0099 decision_scan_seen) ---------------------------
+
+def unseen_reports(conn, max_age_hours=48):
+    """checklist_reports rows created (or re-queued: both upserts re-stamp created_at)
+    within the last `max_age_hours` whose (id, result_key) the decision scan has not
+    marked seen. Oldest first. A re-run under a new result_key is unseen again."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT r.id, r.company_id, r.user_folder, r.report_date, r.session, "
+        "r.template_name, r.check_name, r.result_key, r.walk_key, r.created_at "
+        "FROM checklist_reports r "
+        "WHERE r.created_at >= now() - make_interval(hours => %s) "
+        "AND NOT EXISTS (SELECT 1 FROM decision_scan_seen s "
+        "                WHERE s.report_id = r.id AND s.result_key = r.result_key) "
+        "ORDER BY r.created_at, r.id",
+        (int(max_age_hours),)).fetchall()
+
+
+def mark_seen(conn, report_id, result_key):
+    """Mark (report, result_key) seen. Idempotent (ON CONFLICT DO NOTHING); call it in the
+    same transaction as that report's events."""
+    conn.execute(
+        "INSERT INTO decision_scan_seen (report_id, result_key) VALUES (%s, %s) "
+        "ON CONFLICT DO NOTHING",
+        (report_id, result_key))
