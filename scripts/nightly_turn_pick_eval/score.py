@@ -312,7 +312,11 @@ def build_summary(run_dir, data_dir, labels_dir, scoring):
     owner = tc_score.gold_by_ref(store.read_jsonl(Path(labels_dir, "done.owner.jsonl")))
     adjudicated = tc_score.gold_by_ref(
         store.read_jsonl(Path(run_dir, "done.adjudicate.owner.jsonl")))
-    gold = tc_score.merge_gold(agent, owner, adjudicated)
+    # Pre-registration §6: every scoring but the one addendum uses agent gold only.
+    if scoring.startswith("addendum"):
+        gold = tc_score.merge_gold(agent, owner, adjudicated)
+    else:
+        gold = agent
     decisions = flag_answers(store.read_jsonl(Path(run_dir, "done.flags.owner.jsonl")))
     sessions = store.load_sessions(data_dir, split=split)
     ctx = Ctx(sessions, gold, decisions)
@@ -456,6 +460,10 @@ def main(argv=None):
         run_mod.refuse(f"{summary_path} exists; a held-out run is scored once "
                        f"(one --addendum <date> re-scoring is authorised)")
     else:
+        for d, m in run_mod.other_runs(run_dir):
+            if m.get("split") == "heldout" and Path(d, "summary.json").exists():
+                run_mod.refuse(f"another held-out run ({d.name}) was already scored; the "
+                               f"held-out half is scored once")
         out_path, scoring = summary_path, "first"
 
     summary, exports = build_summary(run_dir, data_dir, labels_dir, scoring)

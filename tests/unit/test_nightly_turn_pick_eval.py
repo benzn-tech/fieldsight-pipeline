@@ -621,3 +621,70 @@ def test_load_log_refuses_duplicate_pairs(env, monkeypatch):
     with pytest.raises(SystemExit) as e:
         run.main(_args(env, "fit", "r1", "--resume"))
     assert "duplicate" in str(e.value.code)
+
+
+def test_second_heldout_run_into_new_dir_is_refused(env, monkeypatch):
+    client = _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
+    n = len(client.calls)
+    with pytest.raises(SystemExit) as e:
+        run.main(_args(env, "heldout", "h2", "--fit-run", str(env.runs / "fit0")))
+    assert "held-out" in str(e.value.code)
+    assert len(client.calls) == n and not (env.runs / "h2").exists()
+    run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0"), "--resume"))
+
+
+def test_first_scoring_refused_when_another_heldout_was_scored(env, monkeypatch):
+    import shutil
+    _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
+    shutil.copytree(env.runs / "h1", env.runs / "h2")
+    _score(env, "h1")
+    with pytest.raises(SystemExit) as e:
+        _score(env, "h2")
+    assert "held-out" in str(e.value.code)
+    assert not (env.runs / "h2" / "summary.json").exists()
+
+
+def test_fit_and_heldout_refused_when_fit_runs_differ_in_guards(env, monkeypatch):
+    client = _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    meta_p = env.runs / "fit0" / "meta.json"
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    meta["hashes"]["src/item_text_match.py"] = "0" * 64
+    meta_p.write_text(json.dumps(meta), encoding="utf-8")
+    run.main(_args(env, "fit", "fit_tmp", "--dry-run"))     # a dry run is not gated
+    n = len(client.calls)
+    with pytest.raises(SystemExit) as e:
+        run.main(_args(env, "fit", "fit1", reps=1))
+    assert "item_text_match" in str(e.value.code)
+    with pytest.raises(SystemExit):
+        run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
+    assert len(client.calls) == n
+
+
+def test_wording_with_more_than_two_revisions_is_refused(env, monkeypatch):
+    client = _patch_client(monkeypatch, FakeClient())
+    env.wording.write_text("".join(f"## v{i}\nprompt_hash: {i:012d}\n" for i in range(3))
+                           + f"## v3\nprompt_hash: {ntp.PROMPT_HASH}\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        run.main(_args(env, "fit", "fit0"))
+    assert "revisions" in str(e.value.code)
+    assert client.calls == []
+
+
+def test_first_heldout_scoring_uses_agent_gold_only(env, monkeypatch):
+    _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
+    owner = [{"item_ref": f"{REF_C}:0:action_items:0", "label": "turn", "turns": [2]},
+             _gold_rows(REF_C)[1]]
+    (env.labels / "done.owner.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in owner), encoding="utf-8")
+    first = _score(env, "h1")
+    assert [r["wrong"] for r in first["bars"]["bar1"]["per_rep"]] == [0, 0, 0]
+    assert first["provisional"] is False
+    final = _score(env, "h1", "--addendum", "2026-11-11")
+    assert [r["wrong"] for r in final["bars"]["bar1"]["per_rep"]] == [1, 1, 1]

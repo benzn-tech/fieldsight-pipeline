@@ -54,6 +54,7 @@ WORDING_FREE = "src/nightly_turn_pick.py"     # may differ fit -> held-out (word
 SANS_KEY = "nightly_turn_pick_sans_instruction"   # ... which this hash proves
 FAILED_PICK = "__failed__"
 HELDOUT_REPS = 3
+MAX_WORDINGS = 3          # v0 + at most 2 revisions
 _WORDING_LINE = re.compile(r"^prompt_hash:\s*([0-9a-f]{12})\s*$", re.MULTILINE)
 _RESUME_KEYS = ("model", "prompt_hash", "split", "reps", "hashes", "manifest_digest",
                 "max_tokens", "max_retries", "effort")
@@ -164,10 +165,44 @@ def last_wording_hash(path=None):
 
 
 def check_wording():
+    p = Path(WORDING_PATH)
+    logged = _WORDING_LINE.findall(p.read_text(encoding="utf-8")) if p.exists() else []
+    if len(logged) > MAX_WORDINGS:
+        refuse(f"{WORDING_PATH} logs {len(logged)} wordings; v0 plus at most 2 revisions "
+               f"are allowed (pre-registration §5)")
     last = last_wording_hash()
     if last != ntp.PROMPT_HASH:
         refuse(f"PROMPT_HASH {ntp.PROMPT_HASH} is not the last entry of {WORDING_PATH} "
                f"({last}); log the wording before running it (pre-registration §5)")
+
+
+def other_runs(exclude=None):
+    """(run dir, meta) for every runs/*/meta.json except `exclude`."""
+    out = []
+    ex = Path(exclude).resolve() if exclude else None
+    for m in sorted(Path(RUNS_DIR).glob("*/meta.json")):
+        if ex is not None and m.parent.resolve() == ex:
+            continue
+        out.append((m.parent, store.read_json(m)))
+    return out
+
+
+def check_fit_runs_frozen(hashes, exclude=None):
+    """Every complete fit run has the current non-wording hashes: only INSTRUCTION may
+    change across the fit half (pre-registration §5)."""
+    for d, m in other_runs(exclude):
+        if m.get("split") != "fit" or not m.get("complete"):
+            continue
+        for rel, h in hashes.items():
+            if rel != WORDING_FREE and (m.get("hashes") or {}).get(rel) != h:
+                refuse(f"{rel} differs from fit run {d.name}; only the wording may change "
+                       f"across fit runs")
+
+
+def check_no_other_heldout(out):
+    for d, m in other_runs(out):
+        if m.get("split") == "heldout":
+            refuse(f"a held-out run already exists ({d.name}); the held-out half is run once")
 
 
 def check_fit_run(fit_run, hashes):
@@ -455,7 +490,10 @@ def main(argv=None):
         refuse(f"nothing to resume at {out}")
     hashes = file_hashes(a.data, a.labels)
     check_wording()
+    check_fit_runs_frozen(hashes, exclude=out)
     if a.split == "heldout":
+        if not a.resume:
+            check_no_other_heldout(out)
         check_fit_run(a.fit_run, hashes)
     client, api_error, setup_errors = make_client()
 
