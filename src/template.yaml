@@ -6073,6 +6073,10 @@ Resources:
           SITE_DECISION_LOOP: !Ref SiteDecisionLoop
           # Gates every run-rule (the nightly.due handler): off | shadow | on.
           NIGHTLY_REMATCH: !Ref NightlyRematch
+          # J1 catch-up re-emits a line's request only while that line is on, read exactly
+          # as the item writer reads them (nightly_rematch._line_mode).
+          CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity
+          RECONCILE_STATUS: !Ref ReconcileStatus
           # Company offboarding gate (tenancy_status): off = shadow log only.
           COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # The lake bucket org-api reads checklist report results from, and the nightly
@@ -6100,6 +6104,18 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/nightly_requests/*
+            # J1 catch-up (spec 2026-11-10 §3): re-read a stale session's final extraction
+            # (in-VPC, through the S3 gateway endpoint) and put the OWNING lines' requests,
+            # built by their own builders, under their own prefixes. No ListBucket on
+            # extractions/: a missing final fails that pair either way (403 or 404).
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/continuity_xday_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/reconcile_requests/*
             # lake_put (lake ownership): every put also appends one line under lake_manifest/
             # in the bucket it wrote to. PutObject on that prefix only; a missing grant costs
             # the manifest line, never the request put.

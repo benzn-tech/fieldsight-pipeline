@@ -99,10 +99,10 @@ class Seed:
                                                  "Fol", "Der", "worker")
 
     def session(self, base=None, *, items=1, written=NOW - dt.timedelta(hours=3),
-                time_range="10:00 – 10:05", texts=None):
+                time_range="10:00 – 10:05", texts=None, day=DAY):
         base = base or ("sid" + uuid.uuid4().hex)
-        key = f"extractions/{self.folder}/{DAY.isoformat()}/{base}.json"
-        t = topics.upsert_topic(self.db, self.site["id"], DAY, f"Topic {base}",
+        key = f"extractions/{self.folder}/{day.isoformat()}/{base}.json"
+        t = topics.upsert_topic(self.db, self.site["id"], day, f"Topic {base}",
                                 user_id=self.user["id"], source_s3_key=key, summary="s",
                                 time_range=time_range)
         self.db.execute("UPDATE topics SET created_at = %s WHERE id = %s", (written, t["id"]))
@@ -318,8 +318,17 @@ def test_shadow_writes_artifacts_and_no_db_rows_besides_hub(db, monkeypatch):
     s = Seed(db)
     sess = s.session(items=2)
     nightly.mark_recompute_failed(db, s.co["id"], "sid" + uuid.uuid4().hex, "failed")
+    # J1: a late Monday final makes both Tuesday finals (sess, written 3 h ago, and an
+    # item-less one) stale; shadow only counts -- no nightly_reemits row, no S3 read, no
+    # re-emitted request
+    s.session(items=0, written=NOW - dt.timedelta(hours=20))
+    s.session(items=0, written=NOW - dt.timedelta(hours=1), day=DAY - dt.timedelta(days=1))
+    assert len(nr.stale_pairs(db, company_id=s.co["id"], site_id=s.site["id"],
+                              now_utc=NOW)) == 2
     lds._insert_event(db, s.event(), dt.date(2026, 11, 11))
     monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+    monkeypatch.setenv("CROSS_DAY_CONTINUITY", "on")
+    monkeypatch.setenv("RECONCILE_STATUS", "true")
     fake = FakeS3()
     before = {t: db.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
               for t in ("decision_records", "event_links", "nightly_reemits",
@@ -329,6 +338,8 @@ def test_shadow_writes_artifacts_and_no_db_rows_besides_hub(db, monkeypatch):
     [row] = _events(db, s.site["id"])
     assert row["status"] == "done"
     [key] = fake.requests()
+    # no continuity_xday_requests/ or reconcile_requests/ (lake_put adds a manifest line)
+    assert [k for k in fake.puts if not k.startswith("lake_manifest/")] == [key]
     assert key == nr.request_key(s.site["id"], NIGHT, sess["key"])
     assert key.startswith(f"nightly_requests/{s.site['id']}/2026-11-10/")
     body = fake.body(key)

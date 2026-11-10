@@ -95,7 +95,7 @@ line): `meeting_session.opened_at` by sid, falling back to the transcript-stem t
 parsed from `session_base`: chunk sessions (every current mobile recording) have a bare `sid<32hex>`
 key with no time. One field, used by reconcile, cross-day and J1; null = unknown, the pair is dropped. Both lines accepted recording-time ordering on 2026-11-10 (§8); J1 is built on their rev-3 builders.
 
-**Detection**, per site and night: a session L whose final was written in the last 24 h, and an
+**Detection**, per site and night: a session L whose final was written in the last 72 h (build note 2026-11-10: 24 h lost over-cap pairs; overlap is safe through `nightly_reemits`), and an
 earlier-written session N on the same site where:
 - L was **recorded before** N (recording instant, not date: at reconcile R0 both are the same
   recorder on the same day), and
@@ -273,7 +273,7 @@ with AllowedValues, workflow variables `TEST_NIGHTLY_REMATCH` / `PROD_NIGHTLY_RE
 | Brake | Value |
 |---|---|
 | J1 re-emits per site per night | 10 (newest N first; the rest wait for the next night, counted) |
-| J1 look-back for late arrivals | finals written in the last 24 h; recordings up to 28 days old |
+| J1 look-back for late arrivals | finals written in the last 72 h (was 24 h; over-cap pairs wait for the next night); recordings up to 28 days old |
 | J2 sessions per site per night | 20; items per call 60 |
 | J2 model calls per session | 1 (no retry inside the worker) |
 | Per-company daily budget | checked in-VPC before a request is written (§4.2); nightly is non-urgent, so it pauses first |

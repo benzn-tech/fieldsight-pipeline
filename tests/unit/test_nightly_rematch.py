@@ -150,9 +150,22 @@ def test_hourly_tick_schedule(doc):
 def test_scan_writes_only_nightly_requests_and_can_tell_missing_from_denied(doc):
     got, prefixes = _grants(doc, SCAN)
     assert got["s3:PutObject"] == {LAKE + "/nightly_requests/*", LAKE + "/lake_manifest/*",
+                                   LAKE + "/continuity_xday_requests/*",
+                                   LAKE + "/reconcile_requests/*",
                                    "arn:aws:s3:::${DataBucketName}/lake_manifest/*"}
     assert LAKE + "/nightly_requests/*" in got["s3:GetObject"]
     assert "nightly_requests/*" in prefixes
+
+
+def test_scan_j1_reads_finals_and_knows_the_owning_lines_flags(doc):
+    """J1 re-reads N's final from extractions/ and re-emits a line only while that line's
+    own flag (the item writer's) is on."""
+    got, _ = _grants(doc, SCAN)
+    assert LAKE + "/extractions/*" in got["s3:GetObject"]
+    env = _props(doc, SCAN)["Environment"]["Variables"]
+    writer = _props(doc, "ItemWriterFunction")["Environment"]["Variables"]
+    for k in ("CROSS_DAY_CONTINUITY", "RECONCILE_STATUS"):
+        assert env[k] == writer[k], k
 
 
 # ---------------------------------------------------------------- worker and writer
