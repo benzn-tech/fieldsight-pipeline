@@ -98,6 +98,40 @@ def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id=No
     ).fetchone()[0]
 
 
+def insert_continues(conn, *, site_id, src_kind, src_row_id, src_stable_id, dst_stable_id,
+                     source_s3_key, rule_version, decision_record_id, method="llm_echo"):
+    """Write one item -> item `continues` edge (cross-day continuity, spec 2026-11-09 X8).
+    Returns the new link id, or None when the (src_stable_id, dst_stable_id) edge already
+    exists (ON CONFLICT DO NOTHING on migration 0099's partial unique index).
+
+    The FK column of `src_kind` is set to `src_row_id`, so deleting the source pass
+    (topics.delete_topics_for_source) cascades the edge. The dst is the same kind as the src
+    and is named by stable_id only. As insert_supported_by: the site must be the source
+    row's own site and `src_stable_id` its current stable_id, else ValueError."""
+    kind = _kind(src_kind)
+    table, col = KIND_TABLE[kind], KIND_SRC_COLUMN[kind]
+    if dst_stable_id is None:
+        raise ValueError("dst_stable_id is required")
+    row = conn.execute(f"SELECT site_id::text, stable_id FROM {table} WHERE id = %s",
+                       (src_row_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no {kind} row {src_row_id}")
+    if str(site_id) != row[0]:
+        raise ValueError(f"site_id {site_id} is not the {kind} row's site {row[0]}")
+    if str(src_stable_id) != str(row[1]):
+        raise ValueError(f"src_stable_id is not the {kind} row's current stable_id")
+    hit = conn.execute(
+        f"INSERT INTO event_links (site_id, link_type, src_kind, src_stable_id, {col}, "
+        f"source_s3_key, dst_kind, dst_stable_id, method, rule_version, decision_record_id) "
+        f"VALUES (%s,'continues',%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        f"ON CONFLICT (src_stable_id, dst_stable_id) WHERE link_type = 'continues' "
+        f"DO NOTHING RETURNING id",
+        (row[0], kind, row[1], src_row_id, source_s3_key, kind, dst_stable_id, method,
+         rule_version, decision_record_id),
+    ).fetchone()
+    return hit[0] if hit else None
+
+
 def live_supported_by(conn, src_kind, src_row_ids: list) -> dict:
     """{row_id: {"dst_turn": ..., "score": ...}} for the rows among `src_row_ids` that are
     live and visible (their topic passes visible_topics_predicate) and have a supported_by
