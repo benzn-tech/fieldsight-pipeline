@@ -673,13 +673,16 @@ def score_stability(pairs):
     return {"pairs": n, "same_turn": same, "share": share, "verdict": verdict}
 
 
-def score_owner_agreement(pairs, missing):
+def score_owner_agreement(pairs, missing_owner, missing_agent=0):
     """Bar 8: agent vs owner on the owner sample. Any owner answer still owed (or no sample)
-    -> pending_owner, never pass."""
-    if missing or not pairs:
-        return {"n": len(pairs), "missing": missing, "agreement": None,
-                "verdict": PENDING_OWNER}
-    return score_agreement(pairs)
+    -> pending_owner, never pass. An item the owner answered but the agent did not is
+    `missing_agent` (the labeller's gap, not the owner's) -> insufficient."""
+    base = {"n": len(pairs), "missing_owner": missing_owner, "missing_agent": missing_agent}
+    if missing_owner or not (pairs or missing_agent):
+        return {**base, "agreement": None, "verdict": PENDING_OWNER}
+    if missing_agent:
+        return {**base, "agreement": None, "verdict": INSUFFICIENT}
+    return {**base, **score_agreement(pairs)}
 
 
 def combine_locator(verdicts):
@@ -751,7 +754,9 @@ def _bars(sessions, runs, status, gold, decisions):
     n_ws_linked = sum(1 for r in with_said if item_status(r) == "linked")
     b2 = {"items": len(b1_rows), "with_said_at": len(with_said), "linked": n_ws_linked,
           "share": n_ws_linked / len(with_said) if with_said else None,
-          "refusals": dict(sorted((k, v) for k, v in statuses.items() if k != "linked")),
+          "refusals": {k: statuses[k] for k in LOCATOR_REFUSALS if statuses.get(k)},
+          "no_locator": statuses.get("no_locator", 0),
+          "no_support": statuses.get("no_support", 0),
           "verdict": REPORTED}
 
     link_rows, missing = [], 0
@@ -806,7 +811,9 @@ def _out_tokens(rec):
     u = rec.get("usage")
     if not isinstance(u, dict):
         return None
-    v = u.get("completion_tokens", u.get("output_tokens"))
+    v = u.get("completion_tokens")
+    if not _num(v):
+        v = u.get("output_tokens")
     return v if _num(v) else None
 
 
@@ -934,19 +941,22 @@ def _session_counts(sessions, status, primary):
 
 
 def score_locator(sessions, runs, *, gold, owner_gold=None, owner_todo=None,
-                  flag_decisions=None, side_runs=None, stage="all"):
+                  flag_decisions=None, side_runs=None, stage="all", primary=None):
     """Bars 1-8, the fit gate, pooled and per-half figures and the reported diagnostics.
 
     sessions: session dicts (ref, split, date, decoded turns); runs: {ref: {"A1": rec, ..}};
     gold: the blind agent's answers {item_ref: gold}; owner_gold: the owner's blind answers on
     the sample (they win over the agent's for bars 3 and 6); owner_todo: the owner sample
     rows; flag_decisions: {flag_id: bool}. stage "fit" scores the fit half and its gate only.
-    Paired bars (1, 7) and B1's bars 2/3/5/6 read eligible sessions only (`session_status`)."""
+    Paired bars (1, 7) and B1's bars 2/3/5/6 read eligible sessions only (`session_status`).
+    `primary` (the fallback test's model) defaults to the mode over every A1 run in `runs`
+    (all stages on disk), so the fit gate, the halves and the owner sample share one
+    exclusion set. Bar 6 never gates the verdict: it sets `inferred_on` only."""
     owner_gold = owner_gold or {}
     merged = merge_gold(gold, owner_gold)
     decisions = flag_decisions or {}
     scored = [s for s in sessions if stage == "all" or s["split"] == stage]
-    primary = primary_model({s["ref"]: runs.get(s["ref"]) or {} for s in scored})
+    primary = primary_model(runs) if primary is None else primary
     status = {s["ref"]: session_status(runs.get(s["ref"]) or {}, primary) for s in scored}
     halves = {h: [s for s in scored if s["split"] == h]
               for h in (("fit", "heldout") if stage == "all" else (stage,))}
@@ -971,12 +981,13 @@ def score_locator(sessions, runs, *, gold, owner_gold=None, owner_todo=None,
         return summary
 
     todo = owner_todo or []
-    pairs = [(gold[t["item_ref"]], owner_gold[t["item_ref"]]) for t in todo
-             if t["item_ref"] in gold and t["item_ref"] in owner_gold]
-    pooled["agent_owner_agreement"] = score_owner_agreement(pairs, len(todo) - len(pairs))
+    refs = [t["item_ref"] for t in todo]
+    pairs = [(gold[r], owner_gold[r]) for r in refs if r in gold and r in owner_gold]
+    pooled["agent_owner_agreement"] = score_owner_agreement(
+        pairs, sum(1 for r in refs if r not in owner_gold),
+        sum(1 for r in refs if r in owner_gold and r not in gold))
     gated = [pooled[k]["verdict"] for k in ("admission", "link_precision",
-                                            "twin_hard_negatives", "coverage",
-                                            "inferred_precision", "stability",
+                                            "twin_hard_negatives", "coverage", "stability",
                                             "agent_owner_agreement")]
     if any(not summary["sessions"]["per_half"][h]["eligible"] for h in halves):
         gated.append(INSUFFICIENT)
@@ -1054,8 +1065,7 @@ def locator_summary(stage, *, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR,
     if stage not in ("fit", "all"):
         raise SystemExit(f"Unknown stage {stage!r}")
     digest = store.manifest_digest(data_dir)
-    sessions = [s for s in store.load_sessions(data_dir)
-                if stage == "all" or s["split"] == stage]
+    sessions = store.load_sessions(data_dir)      # all stages: one primary, one exclusion set
     runs = load_locator_runs(sessions, runs_dir)
     require_frozen_runs(runs, digest)
     store.require_labels_on_manifest(labels_dir, data_dir, store.LOCATOR_LABEL_FILES)

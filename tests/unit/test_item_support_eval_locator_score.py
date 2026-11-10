@@ -334,8 +334,8 @@ def test_bar5_coverage_counts_refusals_in_the_denominator():
     assert out["bars"]["coverage"]["verdict"] == P            # 60% is the owner's line
     b2 = out["bars"]["follow_through"]
     assert b2["with_said_at"] == 9 and b2["linked"] == 6
-    assert b2["refusals"] == {"ambiguous_stamp": 1, "no_line": 1, "no_locator": 1,
-                              "not_shown": 1}
+    assert b2["refusals"] == {"ambiguous_stamp": 1, "no_line": 1, "not_shown": 1}
+    assert b2["no_locator"] == 1 and b2["no_support"] == 0
     assert b2["verdict"] == score.REPORTED
 
 
@@ -625,14 +625,63 @@ def test_export_writes_blind_rows_without_said_at_support_or_status(tmp_path):
     assert not Path(labels, "todo.agent.jsonl").exists()
 
 
-def test_export_writes_twin_flag_candidates(tmp_path):
+def test_export_and_owner_export_never_write_the_flag_file(tmp_path):
     sessions, runs = _twin_set()
     data, runs_dir, labels = _write_files(tmp_path, sessions, runs)
-    out = label.export_locator(runs_dir, data_dir=data, labels_dir=labels)
+    label.export_locator(runs_dir, data_dir=data, labels_dir=labels)
+    label.export_locator_owner(runs_dir, data_dir=data, labels_dir=labels)
+    assert not Path(labels, "flags.owner.locator.jsonl").exists()
+
+
+def test_locator_flags_refuses_until_both_blind_label_sets_are_answered(tmp_path):
+    sessions, runs = _twin_set()
+    data, runs_dir, labels = _write_files(tmp_path, sessions, runs)
+    label.export_locator(runs_dir, data_dir=data, labels_dir=labels)
+    argv = ["locator-flags", "--data", str(data), "--runs", str(runs_dir),
+            "--labels", str(labels)]
+    with pytest.raises(SystemExit) as e:
+        label.main(argv)
+    assert e.value.code not in (0, None)
+    assert not Path(labels, "flags.owner.locator.jsonl").exists()
+    store.write_jsonl(Path(labels, "done.locator.agent.jsonl"),
+                      [{"item_ref": "f000:0:action_items:0", "label": "turn", "turns": [0]}])
+    with pytest.raises(SystemExit):
+        label.main(argv)
+    assert not Path(labels, "flags.owner.locator.jsonl").exists()
+    store.write_jsonl(Path(labels, "done.owner.locator.jsonl"),
+                      [{"item_ref": "f000:0:action_items:0", "label": "turn", "turns": [0]}])
+    out = label.main(argv)
     flags = store.read_jsonl(Path(labels, "flags.owner.locator.jsonl"))
     assert out["flags"] == 1
     assert flags[0]["flag_id"] == "f000:0:action_items:0|0"
     assert flags[0]["classes"] == ["level"]
+
+
+def test_owner_sample_puts_unknown_statuses_in_no_stratum():
+    rows = _strata_rows(30, 12, 8) + [{"item_ref": f"s:0:decisions:{i}", "split": "heldout",
+                                       "status": "no_support"} for i in range(10)]
+    a = label.owner_sample_locator(rows, store.LOCATOR_OWNER_SEED)
+    assert len(a) == 40 and all(r["status"] != "no_support" for r in a)
+
+
+def test_iter_items_order_matches_the_raw_topics_so_said_at_keys_align():
+    raw = [{"action_items": [{"action": "a0"}, {"action": "a1"}],
+            "findings": [{"observation": "f0"}],
+            "decisions": ["d0", {"decision": "d1"}], "questions": ["q0"]},
+           {"decisions": [{"decision": "d2"}], "questions": [], "action_items": [],
+            "findings": [{"observation": "f1"}, {"observation": "f2"}]}]
+    from item_continuity import KINDS, normalise_children
+    expected = []
+    for ti, topic in enumerate(raw):
+        for ln in KINDS:
+            for ci, c in enumerate(topic.get(ln) or []):
+                expected.append((f"{ti}:{ln}:{ci}", c if isinstance(c, str)
+                                 else c[KINDS[ln].text_field]))
+    topics = copy.deepcopy(raw)
+    normalise_children(topics)
+    got = [(f"{ti}:{ln}:{ci}", store.item_text(ln, c))
+           for ti, ln, ci, c, _t in store.iter_items(topics)]
+    assert got == expected
 
 
 def _strata_rows(n_linked, n_nl, n_ref, split="heldout"):
@@ -740,3 +789,76 @@ def test_summary_refuses_runs_on_another_manifest(tmp_path):
     store.write_json(p, dict(store.read_json(p), manifest_digest="old"))
     with pytest.raises(SystemExit, match="manifest"):
         score.locator_summary("fit", data_dir=data, runs_dir=runs_dir, labels_dir=labels)
+
+
+# =========================================================================================
+# Fix round 1
+# =========================================================================================
+
+def _with_no_locator(n_nl, supported):
+    """_passing_all plus one held-out session of n_nl no_locator items; gold says `supported`
+    of them come from a turn."""
+    sessions, runs, gold = _passing_all()
+    s = _session("h900", "heldout")
+    items = [_it(i, "no_locator") for i in range(n_nl)]
+    sessions.append(s)
+    runs["h900"] = _four("h900", s["turns"], items)
+    for k, r in enumerate(score.run_items(runs["h900"]["B1"])):
+        gold[r["item_ref"]] = {"label": "turn", "turns": [k]} if k < supported \
+            else {"label": "none", "turns": []}
+    return sessions, runs, gold
+
+
+def _owner_ok(gold):
+    todo = [{"item_ref": r} for r in list(gold)[:5]]
+    return todo, {t["item_ref"]: gold[t["item_ref"]] for t in todo}
+
+
+def test_bar6_fail_or_reported_only_never_changes_the_overall_verdict():
+    # Coverage stays >= 60% with 30 no_locator items beside 150 links.
+    for n_nl, sup, bar6, inferred in ((30, 5, F, False), (20, 0, RO, False), (30, 0, P, True)):
+        sessions, runs, gold = _with_no_locator(n_nl, sup)
+        todo, owner = _owner_ok(gold)
+        out = score.score_locator(sessions, runs, gold=gold, owner_gold=owner, owner_todo=todo,
+                                  stage="all")
+        assert out["bars"]["inferred_precision"]["verdict"] == bar6
+        assert out["inferred_on"] is inferred
+        assert out["verdict"] == P
+
+
+def test_bar8_owner_answer_without_agent_answer_is_missing_agent_not_pending():
+    sessions, runs, gold = _passing_all()
+    todo, owner = _owner_ok(gold)
+    agent = dict(gold)
+    agent.pop(todo[0]["item_ref"])
+    out = score.score_locator(sessions, runs, gold=agent, owner_gold=owner, owner_todo=todo,
+                              stage="all")
+    b8 = out["bars"]["agent_owner_agreement"]
+    assert b8["missing_agent"] == 1 and b8["missing_owner"] == 0
+    assert b8["verdict"] == I and out["verdict"] == I
+
+
+def test_output_tokens_fall_back_when_completion_tokens_is_null():
+    assert score._out_tokens({"usage": {"completion_tokens": None, "output_tokens": 7}}) == 7
+    assert score._out_tokens({"usage": {"output_tokens": 7}}) == 7
+    assert score._out_tokens({"usage": {"completion_tokens": 5, "output_tokens": 7}}) == 5
+    assert score._out_tokens({"usage": None}) is None
+
+
+def test_primary_model_spans_all_stages_on_disk_and_is_recorded():
+    fit, fr = _set(1, 30, split="fit", models={k: OTHER for k in ("A1", "A2", "B1", "B2")})
+    held, hr = _set(3, 30, split="heldout")
+    sessions, runs = fit + held, {**fr, **hr}
+    out = score.score_locator(sessions, runs, gold=_gold_for(sessions, runs), stage="fit")
+    assert out["sessions"]["primary_model"] == PRIMARY
+    assert out["sessions"]["fallback_excluded"] == 1 and out["sessions"]["eligible"] == 0
+    assert out["fit_gate"]["verdict"] == I
+
+
+def test_locator_summary_fit_stage_reads_the_primary_over_every_stage(tmp_path):
+    fit, fr = _set(1, 30, split="fit", models={k: OTHER for k in ("A1", "A2", "B1", "B2")})
+    held, hr = _set(3, 30, split="heldout")
+    data, runs_dir, labels = _write_files(tmp_path, fit + held, {**fr, **hr})
+    out = score.locator_summary("fit", data_dir=data, runs_dir=runs_dir, labels_dir=labels)
+    assert out["sessions"]["primary_model"] == PRIMARY
+    assert out["sessions"]["scored"] == 1 and out["sessions"]["fallback_excluded"] == 1

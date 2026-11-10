@@ -6,8 +6,10 @@ everything here holds item and turn text and is written under the gitignored lab
     python -m scripts.item_support_eval.label flags --run runs/heldout_a
 
 Locator measurement (spec 2026-11-10 section 6), a separate label set on B1 run items:
-    python -m scripts.item_support_eval.label locator-export   # todo.locator.agent + flags
+    python -m scripts.item_support_eval.label locator-export   # todo.locator.agent
     python -m scripts.item_support_eval.label locator-owner    # todo.owner.locator (40 held-out)
+    python -m scripts.item_support_eval.label locator-flags    # flags.owner.locator, only after
+                                                               # both done files exist
   answers: done.locator.agent.jsonl, done.owner.locator.jsonl (same shape as above),
            done.flags.owner.locator.jsonl {"flag_id", "confirmed": true|false}
 
@@ -179,7 +181,11 @@ LOCATOR_BLIND_KEYS = ("item_ref", "split", "kind", "item_text", "turns", "run_sh
 
 
 def _locator_stratum(status):
-    return status if status in ("linked", "no_locator") else "refusal"
+    """linked / no_locator / refusal (a locator refusal status); None for anything else
+    (e.g. no_support), which is in no stratum and counted apart."""
+    if status in ("linked", "no_locator"):
+        return status
+    return "refusal" if status in score_mod.LOCATOR_REFUSALS else None
 
 
 def owner_sample_locator(rows, seed=store.LOCATOR_OWNER_SEED, strata=LOCATOR_OWNER_STRATA):
@@ -230,27 +236,41 @@ def _refuse_other_manifest(labels_dir, digest, todo):
 
 def export_locator(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
                    labels_dir=store.LABELS_DIR):
-    """Blind rows for every B1 item (todo.locator.agent.jsonl) and the twin-flag candidates
-    for the owner (flags.owner.locator.jsonl; answers go to done.flags.owner.locator.jsonl as
-    {"flag_id", "confirmed": true|false}). Re-run after the held-out half: answers are keyed by
+    """Blind rows for every B1 item (todo.locator.agent.jsonl); never the flag file (see
+    `export_locator_flags`). Re-run after the held-out half: answers are keyed by
     item_ref and stay valid while the B1 run file is unchanged (score checks its sha)."""
     digest = store.manifest_digest(data_dir)
     _refuse_other_manifest(labels_dir, digest, LOCATOR_AGENT_TODO)
     sessions = store.load_sessions(data_dir)
     runs = score_mod.load_locator_runs(sessions, runs_dir)
     rows = _locator_rows(sessions, runs, runs_dir)
-    flags_ = score_mod.locator_flags(sessions, runs)
     store.write_jsonl(Path(labels_dir, LOCATOR_AGENT_TODO), [_blind(r, digest) for r in rows])
-    store.write_jsonl(Path(labels_dir, LOCATOR_FLAGS), flags_)
-    return {"agent": len(rows), "flags": len(flags_),
-            "empty_view": sum(1 for r in rows if not r["turns"])}
+    return {"agent": len(rows), "empty_view": sum(1 for r in rows if not r["turns"])}
+
+
+def export_locator_flags(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
+                         labels_dir=store.LABELS_DIR):
+    """The twin-flag candidates for the owner (flags.owner.locator.jsonl). The file shows the
+    linked turn, i.e. the locator's answer, so it is written only after both blind label
+    sets are answered; before that it refuses and writes nothing."""
+    d = Path(labels_dir)
+    absent = [x for x in ("done.locator.agent.jsonl", "done.owner.locator.jsonl")
+              if not store.read_jsonl(d / x)]
+    if absent:
+        raise SystemExit(f"Refusing: {', '.join(absent)} not answered yet. The flag file shows "
+                         f"the locator's linked turns; it waits for both blind label sets.")
+    sessions = store.load_sessions(data_dir)
+    runs = score_mod.load_locator_runs(sessions, runs_dir)
+    flags_ = score_mod.locator_flags(sessions, runs)
+    store.write_jsonl(d / LOCATOR_FLAGS, flags_)
+    return {"flags": len(flags_)}
 
 
 def export_locator_owner(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
                          labels_dir=store.LABELS_DIR, seed=store.LOCATOR_OWNER_SEED):
     """The owner's blind sample (todo.owner.locator.jsonl) from held-out B1 items of the
     sessions every bar reads (`score.session_status` == eligible). Give it to the owner
-    before the flag file, which shows linked turns."""
+    the flag file waits until this sample is answered."""
     digest = store.manifest_digest(data_dir)
     _refuse_other_manifest(labels_dir, digest, LOCATOR_OWNER_TODO)
     sessions = store.load_sessions(data_dir)
@@ -258,11 +278,14 @@ def export_locator_owner(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
     primary = score_mod.primary_model(runs)
     elig = [s for s in sessions
             if score_mod.session_status(runs.get(s["ref"]) or {}, primary) == "eligible"]
-    sample = owner_sample_locator(_locator_rows(elig, runs, runs_dir), seed)
+    rows = _locator_rows(elig, runs, runs_dir)
+    sample = owner_sample_locator(rows, seed)
     store.write_jsonl(Path(labels_dir, LOCATOR_OWNER_TODO), [_blind(r, digest) for r in sample])
     strata = {name: sum(1 for r in sample if _locator_stratum(r["status"]) == name)
               for name, _n in LOCATOR_OWNER_STRATA}
-    return {"owner": len(sample), "strata": strata}
+    unstratified = sum(1 for r in rows if r["split"] == "heldout"
+                       and _locator_stratum(r["status"]) is None)
+    return {"owner": len(sample), "strata": strata, "unstratified_heldout": unstratified}
 
 
 def main(argv=None):
@@ -273,7 +296,7 @@ def main(argv=None):
         sp = sub.add_parser(name)
         sp.add_argument("--run", required=True)
     sub.add_parser("instruction")
-    for name in ("locator-export", "locator-owner"):
+    for name in ("locator-export", "locator-owner", "locator-flags"):
         sp = sub.add_parser(name)
         sp.add_argument("--data", default=str(store.DATA_DIR))
         sp.add_argument("--runs", default=str(store.RUNS_DIR))
@@ -282,8 +305,9 @@ def main(argv=None):
     if a.cmd == "instruction":
         print(BLIND_LABEL_INSTRUCTION)
         return None
-    if a.cmd in ("locator-export", "locator-owner"):
-        fn = export_locator if a.cmd == "locator-export" else export_locator_owner
+    if a.cmd.startswith("locator-"):
+        fn = {"locator-export": export_locator, "locator-owner": export_locator_owner,
+              "locator-flags": export_locator_flags}[a.cmd]
         out = fn(a.runs, data_dir=a.data, labels_dir=a.labels)
         print(store.dumps(out))
         return out
