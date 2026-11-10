@@ -27,7 +27,8 @@ truncation_head_share, n_segments, max_tokens, topics, shown, usage, model, late
 `attach_support(locator=True, shown=set(shown))` first, and the model's raw `said_at` per child
 is kept in the private `_raw_said_at` (for the copied-evidence diagnostic). With EMIT_EVIDENCE
 on, the extractor's `verify_evidence` runs on the topics as it does in the lambda. Side runs add the
-extractor's `status_suggestions` counts. `usage` is whatever `call_llm` reports through `info`
+extractor's `status_suggestions` counts; main-stage runs record `status_suggestions_stripped`
+(stray suggestions removed, for the report). `usage` is whatever `call_llm` reports through `info`
 (null on a path that reports none).
 
 Never logs item or transcript text: stdout carries counts only.
@@ -214,7 +215,8 @@ def run_one(session, arm, rep, *, call, stage, digest, settings):
         item_continuity.normalise_children(topics)   # the extractor does this before resolve
         rec["status_suggestions"] = _suggestions(topics, session)
     else:
-        status_suggestions.strip_all(topics)
+        # Counted for the report: a stray suggestion on a final with no status instruction.
+        rec["status_suggestions_stripped"] = status_suggestions.strip_all(topics)
     if settings["emit_evidence"]:
         # The extractor's next step, so the stored evidence carries the deployed statuses.
         try:

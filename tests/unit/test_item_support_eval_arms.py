@@ -244,6 +244,18 @@ def test_locator_prompt_only_in_b_and_emit_evidence_is_set_then_restored(tmp_pat
         assert f["prompt_sha"] == arms.prompt_sha(f["arm"] == "B")
 
 
+def test_main_stage_records_how_many_stray_status_suggestions_were_stripped(tmp_path):
+    data, runs = _dirs(tmp_path)
+    _write_set(data, 1, 0)
+    stray = {"status_suggestion": {"status": "done", "quote": "it is fixed", "at": "10:00"}}
+    call = FakeCall(lambda n, prompt: (json.dumps(_payload(extra=stray)), None))
+    _main(["run", "--stage", "fit", "--emit-evidence", "false", "--confirm-count", "4"],
+          data, runs, call=call)
+    for f in _run_files(runs).values():
+        assert f["status_suggestions_stripped"] == 1
+        assert all("status_suggestion" not in c for c in _children(f["topics"]))
+
+
 def test_an_llm_error_is_recorded_and_the_run_continues(tmp_path):
     data, runs = _dirs(tmp_path)
     _write_set(data, 2, 0)

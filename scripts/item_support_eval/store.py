@@ -31,6 +31,8 @@ _DT = "$dt"
 
 SPLIT_SEED = "item-support-eval-2026-11-09"
 OWNER_SEED = "item-support-owner-2026-11-09"
+# Locator owner sample (spec 2026-11-10 section 6), fixed before the run.
+LOCATOR_OWNER_SEED = "item-locator-owner-2026-11-10"
 
 
 def require_eval_dir(path) -> Path:
@@ -190,13 +192,18 @@ LABEL_FILES = {"todo.agent.jsonl": ("done.agent.jsonl",),
                "todo.owner.jsonl": ("done.owner.jsonl", "done.adjudicate.owner.jsonl")}
 
 
-def require_labels_on_manifest(labels_dir=LABELS_DIR, data_dir=DATA_DIR):
+# The locator's own label set: never mixed with Task 10's files above.
+LOCATOR_LABEL_FILES = {"todo.locator.agent.jsonl": ("done.locator.agent.jsonl",),
+                       "todo.owner.locator.jsonl": ("done.owner.locator.jsonl",)}
+
+
+def require_labels_on_manifest(labels_dir=LABELS_DIR, data_dir=DATA_DIR, label_files=None):
     """Refuse labels made on another manifest. Every todo row export wrote carries the
     manifest digest; a label file with answers needs its todo file, on the current digest. A
     done row that itself carries a digest must match too. Returns the current digest."""
     current = manifest_digest(data_dir)
     d = Path(labels_dir)
-    for todo, dones in LABEL_FILES.items():
+    for todo, dones in (label_files or LABEL_FILES).items():
         answered = [x for x in dones if read_jsonl(d / x)]
         todo_rows = read_jsonl(d / todo)
         if answered and not todo_rows:
