@@ -202,6 +202,11 @@ def test_a_cut_off_names_the_budget_that_was_on_the_wire(monkeypatch):
     (None, None), ("", None), ("  ", None),
     ("off", {"enabled": False}), (" OFF ", {"enabled": False}),
     ("low", {"effort": "low"}), ("medium", {"effort": "medium"}), ("High", {"effort": "high"}),
+    # OpenRouter's full effort list (measured 2026-11-06; muse honours each level).
+    ("minimal", {"effort": "minimal"}), ("xhigh", {"effort": "xhigh"}),
+    (" MAX ", {"effort": "max"}),
+    # "none" is OpenRouter's word, not ours: `off` is the setting for no reasoning.
+    ("none", None),
 ])
 def test_parse_reasoning(raw, expected):
     assert lu.parse_reasoning(raw) == expected
@@ -238,6 +243,30 @@ def test_muse_refuses_off_so_the_field_is_omitted_with_a_warning(caplog):
 ])
 def test_parse_provider(raw, expected):
     assert lu.parse_provider(raw) == expected
+
+
+def test_the_global_effort_list_stays_narrow():
+    """LLM_REASONING_EFFORT also reaches Claude 5.x `output_config.effort`, so only the
+    per-function (OpenRouter-only) settings take the wider list."""
+    assert lu.VALID_EFFORTS == ("low", "medium", "high")
+    assert set(lu.VALID_EFFORTS) < set(lu.OPENROUTER_EFFORTS)
+
+
+@pytest.mark.parametrize("reasoning,scale", [
+    (None, 1), ({"enabled": False}, 1), ({"effort": "minimal"}, 1),
+    ({"effort": "low"}, 1), ({"effort": "high"}, 1),
+    ({"effort": "xhigh"}, 2), ({"effort": "max"}, 3),
+])
+def test_reasoning_headroom_scales_only_for_xhigh_and_max(reasoning, scale):
+    assert lu.reasoning_headroom(reasoning) == scale * lu.REASONING_HEADROOM_TOKENS
+
+
+def test_max_effort_buys_the_scaled_headroom(monkeypatch):
+    sent = _stub(monkeypatch, [_ok()])
+    lu.call_llm_parts(PARTS, model=GEM, max_tokens=16000, caller="t",
+                      reasoning={"effort": "max"})
+    assert sent[0]["reasoning"] == {"effort": "max"}
+    assert sent[0]["max_tokens"] == 16000 + 3 * lu.REASONING_HEADROOM_TOKENS
 
 
 def test_reasoning_off_buys_no_headroom(monkeypatch):

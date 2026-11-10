@@ -55,6 +55,10 @@ SYNC_CALLEES = [
     ("SpeakerEmbedFunction", "VoiceprintWriterFunction"),
     ("MatcherFunction", "SuggestionWriterFunction"),
     ("DeviceReportFunction", "DeviceLedgerFunction"),
+    # Action packs (spec 2026-11-01 §14 S1): the agent's claim/heartbeat/store/fail
+    # internal tasks and its records/items tool hops.
+    ("ActionAgentFunction", "OrgApiFunction"),
+    ("ActionAgentFunction", "RagSearchFunction"),
 ]
 
 _RATE_UNIT_SECONDS = {"minute": 60, "minutes": 60, "hour": 3600, "hours": 3600,

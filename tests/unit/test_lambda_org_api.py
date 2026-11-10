@@ -1824,7 +1824,9 @@ def test_live_items_response_passthrough_with_children(wired):
     assert res["statusCode"] == 200
     body = body_of(res)
     assert body["topics"] == canned
-    assert body["topics"][0]["action_items"] == [{"id": "a-1", "text": "fix ladder"}]
+    # + task_no (action packs D1): additive; null here, the fake conn has no number table.
+    assert body["topics"][0]["action_items"] == [{"id": "a-1", "text": "fix ladder",
+                                                  "task_no": None}]
     assert body["topics"][0]["safety_observations"] == [{"id": "so-1", "observation": "loose rail"}]
 
 

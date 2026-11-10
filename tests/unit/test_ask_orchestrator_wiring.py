@@ -418,7 +418,7 @@ def test_ask_agentic_parameter(tmpl):
         assert tmpl["Parameters"][name]["Type"] == "String"
         assert tmpl["Parameters"][name]["Default"] == ""
     reasoning = tmpl["Parameters"]["AskJudgeReasoning"]
-    assert reasoning["AllowedPattern"] == "^(|off|low|medium|high)$"
+    assert reasoning["AllowedPattern"] == "^(|off|minimal|low|medium|high|xhigh|max)$"
 
 
 def test_judge_env_is_on_the_worker_only(tmpl):
@@ -429,8 +429,16 @@ def test_judge_env_is_on_the_worker_only(tmpl):
     assert worker["ASK_JUDGE_FALLBACKS"] == {"Ref": "AskJudgeFallbacks"}
     assert worker["ASK_JUDGE_PROVIDER"] == {"Ref": "AskJudgeProvider"}
     assert worker["ASK_JUDGE_REASONING"] == {"Ref": "AskJudgeReasoning"}
+    # The action agent (spec 2026-11-01) writes through the same llm_tools_client as the
+    # judge, so it carries the judge's model/fallback/provider/reasoning settings -- but it
+    # never runs the orchestrator, so not ASK_AGENTIC.
+    agent = res["ActionAgentFunction"]["Properties"]["Environment"]["Variables"]
+    assert "ASK_AGENTIC" not in agent
+    for key in ("ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS", "ASK_JUDGE_PROVIDER",
+                "ASK_JUDGE_REASONING"):
+        assert agent[key] == worker[key], key
     for name, r in res.items():
-        if name == "AskVoiceWorkerFunction":
+        if name in ("AskVoiceWorkerFunction", "ActionAgentFunction"):
             continue
         env = ((r.get("Properties") or {}).get("Environment") or {}).get("Variables") or {}
         assert not {"ASK_AGENTIC", "ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS",
