@@ -33,12 +33,18 @@ def test_parameter_exists_defaults_off_and_is_constrained():
     assert "AllowedValues: ['off', 'shadow', 'on']" in block.group(1)
 
 
-def test_only_the_item_writer_receives_the_flag():
+def test_only_the_item_writer_and_the_xday_linker_receive_the_flag():
     text = TEMPLATE.read_text(encoding="utf-8")
-    assert "CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity" in _block(text, "ItemWriterFunction"), (
-        "ItemWriterFunction does not receive CROSS_DAY_CONTINUITY -- it would silently take "
-        "the code default")
-    assert text.count("CROSS_DAY_CONTINUITY:") == 1, "CROSS_DAY_CONTINUITY is set elsewhere too"
+    for fn in ("ItemWriterFunction", "ContinuityXdayLinkerFunction"):
+        assert "CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity" in _block(text, fn), (
+            f"{fn} does not receive CROSS_DAY_CONTINUITY -- it would silently take "
+            "the code default")
+    assert text.count("CROSS_DAY_CONTINUITY:") == 2, "CROSS_DAY_CONTINUITY is set elsewhere too"
+
+
+def test_linker_reads_the_same_env_name_and_defaults_off():
+    src = (ROOT / "src" / "lambda_continuity_xday_linker.py").read_text(encoding="utf-8")
+    assert re.search(r'os\.environ\.get\(\s*"CROSS_DAY_CONTINUITY",\s*"off"\s*\)', src)
 
 
 def test_item_writer_may_put_on_the_request_prefix():

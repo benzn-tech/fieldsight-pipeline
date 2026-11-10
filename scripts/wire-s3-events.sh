@@ -17,6 +17,7 @@
 #   ProjectDocIndex ← project_doc_requests/**.json (org-api's request to index an uploaded project document)
 #   Ingest      ← project_doc_vectors/**.json  (project-doc worker output, in-VPC Aurora apply)
 #   ActionAgent ← action_pack_requests/**.json (org-api's request to run one action pack)
+#   ContinuityXdayLinker ← continuity_xday_requests/**.json (item-writer's cross-day continuity request)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -57,8 +58,9 @@ SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-spe
 TEMPLATE_DIGITISE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-template-digitise"
 PROJECT_DOC_INDEX_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-project-doc-index"
 ACTION_AGENT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-action-agent"
+XDAY_LINKER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-continuity-xday-linker"
 
-echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
+echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe ContinuityXdayLinker=${PREFIX}-continuity-xday-linker"
 
 # ---- desired LambdaFunctionConfigurations (our managed entries, Id prefix fs-) ----
 # Only wire functions that actually exist: VadFunction is conditional in the
@@ -293,6 +295,23 @@ if fn_exists "${PREFIX}-speaker-embed"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-speaker-embed not deployed — skipping speaker-embed trigger"
+fi
+
+# NOTE(cross-day continuity, spec 2026-11-09 X3): the non-VPC linker (hop 2) triggers on
+# continuity_xday_requests/*.json -- the request the in-VPC item writer puts after its commit.
+# The linker writes NOTHING to S3 (its result travels in the RequestResponse invoke of the
+# in-VPC link writer), so there is no output prefix and no BUG-13 loop; the prefix is
+# disjoint from every other wired prefix (tests/unit/test_continuity_xday_linker.py).
+# ContinuityXdayLinkerFunction is conditional (HasDb), hence the fn_exists guard. Wired on
+# both stages: the function itself stays idle unless CROSS_DAY_CONTINUITY=on.
+if fn_exists "${PREFIX}-continuity-xday-linker"; then
+  WIRE_FNS+=("${PREFIX}-continuity-xday-linker")
+  DESIRED=$(jq -c --arg arn "$XDAY_LINKER_ARN" '. + [
+    {"Id":"fs-continuity-xday","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"continuity_xday_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-continuity-xday-linker not deployed — skipping continuity-xday trigger"
 fi
 
 # NOTE(action packs, spec 2026-11-01 §14 D3/S1): the non-VPC agent triggers on
