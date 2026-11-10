@@ -385,6 +385,7 @@ jobs:
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
               "DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \
               "StatusSuggestions=${{ vars.TEST_STATUS_SUGGESTIONS || 'false' }}" \
+              "SiteDecisionLoop=${{ vars.TEST_SITE_DECISION_LOOP || 'off' }}" \
               "StatusEvidenceFloorTokens=${{ vars.TEST_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \

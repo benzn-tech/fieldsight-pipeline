@@ -119,6 +119,12 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET    /api/org/programme/delay-flags           → open flags for a site
   POST   /api/org/programme/delay-flags/{id}/acknowledge → PM has seen it
   POST   /api/org/programme/delay-flags/{id}/resolve     → PM has dealt with it
+  GET    /api/org/decision-shadow?label=&limit=&offset= → platform_admin: site decision
+                                                    loop shadow cards of every company,
+                                                    newest first, + label summary
+                                                    (404 unless SITE_DECISION_LOOP=shadow)
+  POST   /api/org/decision-shadow/{card_id}/label → platform_admin: shadow label
+                                                    {label, note}; never changes status
 
 Credentials: PG* env vars injected at deploy time (BUG-36 — no runtime
 Secrets Manager call from a NAT-less VPC). Cognito calls need the
@@ -128,6 +134,7 @@ import json
 import directory
 import site_coords
 import logging
+import math
 import os
 import re
 import secrets
@@ -186,6 +193,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voice_messages,
                           voiceprints)
 from repositories import lake_objects
+from repositories import decision_cards
 from repositories import project_docs
 from repositories import voice_note_photo
 import lake_keys
@@ -659,6 +667,214 @@ def ask_threads_route(conn, caller, sub, thread_id, method):
                "turns": out})
 
 
+def _uuid_or_none(value):
+    """The canonical text of a UUID, or None for anything else -- so a malformed id is
+    answered before it reaches SQL (a cast error would abort the request transaction)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+
+
+# ----------------------------------------------------------
+# Site decision loop P0 shadow review (spec 2026-11-05-site-decision-loop-design rev 5;
+# plan 2026-11-08 Task 6). A platform admin reads every company's shadow cards and labels
+# each one. The response names are fixed by the fieldsight-ui page (ui#469). Labelling never
+# changes a card's status. Both routes 404 like an unknown route unless SITE_DECISION_LOOP
+# is 'shadow' (read per call).
+# ----------------------------------------------------------
+_DECISION_SHADOW_RE = re.compile(r"^/decision-shadow(?:/([^/]+)/label)?$")
+DECISION_SHADOW_LABELS = ("needed", "not_needed", "wrong_evidence")
+DECISION_SHADOW_DEFAULT_LIMIT = 50
+DECISION_SHADOW_MAX_LIMIT = 200
+
+
+def _decision_loop_shadow_on():
+    return (os.environ.get("SITE_DECISION_LOOP") or "").strip().lower() == "shadow"
+
+
+def decision_shadow_route(conn, caller, event, method, route):
+    not_found = error("not found", 404)
+    if not _decision_loop_shadow_on():
+        return not_found
+    m = _DECISION_SHADOW_RE.match(route)
+    if not m:
+        return not_found
+    raw_card = m.group(1)
+    if raw_card is None and method != "GET":
+        return not_found
+    if raw_card is not None and method != "POST":
+        return not_found
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    if raw_card is None:
+        return list_decision_shadow(conn, event)
+    return label_decision_card(conn, caller, raw_card, parse_body(event))
+
+
+def _non_negative_int(raw, default):
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def list_decision_shadow(conn, event):
+    """GET /api/org/decision-shadow?label=&limit=&offset= -- newest first. `label` is one
+    of DECISION_SHADOW_LABELS or absent; limit defaults to 50 and is capped at 200 (0 or
+    a non-integer is a 400). The summary covers EVERY card, not just this page."""
+    p = event.get("queryStringParameters") or {}
+    label = p.get("label")
+    if label in (None, ""):
+        label = None
+    elif label not in DECISION_SHADOW_LABELS:
+        return error("label must be one of " + ", ".join(DECISION_SHADOW_LABELS), 400)
+    limit = _non_negative_int(p.get("limit"), DECISION_SHADOW_DEFAULT_LIMIT)
+    offset = _non_negative_int(p.get("offset"), 0)
+    if limit is None or limit == 0 or offset is None:
+        return error("limit must be a positive integer and offset a non-negative one", 400)
+    limit = min(limit, DECISION_SHADOW_MAX_LIMIT)
+    rows = decision_cards.list_shadow(conn, limit, offset, label=label)
+    return ok({"cards": _decision_card_views(conn, rows),
+               "summary": decision_shadow_summary(decision_cards.shadow_summary_rows(conn))})
+
+
+def label_decision_card(conn, caller, raw_card, body):
+    """POST /api/org/decision-shadow/{card_id}/label {label, note} -- only those two keys
+    are read. Returns the card in the list's shape; status is never touched."""
+    if body is None:
+        return error("invalid JSON body", 400)
+    label, note = body.get("label"), body.get("note")
+    if label not in DECISION_SHADOW_LABELS:
+        return error("label must be one of " + ", ".join(DECISION_SHADOW_LABELS), 400)
+    if note is not None and not isinstance(note, str):
+        return error("note must be a string", 400)
+    card_id = _uuid_or_none(raw_card)
+    if card_id is None:
+        return error("not found", 404)
+    if decision_cards.set_label(conn, card_id, label, note, caller["id"]) is None:
+        return error("not found", 404)
+    row = decision_cards.get_shadow(conn, card_id)
+    if row is None:
+        return error("not found", 404)
+    logger.info("decision-shadow label card=%s label=%s", card_id, label)
+    return ok(_decision_card_views(conn, [row])[0])
+
+
+def _removed_evidence_cards(conn, rows):
+    """Card ids (str) of these rows whose evidence must not be served: the transcript it
+    quotes belongs to a session its owner deleted, or its source cannot be resolved (no
+    report behind the originating event -- fail closed: unverifiable is not shown).
+
+    The deletion check is the one GET /sessions|days/.../report/status uses
+    (`_session_was_removed` / `_any_session_removed`): the S3 deletion mirror read STRICT,
+    compared in both spellings. It is keyed on (folder, date), not on the caller, so a
+    platform admin uses it unchanged. ONE mirror read per distinct (folder, date) in the
+    page, ONE query for the sources. An unreadable mirror raises, as it does there."""
+    with_evidence = [r for r in rows if r.get("evidence")]
+    if not with_evidence:
+        return set()
+    sources = {str(s["card_id"]): s for s in
+               decision_cards.evidence_sources(conn, [r["card_id"] for r in with_evidence])}
+    removed_by_day = {}
+    out = set()
+    for r in with_evidence:
+        cid = str(r["card_id"])
+        src = sources.get(cid)
+        if src is None or not src.get("session"):
+            out.add(cid)
+            continue
+        day = (src["user_folder"], str(src["report_date"])[:10])
+        if day not in removed_by_day:
+            removed_by_day[day] = deletion_mirror.deleted_sessions_strict(
+                s3(), S3_BUCKET, day[0], day[1])
+        if _is_removed_spelling(src["session"], removed_by_day[day]):
+            out.add(cid)
+    return out
+
+
+def _iso_utc(value):
+    if not isinstance(value, datetime):
+        return value
+    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    return aware.astimezone(timezone.utc).isoformat()
+
+
+def _decision_card_views(conn, rows):
+    """Rows -> the ui#469 card shape. ONE users lookup for every recipient on the page."""
+    ids = {str(rc.get("user_id")) for r in rows for rc in (r.get("recipients") or [])
+           if isinstance(rc, dict) and rc.get("user_id")}
+    names = users.display_names_for_ids(conn, ids) if ids else {}
+    removed = _removed_evidence_cards(conn, rows)
+    out = []
+    for r in rows:
+        cid = str(r["card_id"])
+        options = []
+        for o in r.get("options") or []:
+            if not isinstance(o, dict):
+                continue
+            view = {"id": o.get("id"), "label": o.get("label"),
+                    "recommended": bool(o.get("recommended"))}
+            if "reason_required" in o:
+                view["reason_required"] = bool(o["reason_required"])
+            options.append(view)
+        evidence = [] if cid in removed else [
+            {"quote": e.get("quote"), "at": e.get("at")}
+            for e in (r.get("evidence") or []) if isinstance(e, dict)]
+        recipients = [
+            {"user_id": str(rc.get("user_id")), "role": rc.get("role"),
+             "display_name": names.get(str(rc.get("user_id")), "")}
+            for rc in (r.get("recipients") or []) if isinstance(rc, dict)]
+        out.append({
+            "card_id": cid, "company_name": r.get("company_name"),
+            "site_name": r.get("site_name"), "rule_id": r.get("rule_id"),
+            "kind": r.get("kind"), "purpose": r.get("purpose"), "urgency": r.get("urgency"),
+            "question": r.get("question"), "consequence": r.get("consequence"),
+            "created_at": _iso_utc(r.get("created_at")),
+            "shadow_label": r.get("shadow_label"), "label_note": r.get("label_note"),
+            "options": options, "evidence": evidence, "recipients": recipients})
+    return out
+
+
+def decision_shadow_summary(rows):
+    """Counts over EVERY card (rows of shadow_summary_rows).
+
+    precision = needed / (needed + not_needed), None when that is 0 (wrong_evidence is
+    neither). cards_per_recipient_day_p95 is the spec's <=3 gate: cards per (recipient
+    user_id, NZ calendar day of created_at) pair, a Sunday counted with the following
+    Monday, fault cards excluded; the 95th percentile by NEAREST RANK (counts sorted
+    ascending, the value at rank ceil(0.95 * n)), so it is always an observed count.
+    None when there are no pairs."""
+    counts = {k: 0 for k in DECISION_SHADOW_LABELS}
+    per_pair = {}
+    for r in rows:
+        if r.get("shadow_label") in counts:
+            counts[r["shadow_label"]] += 1
+        if r.get("kind") == "fault" or not isinstance(r.get("created_at"), datetime):
+            continue
+        day = nz_time.to_nz(r["created_at"]).date()
+        if day.weekday() == 6:
+            day += timedelta(days=1)
+        for uid in {str(rc.get("user_id")) for rc in (r.get("recipients") or [])
+                    if isinstance(rc, dict) and rc.get("user_id")}:
+            per_pair[(uid, day)] = per_pair.get((uid, day), 0) + 1
+    judged = counts["needed"] + counts["not_needed"]
+    p95 = None
+    if per_pair:
+        ordered = sorted(per_pair.values())
+        p95 = float(ordered[math.ceil(0.95 * len(ordered)) - 1])
+    return {"labelled": sum(counts.values()), **counts,
+            "precision": counts["needed"] / judged if judged else None,
+            "cards_per_recipient_day_p95": p95}
+
+
 def dispatch(conn, event, method, route):
     claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
     sub = claims.get("sub", "")
@@ -705,6 +921,11 @@ def dispatch(conn, event, method, route):
     m_at = re.match(r"^/ask/threads(?:/([^/]+))?$", route)
     if m_at:
         return ask_threads_route(conn, caller, sub, m_at.group(1), method)
+
+    # Site decision loop shadow review (platform_admin). Behind SITE_DECISION_LOOP=shadow:
+    # anything else answers exactly the unknown-route 404 below.
+    if route == "/decision-shadow" or route.startswith("/decision-shadow/"):
+        return decision_shadow_route(conn, caller, event, method, route)
 
     if route == "/me":
         if method == "GET":
