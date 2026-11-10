@@ -53,8 +53,11 @@ output keeps hop 2's src_stable_id, because that is part of the re-delivery dedu
 
 Records (X9): one `item_continuity_xday` row per claim -- subject = src kind / src
 stable_id, object_ref = dst stable_id, question_set, input_key = extraction key,
-input_hash = run_hash, output {src_stable_id, dst_stable_id, outcome, guard}, auto_outcome =
-outcome; deduped on (kind, input_key, input_hash, object_ref, output->>'src_stable_id'). A
+input_hash = run_hash, output {src_stable_id, dst_stable_id, alias, outcome, guard} (alias
+re-checked to the A1/F1/Q1 shape, else null), auto_outcome = outcome; deduped on (kind,
+input_key, input_hash, object_ref, output->>'src_stable_id') and, when object_ref is null
+(e.g. an existence failure), output->>'alias' too -- so two failed claims of one src on
+different aliases are two records. A
 write-time skip does not change the record (it is hop 2's verdict); it is counted in the
 return and in the run record. Plus one `item_continuity_xday_run` row per request
 ("processed, n claims"), deduped on (kind, input_key, input_hash): subject is a live topic of
@@ -143,13 +146,23 @@ def _src_order(request, new_item):
         "first_seen_recorded_at": new_item.get("first_seen_recorded_at")})
 
 
-def _existing_claim_record(conn, key, run_hash, dst, src):
-    row = conn.execute(
-        "SELECT id FROM decision_records WHERE kind = %s AND input_key = %s "
-        "AND input_hash = %s AND object_ref IS NOT DISTINCT FROM %s "
-        "AND output->>'src_stable_id' IS NOT DISTINCT FROM %s "
-        "ORDER BY created_at, id LIMIT 1",
-        (continuity_xday.DECISION_KIND, key, run_hash, dst, src)).fetchone()
+def _alias(value):
+    """The claim's alias if it has the A1/F1/Q1 shape, else None: a record carries ids and
+    enums only, never text the model wrote."""
+    return value if isinstance(value, str) and continuity_xday._ALIAS_RE.match(value) else None
+
+
+def _existing_claim_record(conn, key, run_hash, dst, src, alias):
+    """The claim's record from an earlier delivery: same (kind, key, hash, dst, src), and
+    when dst is null the same alias too (nulls would otherwise collapse distinct claims)."""
+    sql = ("SELECT id FROM decision_records WHERE kind = %s AND input_key = %s "
+           "AND input_hash = %s AND object_ref IS NOT DISTINCT FROM %s "
+           "AND output->>'src_stable_id' IS NOT DISTINCT FROM %s ")
+    params = [continuity_xday.DECISION_KIND, key, run_hash, dst, src]
+    if dst is None:
+        sql += "AND output->>'alias' IS NOT DISTINCT FROM %s "
+        params.append(alias)
+    row = conn.execute(sql + "ORDER BY created_at, id LIMIT 1", params).fetchone()
     return row[0] if row else None
 
 
@@ -225,12 +238,13 @@ def write_links(conn, event):
     for l in links:
         link_by_pair.setdefault((_s(l.get("src_stable_id")), _s(l.get("dst_stable_id"))), l)
     work = [dict(c, src_stable_id=_s(c.get("src_stable_id")),
-                 dst_stable_id=_s(c.get("dst_stable_id"))) for c in claims]
+                 dst_stable_id=_s(c.get("dst_stable_id")), alias=_alias(c.get("alias")))
+            for c in claims]
     claimed = {(c["src_stable_id"], c["dst_stable_id"]) for c in work
                if c.get("outcome") == "accepted"}
     for pair, l in link_by_pair.items():
         if pair not in claimed:
-            work.append({"src_stable_id": pair[0], "dst_stable_id": pair[1],
+            work.append({"src_stable_id": pair[0], "dst_stable_id": pair[1], "alias": None,
                          "outcome": "accepted", "guard": None})
 
     inserted = written = unrecorded = 0
@@ -248,14 +262,15 @@ def write_links(conn, event):
 
         kind = (link or {}).get("src_kind") or (new_by_sid.get(src) or {}).get("kind")
         subject = check[1] if isinstance(check, tuple) else src
-        record_id = _existing_claim_record(conn, key, run_hash, dst, src)
+        record_id = _existing_claim_record(conn, key, run_hash, dst, src, c["alias"])
         if record_id is None:
             if kind not in KIND_TABLE or not subject:
                 unrecorded += 1
             else:
                 record_id = record(continuity_xday.DECISION_KIND, kind, subject, dst,
                                    {"src_stable_id": src, "dst_stable_id": dst,
-                                    "outcome": outcome, "guard": c.get("guard")},
+                                    "alias": c["alias"], "outcome": outcome,
+                                    "guard": c.get("guard")},
                                    outcome if outcome in ("accepted", "rejected") else "rejected")
                 written += 1
 
