@@ -21,6 +21,8 @@ Per record:
 Failure (X10):
   * model error / unparseable answer -> nothing invoked, counts logged, NO raise: a retry would
     only repeat the paid call, and no links is the safe outcome.
+  * an exception in judge / strip_texts / the payload build after a good model answer -> the
+    same: nothing invoked, `type(e).__name__` logged, XdayLinks Outcome=judge_failed, NO raise.
   * malformed artifact -> logged and skipped (a retry reads the same bytes).
   * writer FunctionError or StatusCode != 200 -> RAISE, so S3's async retry is fail-closed
     (as lambda_programme_matcher does). EventInvokeConfig.MaximumRetryAttempts is pinned to 1
@@ -47,6 +49,7 @@ import time
 from urllib.parse import unquote_plus
 
 import boto3
+from botocore.config import Config
 
 import continuity_xday
 import llm_utils
@@ -77,7 +80,10 @@ def s3():
 def lambda_client():
     global _lambda_client
     if _lambda_client is None:
-        _lambda_client = boto3.client("lambda")
+        # The writer's Timeout is 120 s: wait for it (botocore's default read timeout is 60 s),
+        # and never let botocore retry the invoke -- the S3 retry is the only retry.
+        _lambda_client = boto3.client("lambda", config=Config(
+            read_timeout=130, connect_timeout=5, retries={"max_attempts": 0}))
     return _lambda_client
 
 
@@ -161,12 +167,16 @@ def _deadline(context):
 
 # --- one request ------------------------------------------------------------------------------
 
-def _invoke_writer(request, links, claims, model):
+def _writer_payload(request, links, claims, model):
+    return json.dumps({"request": strip_texts(request), "links": links, "claims": claims,
+                       "model": model}, ensure_ascii=False)
+
+
+def _invoke_writer(payload):
     resp = lambda_client().invoke(
         FunctionName=LINK_WRITER_FUNCTION,
         InvocationType="RequestResponse",
-        Payload=json.dumps({"request": strip_texts(request), "links": links,
-                            "claims": claims, "model": model}, ensure_ascii=False),
+        Payload=payload,
     )
     # A crashed writer comes back as a 200 with FunctionError set -- never "written".
     if resp.get("FunctionError"):
@@ -183,7 +193,8 @@ def _invoke_writer(request, links, claims, model):
 
 def process_request(key, request, context=None):
     """Model -> judge -> writer for one request. Returns a counts dict; raises only on a
-    failed writer invoke."""
+    failed writer invoke (everything between the model call and the invoke is caught: an S3
+    retry would repeat the paid call)."""
     if request.get("mode") != "on":
         logger.info("xday linker: idle (artifact mode=%s) key=%s",
                     request.get("mode"), key)
@@ -208,19 +219,33 @@ def process_request(key, request, context=None):
         _emit_metric(key, {"model_failed": 1})
         return {"model_failed": 1}
 
-    links, out = continuity_xday.judge(request, parsed)
-    counts = out["counts"]
-    model = {"provider": llm_utils.LLM_PROVIDER, "model": info.get("model"),
-             "model_version": info.get("served_model")}
-    result = _invoke_writer(request, links, out["claims"], model)
-    values = outcome_counts(counts, result)
+    try:
+        links, out = continuity_xday.judge(request, parsed)
+        counts = out["counts"]
+        model = {"provider": llm_utils.LLM_PROVIDER, "model": info.get("model"),
+                 "model_version": info.get("served_model")}
+        payload = _writer_payload(request, links, out["claims"], model)
+    except Exception as e:  # noqa: BLE001 -- a retry would only repeat the paid model call
+        logger.warning("xday linker: judge failed, nothing invoked: key=%s run_hash=%s "
+                       "new=%d candidates=%d error=%s", key, request.get("run_hash"), n_new,
+                       n_cand, type(e).__name__)
+        _emit_metric(key, {"judge_failed": 1})
+        return {"judge_failed": 1}
+    result = _invoke_writer(payload)
+    try:
+        values = outcome_counts(counts, result)
+    except Exception as e:  # noqa: BLE001 -- the writer already committed: never retry for this
+        logger.warning("xday linker: writer result unreadable: key=%s error=%s", key,
+                       type(e).__name__)
+        result, values = None, outcome_counts(counts)
     logger.info("xday linker: key=%s run_hash=%s new=%d candidates=%d entries=%d dropped=%d "
                 "claims=%d accepted=%d rejected=%d by_guard=%s fuse=%s inserted=%s "
                 "skipped=%s records=%s", key, request.get("run_hash"), counts["new_items"],
                 counts["candidates"], counts["entries"], counts["dropped_entries"],
                 counts["claims"], counts["accepted"], counts["rejected"],
                 json.dumps(counts["by_guard"], sort_keys=True), counts["fuse_tripped"],
-                values["inserted"], values["skipped"], (result or {}).get("records"))
+                values["inserted"], values["skipped"],
+                result.get("records") if isinstance(result, dict) else None)
     _emit_metric(key, values)
     return {"model_failed": 0, **values}
 
@@ -232,7 +257,8 @@ def lambda_handler(event, context):
                     flag, len(event.get("Records") or []))
         return {"idle": len(event.get("Records") or []), "model_failed": 0}
 
-    totals = {"idle": 0, "model_failed": 0, "processed": 0, "malformed": 0}
+    totals = {"idle": 0, "model_failed": 0, "judge_failed": 0, "processed": 0,
+              "malformed": 0}
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])
         obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
@@ -250,6 +276,8 @@ def lambda_handler(event, context):
             totals["idle"] += 1
         elif res.get("model_failed"):
             totals["model_failed"] += 1
+        elif res.get("judge_failed"):
+            totals["judge_failed"] += 1
         else:
             totals["processed"] += 1
     return totals

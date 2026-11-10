@@ -288,17 +288,101 @@ def test_emits_xday_links_by_outcome(wire, capsys, monkeypatch):
     assert by["skipped"] == 0
 
 
+def _four_new_request():
+    """4 new items, 3 candidates: room for 3 of 4 linked, which trips the fuse (X7 rev 4)."""
+    new_items = {"action_items": [
+        {"stable_id": f"s-new{i}", "item_id": f"i-new{i}", "text": t}
+        for i, t in enumerate((SECRET_NEW, SECRET_NEW2, SECRET_NEW3, "Fourth item ZQX-NEW4"))]}
+    candidates = {"action_items": [
+        {"stable_id": "s-old", "item_id": "i-old", "text": SECRET_OLD,
+         "first_date": "2026-11-02", "first_seen_recorded_at": None},
+        {"stable_id": "s-other", "item_id": "i-other", "text": SECRET_OTHER,
+         "first_date": "2026-11-03", "first_seen_recorded_at": None},
+        {"stable_id": "s-third", "item_id": "i-third", "text": "Book the crane for the lift",
+         "first_date": "2026-11-04", "first_seen_recorded_at": None},
+    ]}
+    req = continuity_xday.build_request(
+        site_id=SITE, company_id="c1", extraction_key="extractions/x/final.json",
+        extracted_at="2026-11-09T01:00:00Z", date="2026-11-09", new_items=new_items,
+        candidates=candidates, precap_counts={"action_items": 3})
+    req["mode"] = "on"
+    return req
+
+
 def test_a_fuse_trip_is_counted_and_nothing_accepted_is_sent(wire, capsys):
+    st = wire(_four_new_request())
+    st["answer"] = (json.dumps({"links": [
+        {"ref": "N1", "continues": {"id": "A1", "starts": "Plumber to fix riser"}},
+        {"ref": "N2", "continues": {"id": "A2", "starts": "Order scaffold boards for"}},
+        {"ref": "N3", "continues": {"id": "A3", "starts": "Book the crane for"}}]}), None)
+    linker.lambda_handler(_event(), _Ctx())
+    payload = json.loads(st["lam"].calls[0]["Payload"])
+    assert payload["links"] == []
+    assert {c["guard"] for c in payload["claims"]} == {"fuse"}
+    by = {o["Outcome"]: o["XdayLinks"] for o in _emf_lines(capsys.readouterr().out)}
+    assert by["fuse_tripped"] == 1 and by["rejected_fuse"] == 3
+
+
+def test_two_of_three_new_items_linked_is_under_the_fuse_floor(wire, capsys):
+    """3 new items, 2 linked: below the floor of 4 the fuse does not apply (X7 rev 4)."""
     st = wire(_request())
     st["answer"] = (json.dumps({"links": [
         {"ref": "N1", "continues": {"id": "A1", "starts": "Plumber to fix riser"}},
         {"ref": "N2", "continues": {"id": "A2", "starts": "Order scaffold boards for"}}]}), None)
     linker.lambda_handler(_event(), _Ctx())
     payload = json.loads(st["lam"].calls[0]["Payload"])
-    assert payload["links"] == []
-    assert {c["guard"] for c in payload["claims"]} == {"fuse"}
+    assert len(payload["links"]) == 2
     by = {o["Outcome"]: o["XdayLinks"] for o in _emf_lines(capsys.readouterr().out)}
-    assert by["fuse_tripped"] == 1 and by["rejected_fuse"] == 2
+    assert by["fuse_tripped"] == 0 and by["accepted"] == 2
+
+
+# --- the writer client and a failing judge (final review I3/I4) -------------------------------
+
+def test_the_writer_client_waits_for_the_writer_and_never_retries(monkeypatch):
+    made = []
+    monkeypatch.setattr(linker, "_lambda_client", None)
+    monkeypatch.setattr(linker.boto3, "client",
+                        lambda name, **kw: made.append((name, kw)) or object())
+    linker.lambda_client()
+    linker.lambda_client()                      # cached: one client
+    assert len(made) == 1 and made[0][0] == "lambda"
+    cfg = made[0][1]["config"]
+    assert cfg.read_timeout == 130 and cfg.connect_timeout == 5
+    assert cfg.retries == {"max_attempts": 0}
+
+
+@pytest.mark.parametrize("target", ["judge", "strip_texts", "payload"])
+def test_a_failure_after_the_model_call_invokes_nothing_and_does_not_raise(
+        wire, monkeypatch, caplog, capsys, target):
+    st = wire(_request())
+
+    def boom(*a, **k):
+        raise ValueError("leaked " + SECRET_NEW)
+
+    if target == "judge":
+        monkeypatch.setattr(continuity_xday, "judge", boom)
+    elif target == "strip_texts":
+        monkeypatch.setattr(linker, "strip_texts", boom)
+    else:
+        monkeypatch.setattr(linker, "_writer_payload", boom)
+    with caplog.at_level(logging.DEBUG):
+        out = linker.lambda_handler(_event(), _Ctx())
+    assert len(st["llm_calls"]) == 1
+    assert st["lam"].calls == []
+    assert out["judge_failed"] == 1 and out["processed"] == 0
+    assert "ValueError" in caplog.text
+    _no_text(caplog.text)
+    printed = capsys.readouterr().out
+    _no_text(printed)
+    by = {o["Outcome"]: o["XdayLinks"] for o in _emf_lines(printed)}
+    assert by == {"judge_failed": 1}
+
+
+def test_an_unreadable_writer_result_does_not_raise(wire):
+    lam = _FakeLambda({"StatusCode": 200, "Payload": io.BytesIO(b'["not", "a", "dict"]')})
+    wire(_request(), lam=lam)
+    out = linker.lambda_handler(_event(), _Ctx())
+    assert out["processed"] == 1 and len(lam.calls) == 1
 
 
 # --- wiring -----------------------------------------------------------------------------------
