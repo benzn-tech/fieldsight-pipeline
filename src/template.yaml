@@ -1297,6 +1297,16 @@ Parameters:
       the quote verifies. Proposals are stored for a person to accept or dismiss -- never written
       to action_items.status. Needs DeclareContinuity. Off = prompt byte-identical.
 
+  ReconcileStatus:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Plan 2026-11-10 (cross-session status reconcile R0): after a FINAL extraction, item-writer
+      writes a reconcile_requests/ artifact offering the recorder's open items from other
+      sessions that day; the matcher proposes status changes on them. Proposals only, never a
+      write to action_items.status. TEST only in R0; prod stays on this default.
+
   ContinuityLinker:
     Type: String
     Default: 'false'
@@ -5133,6 +5143,10 @@ Resources:
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
+          # Cross-session status reconcile R0: post-commit reconcile_requests/ artifact
+          # (lambda_item_writer.RECONCILE_STATUS); the cap is find_items' limit.
+          RECONCILE_STATUS: !Ref ReconcileStatus
+          RECONCILE_CANDIDATE_CAP: '40'
           # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
           # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
           # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
@@ -5164,6 +5178,12 @@ Resources:
               # EmbedReportFunction's embeddings/* PutObject grant.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
+            - Effect: Allow
+              # Cross-session status reconcile R0: post-commit reconcile_requests/ artifact
+              # (reconcile_request.emit) for the same non-VPC MatcherFunction, on its own
+              # S3 notification (fs-status-reconcile) -- mirrors the match_requests/ grant.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/reconcile_requests/*
             - Effect: Allow
               # Session search index (spec 2026-10-13 4.1): post-commit index_requests/
               # artifact for the non-VPC EmbedReportFunction (in-VPC, so S3 not invoke, BUG-36).
@@ -5649,6 +5669,20 @@ Resources:
           LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
+          # Cross-session status reconcile R0: the worker verifies each quote with
+          # extract_session's own evidence check, so it reads the same knobs with the
+          # same values as ExtractSessionFunction.
+          STATUS_EVIDENCE_FLOOR_TOKENS: !Ref StatusEvidenceFloorTokens
+          EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
+          EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
+          # The worker's turns come from assemble_session_turns, which applies these two at
+          # import: the same values as ExtractSessionFunction, or the reconcile model reads a
+          # different transcript than extraction did.
+          DEVICE_ANNOUNCEMENT_PATTERNS: !Ref DeviceAnnouncementPatterns
+          FILTER_AUDIO_EVENT_TAGS: !Ref FilterAudioEventTags
+          # No LLM_HTTP_TIMEOUT here on purpose: raising it would change the programme
+          # match/impact calls too. The reconcile call is bounded by the Lambda's remaining
+          # time instead (lambda_programme_matcher._reconcile_deadline_s).
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref SuggestionWriterFunction
@@ -5659,6 +5693,15 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${DataBucketName}/programmes/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
+                # Cross-session status reconcile R0 (mirrors ExtractSessionFunction): the
+                # request itself, the session's transcripts, the agent-answer sidecars read
+                # by agent_turn_filter, and audio_segments/ for the batch time map read by
+                # _rebase_batch_turns. A denied batch-map read is swallowed and silently
+                # shifts every anchor, so this grant is not optional.
+                - !Sub arn:aws:s3:::${IngestBucketName}/reconcile_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
             - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
@@ -5680,6 +5723,11 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - match_requests/*
+                    # Status reconcile: without ListBucket a missing key is 403, not 404,
+                    # which the readers cannot tell from a real denial (BUG-43 lesson 3).
+                    - reconcile_requests/*
+                    - transcripts/*
+                    - voice_ask/*
 
   # ----------------------------------------------------------
   # Lambda 16: RAG Search (Phase 5) — in-VPC ACL-scoped semantic

@@ -1,6 +1,6 @@
 # Cross-day item continuity: link today's items to the same work on earlier days
 
-**Date:** 2026-11-09 · **Revision:** 2 (after Fable review 2026-11-09: 2 critical / 6 important / 8 minor, folded in; §8)
+**Date:** 2026-11-09 · **Revision:** 3 (rev 2 after Fable review 2026-11-09: 2 critical / 6 important / 8 minor, folded in; rev 3 2026-11-10: recording-time order, nightly re-emit interface; §8)
 **Status:** design. No code yet.
 **Line:** continuity (jev TrackB). **Builds on:** `2026-09-30-extractor-declares-item-continuity-design.md`
 (same-session continuity), `2026-11-08-continuity-linker-design.md` (the linker call),
@@ -55,8 +55,10 @@ exist. It also leaves the just-measured same-session linker untouched.
 - **X3. Hops** (BUG-36: in-VPC lambdas have no egress; `find_items` is in-VPC; the model is not).
   The `match_requests/` pattern, including its direct writer invoke:
   1. **Item writer (in-VPC)** writes `continuity_xday_requests/{site_id}/{date}/{run_hash}.json`
-     (`run_hash` = hash of extraction key + `extracted_at`, so an overwritten request is
-     detectable). Registered in `lake_keys` (site-scoped, like `match`).
+     (`run_hash` = hash of extraction key + `extracted_at` + optional `nonce`, so an overwritten
+     request is detectable and a deliberate re-emit gets its own records; the builder is public
+     for the nightly re-match agent, which passes a nonce and logs `"trigger": "nightly"` in the
+     artifact only). Registered in `lake_keys` (site-scoped, like `match`).
   2. **Cross-day linker (new non-VPC function, S3-triggered on that prefix)** calls the model,
      applies the guards (X7), then invokes **a new small in-VPC `continuity-link-writer`**
      (clone of `lambda_suggestion_writer.py`'s shape) RequestResponse, raising on `FunctionError`
@@ -74,8 +76,15 @@ exist. It also leaves the just-measured same-session linker untouched.
   statuses: action items `open|in_progress|blocked`, questions `open`, findings unfiltered.
   Selection, capped 40 per kind: the union of (a) recency top 20 and (b) for each new item of that
   kind, the lexical top 5 from `find_items(query=<new item text>)`. Then:
-  - drop candidates whose first-seen is not strictly earlier than the new item's (no
-    time-reversed edges from a same-day later session written first);
+  - drop candidates not **recorded** strictly earlier than the new item. Order is recording
+    time, never DB write time (`find_items.first_seen` is `created_at`, so a device uploading
+    Monday's recording on Wednesday would otherwise look newer than Tuesday): compare
+    `find_items.first_seen_recorded_at` (UTC recording start; Track C's one shared
+    implementation: `meeting_session.opened_at` by sid, else the transcript-stem timestamp) when
+    both sides have it; otherwise `first_date` (the recording date) strictly earlier; a same-date
+    pair without both instants is not ordered and is dropped. Never parse `session_base`: chunk
+    sessions' keys are a bare `sid<32hex>` (a missed link costs
+    nothing that exists today);
   - **collapse chains**: candidates already joined by `continues` edges are shown once, as the
     newest member of the chain; a link to it is a link to the chain.
   Hop 1 records, per kind, how many live candidates existed before the cap (counts only).
@@ -95,7 +104,7 @@ exist. It also leaves the just-measured same-session linker untouched.
   continuation is a failure, not a result.
 - **X8. Write-time checks (link writer).** Per link: both endpoints have a live row on the
   request's site (src resolved by stable_id, falling back to `item_id` lineage when non-null;
-  else skipped and counted); dst first-seen still earlier than src. Insert with
+  else skipped and counted); dst still recorded earlier than src (X5's order). Insert with
   `ON CONFLICT DO NOTHING` on a new partial unique index
   `(src_stable_id, dst_stable_id) WHERE link_type = 'continues'` (migration in this line's plan).
   Link row: src FK column of the src kind and `source_s3_key` = the request's extraction key, so
@@ -106,7 +115,10 @@ exist. It also leaves the just-measured same-session linker untouched.
   stable_id, `question_set` = `XDAY_QUESTION_SET`, `input_key` = extraction key, `input_hash` =
   `run_hash`, output `{src_stable_id, dst_stable_id, outcome, guard}` (ids and enums only).
   Re-delivery dedupe key: (`kind`, `input_key`, `input_hash`, `object_ref`,
-  `output->>'src_stable_id'`). The link's `decision_record_id` points at its record. Counts-only
+  `output->>'src_stable_id'`). The link's `decision_record_id` points at its record. The link
+  writer also records once per request "processed, n claims" (kind `item_continuity_xday_run`,
+  `input_key`/`input_hash` as above), so a request whose retries ran out is told apart from one
+  that legitimately produced zero links. Counts-only
   logs; EMF `XdayLinks` by outcome and `XdayOrphanedLinks` (links whose endpoint is no longer
   visible, counted by a periodic read).
 - **X10. Failure never touches the extraction.** Hop 1 errors are logged and skipped after the
@@ -177,4 +189,8 @@ one tells a user two different jobs are the same.
   model judges them the same job — no auto-link; (2) window 28 days, not 14, with relevance
   selection so the wider window does not crowd out the counterpart; (3) prod shadow is acceptable
   as a design, flipping it is the owner's; (4) same-day links between devices are allowed when the
-  earlier item was first seen earlier.
+  earlier item was recorded earlier.
+- Rev 3 (2026-11-10, from the 架构研究 line's review): "earlier" was DB write time, so a late
+  upload reversed edges → recording date + session start (X5, X8); public request builder with
+  optional nonce, and a per-request processed record (X3, X9) for the nightly re-match design
+  (pipeline#1272). Nightly never writes `continues` edges.

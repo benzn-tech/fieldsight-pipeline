@@ -182,11 +182,18 @@ fi
 # topics. Prefix "match_requests/" is disjoint from every other prefix
 # wired above (users/, audio_segments/, transcripts/, reports/, embeddings/,
 # extractions/) — no double-trigger.
+# NOTE(status reconcile R0, Task 4): the same matcher also triggers on
+# reconcile_requests/*.json (fs-status-reconcile), written post-commit by
+# item-writer (reconcile_request.emit). Its own disjoint prefix; the matcher
+# routes by key prefix. Its outputs (an invoke of the suggestion writer)
+# write nothing under any wired prefix — no BUG-13 loop.
 if fn_exists "${PREFIX}-programme-matcher"; then
   WIRE_FNS+=("${PREFIX}-programme-matcher")
   DESIRED=$(jq -c --arg arn "$MATCHER_ARN" '. + [
     {"Id":"fs-programme-match","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"match_requests/"},{"Name":"suffix","Value":".json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"match_requests/"},{"Name":"suffix","Value":".json"}]}}},
+    {"Id":"fs-status-reconcile","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reconcile_requests/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-programme-matcher not deployed — skipping programme-matcher trigger"

@@ -152,6 +152,10 @@ def wired(monkeypatch):
     # implements get_object, so stub emit to a no-op by default here;
     # tests that care about the emit call override this explicitly.
     monkeypatch.setattr(iw.match_request, "emit", lambda *a, **k: None)
+    # Same for the reconcile_requests/ emit (status reconcile R0, Task 4); its
+    # flag stays OFF by default so no pre-existing test reaches find_items.
+    monkeypatch.setattr(iw.reconcile_request, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(iw, "RECONCILE_STATUS", False)
     # video-keyframe plan: same reasoning for the keyframe_requests/ emit, and
     # keep emission OFF by default (module constant is env-gated at import) so
     # the pre-existing tests never trip it.
@@ -1590,3 +1594,119 @@ def test_a_named_person_survives_even_with_one_voice(wired):
     items = _run_with(wired, speaker_count=1, responsible="Daniel")
     assert items[0]["responsible"] == "Daniel"
 
+
+
+# ---------------------------------------------------------------------------
+# Cross-session status reconcile R0 (Task 4): after a FINAL extraction is written,
+# item-writer looks up the recorder's open items from OTHER sessions that day and
+# emits a reconcile_requests/ artifact post-commit. All text is synthetic.
+# ---------------------------------------------------------------------------
+
+RECON_SITE = {"id": "site-B", "company_id": "co-B"}
+
+
+def _reconcile_wired(wired, *, tier="final", rows=None, **extraction_over):
+    """Flag on, a FINAL extraction, the site in company B (the recorder's home is co-1),
+    find_items recording its kwargs and the emit recording its body."""
+    wired.setattr(iw, "RECONCILE_STATUS", True)
+    extraction = make_extraction(tier=tier, **extraction_over)
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(extraction)}))
+    wired.setattr(iw.lambda_ingest, "resolve_site", lambda *a, **k: dict(RECON_SITE))
+    wired.setattr(iw, "_final_email_context", lambda *a, **k: None)
+    found, emitted = [], []
+    if rows is None:
+        rows = [{"kind": "action_item", "stable_id": "sid-1", "item_id": "a1",
+                 "text": "Synthetic other task", "responsible": None, "deadline": None,
+                 "status": "open", "first_seen": None,
+                 "source": {"user_folder": "Jarley_Trainor", "date": "2026-07-06",
+                            "session_base": "other", "source_s3_key": "k"},
+                 "recorded_by": "Jarley_Trainor", "carried_from": None, "score": 0.0,
+                 "matched_terms": [], "place": None, "origin": None}]
+    wired.setattr(iw.reconcile_request.item_history, "find_items",
+                  lambda conn, **kw: found.append(kw) or list(rows))
+    wired.setattr(iw.reconcile_request, "emit",
+                  lambda s3_client, bucket, body: emitted.append(body) or "reconcile_requests/x")
+    return found, emitted
+
+
+def _write():
+    return iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+
+def test_reconcile_uses_owner_company_id(wired):
+    found, emitted = _reconcile_wired(wired)
+    _write()
+    assert len(found) == 1
+    assert found[0]["company_id"] == "co-B"        # the SITE's company, never co-1
+    assert found[0]["site_id"] == "site-B"
+    assert len(emitted) == 1 and emitted[0]["site_id"] == "site-B"
+
+
+def test_reconcile_r0_filters(wired):
+    found, emitted = _reconcile_wired(wired)
+    _write()
+    (kw,) = found
+    assert kw["recorded_by"] == "Jarley_Trainor"
+    assert kw["since"] == kw["until"] == "2026-07-06"
+    assert kw["exclude_source_keys"] == [EXTRACTION_KEY]
+    assert kw["statuses"] == {"action_item": ["open", "in_progress", "blocked"]}
+    body = emitted[0]
+    assert body["extraction_key"] == EXTRACTION_KEY
+    assert body["session_base"] == "Benl1_2026-07-06_10-00-00"
+    assert body["extracted_at"] == "2026-07-06T10:05:00Z"
+
+
+def test_no_request_when_flag_off(wired):
+    found, emitted = _reconcile_wired(wired)
+    wired.setattr(iw, "RECONCILE_STATUS", False)
+    _write()
+    assert found == [] and emitted == []
+
+
+def test_no_request_on_live_tier(wired):
+    found, emitted = _reconcile_wired(wired, tier="live")
+    _write()
+    assert found == [] and emitted == []
+
+
+def test_no_request_when_incomplete(wired):
+    found, emitted = _reconcile_wired(wired, incomplete=True)
+    _write()
+    assert found == [] and emitted == []
+
+
+def test_no_request_for_group_member(wired):
+    found, emitted = _reconcile_wired(wired)
+    wired.setattr(iw, "_group_for_session",
+                  lambda conn, base: {"group_id": "g1", "merged_at": None})
+    _write()
+    assert found == [] and emitted == []
+
+
+def test_no_request_when_no_candidates(wired):
+    found, emitted = _reconcile_wired(wired, rows=[])
+    result = _write()
+    assert len(found) == 1 and emitted == []
+    assert result["skipped"] is False
+
+
+def test_find_items_failure_keeps_the_write(wired):
+    found, emitted = _reconcile_wired(wired)
+
+    def boom(conn, **kw):
+        raise RuntimeError("synthetic failure")
+    wired.setattr(iw.reconcile_request.item_history, "find_items", boom)
+    result = _write()
+    assert result == {"skipped": False, "topics": 1}
+    assert emitted == []
+
+
+def test_group_lookup_failure_skips_reconcile_and_keeps_the_write(wired):
+    found, emitted = _reconcile_wired(wired)
+
+    def boom(conn, base):
+        raise RuntimeError("synthetic failure")
+    wired.setattr(iw, "_group_for_session", boom)
+    result = _write()
+    assert result == {"skipped": False, "topics": 1}
+    assert found == [] and emitted == []

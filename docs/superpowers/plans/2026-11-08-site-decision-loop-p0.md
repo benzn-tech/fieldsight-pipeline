@@ -38,7 +38,7 @@
 - **Invariant this plan relies on:** `checklist_reports` rows are created only behind the `tier == "final"` gate (`lambda_item_writer.py:1662-1667`); `requeue_walk` reuses the same rows. A future generator that writes rows for non-final extractions must also mark them, or the gap scan will start carding live extractions.
 - NZ time through `nz_time.py`, never a fixed +13.
 - Python: `C:\Users\camil\fspy\Scripts\python.exe`. Integration tests: one pytest process at a time against the local pgserver (`fswork/run-tests.sh`); CI has a Postgres service in `.github/workflows/test.yml`.
-- Migration number: `0097` unless develop has moved on when you start; take the next free number and keep it everywhere this plan says 0097.
+- Migration number: develop has moved on. `0097` (action-pack sub-tasks) and `0098` (Track C `event_links`) are taken as of 2026-11-10, so the next free number is `0099`. Recheck when you start, and use that number everywhere this plan says 0097.
 
 ## Review Focus
 
