@@ -1606,3 +1606,60 @@ def test_handler_passes_the_contexts_remaining_time(monkeypatch):
     iw.lambda_handler({"Records": [{"s3": {"object": {
         "key": "extractions/Ada/2026-11-09/sid" + "a" * 32 + ".json"}}}]}, Ctx())
     assert len(seen) == 1 and seen[0]["remaining_ms"]() == 1234
+
+
+# --- cross-day continuity, hop 1: flag, deadline, in-process lexical (final review) ----------
+
+@pytest.mark.parametrize("raw,want", [(" Shadow ", "shadow"), ("ON\n", "on"), ("", "off"),
+                                      ("bogus", "bogus")])
+def test_xday_flag_is_stripped_and_lower_cased(monkeypatch, raw, want):
+    monkeypatch.setenv("CROSS_DAY_CONTINUITY", raw)
+    assert iw._read_xday_flag() == want
+
+
+def test_xday_flag_defaults_to_off(monkeypatch):
+    monkeypatch.delenv("CROSS_DAY_CONTINUITY", raising=False)
+    assert iw._read_xday_flag() == "off"
+
+
+@pytest.mark.parametrize("remaining_ms,budget", [
+    (lambda: 100_000, 20.0),    # plenty left: the fixed 20 s cap
+    (lambda: 25_000, 15.0),     # remaining - 10 s reserve
+    (lambda: 5_000, -5.0),      # inside the reserve: already past
+    (None, 20.0),               # unknown (outside a Lambda): the flat 20 s
+])
+def test_xday_deadline_is_min_of_20s_and_remaining_minus_10s(monkeypatch, remaining_ms,
+                                                            budget):
+    class _Clock:
+        def monotonic(self):
+            return 1000.0
+
+    monkeypatch.setattr(iw, "time", _Clock())   # the writer module's `time` only
+    assert iw._xday_deadline(remaining_ms) == pytest.approx(1000.0 + budget)
+
+
+def test_xday_lexical_scores_with_find_items_scorer_and_ranks_by_recording_order():
+    import item_text_match
+
+    def row(sid, text, date):
+        return {"stable_id": sid, "text": text, "source": {"date": date}}
+
+    pool = [row("a", "order rebar chairs for level two", "2026-11-01"),
+            row("b", "order rebar for the slab", "2026-11-03"),
+            row("c", "order rebar for the slab", "2026-11-05"),     # same score as b, newer
+            row("d", "toolbox talk on ladders", "2026-11-06"),      # zero overlap: dropped
+            row("e", "rebar", "2026-11-02"),
+            row("f", "chase rebar order slab level two", "2026-10-30"),
+            row("g", "level two slab", "2026-11-04")]
+    toks = [set(item_text_match.tokens(r["text"])) for r in pool]
+    text = "chase the rebar order for level two slab"
+    got = iw._xday_lexical(text, pool, toks)
+
+    want = sorted((r for r in pool if item_text_match.overlap(text, r["text"])[0] > 0),
+                  key=lambda r: (item_text_match.overlap(text, r["text"])[0],
+                                 r["source"]["date"]), reverse=True)[:5]
+    assert [r["stable_id"] for r in got] == [r["stable_id"] for r in want]
+    assert got[0]["stable_id"] == "f"                    # full containment
+    assert "d" not in [r["stable_id"] for r in got]
+    assert [r["stable_id"] for r in got].index("c") < [r["stable_id"] for r in got].index("b")
+    assert iw._xday_lexical("the of and", pool, toks) == []    # no tokens: no match

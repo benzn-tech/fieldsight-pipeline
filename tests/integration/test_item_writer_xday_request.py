@@ -9,6 +9,7 @@ Skipped without TEST_DATABASE_URL -- a skip is NOT a pass.
 """
 import io
 import json
+import logging
 import uuid
 
 import pytest
@@ -206,6 +207,7 @@ def test_shadow_builds_and_puts_the_request_after_commit(world, monkeypatch):
     assert body["trigger"] == "final"
     assert body["mode"] == "shadow"
     assert body["lexical_skipped_budget"] == 0
+    assert body["reads_skipped_budget"] == 0
     assert body["extracted_at"] == "2026-11-09T11:00:00Z"
 
     news = {n["kind"]: n for n in body["new_items"]}
@@ -236,8 +238,32 @@ def test_shadow_builds_and_puts_the_request_after_commit(world, monkeypatch):
             assert kw["statuses"] == {"question": ["open"]}
         else:
             assert kw["statuses"] in (None, {})
-    lexical = [kw for kw in calls if kw.get("query")]
-    assert len(lexical) == 3 and all(kw["limit"] == 5 for kw in lexical)
+    # Ruling R12: ONE window read per kind; the lexical top 5 are scored in-process, so no
+    # find_items call carries a query
+    assert len(calls) == 3, calls
+    assert [kw["kinds"] for kw in calls] == [["action_item"], ["question"], ["finding"]]
+    assert all(not kw.get("query") and kw["limit"] == 1000 for kw in calls)
+
+
+def test_lexical_reaches_past_the_recency_top_20_without_a_query_per_item(world, monkeypatch):
+    """An older matching item that is outside the 20 newest is still a candidate: picked by
+    the in-process lexical top 5 over the window read, not by a find_items query."""
+    w = world
+    w["write"](EARLIER, "earlier", _artifact(
+        "final", "2026-10-30T10:00:00Z", actions=["Order rebar for level two slab"]))
+    old = _live_stable_id(w, w["key_for"](EARLIER, "earlier"), "action_items", "text",
+                          "Order rebar for level two slab")
+    noise = [f"Unrelated chore number {i} zz{i}" for i in range(22)]
+    w["write"](EARLY, "early", _artifact("final", "2026-11-02T10:30:00Z", actions=noise))
+    calls = _spy_find_items(monkeypatch)
+    w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z",
+                                        actions=TODAY["actions"]), mode="shadow")
+    body = w["s3"].puts[-1]["body"]
+    ids = [c["stable_id"] for c in body["candidates"]]
+    assert len(ids) == 21 and old in ids
+    assert ids[-1] == old                      # after the 20 recency rows
+    assert body["precap_counts"]["action_items"] == 23
+    assert len(calls) == 1 and not calls[0].get("query")
 
 
 def test_on_also_emits_the_request(world):
@@ -248,28 +274,69 @@ def test_on_also_emits_the_request(world):
     assert w["s3"].puts[0]["body"]["mode"] == "on"
 
 
-def test_out_of_budget_skips_the_lexical_queries_and_counts_them(world, monkeypatch):
-    """No time left (remaining time inside the reserve): the recency reads still run, every
-    lexical query is skipped and counted, and the request still goes out."""
+def test_out_of_budget_runs_no_cross_day_read_and_counts_the_skip(world, monkeypatch, caplog):
+    """No time left (remaining time inside the 10 s reserve): the WHOLE build is capped, so
+    not even the window reads run; the skip is logged with its counts and nothing is put."""
     w = world
-    early = _seed_earlier(w)
+    _seed_earlier(w)
     calls = _spy_find_items(monkeypatch)
+    caplog.set_level(logging.INFO, logger=lambda_item_writer.logger.name)
     w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY),
                mode="shadow", remaining_ms=lambda: 5000)
-    assert [kw for kw in calls if kw.get("query")] == []
+    assert calls == []
+    assert w["s3"].puts == []
+    assert "xday request skipped: budget" in caplog.text
+
+
+class _WriterClock:
+    """Stands in for the writer module's `time`: monotonic() is settable, the rest is real."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, name):
+        import time as _time
+        return getattr(_time, name)
+
+
+def test_the_budget_running_out_mid_build_skips_reads_and_counts_them(world, monkeypatch):
+    """The deadline passes after the first window read: the other kinds' reads and their
+    lexical picks are skipped and counted, and the request still goes out with what it has."""
+    w = world
+    early = _seed_earlier(w)
+    calls = []
+    real = item_history.find_items
+    clock = _WriterClock(0.0)
+
+    def spy(conn, **kw):
+        calls.append(kw)
+        out = real(conn, **kw)
+        clock.now = 10.0 ** 12                  # the writer's clock jumps past the deadline
+        return out
+
+    monkeypatch.setattr(item_history, "find_items", spy)
+    monkeypatch.setattr(lambda_item_writer, "time", clock)   # the writer's `time` only
+    w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY),
+               mode="shadow", remaining_ms=lambda: 100000)
+    assert len(calls) == 1
     body = w["s3"].puts[-1]["body"]
-    assert body["lexical_skipped_budget"] == 3
-    assert {c["stable_id"] for c in body["candidates"]} == set(early.values())
+    assert body["reads_skipped_budget"] == 2
+    assert body["lexical_skipped_budget"] == 3   # the read kind's pick + the two skipped kinds
+    assert [c["stable_id"] for c in body["candidates"]] == [early["action"]]
 
 
-def test_with_time_left_no_lexical_query_is_skipped(world, monkeypatch):
+def test_with_time_left_nothing_is_skipped(world, monkeypatch):
     w = world
     _seed_earlier(w)
     calls = _spy_find_items(monkeypatch)
     w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z", **TODAY),
                mode="shadow", remaining_ms=lambda: 100000)
-    assert len([kw for kw in calls if kw.get("query")]) == 3
-    assert w["s3"].puts[-1]["body"]["lexical_skipped_budget"] == 0
+    assert len(calls) == 3 and not any(kw.get("query") for kw in calls)
+    body = w["s3"].puts[-1]["body"]
+    assert body["lexical_skipped_budget"] == 0 and body["reads_skipped_budget"] == 0
 
 
 def test_this_sessions_earlier_pass_is_never_a_candidate(world):
@@ -349,8 +416,9 @@ def test_a_chain_collapses_through_a_member_that_is_not_a_candidate(world):
 
 
 @pytest.mark.parametrize("case", ["incomplete", "live_tier", "zero_candidates", "off"])
-def test_no_request(world, monkeypatch, case):
+def test_no_request(world, monkeypatch, caplog, case):
     w = world
+    caplog.set_level(logging.INFO, logger=lambda_item_writer.logger.name)
     if case != "zero_candidates":
         _seed_earlier(w)
     if case == "off":
@@ -364,6 +432,14 @@ def test_no_request(world, monkeypatch, case):
                      mode="off" if case == "off" else "shadow")
     assert res["skipped"] is False
     assert w["s3"].puts == []
+    # every skip at the writer's guard is a counted log line (X2); off logs nothing
+    want = {"incomplete": "xday request skipped: incomplete",
+            "live_tier": "xday request skipped: not_final",
+            "zero_candidates": "xday request skipped: no_candidates"}.get(case)
+    if want:
+        assert want in caplog.text
+    else:
+        assert "xday request" not in caplog.text
 
 
 def test_no_site_builds_nothing_and_runs_no_sql():
@@ -377,6 +453,24 @@ def test_no_site_builds_nothing_and_runs_no_sql():
     assert lambda_item_writer.build_xday_request(
         _NoConn(), site=None, company_id="c", extraction={"tier": "final"},
         extraction_key="extractions/f/2026-11-09/sidx.json", date=DATE) is None
+
+
+@pytest.mark.parametrize("site", [{"id": "s1"}, {"id": "s1", "company_id": None},
+                                  {"id": "s1", "company_id": ""}])
+def test_no_company_skips_and_runs_no_sql(site, caplog):
+    """A missing company is skipped (counted), never sent as the string "None"."""
+    class _NoConn:
+        def execute(self, *a, **k):
+            raise AssertionError("no SQL without a company")
+
+        def cursor(self, *a, **k):
+            raise AssertionError("no SQL without a company")
+
+    caplog.set_level(logging.INFO, logger=lambda_item_writer.logger.name)
+    assert lambda_item_writer.build_xday_request(
+        _NoConn(), site=site, company_id=None, extraction={"tier": "final"},
+        extraction_key="extractions/f/2026-11-09/sidx.json", date=DATE) is None
+    assert "xday request skipped: no_company" in caplog.text
 
 
 def test_a_failing_build_never_fails_the_write(world, monkeypatch):
