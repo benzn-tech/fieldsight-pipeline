@@ -302,3 +302,27 @@ def test_today_nz_of_at_the_nz_midnight_boundary(utc, nz_day):
     # the overdue dedupe bucket follows the event's NZ day
     assert RULES["todo.overdue"].bucket(e, hub.today_nz_of(e)) == nz_day.isoformat()
     assert hub.dedupe_key(e, hub.today_nz_of(e)).endswith("|" + nz_day.isoformat())
+
+
+# --- run-rules (nightly plan Task 4) -----------------------------------------
+
+def test_rule_requires_exactly_one_of_run_or_build_card():
+    from decision_rules import Rule
+    common = dict(rule_id="x.test", bucket=lambda e, d: "", late_after_days=None,
+                  purpose="test")
+    with pytest.raises(ValueError, match="exactly one"):
+        Rule(**common)
+    with pytest.raises(ValueError, match="exactly one"):
+        Rule(**common, build_card=lambda e: None, run=lambda c, e, ctx: "done")
+    assert Rule(**common, run=lambda c, e, ctx: "done").build_card is None
+    assert Rule(**common, build_card=lambda e: None).run is None
+    # the production rules are all card rules
+    assert all(r.build_card is not None and r.run is None for r in RULES.values())
+
+
+def test_run_context_is_frozen():
+    ctx = hub.RunContext(run_id="r", company_id="c", site_id="s", now_utc=_utc(2026, 11, 6),
+                         flag="shadow", s3_client=None, bucket=None)
+    with pytest.raises(Exception):
+        ctx.flag = "on"
+    assert hub.RUN_OUTCOMES == ("done", "nothing")

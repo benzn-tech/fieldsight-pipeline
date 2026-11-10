@@ -17,6 +17,13 @@ todo_overdue   one todo.overdue event per live open action item past its deadlin
                the scan's NZ day, so one event per item per day).
 process        claims due queued events (FOR UPDATE SKIP LOCKED) and runs them through the
                hub: auth -> too_deep -> match -> late -> merge -> ledger -> open card.
+               A run-rule (Rule.run, e.g. the nightly job) skips the ledger and the card:
+               after the merge the hub calls rule.run(conn, event, RunContext) inside the
+               run; its outcome ('done' / 'nothing') is both the run outcome and the event
+               status, and a raise is a failed attempt (backoff, fault at 3, stop at 5).
+               NIGHTLY_REMATCH gates every run-rule: unless it is "shadow" or "on", the
+               event ends 'nothing' (run outcome 'nothing') WITHOUT calling run, so a
+               leftover event can never act once the flag is turned off.
 
 Each emit scan runs process right after it, in the same invocation and connection, and
 returns the summed counts. There is no process schedule: Aurora pauses after 600 s idle
@@ -44,9 +51,9 @@ import checklist_reports
 import nz_time
 import tenancy_status
 from db.connection import get_connection
-from decision_hub import (FAULT_AT, FAULT_RULE_ID, STOP_AT, Event, backoff_seconds,
-                          card_key, dedupe_key, fault_card, fault_card_key, is_late, match,
-                          recipients, too_deep, too_deep_card)
+from decision_hub import (FAULT_AT, FAULT_RULE_ID, RUN_OUTCOMES, STOP_AT, Event, RunContext,
+                          backoff_seconds, card_key, dedupe_key, fault_card, fault_card_key,
+                          is_late, match, recipients, too_deep, too_deep_card)
 from repositories import action_items, decision_cards, decision_ledger, event_runs
 from repositories import memberships, recordings, site_events, users
 
@@ -54,6 +61,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 FLAG = "SITE_DECISION_LOOP"
+RUN_FLAG = "NIGHTLY_REMATCH"         # gates every run-rule; "shadow" | "on" run, else nothing
+RUN_FLAG_VALUES = ("shadow", "on")
 RESULT_KEYS = ("emitted", "duplicates", "skipped_ambiguous_site", "skipped_pending",
                "processed", "cards", "faults", "errors")
 
@@ -282,8 +291,28 @@ def _lock_queued(conn, event_ids):
     return {r[0] for r in rows}
 
 
-def _dispatch(conn, row, ev, rule, now):
-    """Merge, run, handle -- inside the event's savepoint. Returns (status, outcome, card)."""
+def _run_job(conn, ev, rule, run_id, now, job):
+    """A run-rule's work: rule.run inside the open run. No ledger lookup (a run-rule's
+    subject_ref is a site, not an item) and no card. Flag off -> 'nothing' without calling
+    run. An outcome outside RUN_OUTCOMES raises (a failed attempt like any other)."""
+    flag, s3_client, bucket = job
+    if flag not in RUN_FLAG_VALUES:
+        logger.info("decision-scan process: run-rule %s event %s not run (%s off)",
+                    rule.rule_id, ev.event_id, RUN_FLAG)
+        return "nothing", "nothing", None
+    outcome = rule.run(conn, ev, RunContext(
+        run_id=run_id, company_id=ev.company_id, site_id=ev.site_id, now_utc=now,
+        flag=flag, s3_client=s3_client, bucket=bucket))
+    if outcome not in RUN_OUTCOMES:
+        # The type only: a bad return value may carry item text (never logged).
+        raise ValueError(f"run-rule {rule.rule_id} returned a {type(outcome).__name__}, "
+                         f"not one of {RUN_OUTCOMES}")
+    return outcome, outcome, None
+
+
+def _dispatch(conn, row, ev, rule, now, job=(None, None, None)):
+    """Merge, run, handle -- inside the event's savepoint. Returns (status, outcome, card).
+    job = (NIGHTLY_REMATCH value, s3_client, bucket), used only by run-rules."""
     cid, sid = ev.company_id, ev.site_id
     others = [r["event_id"] for r in site_events.queued_same_subject(
         conn, cid, sid, ev.type, ev.subject_ref) if r["event_id"] != ev.event_id]
@@ -293,7 +322,10 @@ def _dispatch(conn, row, ev, rule, now):
     for eid in merged:
         site_events.set_status(conn, eid, cid, sid, "merged", rule_id=rule.rule_id)
         event_runs.add_event(conn, run["run_id"], eid, cid, sid)
-    status, outcome, card = _handle(conn, ev, rule, now)
+    if rule.run is not None:
+        status, outcome, card = _run_job(conn, ev, rule, run["run_id"], now, job)
+    else:
+        status, outcome, card = _handle(conn, ev, rule, now)
     site_events.set_status(conn, ev.event_id, cid, sid, status, rule_id=rule.rule_id)
     event_runs.finish(conn, run["run_id"], cid, sid, outcome)
     return status, outcome, card
@@ -361,7 +393,7 @@ def _bare_event(row, now):
                  chain_depth=0)
 
 
-def _process_one(conn, row, now, out):
+def _process_one(conn, row, now, out, job=(None, None, None)):
     """A row _event_of cannot read (malformed payload/timestamps) is a failed attempt like
     a handler failure: it goes through _fail (backoff, fault at 3, stop at 5)."""
     try:
@@ -391,23 +423,25 @@ def _process_one(conn, row, now, out):
                 site_events.set_status(conn, ev.event_id, cid, sid, "late",
                                        rule_id=rule.rule_id)
                 return
-            _status, _outcome, card = _dispatch(conn, row, ev, rule, now)
+            _status, _outcome, card = _dispatch(conn, row, ev, rule, now, job)
             if card is not None:
                 out["cards"] += 1
     except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
         _fail(conn, row, ev, exc, now, out)
 
 
-def process(conn, now):
+def process(conn, now, *, s3_client=None, bucket=None):
     """Claim due events and run each through the hub. One transaction per batch; each
-    event in its own savepoint. Returns counts (processed, cards, faults)."""
+    event in its own savepoint. Returns counts (processed, cards, faults). s3_client and
+    bucket only reach run-rules (RunContext); NIGHTLY_REMATCH is read once per call."""
     out = _counts()
+    job = (os.environ.get(RUN_FLAG), s3_client, bucket)
     for _ in range(MAX_BATCHES):
         with conn.transaction():
             rows = site_events.claim_due(conn, now, BATCH)
             for row in rows:
                 out["processed"] += 1
-                _process_one(conn, row, now, out)
+                _process_one(conn, row, now, out, job)
         if len(rows) < BATCH:
             break
     logger.info("decision-scan process %s", out)
@@ -448,7 +482,8 @@ def lambda_handler(event, context):
                 conn, lambda key: checklist_reports.read_result_status(key, _s3(), bucket),
                 now))
         # Always process, right after the emit: no separate schedule wakes the database.
-        runs.append(process(conn, now))
+        runs.append(process(conn, now, s3_client=_s3() if bucket else None,
+                            bucket=bucket or None))
     for got in runs:
         for k in RESULT_KEYS:
             result[k] += got.get(k, 0)

@@ -269,6 +269,30 @@ def test_runs_are_tenant_scoped(db):
     assert er.add_event(db, run["run_id"], e1["event_id"], co["id"], site["id"]) == 1
 
 
+def test_add_usage_accumulates(db):
+    co, site = _world(db)
+    run = er.start(db, co["id"], site["id"], [], 1, "nightly.due")
+    assert run["model_calls"] == 0 and run["tokens_in"] is None and run["cost_usd"] is None
+    r1 = er.add_usage(db, run["run_id"], tokens_in=100, tokens_out=20, model="m-a",
+                      cost_usd=None)
+    assert (r1["tokens_in"], r1["tokens_out"], r1["model_calls"]) == (100, 20, 1)
+    assert r1["cost_usd"] is None                       # unknown cost is not 0
+    assert r1["models"] == ["m-a"]
+    r2 = er.add_usage(db, run["run_id"], tokens_in=50, tokens_out=5, model="m-b",
+                      cost_usd=0.5)
+    assert (r2["tokens_in"], r2["tokens_out"], r2["model_calls"]) == (150, 25, 2)
+    assert float(r2["cost_usd"]) == 0.5
+    r3 = er.add_usage(db, run["run_id"], tokens_in=1, tokens_out=1, model="m-a",
+                      cost_usd=None)
+    assert float(r3["cost_usd"]) == 0.5                 # None leaves the known cost alone
+    r4 = er.add_usage(db, run["run_id"], tokens_in=0, tokens_out=0, model="m-a",
+                      cost_usd=0.25)
+    assert float(r4["cost_usd"]) == 0.75
+    assert r4["model_calls"] == 4 and r4["models"] == ["m-a", "m-b", "m-a", "m-a"]
+    assert er.add_usage(db, uuid.uuid4(), tokens_in=1, tokens_out=1, model="m-a",
+                        cost_usd=None) is None
+
+
 # ---------------------------------------------------------------- decision_cards
 
 def test_insert_open_returns_none_when_open_card_exists(db):

@@ -45,3 +45,23 @@ def finish(conn, run_id, company_id, site_id, outcome, error=None, result_hash=N
         "UPDATE event_runs SET outcome = %s, error = %s, result_hash = %s, ended_at = now() "
         f"WHERE run_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",
         (outcome, error, result_hash, run_id, company_id, site_id)).fetchone()
+
+
+def add_usage(conn, run_id, *, tokens_in, tokens_out, model, cost_usd):
+    """Add one model call's usage to a run: tokens summed (NULL counts as 0), model_calls + 1,
+    model appended to the models array (in call order, repeats kept). cost_usd None (cost
+    unknown) leaves cost_usd as it is -- a NULL is never turned into 0. Returns the row, or
+    None for an unknown run.
+
+    Keyed by run_id only: the caller is the run's own writer, which holds the run_id the
+    hub gave it (RunContext.run_id), never one taken from a request."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE event_runs SET "
+        "  tokens_in = COALESCE(tokens_in, 0) + COALESCE(%s::int, 0), "
+        "  tokens_out = COALESCE(tokens_out, 0) + COALESCE(%s::int, 0), "
+        "  cost_usd = CASE WHEN %s::numeric IS NULL THEN cost_usd "
+        "                  ELSE COALESCE(cost_usd, 0) + %s::numeric END, "
+        "  model_calls = model_calls + 1, "
+        "  models = COALESCE(models, '[]'::jsonb) || jsonb_build_array(%s::text) "
+        f"WHERE run_id = %s RETURNING {_COLS}",
+        (tokens_in, tokens_out, cost_usd, cost_usd, model, run_id)).fetchone()

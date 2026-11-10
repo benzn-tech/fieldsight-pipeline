@@ -151,6 +151,69 @@ def test_merged_event_is_not_gated(db):
     assert any("merged but in no run" in m for m in out), out
 
 
+def test_replay_understands_run_rule_events(db, monkeypatch):
+    """A run-rule event has no card by design: done / nothing (incl. flag off) and a
+    failing one are all clean; a card naming it or a run outcome that disagrees with the
+    status is reported."""
+    import decision_rules
+    from repositories import decision_cards as dc
+    from repositories import sites as sites_repo
+    outcomes = {}
+
+    def run(conn, event, ctx):
+        o = outcomes[str(event.site_id)]
+        if o == "raise":
+            raise RuntimeError("job exploded")
+        return o
+    monkeypatch.setitem(decision_rules.RULES, "test.run", decision_rules.Rule(
+        rule_id="test.run", bucket=lambda event, today_nz: today_nz.isoformat(),
+        late_after_days=None, purpose="run", run=run))
+    co, site_done, pm, admin = _world(db)
+    site_nothing, site_raise, site_off = (
+        sites_repo.create_site(db, co["id"], f"S-rr-{uuid.uuid4().hex[:6]}")
+        for _ in range(3))
+    outcomes.update({str(site_done["id"]): "done", str(site_nothing["id"]): "nothing",
+                     str(site_raise["id"]): "raise"})
+    evs = {}
+    for name, s in (("done", site_done), ("nothing", site_nothing), ("raise", site_raise)):
+        evs[name] = _direct(db, co, s, "test.run", str(s["id"]), NOW)
+    monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+    t = NOW
+    for _ in range(3):                                    # the raising one reaches FAULT_AT
+        lds.process(db, t)
+        t += dt.timedelta(hours=2)
+    monkeypatch.delenv("NIGHTLY_REMATCH")
+    evs["off"] = _direct(db, co, site_off, "test.run", str(site_off["id"]), t)
+    lds.process(db, t)
+    st = {k: db.execute("SELECT status, attempts FROM site_events WHERE event_id = %s",
+                        (e["event_id"],)).fetchone() for k, e in evs.items()}
+    # the raising event is due again in the flag-off pass: the flag is a kill switch for a
+    # retrying run-rule event too (it ends 'nothing' after its 3 failed runs)
+    assert st == {"done": ("done", 0), "nothing": ("nothing", 0), "raise": ("nothing", 3),
+                  "off": ("nothing", 0)}, st
+    assert decision_replay.replay(db, company_id=co["id"]) == []
+    assert decision_replay.invariants(db, company_ids=[co["id"]]) == []
+
+    # tamper 1: the run outcome disagrees with the event status
+    run_of = ("UPDATE event_runs SET outcome = %s WHERE run_id = "
+              "(SELECT run_id FROM run_events WHERE event_id = %s)")
+    db.execute(run_of, ("done", evs["nothing"]["event_id"]))
+    out = decision_replay.replay(db, company_id=co["id"])
+    assert any("run-rule event nothing with run outcome(s) ['done']" in m for m in out), out
+    db.execute(run_of, ("nothing", evs["nothing"]["event_id"]))
+    assert decision_replay.replay(db, company_id=co["id"]) == []
+    # tamper 2: a card names a run-rule event
+    dc.insert_open(db, {"card_key": f"tamper|{uuid.uuid4()}", "rule_id": "test.run",
+                        "purpose": "run", "subject_ref": str(site_done["id"]),
+                        "kind": "choose", "question": "q", "consequence": "c",
+                        "options": [], "evidence": [], "urgency": "normal",
+                        "deadline_at": None, "timeout_default": None, "recipients": [],
+                        "event_id": evs["done"]["event_id"], "company_id": co["id"],
+                        "site_id": site_done["id"]})
+    out = decision_replay.replay(db, company_id=co["id"])
+    assert any("run-rule event done but 1 card(s) name it" in m for m in out), out
+
+
 def test_cli_connection_is_one_read_only_snapshot(migrated_db_url):
     conn = decision_replay.connect_read_only(migrated_db_url)
     other = psycopg.connect(migrated_db_url, autocommit=True)
