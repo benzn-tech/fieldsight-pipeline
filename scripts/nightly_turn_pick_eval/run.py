@@ -53,6 +53,7 @@ SOURCES = ("src/nightly_turn_pick.py", "src/item_support.py", "src/item_text_mat
 WORDING_FREE = "src/nightly_turn_pick.py"     # may differ fit -> held-out (wording only)
 SANS_KEY = "nightly_turn_pick_sans_instruction"   # ... which this hash proves
 FAILED_PICK = "__failed__"
+HELDOUT_REPS = 3
 _WORDING_LINE = re.compile(r"^prompt_hash:\s*([0-9a-f]{12})\s*$", re.MULTILINE)
 _RESUME_KEYS = ("model", "prompt_hash", "split", "reps", "hashes", "manifest_digest",
                 "max_tokens", "max_retries", "effort")
@@ -357,6 +358,10 @@ def load_log(out):
             if i != len(lines) - 1:
                 refuse(f"{p} line {i + 1} is not JSON")
             write_jsonl(p, entries)
+    dup = [k for k, n in Counter((e["session"], e["rep"]) for e in entries).items() if n > 1]
+    if dup:
+        refuse(f"{p} holds duplicate (session, rep) entries for {len(dup)} pair(s); a "
+               f"recorded outcome is never re-called, so the log is not trusted")
     return entries
 
 
@@ -423,12 +428,14 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--fit-run", default=None)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=2)
     p.add_argument("--data", default=DEFAULT_DATA)
     p.add_argument("--labels", default=DEFAULT_LABELS)
     a = p.parse_args(argv)
     if a.reps < 1 or a.workers < 1:
         refuse("--reps and --workers must be >= 1")
+    if a.split == "heldout" and a.reps != HELDOUT_REPS:
+        refuse(f"a held-out run has exactly {HELDOUT_REPS} reps (bar 4 needs them)")
 
     out = require_runs_dir(a.out)
     sessions, digest = load_split(a.data, a.labels, a.split)
@@ -468,6 +475,7 @@ def main(argv=None):
                 "skipped": dict(sorted(skipped.items())), "complete": False}
         out.mkdir(parents=True)
         write_json(Path(out, "meta.json"), meta)
+    meta["workers"] = a.workers
 
     entries = load_log(out)
     done = {(e["session"], e["rep"]) for e in entries}
@@ -488,8 +496,7 @@ def main(argv=None):
                 record(no_call_entry(preps[ref], k))
     try:
         execute(todo, preps, client, api_error, a.workers, record, setup_errors)
-    except SetupError as e:
-        finalize(out, meta, entries, sorted(preps), a.reps)
+    except SetupError as e:     # `finally` still rebuilds the totals from the log
         refuse(f"setup error from the API ({e}); nothing recorded for that call. Fix the "
                f"setup, then re-run with --resume")
     finally:

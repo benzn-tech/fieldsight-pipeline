@@ -196,7 +196,7 @@ def judge_rep(rows, ctx, allow_cross):
     by_gold = pairs = 0
     for r, ok in zip(acc, c):
         twins = ctx.twins.get(r["item_ref"], set())
-        if ok is not True and any(r["turn_index"] in (ctx.gold.get(t) or {}).get("turns", ())
+        if ok is False and any(r["turn_index"] in (ctx.gold.get(t) or {}).get("turns", ())
                                   for t in twins):
             by_gold += 1
         pairs += sum(1 for t in twins if t > r["item_ref"] and by_turn.get(t) == r["turn_index"])
@@ -285,6 +285,9 @@ def assert_counts_only(obj, path="summary"):
 
 def load_run(run_dir, data_dir, labels_dir):
     meta = store.read_json(Path(run_dir, "meta.json"))
+    if meta.get("split") == "heldout" and meta.get("reps") != run_mod.HELDOUT_REPS:
+        run_mod.refuse(f"a held-out run is scored only with {run_mod.HELDOUT_REPS} reps; "
+                       f"this one has {meta.get('reps')}")
     if not meta.get("complete"):
         run_mod.refuse(f"{run_dir} is not complete; resume it first")
     digest = store.manifest_digest(data_dir)

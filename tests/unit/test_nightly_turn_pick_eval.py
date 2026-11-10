@@ -558,3 +558,66 @@ def test_heldout_refuses_non_wording_change(env, monkeypatch):
         run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
     assert "sans_instruction" in str(e.value.code)
     assert len(client.calls) == n
+
+
+def test_heldout_run_refuses_reps_other_than_3(env, monkeypatch):
+    client = _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    n = len(client.calls)
+    for reps in (1, 2, 4):
+        with pytest.raises(SystemExit):
+            run.main(_args(env, "heldout", f"h{reps}", "--fit-run", str(env.runs / "fit0"),
+                           reps=reps))
+        with pytest.raises(SystemExit):
+            run.main(_args(env, "heldout", f"d{reps}", "--dry-run", reps=reps))
+    assert len(client.calls) == n
+
+
+def test_score_refuses_heldout_with_reps_other_than_3(env, monkeypatch):
+    _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
+    meta_p = env.runs / "h1" / "meta.json"
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    meta["reps"] = 1
+    meta_p.write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        _score(env, "h1")
+    assert "reps" in str(e.value.code)
+    assert not (env.runs / "h1" / "summary.json").exists()
+
+
+def test_bar3b_missing_gold_is_not_a_by_gold_hit():
+    turns = [_turn(1, "pour slab level 3 now", "S1"), _turn(2, "pour slab level 4 now", "S2")]
+    sess = {"base": "b", "date": "2026-11-10", "folder": "synthetic", "ref": REF_A,
+            "split": "fit", "turns": turns,
+            "topics": [{"time_range": "10:00-10:05",
+                        "action_items": [{"action": "pour slab level 3"},
+                                         {"action": "pour slab level 4"}],
+                        "findings": [], "decisions": [], "questions": []}]}
+    r3, r4 = f"{REF_A}:0:action_items:0", f"{REF_A}:0:action_items:1"
+    ctx = score.Ctx([sess], {r4: {"label": "turn", "turns": [1]}}, {})   # r3 has no gold
+    rows = [{"item_ref": r3, "session": REF_A, "outcome": "accepted", "turn_index": 1,
+             "cross_language": False}]
+    b1, _b2, b3 = score.judge_rep(rows, ctx, True)
+    assert b3["by_gold"] == 0 and b1["missing_gold"] == 1 and b1["verdict"] == I
+
+
+def test_workers_default_2_recorded_in_meta(env, monkeypatch):
+    _patch_client(monkeypatch, FakeClient())
+    args = [a for a in _args(env, "fit", "r1") if a not in ("--workers", "1")]
+    run.main(args)
+    meta = json.loads((env.runs / "r1" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["workers"] == 2
+
+
+def test_load_log_refuses_duplicate_pairs(env, monkeypatch):
+    _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "r1"))
+    log = env.runs / "r1" / "log.jsonl"
+    first = log.read_text(encoding="utf-8").splitlines()[0]
+    with log.open("a", encoding="utf-8") as f:
+        f.write(first + "\n")
+    with pytest.raises(SystemExit) as e:
+        run.main(_args(env, "fit", "r1", "--resume"))
+    assert "duplicate" in str(e.value.code)
