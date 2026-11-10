@@ -633,28 +633,42 @@ def test_export_and_owner_export_never_write_the_flag_file(tmp_path):
     assert not Path(labels, "flags.owner.locator.jsonl").exists()
 
 
-def test_locator_flags_refuses_until_both_blind_label_sets_are_answered(tmp_path):
+def test_locator_flags_waits_until_every_existing_todo_is_fully_answered(tmp_path):
     sessions, runs = _twin_set()
     data, runs_dir, labels = _write_files(tmp_path, sessions, runs)
-    label.export_locator(runs_dir, data_dir=data, labels_dir=labels)
     argv = ["locator-flags", "--data", str(data), "--runs", str(runs_dir),
             "--labels", str(labels)]
-    with pytest.raises(SystemExit) as e:
-        label.main(argv)
-    assert e.value.code not in (0, None)
-    assert not Path(labels, "flags.owner.locator.jsonl").exists()
-    store.write_jsonl(Path(labels, "done.locator.agent.jsonl"),
-                      [{"item_ref": "f000:0:action_items:0", "label": "turn", "turns": [0]}])
-    with pytest.raises(SystemExit):
-        label.main(argv)
-    assert not Path(labels, "flags.owner.locator.jsonl").exists()
-    store.write_jsonl(Path(labels, "done.owner.locator.jsonl"),
-                      [{"item_ref": "f000:0:action_items:0", "label": "turn", "turns": [0]}])
+    flag_file = Path(labels, "flags.owner.locator.jsonl")
+
+    def refused():
+        with pytest.raises(SystemExit) as e:
+            label.main(argv)
+        assert e.value.code not in (0, None)
+        assert not flag_file.exists()
+
+    refused()                                           # no agent todo exported yet
+    label.export_locator(runs_dir, data_dir=data, labels_dir=labels)
+    todo = store.read_jsonl(Path(labels, "todo.locator.agent.jsonl"))
+    assert len(todo) == 5
+    answer = lambda r: {"item_ref": r["item_ref"], "label": "none", "turns": []}  # noqa: E731
+    refused()                                           # nothing answered
+    store.write_jsonl(Path(labels, "done.locator.agent.jsonl"), [answer(todo[0])])
+    refused()                                           # 1 of 5: non-empty is not enough
+    store.write_jsonl(Path(labels, "done.locator.agent.jsonl"), [answer(r) for r in todo])
+    # Fit stage: agent todo complete, no owner todo yet -> allowed.
     out = label.main(argv)
-    flags = store.read_jsonl(Path(labels, "flags.owner.locator.jsonl"))
+    flags = store.read_jsonl(flag_file)
     assert out["flags"] == 1
     assert flags[0]["flag_id"] == "f000:0:action_items:0|0"
     assert flags[0]["classes"] == ["level"]
+    flag_file.unlink()
+    # Held-out stage: an owner todo of 40 exists; 1 of 40 answered -> refused; all -> allowed.
+    owner = [{"item_ref": f"h{i:03d}:0:action_items:0"} for i in range(40)]
+    store.write_jsonl(Path(labels, "todo.owner.locator.jsonl"), owner)
+    store.write_jsonl(Path(labels, "done.owner.locator.jsonl"), [answer(owner[0])])
+    refused()
+    store.write_jsonl(Path(labels, "done.owner.locator.jsonl"), [answer(r) for r in owner])
+    assert label.main(argv)["flags"] == 1 and flag_file.exists()
 
 
 def test_owner_sample_puts_unknown_statuses_in_no_stratum():

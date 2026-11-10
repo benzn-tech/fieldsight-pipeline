@@ -35,7 +35,7 @@ LOCATOR_FIELD = "said_at"
 STATUSES = ("linked", "no_locator", "unparseable", "not_shown", "no_line",
             "ambiguous_stamp", "outside_topic")
 
-_STAMP = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})")
+_STAMP = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})", re.ASCII)   # ASCII digits only
 # Each side of the topic's range, on top of `topic_window`'s inclusive end minute.
 _RANGE_WIDEN = timedelta(minutes=1)
 

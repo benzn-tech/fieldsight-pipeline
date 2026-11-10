@@ -82,6 +82,12 @@ def test_unparseable_stamps():
         assert "source_stem" not in s
 
 
+def test_full_width_digit_stamp_is_unparseable():
+    # U+FF10.. digits would otherwise match \d and normalise to a real stamp.
+    s = _resolve("０９:０５:０３")
+    assert s["status"] == "unparseable"
+
+
 def test_null_and_absent_are_no_locator():
     assert _resolve(None)["status"] == "no_locator"
     assert _resolve(None, absent=True)["status"] == "no_locator"

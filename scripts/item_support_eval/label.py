@@ -251,14 +251,28 @@ def export_locator(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
 def export_locator_flags(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
                          labels_dir=store.LABELS_DIR):
     """The twin-flag candidates for the owner (flags.owner.locator.jsonl). The file shows the
-    linked turn, i.e. the locator's answer, so it is written only after both blind label
-    sets are answered; before that it refuses and writes nothing."""
+    linked turn, i.e. the locator's answer, so it is written only once every blind todo that
+    exists is fully answered: every item_ref of todo.locator.agent.jsonl (which must exist)
+    in done.locator.agent.jsonl, and, if todo.owner.locator.jsonl is non-empty, every one of
+    its item_refs in done.owner.locator.jsonl. At the fit stage there is no owner todo yet
+    (the owner sample is held-out only, so fit flags cannot unblind it); without this the
+    fit gate's bar 4 would wait on the held-out spend the gate decides. Otherwise it refuses
+    and writes nothing."""
     d = Path(labels_dir)
-    absent = [x for x in ("done.locator.agent.jsonl", "done.owner.locator.jsonl")
-              if not store.read_jsonl(d / x)]
-    if absent:
-        raise SystemExit(f"Refusing: {', '.join(absent)} not answered yet. The flag file shows "
-                         f"the locator's linked turns; it waits for both blind label sets.")
+    owed = []
+    for todo, done, required in ((LOCATOR_AGENT_TODO, "done.locator.agent.jsonl", True),
+                                 (LOCATOR_OWNER_TODO, "done.owner.locator.jsonl", False)):
+        refs = {r["item_ref"] for r in store.read_jsonl(d / todo)}
+        if not refs:
+            if required:
+                owed.append(f"{todo} (not exported)")
+            continue
+        answered = {r.get("item_ref") for r in store.read_jsonl(d / done)}
+        if refs - answered:
+            owed.append(f"{done} ({len(refs - answered)} of {len(refs)} unanswered)")
+    if owed:
+        raise SystemExit(f"Refusing: {'; '.join(owed)}. The flag file shows the locator's "
+                         f"linked turns; it waits until every blind todo is answered.")
     sessions = store.load_sessions(data_dir)
     runs = score_mod.load_locator_runs(sessions, runs_dir)
     flags_ = score_mod.locator_flags(sessions, runs)

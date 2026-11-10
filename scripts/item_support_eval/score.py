@@ -891,8 +891,8 @@ def locator_diagnostics(sessions, runs, status):
             "range_checked_false": rate(sum(1 for r in linked
                                             if r["support"].get("range_checked") is False),
                                         len(linked))},
-        # The prompt asks for minute-only evidence stamps, so a zero here is only readable
-        # beside how many evidence stamps carry seconds at all.
+        # The final schema asks for HH:MM:SS evidence stamps; a stamp without seconds can
+        # never match, so the share is read beside how many stamps carry seconds.
         "said_at_equals_evidence_at": {"links": len(with_said), "equal": copied,
                                        "share": copied / len(with_said) if with_said else None,
                                        "evidence_stamps": ev_total,
