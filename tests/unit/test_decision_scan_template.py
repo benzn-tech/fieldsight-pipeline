@@ -126,9 +126,11 @@ def test_no_ses_or_invoke_permission(doc):
             assert a != "lambda:InvokeFunction", a
             assert a in ("s3:GetObject", "s3:ListBucket", "s3:PutObject"), a
             if a == "s3:PutObject":
-                # the nightly handler's J2 requests (+ lake_put's manifest line), nothing else
+                # the nightly handler's J2 requests, J1's re-emits under the owning lines'
+                # prefixes (+ lake_put's manifest line), nothing else
                 assert {_sub(r) for r in _as_list(st["Resource"])} <= {
                     LAKE + "/nightly_requests/*", LAKE + "/lake_manifest/*",
+                    LAKE + "/continuity_xday_requests/*", LAKE + "/reconcile_requests/*",
                     "arn:aws:s3:::${DataBucketName}/lake_manifest/*"}
     # No SAM policy templates that grant SES or invoke either.
     for pol in _props(doc, FN)["Policies"]:
@@ -137,7 +139,8 @@ def test_no_ses_or_invoke_permission(doc):
 
 
 def test_s3_scope_is_session_report_results_with_listbucket(doc):
-    # plus nightly_requests/ for the nightly handler (head before put, breaker reads)
+    # plus nightly_requests/ for the nightly handler (head before put, breaker reads) and
+    # extractions/ for J1 (re-read a stale session's final; no ListBucket needed there)
     gets, lists = set(), set()
     for st in _statements(doc, FN):
         assert st["Effect"] == "Allow"
@@ -149,7 +152,8 @@ def test_s3_scope_is_session_report_results_with_listbucket(doc):
                 gets |= {_sub(r) for r in _as_list(st["Resource"])}
             else:
                 assert a == "s3:PutObject"
-    assert gets == {LAKE + "/session_report_results/*", LAKE + "/nightly_requests/*"}
+    assert gets == {LAKE + "/session_report_results/*", LAKE + "/nightly_requests/*",
+                    LAKE + "/extractions/*"}
     assert lists == {"session_report_results/*", "nightly_requests/*"}
 
 

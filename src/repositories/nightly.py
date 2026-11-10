@@ -10,7 +10,8 @@ input, J3 markers) and §5.
   any scope, not non_work) -- the same hide rule the action-pack items tool applies before
   handing items to a model.
 * `nightly_support_count_today` -- the per-company daily budget check.
-* `record_reemit` -- J1's "never twice for one (N, L)" record.
+* `record_reemit` -- J1's "never twice for one (N, L)" record; `set_reemit_artifact`,
+  `recorded_reemit_pairs` and `site_finals` (J1's input) serve the same job.
 * `mark_recompute_failed` / `failed_recomputes` / `claim_one_recompute` /
   `resolve_recompute` -- J3's markers for voiceprint-writer recomputes that timed out or
   failed.
@@ -153,6 +154,49 @@ def record_reemit(conn, *, site_id, line, n_key, l_key, artifact_key, night) -> 
         "artifact_key, night) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id",
         (site_id, line, n_key, l_key, artifact_key, night)).fetchone()
     return row is not None
+
+
+def set_reemit_artifact(conn, *, line, n_key, l_keys, night, artifact_key):
+    """Point this night's just-recorded re-emit rows of (line, N, each L) at the artifact
+    actually put. Cross-day's key carries a hash of N's extracted_at, known only after the
+    S3 read that follows the record; these rows are nightly's own (same night)."""
+    conn.execute(
+        "UPDATE nightly_reemits SET artifact_key = %s WHERE line = %s "
+        "AND n_extraction_key = %s AND l_extraction_key = ANY(%s) AND night = %s",
+        (artifact_key, line, n_key, list(l_keys), night))
+
+
+def recorded_reemit_pairs(conn, site_id) -> set:
+    """{(line, n_extraction_key, l_extraction_key)} already recorded for the site (late
+    arrivals only, L not null): J1 detection leaves them out, so a recorded pair never
+    takes one of the night's cap slots."""
+    return {tuple(r) for r in conn.execute(
+        "SELECT line, n_extraction_key, l_extraction_key FROM nightly_reemits "
+        "WHERE site_id = %s AND l_extraction_key IS NOT NULL", (site_id,)).fetchall()}
+
+
+def site_finals(conn, *, company_id, site_id, since_date) -> list[dict]:
+    """J1's input: one row per extraction key of the site with a visible topic whose
+    report_date is on or after `since_date`: `{extraction_key, date (report_date, the
+    recording date), written_at (latest visible topic write: when the final landed),
+    opened_at (meeting_session.opened_at by the sid the key's file name carries, or None),
+    session_status (that row's status, or None)}`. Company-checked through
+    sites.company_id (the site's CURRENT owner). Visibility through deleted_predicates.
+    The session join is item_history's (the sid in the key's file name, the table's
+    primary key)."""
+    if not company_id or not site_id:
+        raise ValueError("company_id and site_id are required")
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT t.source_s3_key AS extraction_key, min(t.report_date) AS date, "
+        "max(t.created_at) AS written_at, max(ms.opened_at) AS opened_at, "
+        "max(ms.status) AS session_status "
+        "FROM topics t JOIN sites s ON s.id = t.site_id "
+        "LEFT JOIN meeting_session ms ON ms.session_id = "
+        "substring(split_part(t.source_s3_key, '/', 4) from 'sid([0-9a-f]{32})') "
+        "WHERE t.site_id = %s AND s.company_id = %s AND t.report_date >= %s "
+        "AND t.source_s3_key LIKE 'extractions/%%' "
+        f"AND {visible_topics_predicate('t')} "
+        "GROUP BY t.source_s3_key", (site_id, company_id, since_date)).fetchall()
 
 
 def mark_recompute_failed(conn, company_id, session_base, reason):
