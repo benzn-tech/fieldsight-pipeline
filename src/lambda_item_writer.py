@@ -72,7 +72,12 @@ import status_suggestions
 from repositories import status_suggestions as status_suggestions_repo
 import index_request
 import continuity_records
+import continuity_xday
+import continuity_xday_request
+from deleted_predicates import visible_topics_predicate
+from repositories import item_history
 import item_continuity
+import item_text_match
 import lambda_ingest
 import keyframe_request
 import match_request
@@ -147,6 +152,19 @@ SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # default so the write path ships inert: this only ever writes rows to
 # topic_thread_suggestions, which nothing reads yet.
 SUGGEST_THREADS = os.environ.get("SUGGEST_THREADS", "false").lower() == "true"
+
+# Cross-day item continuity (spec 2026-11-09 X1): off | shadow | on. `shadow` and `on` both
+# build the hop-1 request on a fresh connection after the commit and put it to S3; anything
+# else (including a typo) is `off`, where no extra SQL runs and nothing is put.
+
+
+def _read_xday_flag():
+    """The CROSS_DAY_CONTINUITY env, stripped and lower-cased (as the linker reads it)."""
+    return (os.environ.get("CROSS_DAY_CONTINUITY", "off") or "off").strip().lower()
+
+
+CROSS_DAY_CONTINUITY = _read_xday_flag()
+_XDAY_MODES = ("shadow", "on")
 
 #: Cross-session status reconcile (R0): after a FINAL pass, ask the matcher whether this
 #: session reports a status change on the recorder's open items from other sessions that day.
@@ -1289,7 +1307,284 @@ def _emit_item_support_metric(key, items, counts):
         logger.warning("could not emit the item support metric for %s", key)
 
 
-def write_extraction_items(date, user_folder, extraction_key):
+# --- cross-day continuity, hop 1 (spec 2026-11-09 X2-X5) ------------------------------------
+
+# kind list name -> (child table, text column)
+_XDAY_TABLES = {
+    "action_items": ("action_items", "text"),
+    "questions": ("topic_questions", "question"),
+    "findings": ("findings", "observation"),
+}
+# X5: action items open|in_progress|blocked, questions open, findings unfiltered (find_items
+# refuses a status filter on findings, so they get no entry).
+_XDAY_STATUSES = {
+    "action_items": {"action_item": ["open", "in_progress", "blocked"]},
+    "questions": {"question": ["open"]},
+    "findings": None,
+}
+_XDAY_RECENCY = 20
+_XDAY_LEXICAL = 5
+# ONE read per kind fetches the whole window; both the recency top 20 and every new item's
+# lexical top 5 are picked from it in-process (Ruling R12), so its length is the pre-cap
+# count; at this ceiling it is a lower bound.
+_XDAY_POOL_LIMIT = 1000
+# The whole build gets at most this many seconds (Ruling R12) ...
+_XDAY_BUDGET_S = 20.0
+# ... and never the last seconds of the invocation, kept for the put and the return.
+_XDAY_RESERVE_S = 10.0
+
+
+def _xday_recorded_at(conn, session_base):
+    """UTC recording start of this session's items, for their order key.
+
+    TODO(Track C): return the same `first_seen_recorded_at` rule find_items will expose
+    (meeting_session.opened_at by sid, else the transcript-stem timestamp) once it lands.
+    Until then None: a same-date candidate is then not ordered and is dropped (Ruling R3)."""
+    return None
+
+
+def _xday_str(value):
+    return None if value is None else str(value)
+
+
+def _xday_row(row):
+    """A find_items row with its uuids as strings (the request is JSON)."""
+    out = dict(row)
+    out["stable_id"] = _xday_str(row.get("stable_id"))
+    out["item_id"] = _xday_str(row.get("item_id"))
+    return out
+
+
+def _xday_new_items(conn, site_id, extraction_key):
+    """X4: the pass's live child rows of the three kinds, read back by key (so the nightly
+    caller, which has no topic ids, reads exactly what the writer would)."""
+    live = visible_topics_predicate("t")
+    out = {}
+    for ln in continuity_xday.XDAY_KINDS:
+        table, col = _XDAY_TABLES[ln]
+        rows = conn.execute(
+            f"SELECT c.stable_id::text, c.item_id::text, c.{col} FROM {table} c "
+            f"JOIN topics t ON t.id = c.topic_id "
+            f"WHERE t.source_s3_key = %s AND c.site_id = %s AND {live} "
+            f"ORDER BY c.{col}, c.stable_id", (extraction_key, site_id)).fetchall()
+        out[ln] = [{"stable_id": r[0], "item_id": r[1], "text": r[2]}
+                   for r in rows if r[0]][:continuity_xday.CAP_PER_KIND]
+    return out
+
+
+_xday_order = continuity_xday.sort_key
+
+
+def _xday_lexical(text, pool, pool_tokens):
+    """A new item's lexical top 5 over the kind's window `pool` (Ruling R12): the score is
+    find_items' own -- item_text_match.overlap(new text, row text), the containment of the new
+    item's tokens -- with each row's tokens computed once per pool (`pool_tokens`); ranked
+    score DESC, then newest RECORDED first; zero overlap is no match (Ruling R6)."""
+    mine = set(item_text_match.tokens(text))
+    if not mine:
+        return []
+    scored = []
+    for row, toks in zip(pool, pool_tokens):
+        hit = len(mine & toks)
+        if hit:
+            scored.append((hit / len(mine), row))
+    scored.sort(key=lambda p: _xday_order(p[1]), reverse=True)
+    scored.sort(key=lambda p: p[0], reverse=True)
+    return [row for _, row in scored[:_XDAY_LEXICAL]]
+
+
+def _xday_chains(conn, site_id, rows_by_sid, own_sids):
+    """One query for the `continues` edges touching the candidate (and own) stable_ids --
+    either end, so a chain still collapses through one member that is not a candidate
+    (closed, or outside the window) ->
+    {stable_id: its chain's newest member}. Newest by RECORDING order over the rows in hand
+    (ties broken by stable_id); a chain holding one of this session's own items is headed by
+    it, so select_candidates hides the whole chain."""
+    ids = sorted(set(rows_by_sid) | set(own_sids))
+    if not rows_by_sid:
+        return {}
+    edges = conn.execute(
+        "SELECT src_stable_id::text, dst_stable_id::text FROM event_links "
+        "WHERE site_id = %s AND link_type = 'continues' "
+        "AND (src_stable_id = ANY(%s::uuid[]) OR dst_stable_id = ANY(%s::uuid[]))",
+        (site_id, ids, ids)).fetchall()
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        parent[find(a)] = find(b)
+    groups = {}
+    for sid in parent:
+        groups.setdefault(find(sid), []).append(sid)
+    chains = {}
+    for members in groups.values():
+        own = sorted(m for m in members if m in own_sids)
+        if own:
+            head = own[0]
+        else:
+            known = [rows_by_sid[m] for m in members if m in rows_by_sid]
+            if not known:
+                continue
+            head = max(known, key=_xday_order)["stable_id"]
+        for m in members:
+            chains[m] = head
+    return chains
+
+
+def build_xday_request(conn, *, site, company_id, extraction, extraction_key, date,
+                       nonce=None, trigger="final", deadline=None):
+    """Hop 1's request for one session's final pass, or None (skip, counted in the log).
+
+    Public: the item writer calls it on a fresh connection after its commit (stable_ids are
+    final) and the nightly re-match agent calls it with a `nonce`; `trigger` is written into
+    the artifact only. SQL: the new items (one read per kind), ONE window read per kind with
+    new items, one chain read -- the lexical top 5 are scored in-process over the window
+    (Ruling R12). `deadline` (time.monotonic()) bounds the whole build: a window read or a
+    new item's lexical pick past it is skipped and counted (`reads_skipped_budget`,
+    `lexical_skipped_budget`) and the request goes out with what it has; past it before the
+    new-item read, the request is skipped (`budget`). Runs no SQL when it skips on its inputs (no site, no company, not a
+    final, an incomplete final). Logs counts and keys, never item text."""
+    def skip(reason, **counts):
+        logger.info("xday request skipped: %s key=%s %s", reason, extraction_key,
+                    " ".join(f"{k}={v}" for k, v in counts.items()))
+        return None
+
+    if not site or not site.get("id"):
+        return skip("no_site")
+    if (extraction or {}).get("tier") != "final":
+        return skip("not_final")
+    if extraction.get("incomplete"):
+        return skip("incomplete")
+    company_id = company_id or site.get("company_id")
+    if not company_id:
+        return skip("no_company")
+    site_id = str(site["id"])
+    company_id = str(company_id)
+    day = continuity_xday._iso_date(date)
+    until = datetime.date.fromisoformat(day)
+    since = until - datetime.timedelta(days=continuity_xday.WINDOW_DAYS)
+    session_base = _parse_extraction_key(extraction_key)[2]
+
+    def past_deadline():
+        return deadline is not None and time.monotonic() >= deadline
+
+    if past_deadline():
+        return skip("budget", stage="new_items")
+    new_items = _xday_new_items(conn, site_id, extraction_key)
+    n_new = sum(len(v) for v in new_items.values())
+    if not n_new:
+        return skip("no_new_items")
+    recorded_at = _xday_recorded_at(conn, session_base)
+    # Every round of a session (late-chunk reopens included) writes under ONE extraction key:
+    # `-r{n}` names only the per-round request/brief/result markers, never the extraction.
+    exclude = [extraction_key]
+
+    calls = skipped_budget = reads_skipped = 0
+    pools, precap, rows_by_sid = {}, {}, {}
+    own_all = {}
+    for ln in continuity_xday.XDAY_KINDS:
+        news = new_items[ln]
+        if not news:
+            continue
+        kind = continuity_xday.record_type(ln)
+        own = {n["stable_id"]: (day, recorded_at) for n in news}
+        own_all.update(own)
+        if past_deadline():
+            reads_skipped += 1
+            skipped_budget += len(news)
+            continue
+        calls += 1
+        rows = [_xday_row(r) for r in item_history.find_items(
+            conn, company_id=company_id, site_id=site_id, kinds=[kind],
+            statuses=_XDAY_STATUSES[ln], since=since, until=until,
+            exclude_source_keys=exclude, limit=_XDAY_POOL_LIMIT)]
+        new_keys = list(own.values())
+        eligible = [r for r in rows if r["stable_id"] not in own and all(
+            continuity_xday.recorded_earlier(continuity_xday.order_key(r), k)
+            for k in new_keys)]
+        precap[ln] = len(eligible)
+        # newest RECORDED first (stable over find_items' order), never by write time
+        recency = sorted(eligible, key=_xday_order, reverse=True)[:_XDAY_RECENCY]
+        # in-process over the window already read (Ruling R12): no query per new item
+        pool_tokens = [set(item_text_match.tokens(r.get("text") or "")) for r in eligible]
+        lexical = {}
+        for n in news:
+            if not (n.get("text") or "").strip():
+                continue
+            if past_deadline():
+                skipped_budget += 1
+                continue
+            lexical[n["stable_id"]] = _xday_lexical(n["text"], eligible, pool_tokens)
+        for r in recency + [r for rs in lexical.values() for r in rs]:
+            rows_by_sid.setdefault(r["stable_id"], r)
+        pools[ln] = (recency, lexical, own)
+
+    # The chain read runs even past the deadline: it is one indexed query (the 10 s reserve
+    # absorbs it), and without it a partial request could show an older chain member.
+    calls += 1
+    chains = _xday_chains(conn, site_id, rows_by_sid, set(own_all))
+    candidates = {ln: continuity_xday.select_candidates(recency, lexical, own, chains)
+                  for ln, (recency, lexical, own) in pools.items()}
+    n_cand = sum(len(v) for v in candidates.values())
+    if not n_cand:
+        return skip("no_candidates", new=n_new, queries=calls,
+                    reads_skipped_budget=reads_skipped, lexical_skipped_budget=skipped_budget)
+    request = continuity_xday.build_request(
+        site_id=site_id, company_id=company_id, extraction_key=extraction_key,
+        extracted_at=extraction.get("extracted_at"), date=day, new_items=new_items,
+        candidates=candidates, precap_counts=precap, nonce=nonce)
+    request["trigger"] = trigger
+    request["lexical_skipped_budget"] = skipped_budget
+    request["reads_skipped_budget"] = reads_skipped
+    logger.info("xday request built: key=%s new=%d candidates=%d precap=%s queries=%d "
+                "reads_skipped_budget=%d lexical_skipped_budget=%d", extraction_key, n_new,
+                n_cand, ",".join(str(precap.get(ln, 0)) for ln in continuity_xday.XDAY_KINDS),
+                calls, reads_skipped, skipped_budget)
+    return request
+
+
+def _xday_deadline(remaining_ms):
+    """The build's time.monotonic() deadline (Ruling R12): now + min(20 s, remaining - 10 s);
+    the flat 20 s when the remaining time is unknown (outside a Lambda). The nightly caller
+    passes its own deadline to build_xday_request."""
+    budget = _XDAY_BUDGET_S
+    if remaining_ms is not None:
+        try:
+            budget = min(budget, float(remaining_ms()) / 1000.0 - _XDAY_RESERVE_S)
+        except Exception:  # noqa: BLE001 -- remaining time unknown: the flat budget
+            pass
+    return time.monotonic() + budget
+
+
+def _emit_xday_request(*, site, company_id, extraction, extraction_key, date, remaining_ms):
+    """Build on a fresh connection, then put. Never raises (X10); logs the stage and the
+    exception type only -- a message could carry item text."""
+    stage = "build"
+    try:
+        with get_connection() as conn:
+            request = build_xday_request(
+                conn, site=site, company_id=company_id, extraction=extraction,
+                extraction_key=extraction_key, date=date,
+                deadline=_xday_deadline(remaining_ms))
+        if request is None:
+            return
+        request["mode"] = CROSS_DAY_CONTINUITY
+        stage = "emit"
+        continuity_xday_request.emit(s3(), S3_BUCKET, request)
+    except Exception as e:  # noqa: BLE001 -- never fails the write (X10)
+        logger.warning("xday request failed: stage=%s key=%s error=%s", stage,
+                       extraction_key, type(e).__name__)
+
+
+def write_extraction_items(date, user_folder, extraction_key, remaining_ms=None):
+    # `remaining_ms`: the Lambda context's get_remaining_time_in_millis (None outside a
+    # Lambda); it only bounds the cross-day continuity build at the end.
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
 
@@ -1999,6 +2294,20 @@ def write_extraction_items(date, user_folder, extraction_key):
                    site_id=(site or {}).get("id"),
                    home_company_id=company["id"], recorder_user_id=user_id)
 
+    # Cross-day continuity, hop 1 (spec 2026-11-09 X2/X3), LAST: after the commit, on a fresh
+    # read with no lock held (the stable_ids are final once committed), bounded by the time the
+    # invocation has left, so it can never cost the pass or the post-commit steps above.
+    if CROSS_DAY_CONTINUITY in _XDAY_MODES:
+        if extraction.get("tier") != "final":
+            logger.info("xday request skipped: not_final key=%s tier=%s", extraction_key,
+                        extraction.get("tier"))
+        elif extraction.get("incomplete"):
+            logger.info("xday request skipped: incomplete key=%s", extraction_key)
+        else:
+            _emit_xday_request(site=site, company_id=owner_company_id, extraction=extraction,
+                               extraction_key=extraction_key, date=date,
+                               remaining_ms=remaining_ms)
+
     return {"skipped": False, "topics": topics_n,
             **({"reason": placeholder_kept} if placeholder_kept else {})}
 
@@ -2212,7 +2521,10 @@ def lambda_handler(event, context):
         pipeline_trace.begin("item-writer", user_folder=user_folder, date=date,
                              session=session_base)
         try:
-            results.append(write_extraction_items(date, user_folder, key))
+            # the invocation's remaining time bounds the cross-day build (only when known)
+            remaining = getattr(context, "get_remaining_time_in_millis", None)
+            results.append(write_extraction_items(date, user_folder, key, **(
+                {"remaining_ms": remaining} if remaining is not None else {})))
         finally:
             pipeline_trace.flush(s3, S3_BUCKET)
     return {"results": results}

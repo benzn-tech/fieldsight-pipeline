@@ -320,6 +320,8 @@ IMPORTS_BUT_NEVER_WRITES = {
                             "(its only S3 write is web snapshots, recorded by org-api)"),
     "ApiFunction": "imports ask_voice_turn for its turn-store helpers only",
     "MatcherFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
+    "ContinuityXdayLinkerFunction": ("imports pipeline_trace via llm_usage; never flushes a "
+                                     "trace (writes nothing to S3: its result rides the invoke)"),
     "SessionActivityFunction": "imports helpers; calls none of the writers",
     "RecordingSegmentsFunction": "reads transcripts only; its own test forbids PutObject",
     "SpeakerEmbedFunction": "reads a raw window via batch_seal; never seals",

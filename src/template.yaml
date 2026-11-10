@@ -1316,6 +1316,16 @@ Parameters:
       second, thinking-off call states which new item continues which. Needs DeclareContinuity.
       Live passes unchanged. Off = today's final pass byte-for-byte.
 
+  CrossDayContinuity:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'shadow', 'on']
+    Description: >-
+      Spec 2026-11-09 (cross-day continuity): after a session's complete final pass, the item
+      writer builds a request of earlier same-site items that today's items may continue and puts
+      it to continuity_xday_requests/ after the commit. shadow = that request only (no model call,
+      no DB write); on = all hops. Off = no extra SQL, nothing put.
+
   StatusEvidenceFloorTokens:
     Type: Number
     Default: 5
@@ -5143,6 +5153,8 @@ Resources:
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
+          # Cross-day item continuity hop 1 (spec 2026-11-09 X1): off | shadow | on.
+          CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity
           # Cross-session status reconcile R0: post-commit reconcile_requests/ artifact
           # (lambda_item_writer.RECONCILE_STATUS); the cap is find_items' limit.
           RECONCILE_STATUS: !Ref ReconcileStatus
@@ -5196,6 +5208,11 @@ Resources:
               # above). Its own PutObject grant, gated to the disjoint prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
+              # Cross-day continuity (spec 2026-11-09 X3): post-commit request artifact for the
+              # non-VPC cross-day linker's S3 trigger (in-VPC, so S3 not invoke, BUG-36).
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/continuity_xday_requests/*
             - Effect: Allow
               # Phase C multi-device merge: once the merged topics are durable,
               # every member is told to look at them. Enqueued HERE and not by
@@ -5596,6 +5613,101 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
         - VPCAccessPolicy: {}
+
+  # Cross-day item continuity hop 3 (spec 2026-11-09 X3/X8/X9): in-VPC link writer, invoked
+  # RequestResponse by the non-VPC cross-day linker (hop 2) with its judged links + claims;
+  # re-checks each link and writes `continues` event_links + decision_records in one
+  # transaction. Same VPC/secret/layer shape as SuggestionWriterFunction. NO Events: it is
+  # only ever invoked directly.
+  ContinuityLinkWriterFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-continuity-link-writer", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_continuity_link_writer.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
+  # Cross-day item continuity hop 2 (spec 2026-11-09 X3/X6/X7/X9): non-VPC linker,
+  # S3-triggered on continuity_xday_requests/*.json (wired by scripts/wire-s3-events.sh,
+  # BUG-33 -- NO Events here). Calls the stage's extraction model once (thinking off), runs
+  # continuity_xday.judge, then invokes ContinuityLinkWriterFunction RequestResponse, raising
+  # on FunctionError so the S3 retry is fail-closed. Idle unless BOTH CROSS_DAY_CONTINUITY
+  # here AND the artifact's own `mode` are "on". NOT in VPC (it needs the model's public
+  # endpoint, BUG-36); NO PsycopgLayer (continuity_xday/item_continuity/llm_utils import no
+  # psycopg). Condition HasDb: its env/policy Ref the HasDb-only link writer.
+  ContinuityXdayLinkerFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-continuity-xday-linker", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_continuity_xday_linker.lambda_handler
+      # 600 = the model chain (LLM_CHAIN_BUDGET_SECONDS 420) + the writer's Timeout 120 +
+      # 60 margin. The handler also passes call_llm a deadline of remaining time minus 130s,
+      # so a slow chain cannot eat the writer's window.
+      Timeout: 600
+      MemorySize: 256
+      # A retry is a second paid model call (spec X3): one, not the default two.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 1
+      Environment:
+        Variables:
+          # continuity_xday_requests/ lands in the lake bucket the item writer puts to.
+          S3_BUCKET: !Ref IngestBucketName
+          LINK_WRITER_FUNCTION: !Ref ContinuityLinkWriterFunction
+          # Spec X1: off | shadow | on; this function acts only on "on".
+          CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity
+          # XdayLinks EMF dimension (Ruling R22: without it, Stage=unknown).
+          STAGE: !Ref Stage
+          # The stage's deployed extraction model -- same block as MatcherFunction /
+          # ExtractSessionFunction; the call is thinking-off, so QWEN_MODEL_NONTHINKING
+          # decides the model actually reached.
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-5-5
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '420'  # Timeout 600 - the writer's 120 - 60: the chain stops starting attempts while the writer still fits
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ContinuityLinkWriterFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/continuity_xday_requests/*
+            - Effect: Allow
+              # Without ListBucket S3 answers a missing key with 403 AccessDenied, not 404.
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - continuity_xday_requests/*
 
   # ----------------------------------------------------------
   # Lambda 18: Programme Matcher (Programme<->Item feedback, Task 3) —

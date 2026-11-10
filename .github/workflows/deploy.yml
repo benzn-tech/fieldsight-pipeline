@@ -441,6 +441,7 @@ jobs:
               "StatusSuggestions=${{ vars.TEST_STATUS_SUGGESTIONS || 'false' }}" \
               "ReconcileStatus=${{ vars.TEST_RECONCILE_STATUS || 'false' }}" \
               "ContinuityLinker=${{ vars.TEST_CONTINUITY_LINKER || 'false' }}" \
+              "CrossDayContinuity=${{ vars.TEST_CROSS_DAY_CONTINUITY || 'off' }}" \
               "StatusEvidenceFloorTokens=${{ vars.TEST_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "ReportLocationsSection=${{ vars.TEST_REPORT_LOCATIONS_SECTION || 'true' }}" \

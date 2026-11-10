@@ -59,6 +59,8 @@ SYNC_CALLEES = [
     # internal tasks and its records/items tool hops.
     ("ActionAgentFunction", "OrgApiFunction"),
     ("ActionAgentFunction", "RagSearchFunction"),
+    # Cross-day continuity (spec 2026-11-09 X3): hop 2 -> hop 3.
+    ("ContinuityXdayLinkerFunction", "ContinuityLinkWriterFunction"),
 ]
 
 _RATE_UNIT_SECONDS = {"minute": 60, "minutes": 60, "hour": 3600, "hours": 3600,
