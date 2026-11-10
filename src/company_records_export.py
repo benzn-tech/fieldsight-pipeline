@@ -289,6 +289,8 @@ NOT_EXPORTED = (
     ("topic_threads", "recurring-item threads across topics"),
     ("topic_thread_suggestions", "suggested links of topics to recurring-item threads"),
     ("action_status_suggestions", "suggested action item status changes awaiting review"),
+    ("status_pick_cards", "spoken status changes that could refer to several action items, "
+                          "awaiting a person's pick"),
     ("action_task_numbers", "the per-site task numbers (#N) shown for action items"),
     ("action_packs", "action agent runs (instruction, reading, conclusion, run state)"),
     ("action_pack_sources", "the records, documents and web pages an action agent run cited"),

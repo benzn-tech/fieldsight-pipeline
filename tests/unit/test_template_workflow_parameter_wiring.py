@@ -82,6 +82,10 @@ UNWIRED_BY_DESIGN = {
     # The data bucket lives in the prod account and its policy is owned there;
     # the test stack must never try to manage it.
     "ManageDataBucketPolicy": {"test"},
+    # Cross-session status reconcile R0 (plan 2026-11-10) is TEST-only: the plan has no
+    # prod flag, so prod holds the template default ('false'). Turning it on in prod means
+    # adding the deploy-prod.yml override line and deleting this entry, together.
+    "ReconcileStatus": {"prod"},
 }
 
 
@@ -1426,3 +1430,11 @@ def test_every_run_block_fits_githubs_expression_limit(env_name):
                     f"{env_name}:{job_name}:{step.get('name')} run is {len(run)} chars; move "
                     "comments out of `run:` (YAML comments above it) or the workflow stops "
                     "loading")
+
+
+def test_the_status_reconcile_switch_is_wired_in_test():
+    """The R0 rollout is "set TEST_RECONCILE_STATUS and redeploy"; `|| 'false'` makes an
+    unset variable deploy off rather than keep a stale value (SAM reuses the previous one)."""
+    assert "ReconcileStatus" in _overrides(WORKFLOWS["test"])
+    assert ("\"ReconcileStatus=${{ vars.TEST_RECONCILE_STATUS || 'false' }}\""
+            in _raw_override_lines(WORKFLOWS["test"]))

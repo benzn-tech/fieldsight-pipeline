@@ -40,6 +40,8 @@ _SITE_OR_COMPANY = [
     ("voice",       rf"^voice/(?P<company_id>{_UUID})/(?P<site_id>{_UUID})/[^/]+$"),
     ("voiceprint",  rf"^voiceprint_requests/(?P<company_id>{_UUID})/(?P<base>[^/]+)/[^/]+$"),
     ("match",       rf"^match_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
+    # The status-reconcile request (reconcile_request.emit): the same site/day shape as match.
+    ("reconcile",   rf"^reconcile_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
     # weather/ and programmes/ carry a site uuid, or the site slug as a fallback
     ("weather",     rf"^weather/(?P<site_ref>[^/]+)/{_DATE}/[^/]+$"),
     ("programme",   r"^programmes/(?P<site_ref>[^/]+)/[^/]+$"),
