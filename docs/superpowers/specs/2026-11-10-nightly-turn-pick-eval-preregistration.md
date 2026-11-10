@@ -59,15 +59,18 @@ whether J2 may run `on` anywhere, and whether it may write cross-language links.
   covers this model only, and a fallback model's picks are not covered by it.
 - **Failed call:** a call that ends in `refusal` or `max_tokens`, whose answer fails
   `parse_answer`, or that errors after the SDK's retries. Its items count as not linked (for
-  coverage) and are reported by count. They are not `abstained`.
+  coverage) and are reported by count. They are not `abstained`. An authentication, permission or
+  not-found error (401 / 403 / 404) is a setup error, not an outcome. It aborts the run without
+  recording that (session, rep), and the run resumes after the fix.
 - **Prompt:** `nightly_turn_pick.INSTRUCTION`, hashed into `PROMPT_HASH`. Item text and turn text
   are fenced as quoted data. Every run records `PROMPT_HASH`.
 - **Reps:** 3 per session per run.
-- **Calls:** one per session per rep. A session with no eligible item (every item `no_window`) makes
-  no call. `run.py --dry-run` prints the exact counts.
-  - Expected: about 30×3 + 29×3 = 177, plus at most 2 fit wording revisions of 1 rep each (about 30
-    calls each).
-  - Ceiling: 237 calls.
+- **Calls:** one per session per rep. A session with no eligible item makes no call. `run.py
+  --dry-run` prints the exact counts.
+  - Dry-run on the set (2026-11-10, before any call): fit 24 sessions with items (6 have zero
+    items) → 72 calls; held-out 26 (3 have zero items) → 78 calls. Base: 150 calls.
+  - Plus at most 2 fit wording revisions of 1 rep each (24 calls each).
+  - Ceiling: 198 calls.
   - The count goes to the owner first. No paid call is made before the owner approves it.
 - **Crashes:** an interrupted run resumes only the (session, rep) pairs that have no recorded row.
   A recorded outcome, a failed call included, is never re-called. A run is never voided or re-run
