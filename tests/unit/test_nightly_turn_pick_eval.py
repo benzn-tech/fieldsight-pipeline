@@ -464,6 +464,12 @@ def test_bar3a_flags_exported_and_answers_read(env, monkeypatch):
     assert a["outcome"] == "accepted" and a["cross_language"] is True and a["lang"] == "zh"
     s = _score(env, "fit0")
     assert s["bars"]["bar3"]["verdict"] == PEND and s["provisional"] is True
+    # 1 cross-language link per rep: bar 2 insufficient -> cross-language off, re-judged.
+    assert s["bars"]["bar2"]["verdict"] == I and s["allow_cross_language"] is False
+    assert s["bars_cross_off"]["bar3"]["verdict"] == P
+    cov, off = s["reported"]["coverage"], s["reported"]["coverage_cross_off"]
+    assert (cov["overall"]["min"], off["overall"]["min"]) == (0.5, 0.25)
+    assert cov["mixed"]["min"] == 0.25 and off["mixed"]["min"] == 0
     flags = store.read_jsonl(env.runs / "fit0" / "flags.owner.jsonl")
     fid = f"{REF_A}:0:action_items:0|0"
     assert [f["flag_id"] for f in flags] == [fid]
@@ -476,3 +482,34 @@ def test_bar3a_flags_exported_and_answers_read(env, monkeypatch):
     assert s["bars"]["bar3"]["verdict"] == P
     done.write_text(json.dumps({"flag_id": fid, "confirmed": True}) + "\n", encoding="utf-8")
     assert _score(env, "fit0")["bars"]["bar3"]["verdict"] == F
+
+
+def test_bar3_by_gold_and_pairs_from_a_real_twin_pair():
+    turns = [_turn(1, "pour slab level 3 now", "S1"), _turn(2, "pour slab level 4 now", "S2"),
+             _turn(3, "ok thanks", "S1")]
+    sess = {"base": "b", "date": "2026-11-10", "folder": "synthetic", "ref": REF_A,
+            "split": "fit", "turns": turns,
+            "topics": [{"time_range": "10:00-10:05",
+                        "action_items": [{"action": "pour slab level 3"},
+                                         {"action": "pour slab level 4"}],
+                        "findings": [], "decisions": [], "questions": []}]}
+    r3, r4 = f"{REF_A}:0:action_items:0", f"{REF_A}:0:action_items:1"
+    gold = {r3: {"label": "turn", "turns": [0]}, r4: {"label": "turn", "turns": [1]}}
+    ctx = score.Ctx([sess], gold, {})
+    assert ctx.twins == {r3: {r4}, r4: {r3}}
+
+    def row(ref, outcome, turn_index, cross=False):
+        return {"item_ref": ref, "session": REF_A, "outcome": outcome,
+                "turn_index": turn_index, "cross_language": cross}
+
+    # Both twins accepted on one turn: one pair; r4 sits on r3's gold turn and is wrong.
+    _b1, _b2, b3 = score.judge_rep([row(r3, "accepted", 0), row(r4, "accepted", 0)], ctx, True)
+    assert (b3["pairs"], b3["by_gold"], b3["verdict"]) == (1, 1, F)
+    # One twin accepted on its twin's gold turn.
+    _b1, _b2, b3 = score.judge_rep([row(r3, "accepted", 1), row(r4, "abstained", None)],
+                                   ctx, True)
+    assert (b3["pairs"], b3["by_gold"]) == (0, 1)
+    # Cross-language links counted as not linked when cross-language is off.
+    rows = [row(r3, "accepted", 0, True), row(r4, "accepted", 0, True)]
+    _b1, _b2, b3 = score.judge_rep(rows, ctx, False)
+    assert (b3["pairs"], b3["by_gold"], b3["verdict"]) == (0, 0, P)
