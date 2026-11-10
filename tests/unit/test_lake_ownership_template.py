@@ -316,6 +316,8 @@ LAKE_PUT_CALLERS = {
 IMPORTS_BUT_NEVER_WRITES = {
     "AskAgentFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
     "AskVoiceWorkerFunction": "runs AskAgent's code path; never flushes a trace",
+    "ActionAgentFunction": ("imports pipeline_trace via llm_usage; never flushes a trace "
+                            "(its only S3 write is web snapshots, recorded by org-api)"),
     "ApiFunction": "imports ask_voice_turn for its turn-store helpers only",
     "MatcherFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
     "SessionActivityFunction": "imports helpers; calls none of the writers",

@@ -31,6 +31,26 @@ def append_content_edit(conn, company_id, table_name, row_id, field,
     ).fetchone()
 
 
+def count_item_edits_after(conn, stable_id, since) -> int:
+    """How many content_edits rows touch the action item `stable_id` after `since` -- on ANY
+    row of its carried_from chain (action packs spec §14 S11): a person's edit can sit on an
+    earlier pass's row of the same item. The chain is every row carrying this stable_id plus
+    each row reached through carried_from (so a predecessor whose own stable_id is gone, or
+    whose row was deleted -- content_edits has no FK -- still counts). Any actor counts: a
+    person, or another applier's pack."""
+    return conn.execute(
+        "WITH RECURSIVE chain(id, carried_from) AS ("
+        "  SELECT id, carried_from FROM action_items WHERE stable_id = %s"
+        "  UNION"
+        "  SELECT a.id, a.carried_from FROM action_items a JOIN chain c ON a.id = c.carried_from"
+        ") SELECT count(*) FROM content_edits ce "
+        "WHERE ce.table_name = 'action_items' AND ce.created_at > %s "
+        "AND (ce.row_id IN (SELECT id FROM chain) "
+        "     OR ce.row_id IN (SELECT carried_from FROM chain WHERE carried_from IS NOT NULL))",
+        (stable_id, since),
+    ).fetchone()[0]
+
+
 def list_content_edits(conn, company_id, table_name, row_id):
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS_QUALIFIED}, "

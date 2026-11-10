@@ -1347,3 +1347,82 @@ def test_both_workflows_pass_the_rerank_tunables():
         for _, (param, _) in _RERANK_TUNABLES.items():
             assert f"{param}=" in wf, \
                 f"{env_name} does not pass {param}; the Parameter holds its default forever"
+
+
+# ---- action packs (spec 2026-11-01 §14 S16) ------------------------------------
+
+
+@pytest.mark.parametrize("env_name", ["prod", "test"])
+def test_both_workflows_pass_action_packs_only_when_their_variable_is_set(env_name):
+    """Reachable from a repo variable, never as a bare `ActionPacks=` (SAM exits 2 on it),
+    and an unset variable keeps the template Default 'off' on both stacks."""
+    wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+    var = f"{env_name.upper()}_ACTION_PACKS"
+    assert re.search(r'ACTION_PACKS_PARAM=""\s+if \[ -n "\$\{\{ vars\.%s \}\}" \]; then\s+'
+                     r'ACTION_PACKS_PARAM="ActionPacks=\$\{\{ vars\.%s \}\}"\s+fi' % (var, var),
+                     wf)
+    assert "$ACTION_PACKS_PARAM \\" in _raw_override_lines(WORKFLOWS[env_name])
+    assert not re.search(r'^\s+"ActionPacks=', wf, re.M)
+    other = "TEST_ACTION_PACKS" if env_name == "prod" else "PROD_ACTION_PACKS"
+    assert other not in wf, f"{env_name} must not read the other stage's switch"
+    assert _template()["Parameters"]["ActionPacks"]["Default"] == "off"
+
+
+def test_the_action_packs_switch_reaches_org_api_and_the_agent():
+    """The middle segment, for both readers: the routes/internal tasks and the worker."""
+    for fn in ("OrgApiFunction", "ActionAgentFunction"):
+        assert "ACTION_PACKS: !Ref ActionPacks" in _env_text(fn), fn
+
+
+# ---- action packs: the verifier model is a deploy-time choice -----------------------------
+
+@pytest.mark.parametrize("parameter,var,shell", [
+    ("ActionVerifierModel", "ACTION_VERIFIER_MODEL", "ACTION_VERIFIER_MODEL_PARAM"),
+    ("ActionVerifierFallbacks", "ACTION_VERIFIER_FALLBACKS", "ACTION_VERIFIER_FALLBACKS_PARAM"),
+    # PR-1 (spec 2026-11-05 §8.2): the writer's own settings and the hide switch.
+    ("ActionWriterModel", "ACTION_WRITER_MODEL", "ACTION_WRITER_MODEL_PARAM"),
+    ("ActionWriterReasoning", "ACTION_WRITER_REASONING", "ACTION_WRITER_REASONING_PARAM"),
+    ("ActionWriterProvider", "ACTION_WRITER_PROVIDER", "ACTION_WRITER_PROVIDER_PARAM"),
+    ("ActionWriterFallbacks", "ACTION_WRITER_FALLBACKS", "ACTION_WRITER_FALLBACKS_PARAM"),
+    ("ActionVerifierHideUnsupported", "ACTION_VERIFIER_HIDE_UNSUPPORTED",
+     "ACTION_VERIFIER_HIDE_UNSUPPORTED_PARAM"),
+    # PR-3 (spec 2026-11-05 §11): the gather-round latency knob.
+    ("ActionMaxRounds", "ACTION_MAX_ROUNDS", "ACTION_MAX_ROUNDS_PARAM"),
+])
+def test_the_action_verifier_is_settable_from_a_repo_variable(parameter, var, shell):
+    """Spec 2026-11-01 §14 S6: the verifier must be a different family from the writer. On a
+    stage whose Ask judge is the cheap model's family every pack fails `model` until the
+    verifier is changed -- which must be a repo variable and a redeploy, not a template edit.
+    Optional (empty = the cheap model in code), so it uses the bare-Key guard: appended only
+    when the repo variable is non-empty."""
+    for env, path in WORKFLOWS.items():
+        text = open(path, encoding="utf-8").read()
+        prefix = env.upper()
+        assert f'if [ -n "${{{{ vars.{prefix}_{var} }}}}" ]; then' in text, env
+        assert f'{shell}="{parameter}=${{{{ vars.{prefix}_{var} }}}}"' in text, env
+        # One continuation line of its own: two `$X` on one line still pass the check
+        # above, and a lost `\` would end the parameter list early.
+        assert f"${shell} \\" in _raw_override_lines(path).splitlines(), env
+
+
+# ---- GitHub's template limit ---------------------------------------------------------------
+
+# GitHub evaluates a `run:` string that contains `${{ }}` as one expression, capped at 21,000
+# characters. Over it the workflow does not load at all ("workflow file issue", a 0 s failed
+# run on every push), so the deploy silently never starts. PR-1 of the action-pack fixes hit
+# it on deploy.yml at 21,127. The margin leaves room for the next few parameters.
+GITHUB_EXPRESSION_MAX = 21000
+
+
+@pytest.mark.parametrize("env_name", ["prod", "test"])
+def test_every_run_block_fits_githubs_expression_limit(env_name):
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load(open(WORKFLOWS[env_name], encoding="utf-8"))
+    for job_name, job in wf["jobs"].items():
+        for step in job.get("steps") or []:
+            run = step.get("run") or ""
+            if "${{" in run:
+                assert len(run) < GITHUB_EXPRESSION_MAX - 500, (
+                    f"{env_name}:{job_name}:{step.get('name')} run is {len(run)} chars; move "
+                    "comments out of `run:` (YAML comments above it) or the workflow stops "
+                    "loading")

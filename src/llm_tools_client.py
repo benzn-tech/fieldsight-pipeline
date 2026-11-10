@@ -37,6 +37,11 @@ Rules that shape the code below:
   Unset means no `provider` / `reasoning` key, the payload as before.
 - **Deadline** is an absolute `time.monotonic()` value, the convention the Ask
   agent already uses. Under one second left means no call at all.
+- **Claude ids never go to OpenRouter** (owner rule 2026-11-04). A chain entry that
+  is `claude-*` or `anthropic/*` is sent to the Anthropic Messages API with
+  `ANTHROPIC_API_KEY` (unset = an error, no OpenRouter fallback), converted to and
+  from the OpenAI shape callers use; `anthropic/claude-opus-5.5` is sent as
+  `claude-opus-5-5`. Other entries keep going to OpenRouter. A 529 counts as a 5xx.
 - **Logging** carries caller, model, tool names, token usage and ms. Never
   message, argument or answer text: those are customer conversation data.
 """
@@ -45,6 +50,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -87,6 +93,12 @@ class ChatTurn:
     error: str | None = None
     timed_out: bool = False
     bad_args: list = field(default_factory=list)
+    # complete_json only: the chain entry that answered (`model` is the vendor's id).
+    requested_model: str = ""
+    # The vendor's stop cause: OpenRouter's `choices[0].finish_reason` as given, or
+    # Anthropic's `stop_reason` with `max_tokens` mapped to `length`, so one check
+    # `finish_reason == "length"` means "cut off by the token limit" on either route.
+    finish_reason: str = ""
 
 
 def _primary_model():
@@ -104,8 +116,8 @@ def _provider_pin():
 
 
 def _reasoning():
-    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, low, medium or
-    high; anything else (after a warning) and unset mean no key at all.
+    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, minimal, low, medium,
+    high, xhigh or max; anything else (after a warning) and unset mean no key at all.
 
     No model is passed, on purpose: the judge's `off` reaches the wire as
     `{"enabled": false}` whatever the judge model is, as it always has."""
@@ -125,6 +137,259 @@ def _model_chain(primary):
         if m and m not in chain:
             chain.append(m)
     return chain
+
+
+# ---- Claude models: api.anthropic.com only, never OpenRouter (owner rule 2026-11-04) ----
+
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+
+# complete_json on Anthropic: no response_format json_object there, and an assistant
+# prefill is a 400 on every 4.6+ model. A system instruction asks; the callers' own
+# parsers (fence / brace slice) still read what comes back, as they do for OpenRouter.
+JSON_SYSTEM = ("Reply with exactly one JSON object and nothing else: no prose before or "
+               "after it, no code fence.")
+
+# Anthropic tool_use ids must match ^[a-zA-Z0-9_-]+$. The same mapping is applied to
+# the assistant's tool_use id and the tool message's tool_call_id, so pairs still match.
+_TOOL_ID_BAD = re.compile(r"[^A-Za-z0-9_-]")
+
+# A tool call written into visible text instead of a tool_use block: the call never
+# runs and nothing errors (memory: anthropic-tooluse-silent-shapes). Markup markers...
+_TEXT_TOOL_MARKUP = re.compile(
+    r"<\s*/?\s*(?:antml:)?(?:function_calls|invoke|tool_use|tool_call)\b", re.I)
+
+_CLAUDE_MAJOR = re.compile(r"^claude-[a-z]+-(\d+)")
+
+
+def is_claude(model_id):
+    """A Claude model id: bare `claude-*` or OpenRouter-style `anthropic/*`."""
+    if not isinstance(model_id, str):
+        return False
+    mid = model_id.strip().lower()
+    return mid.startswith("claude-") or mid.startswith("anthropic/")
+
+
+def native_claude_id(model_id):
+    """The Anthropic API id for a Claude id: `anthropic/claude-opus-5.5` ->
+    `claude-opus-5-5`; a bare id passes through (lower-cased, dots to dashes)."""
+    mid = model_id.strip()
+    if "/" in mid:
+        mid = mid.split("/", 1)[1]
+    mid = mid.split(":", 1)[0]              # OpenRouter variants such as ":beta"
+    return mid.replace(".", "-").lower()
+
+
+def _anthropic_key():
+    """Read per call, so a test or an env change takes effect without a reload."""
+    return os.environ.get("ANTHROPIC_API_KEY") or ""
+
+
+def _thinks_by_default(native):
+    """Claude 5.x and later think when `thinking` is omitted (and Opus 5.5 cannot turn
+    it off). Forced tool use (`any` / `tool`) is rejected with thinking on, and on Opus
+    5.5 / Sonnet 5.5 / Fable 5.1 outright, so those models are only ever sent `auto`."""
+    m = _CLAUDE_MAJOR.match(native or "")
+    return bool(m) and int(m.group(1)) >= 5
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p["text"] for p in content
+                         if isinstance(p, dict) and p.get("type") == "text"
+                         and isinstance(p.get("text"), str))
+    return ""
+
+
+def _tool_id(cid):
+    return _TOOL_ID_BAD.sub("_", str(cid or "")) or "call"
+
+
+def _to_anthropic_messages(messages):
+    """OpenAI-shape messages -> (system text, Anthropic messages).
+
+    System messages go to the top-level `system`. An assistant turn becomes text (when
+    there is any) plus one `tool_use` block per tool call, its JSON-string arguments
+    parsed into `input`. Each `tool` message becomes a `tool_result` block, and
+    consecutive same-role turns are merged so the N results after one assistant turn
+    arrive in ONE user message (results first, any following user text after them).
+    No thinking blocks are replayed: ChatTurn carries none, and a history without
+    them is the documented no-replay shape."""
+    system, out = [], []
+
+    def push(role, blocks):
+        if not blocks:
+            return
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": list(blocks)})
+
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        text = _text_of(m.get("content"))
+        if role == "system":
+            if text.strip():
+                system.append(text)
+        elif role == "user":
+            if text.strip():
+                push("user", [{"type": "text", "text": text}])
+        elif role == "assistant":
+            blocks = [{"type": "text", "text": text}] if text.strip() else []
+            for call in m.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = None
+                blocks.append({"type": "tool_use", "id": _tool_id(call.get("id")),
+                               "name": fn.get("name") or "unknown",
+                               "input": args if isinstance(args, dict) else {}})
+            push("assistant", blocks)
+        elif role == "tool":
+            push("user", [{"type": "tool_result",
+                           "tool_use_id": _tool_id(m.get("tool_call_id")),
+                           "content": text}])
+    return "\n\n".join(system), out
+
+
+def _to_anthropic_tools(tools):
+    out = []
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        spec = {"name": fn["name"],
+                "input_schema": fn.get("parameters") or {"type": "object",
+                                                         "properties": {}}}
+        if fn.get("description"):
+            spec["description"] = fn["description"]
+        out.append(spec)
+    return out
+
+
+def _anthropic_choice(choice, tools, native):
+    """OpenAI tool_choice -> (Anthropic tool_choice, the OpenAI tools to offer).
+
+    "auto" -> auto, "none" -> none. "required" -> `any` and a forced function ->
+    `{"type": "tool"}` only on a model that does not think by default; on 5.x they
+    become `auto`, a forced function offering ONLY that tool (as `_auto_only` does)."""
+    if choice == "none":
+        return {"type": "none"}, tools
+    if _thinks_by_default(native):
+        if isinstance(choice, dict):
+            _, tools = _auto_only(choice, tools)
+        return {"type": "auto"}, tools
+    if choice == "required":
+        return {"type": "any"}, tools
+    if isinstance(choice, dict):
+        name = (choice.get("function") or {}).get("name")
+        if name:
+            return {"type": "tool", "name": name}, tools
+    return {"type": "auto"}, tools
+
+
+def _anthropic_payload(native, messages, tools, choice, max_tokens, json_mode=False):
+    """The Messages API body. Never carries OpenRouter's `provider` / `reasoning` /
+    `response_format`, nor `thinking` (5.x default adaptive; disabling it makes Opus
+    write tool calls into text) nor `output_config.effort` (Haiku 4.5 400s on it; the
+    model's own default applies). `max_tokens` keeps the reasoning headroom: thinking
+    tokens count against it, as reasoning does on OpenRouter."""
+    system, msgs = _to_anthropic_messages(messages)
+    if json_mode:
+        system = (system + "\n\n" + JSON_SYSTEM) if system else JSON_SYSTEM
+    payload = {"model": native,
+               "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS,
+               "messages": msgs}
+    if system:
+        payload["system"] = system
+    if tools:
+        wire_choice, offered = _anthropic_choice(choice, tools, native)
+        a_tools = _to_anthropic_tools(offered)
+        if a_tools:
+            payload["tools"] = a_tools
+            payload["tool_choice"] = wire_choice
+    return payload
+
+
+def _anthropic_headers(key):
+    return {"Content-Type": "application/json", "x-api-key": key,
+            "anthropic-version": ANTHROPIC_VERSION}
+
+
+def _anthropic_usage(raw):
+    """Anthropic usage -> the OpenAI keys the rest of the code reads. `prompt_tokens`
+    is the whole prompt (input + cache read + cache write), as OpenAI counts it."""
+    if not isinstance(raw, dict):
+        return {}
+
+    def num(k):
+        v = raw.get(k)
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    inp, out = num("input_tokens"), num("output_tokens")
+    read, write = num("cache_read_input_tokens"), num("cache_creation_input_tokens")
+    usage = {"prompt_tokens": (None if inp is None else inp + (read or 0) + (write or 0)),
+             "completion_tokens": out}
+    if read is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": read}
+    if write is not None:
+        usage["cache_creation_input_tokens"] = write
+    return usage
+
+
+def _tool_call_in_text(text, offered_names):
+    if _TEXT_TOOL_MARKUP.search(text):
+        return True
+    for name in offered_names:
+        n = re.escape(name)
+        if (re.search(r'"name"\s*:\s*"' + n + '"', text)
+                or re.search(r"\b" + n + r"\s*\(\s*\{", text)):
+            return True
+    return False
+
+
+def _parse_anthropic(data, model, offered_names=()):
+    """Read one Messages API response into a ChatTurn (thinking blocks ignored)."""
+    blocks = data.get("content") or []
+    if not isinstance(blocks, list):
+        blocks = []
+    texts, tool_calls, bad_args = [], [], []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text" and isinstance(b.get("text"), str):
+            texts.append(b["text"])
+        elif b.get("type") == "tool_use":
+            cid = b.get("id") or ""
+            args = b.get("input")
+            if not isinstance(args, dict):
+                args = {}
+                bad_args.append(cid)
+            tool_calls.append({"id": cid, "name": b.get("name") or "", "arguments": args})
+    stop = data.get("stop_reason")
+    turn = ChatTurn(tool_calls=tool_calls, text="".join(texts),
+                    usage=_anthropic_usage(data.get("usage")),
+                    model=data.get("model") or model, bad_args=bad_args,
+                    finish_reason=("length" if stop == "max_tokens"
+                                   else stop if isinstance(stop, str) else ""))
+    if stop == "refusal":
+        turn.error = "refusal"
+    elif stop == "max_tokens" and not tool_calls and not turn.text.strip():
+        turn.error = "max_tokens before any text"
+    elif (offered_names and not tool_calls and turn.text.strip()
+          and _tool_call_in_text(turn.text, offered_names)):
+        # Succeeding here would hand the loop an "answer" whose tool never ran.
+        turn.error = "tool call written as text"
+    return turn
 
 
 def _parse(data, model):
@@ -166,9 +431,11 @@ def _parse(data, model):
                            "arguments": parsed})
 
     usage = data.get("usage")
+    finish = choice.get("finish_reason")
     return ChatTurn(tool_calls=tool_calls, text=text,
                     usage=usage if isinstance(usage, dict) else {},
-                    model=data.get("model") or model, bad_args=bad_args)
+                    model=data.get("model") or model, bad_args=bad_args,
+                    finish_reason=finish if isinstance(finish, str) else "")
 
 
 def _error_detail(resp):
@@ -189,22 +456,22 @@ def _error_detail(resp):
         return ""
 
 
-def _log(turn, caller, elapsed, n_tools_offered):
+def _log(turn, caller, elapsed, n_tools_offered, provider="openrouter"):
     # Telemetry must never cost the caller its turn.
     try:
         usage = turn.usage or {}
         completion_detail = usage.get("completion_tokens_details") or {}
         prompt_detail = usage.get("prompt_tokens_details") or {}
-        log_usage("openrouter", turn.model, caller, elapsed,
+        log_usage(provider, turn.model, caller, elapsed,
                   prompt_tokens=usage.get("prompt_tokens"),
                   completion_tokens=usage.get("completion_tokens"),
                   reasoning_tokens=completion_detail.get("reasoning_tokens"),
                   cache_read_tokens=prompt_detail.get("cached_tokens"),
-                  cache_write_tokens=None)
+                  cache_write_tokens=usage.get("cache_creation_input_tokens"))
         # Names and counts only. Arguments and text are conversation data.
-        logger.info("LLM_TOOLS caller=%s model=%s tools_offered=%d "
+        logger.info("LLM_TOOLS provider=%s caller=%s model=%s tools_offered=%d "
                     "tool_calls=%s n_bad_args=%d text_chars=%d ms=%d",
-                    caller, turn.model, n_tools_offered,
+                    provider, caller, turn.model, n_tools_offered,
                     ",".join(c["name"] for c in turn.tool_calls) or "-",
                     len(turn.bad_args), len(turn.text), int(elapsed * 1000))
     except Exception:                         # noqa: BLE001
@@ -233,19 +500,23 @@ def chat(messages, tools, *, model=None, tool_choice="required",
     `max_tokens` is an ANSWER budget; `llm_utils.REASONING_HEADROOM_TOKENS` is
     added on the wire because reasoning tokens are completion tokens and are
     spent before the answer.
+
+    A Claude chain entry (`claude-*` / `anthropic/*`) is sent to api.anthropic.com
+    with ANTHROPIC_API_KEY, never to OpenRouter; with that key unset the call ends
+    with an error on that entry (no OpenRouter fallback, no next entry). Every other
+    entry goes to OpenRouter as before. The fallback rules are the same on both.
     """
-    key = corroboration_client.api_key()
-    if not key:
+    env_primary = _primary_model()
+    chain = _model_chain(model or env_primary)
+    if not any(is_claude(m) for m in chain) and not corroboration_client.api_key():
         logger.error("llm_tools: API key not set caller=%s", caller)
         return ChatTurn(error="API key not configured")
 
     if deadline is not None and deadline - _now() < MIN_TIME_LEFT:
         return ChatTurn(error="no time left", timed_out=True)
 
-    env_primary = _primary_model()
-    chain = _model_chain(model or env_primary)
     # Pin and reasoning belong to the configured judge model: never to a
-    # fallback, nor to a model a caller names in its place.
+    # fallback, nor to a model a caller names in its place. OpenRouter only.
     primary_extras = {}
     if chain[0] == env_primary:
         pin, reasoning = _provider_pin(), _reasoning()
@@ -253,8 +524,6 @@ def chat(messages, tools, *, model=None, tool_choice="required",
             primary_extras["provider"] = pin
         if reasoning:
             primary_extras["reasoning"] = reasoning
-    headers = {"Content-Type": "application/json",
-               "Authorization": "Bearer " + key}
     http = corroboration_client.http_session()
     started = _now()
     choice = tool_choice
@@ -277,19 +546,39 @@ def chat(messages, tools, *, model=None, tool_choice="required",
         if current in _AUTO_ONLY and choice != "auto":
             choice, tools = _auto_only(choice, tools)
             downgraded = True
-        payload = {
-            "model": current,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": choice,
-            "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS,
-        }
-        if idx == 0:
-            payload.update(primary_extras)
+        claude = is_claude(current)
+        if claude:
+            akey = _anthropic_key()
+            if not akey:
+                logger.error("llm_tools: ANTHROPIC_API_KEY not set caller=%s model=%s",
+                             caller, current)
+                return ChatTurn(error="ANTHROPIC_API_KEY not configured", model=current)
+            url, headers = ANTHROPIC_URL, _anthropic_headers(akey)
+            payload = _anthropic_payload(native_claude_id(current), messages, tools,
+                                         choice, max_tokens)
+        else:
+            key = corroboration_client.api_key()
+            if not key:
+                logger.error("llm_tools: API key not set caller=%s", caller)
+                return ChatTurn(error="API key not configured", model=current)
+            url = corroboration_client.API_URL
+            headers = {"Content-Type": "application/json",
+                       "Authorization": "Bearer " + key}
+            payload = {
+                "model": current,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": choice,
+                "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS,
+            }
+            if idx == 0:
+                payload.update(primary_extras)
+                # xhigh/max think past the default headroom (llm_utils).
+                payload["max_tokens"] = max_tokens + llm_utils.reasoning_headroom(
+                    primary_extras.get("reasoning"))
         attempt_start = _now()
         try:
-            resp = http.request("POST", corroboration_client.API_URL,
-                                body=json.dumps(payload), headers=headers,
+            resp = http.request("POST", url, body=json.dumps(payload), headers=headers,
                                 timeout=timeout)
         except Exception as e:                # noqa: BLE001 - all of it is a miss
             last_error = f"{type(e).__name__} on {current}"
@@ -309,11 +598,18 @@ def chat(messages, tools, *, model=None, tool_choice="required",
                 logger.warning("llm_tools: unreadable 200 caller=%s model=%s",
                                caller, current)
                 return ChatTurn(error="unreadable completion", model=current)
-            turn = _parse(data, current)
-            if not turn.tool_calls and not turn.text.strip():
+            if claude:
+                names = [(t.get("function") or {}).get("name") for t in tools or []
+                         if isinstance(t, dict)]
+                turn = _parse_anthropic(data, native_claude_id(current),
+                                        [n for n in names if n])
+            else:
+                turn = _parse(data, current)
+            if turn.error is None and not turn.tool_calls and not turn.text.strip():
                 # A 200 with nothing in it is a failure, not an empty answer.
                 turn.error = "empty completion"
-            _log(turn, caller, _now() - started, len(tools or []))
+            _log(turn, caller, _now() - started, len(tools or []),
+                 provider="anthropic" if claude else "openrouter")
             return turn
 
         message = _error_detail(resp)
@@ -336,3 +632,134 @@ def chat(messages, tools, *, model=None, tool_choice="required",
 
     return ChatTurn(error=last_error or "no response", timed_out=last_timed_out,
                     model=chain[min(idx, len(chain) - 1)])
+
+
+def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
+                  caller="ask_judge", attempt_timeout=None, judge_routing=True,
+                  chain=None, primary_extras=None) -> ChatTurn:
+    """One tool-less JSON answer routed exactly like the Ask judge: `model` (default the
+    judge model) then ASK_JUDGE_FALLBACKS (unset = none), the provider pin and reasoning on
+    the configured judge model only, a fallback on a 5xx, a 429 or a transport failure,
+    never on another 4xx. `response_format` json_object; no tools. Never raises for a
+    vendor failure. `deadline` is absolute on `_now()`; `attempt_timeout` (default
+    HTTP_TIMEOUT_CAP) caps one attempt. `turn.requested_model` is the chain entry that
+    answered, `turn.model` the vendor's served id. Added for the action agent (action
+    packs Task 11); `chat` is unchanged.
+
+    `judge_routing=False` (the action-pack verifier, Task 12): only `model`, no
+    ASK_JUDGE_FALLBACKS and never the judge's provider pin or reasoning -- the verifier
+    walks its own chain and checks each answer's family itself.
+
+    `chain` (the action-pack writer, PR-1): the whole chain, in order. `model`,
+    `judge_routing` and every ASK_JUDGE_* setting are then ignored. `primary_extras`
+    (e.g. `provider`, `reasoning`) goes on chain index 0 only, and never on a Claude
+    entry (the Claude API payload is built separately). `turn.finish_reason` is
+    recorded on every route.
+
+    A Claude entry goes to api.anthropic.com exactly as in `chat` (ANTHROPIC_API_KEY,
+    unset = an error, never OpenRouter), with a JSON-only system instruction in place
+    of `response_format`."""
+    explicit = chain is not None
+    if explicit:
+        chain = [m for m in chain if m]
+        if not chain:
+            return ChatTurn(error="no model configured")
+        env_primary = None
+    else:
+        env_primary = _primary_model()
+        chain = (_model_chain(model or env_primary) if judge_routing
+                 else [model or env_primary])
+    if not any(is_claude(m) for m in chain) and not corroboration_client.api_key():
+        logger.error("llm_tools: API key not set caller=%s", caller)
+        return ChatTurn(error="API key not configured")
+    if deadline is not None and deadline - _now() < MIN_TIME_LEFT:
+        return ChatTurn(error="no time left", timed_out=True)
+    if explicit:
+        primary_extras = dict(primary_extras or {})
+    else:
+        primary_extras = {}
+        if judge_routing and chain[0] == env_primary:
+            pin, reasoning = _provider_pin(), _reasoning()
+            if pin:
+                primary_extras["provider"] = pin
+            if reasoning:
+                primary_extras["reasoning"] = reasoning
+    http = corroboration_client.http_session()
+    cap = HTTP_TIMEOUT_CAP if attempt_timeout is None else float(attempt_timeout)
+    started = _now()
+    last_error, last_timed_out = None, False
+    for idx, current in enumerate(chain):
+        timeout = cap
+        if deadline is not None:
+            left = deadline - _now()
+            if left < MIN_TIME_LEFT:
+                return ChatTurn(error=f"deadline reached ({last_error})", timed_out=True,
+                                model=current, requested_model=current)
+            timeout = min(timeout, left)
+        claude = is_claude(current)
+        if claude:
+            akey = _anthropic_key()
+            if not akey:
+                logger.error("llm_tools json: ANTHROPIC_API_KEY not set caller=%s model=%s",
+                             caller, current)
+                return ChatTurn(error="ANTHROPIC_API_KEY not configured", model=current,
+                                requested_model="")
+            url, headers = ANTHROPIC_URL, _anthropic_headers(akey)
+            payload = _anthropic_payload(native_claude_id(current),
+                                         [{"role": "user", "content": prompt}],
+                                         None, None, max_tokens, json_mode=True)
+        else:
+            key = corroboration_client.api_key()
+            if not key:
+                logger.error("llm_tools: API key not set caller=%s", caller)
+                return ChatTurn(error="API key not configured", model=current,
+                                requested_model="")
+            url = corroboration_client.API_URL
+            headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
+            payload = {"model": current,
+                       "messages": [{"role": "user", "content": prompt}],
+                       "response_format": {"type": "json_object"},
+                       "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS}
+            if idx == 0:
+                payload.update(primary_extras)
+                # xhigh/max think past the default headroom (llm_utils).
+                payload["max_tokens"] = max_tokens + llm_utils.reasoning_headroom(
+                    primary_extras.get("reasoning"))
+        attempt_start = _now()
+        try:
+            resp = http.request("POST", url, body=json.dumps(payload), headers=headers,
+                                timeout=timeout)
+        except Exception as e:                # noqa: BLE001 - all of it is a miss
+            last_error = f"{type(e).__name__} on {current}"
+            last_timed_out = isinstance(e, urllib3.exceptions.TimeoutError)
+            logger.warning("llm_tools json: %s caller=%s model=%s after %.2fs",
+                           type(e).__name__, caller, current, _now() - attempt_start)
+            continue
+        if resp.status == 200:
+            try:
+                data = json.loads(resp.data.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+            except Exception:                 # noqa: BLE001
+                return ChatTurn(error="unreadable completion", model=current,
+                                requested_model=current)
+            if claude:
+                turn = _parse_anthropic(data, native_claude_id(current))
+            else:
+                turn = _parse(data, current)
+            turn.requested_model = current
+            if turn.error is None and not turn.text.strip():
+                turn.error = "empty completion"
+            _log(turn, caller, _now() - started, 0,
+                 provider="anthropic" if claude else "openrouter")
+            return turn
+        message = _error_detail(resp)
+        last_error = f"HTTP {resp.status}: {message}" if message else f"HTTP {resp.status}"
+        last_timed_out = False
+        logger.warning("llm_tools json: HTTP %d caller=%s model=%s after %.2fs",
+                       resp.status, caller, current, _now() - attempt_start)
+        if 500 <= resp.status < 600 or resp.status == 429:
+            continue
+        break
+    return ChatTurn(error=last_error or "no response", timed_out=last_timed_out,
+                    model=chain[-1], requested_model="")

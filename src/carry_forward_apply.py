@@ -212,3 +212,30 @@ def _report_orphaned_human_edits(key, count, carried=None):
                 }))
     except Exception:
         logger.warning("could not emit the OrphanedHumanEdits metric for %s", key)
+
+
+def number_new_items(conn, new_topic_ids, site_id, key) -> int | None:
+    """Give this pass's new action items their task numbers (action packs, spec §14 D1), for
+    both write paths. Call it AFTER `_carry_forward_children`: a carried row has by then taken
+    its predecessor's stable_id, which already has a number, so only genuinely new
+    commitments are numbered and a re-extraction never burns numbers. Call it as the LAST
+    write of the pass: the per-site lock it takes is then held only for the commit, and is
+    the last lock taken (see repositories/action_items.py's lock-order note).
+
+    Never fatal, and never aborts the pass: action_items.assign_task_nos_for_topics runs in
+    its own SAVEPOINT, returns None before migration 0093 (sam deploy runs before migrate),
+    and any other failure is logged here; an item left unnumbered is picked up by
+    scripts/backfill_task_numbers.py. If carry-forward itself degraded, the fresh stable_ids
+    are numbered -- the same identity the rest of the pass now uses. Logs counts and keys only."""
+    if not new_topic_ids:
+        return 0
+    try:
+        n = action_items.assign_task_nos_for_topics(conn, new_topic_ids, site_id)
+    except Exception:  # noqa: BLE001 -- degrade, see above
+        logger.warning("task numbers not assigned for %s", key, exc_info=True)
+        return None
+    if n is None:
+        logger.info("task numbers: table not migrated yet, skipped for %s", key)
+    elif n:
+        logger.info("task numbers: %d assigned for %s", n, key)
+    return n

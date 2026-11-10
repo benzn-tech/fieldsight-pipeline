@@ -17,7 +17,6 @@ import uuid
 
 import psycopg
 import pytest
-from psycopg.rows import dict_row
 
 import checklist_reports
 import decision_hub
@@ -154,13 +153,8 @@ def _overdue_item(conn, site, text="Order the rebar", deadline=dt.date(2026, 11,
                   responsible="Mike"):
     t = topics.upsert_topic(conn, site["id"], DATE, f"T-{_tag()}",
                             source_s3_key=f"extractions/x/{DATE}/{_tag()}.json")
-    # release/* on main: action_items.insert_item (action packs) is not on main yet, so
-    # the seed writes the row itself with the same columns.
-    return conn.cursor(row_factory=dict_row).execute(
-        "INSERT INTO action_items (topic_id, site_id, text, responsible, deadline, "
-        "deadline_text, status) VALUES (%s,%s,%s,%s,%s,%s,'open') "
-        "RETURNING id, stable_id, topic_id, site_id, text, responsible, deadline, status",
-        (t["id"], site["id"], text, responsible, deadline, deadline)).fetchone()
+    return action_items.insert_item(conn, t["id"], site["id"], text,
+                                    responsible=responsible, deadline=deadline)
 
 
 def _queued(conn, co, site, **over):
