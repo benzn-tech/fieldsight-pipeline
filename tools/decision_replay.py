@@ -27,12 +27,18 @@ replay() contract
 * Pre-dispatch outcomes (late, unmatched, blocked, too_deep) are recomputed in the hub's
   order (blocked -> too_deep -> unmatched -> late -> dispatch) and compared one to one;
   done / nothing / merged / failed all mean "dispatched".
+* `merged` events are the hub's absorb path (_dispatch merges same-subject queued events
+  into the run without gating them): no pre-dispatch outcome is compared for them; they
+  must be in run_events and named by no card.
 * `blocked` is recomputed from the company's CURRENT companies.status (the status at
-  processing time is not stored). Any mismatch where the stored or the recomputed outcome
-  is 'blocked' is therefore returned with the prefix KNOWN_FALSE ("KNOWN_FALSE: ...") -- a
-  company suspended or reactivated since. This also means a real bug in the blocked gate
-  surfaces only as a KNOWN_FALSE line; real() drops them, the CLI prints them but does not
-  fail on them.
+  processing time is not stored). A mismatch where the stored or the recomputed outcome is
+  'blocked' gets the prefix KNOWN_FALSE ("KNOWN_FALSE: ...") only when
+  companies.status_changed_at (migration 0092, set by every status change) is later than
+  the event's last run start, or its received_at when it has no run; if the column is
+  missing, every such mismatch is KNOWN_FALSE. A blocked mismatch with no status change
+  since is a REAL finding. A real blocked-gate bug on a company whose status changed since
+  still surfaces only as a KNOWN_FALSE line; real() drops them, the CLI prints them but
+  does not fail on them.
 * Rule cards (rule_id != 'hub.fault'): every 'done' event whose run outcome is 'done' has
   exactly one card naming it, with card_key / kind / purpose / rule_id / subject_ref /
   tenant recomputed from the event; a 'done' event without a card needs a ledger decision
@@ -49,6 +55,11 @@ replay() contract
   'fault')), marked stopped (version > 1 or 'stopped' in the consequence) once >= STOP_AT;
   a 'failed' event has >= STOP_AT failed runs; every too_deep event's chain has exactly one
   'too_deep' card; every fault card points at such an event / chain.
+
+Consistency: judge(conn) runs replay() and invariants() in ONE transaction; the CLI's
+connection is REPEATABLE READ READ ONLY with autocommit off (plus
+default_transaction_read_only=on as a second guard), so both read a single snapshot and a
+concurrent process() commit on a live database cannot produce a false finding.
 
 CLI:  python tools/decision_replay.py --database-url URL [--company-id ID ...]
       prints every finding (KNOWN_FALSE ones labelled); exit 1 when any REAL finding
@@ -131,6 +142,31 @@ def _predict(ev, today, statuses):
     return "dispatch", rule
 
 
+def _status_changed_at(conn):
+    """{str(company id): companies.status_changed_at}; None when the column is not there
+    (migration 0092 missing), in which case every blocked mismatch is KNOWN_FALSE."""
+    try:
+        with conn.transaction():
+            rows = conn.execute("SELECT id, status_changed_at FROM companies").fetchall()
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if getattr(exc, "sqlstate", None) in ("42703", "42P01"):
+            return None
+        raise
+    return {str(r[0]): r[1] for r in rows}
+
+
+def _status_changed_since(changed_at, company_id, processed_at):
+    """True when the company's status may have changed after the event was processed:
+    status_changed_at is later than the event's last run start (or, for an event with no
+    run, its received_at -- processing is never earlier). Missing column -> True."""
+    if changed_at is None:
+        return True
+    at = changed_at.get(company_id)
+    if at is None:
+        return False
+    return _utc(at) > _utc(processed_at)
+
+
 def _decided(conn, ev):
     return conn.execute(
         "SELECT 1 FROM decision_ledger WHERE company_id = %s AND site_id = %s "
@@ -149,10 +185,16 @@ def replay(conn, company_id=None):
                         "FROM decision_cards" + w + " ORDER BY created_at, card_id", p)
     wr, pr = _where(ids, "re.company_id")
     runs = defaultdict(list)                       # event_id -> [outcome]
-    for r in _rows(conn, "SELECT re.event_id, r.outcome FROM run_events re "
+    last_run = {}                                  # event_id -> latest run started_at
+    for r in _rows(conn, "SELECT re.event_id, r.outcome, r.started_at FROM run_events re "
                          "JOIN event_runs r ON r.run_id = re.run_id" + wr, pr):
-        runs[str(r["event_id"])].append(r["outcome"])
+        eid_ = str(r["event_id"])
+        runs[eid_].append(r["outcome"])
+        if r["started_at"] is not None and (eid_ not in last_run
+                                            or r["started_at"] > last_run[eid_]):
+            last_run[eid_] = r["started_at"]
     statuses = tenancy_status.company_statuses(conn)
+    changed_at = _status_changed_at(conn)
 
     out = []
     by_id = {str(e["event_id"]): e for e in events}
@@ -213,13 +255,23 @@ def replay(conn, company_id=None):
         if status in UNDECIDED:
             continue
 
+        if status == "merged":
+            # The absorb path: _dispatch merges same-subject queued events into the run
+            # without gating them, so no pre-dispatch outcome is compared. Only membership
+            # in run_events is judged (and that no card names it).
+            if not runs.get(eid):
+                out.append(f"{tag}: merged but in no run (run_events)")
+            if rule_cards.get(eid):
+                out.append(f"{tag}: merged but {len(rule_cards[eid])} card(s) name it")
+            continue
         pred, prule = _predict(ev, today, statuses)
         actual = "dispatch" if status in DISPATCHED else status
         if pred != actual:
             msg = f"{tag}: stored {status}, hub says {pred}"
-            if "blocked" in (pred, actual):
+            if "blocked" in (pred, actual) and _status_changed_since(
+                    changed_at, str(ev.company_id), last_run.get(eid) or ev.received_at):
                 msg = (KNOWN_FALSE + msg + " (blocked is recomputed from the company's "
-                       "CURRENT status, which may have changed since)")
+                       "CURRENT status, which changed after the event was processed)")
             out.append(msg)
         if status == "too_deep":
             too_deep_chains.add((str(ev.company_id), str(ev.site_id),
@@ -237,9 +289,9 @@ def replay(conn, company_id=None):
             continue
         if status == "failed" and failed_runs < STOP_AT:
             out.append(f"{tag}: failed with {failed_runs} failed run(s), stop is at {STOP_AT}")
-        if status in ("done", "nothing", "merged") and len(ok_runs) != 1:
+        if status in ("done", "nothing") and len(ok_runs) != 1:
             out.append(f"{tag}: {status} with {len(ok_runs)} non-failed run(s), expected 1")
-        if status in ("nothing", "merged", "failed") and own:
+        if status in ("nothing", "failed") and own:
             out.append(f"{tag}: {status} but {len(own)} card(s) name it")
         rule = rule or prule
         if rule is None or status not in ("done", "nothing"):
@@ -416,11 +468,22 @@ def invariants(conn, company_ids=None):
 
 
 def connect_read_only(url):
-    """A connection on which every transaction is READ ONLY (set at connect time, so it
-    holds for every transaction, including the ones tenancy_status opens)."""
+    """Autocommit OFF, every transaction REPEATABLE READ READ ONLY (psycopg session
+    settings), and default_transaction_read_only=on at connect time as a second guard.
+    tenancy_status's conn.transaction() inside it becomes a savepoint."""
     import psycopg
-    return psycopg.connect(url, autocommit=True,
+    conn = psycopg.connect(url, autocommit=False,
                            options="-c default_transaction_read_only=on")
+    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    conn.read_only = True
+    return conn
+
+
+def judge(conn, company_ids=None):
+    """(replay findings, invariant findings), both read inside ONE transaction (one
+    snapshot under REPEATABLE READ) that is always rolled back -- nothing is written."""
+    with conn.transaction(force_rollback=True):
+        return replay(conn, company_ids), invariants(conn, company_ids)
 
 
 def main(argv=None):
@@ -434,8 +497,7 @@ def main(argv=None):
         ap.error("--database-url (or DATABASE_URL) is required")
     conn = connect_read_only(args.database_url)
     try:
-        rep = replay(conn, args.company_id)
-        inv = invariants(conn, args.company_id)
+        rep, inv = judge(conn, args.company_id)
     finally:
         conn.close()
     known = [f for f in rep if f.startswith(KNOWN_FALSE)]

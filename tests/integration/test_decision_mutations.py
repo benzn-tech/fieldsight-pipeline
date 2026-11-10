@@ -30,6 +30,9 @@ import decision_replay  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
+REAL_INSERT_EVENT = lds._insert_event
+REAL_HANDLE = lds._handle
+
 
 def wrong_company(mp):
     """emit_checklist_gaps uses checklist_reports.company_id (the recorder's home company)
@@ -103,7 +106,8 @@ def test_mutations_are_all_caught(db, name):
     patch, caught_by = MUTATIONS[name]
     day = run_scripted_day(db, mutate=patch)
     # the patch is undone: the module is the real one again before the judge runs
-    assert lds._handle.__module__ == "lambda_decision_scan"
+    assert lds._handle is REAL_HANDLE
+    assert lds._insert_event is REAL_INSERT_EVENT
     assert lds.dedupe_key is decision_hub.dedupe_key
     assert lds.is_late is decision_hub.is_late
     assert lds.recordings is real_recordings and lds.site_events is real_site_events
