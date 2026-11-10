@@ -166,6 +166,34 @@ def _as_uuid(value):
         return None
 
 
+def overdue_open(conn, today_nz) -> list[dict]:
+    """Every LIVE open action item whose deadline is before `today_nz` (an NZ date), one per
+    stable_id, for the decision loop's todo.overdue scan (spec 2026-11-05 §6.3).
+
+    Live = its topic passes `visible_topics_predicate` (not deleted, not superseded by a
+    later pass); a carried-forward chain shares one stable_id, so DISTINCT ON keeps the
+    newest row, as get_live_by_stable_id does. An archived site's items are left out.
+    `company_id` is the SITE's company (project-owned tenancy). Items with no deadline are
+    never overdue. Every company: this is the scan's global read."""
+    # The newest live row per stable_id is picked FIRST (get_live_by_stable_id's ordering),
+    # and only then filtered on open/overdue: an older open row behind a newer done one is
+    # not overdue.
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT stable_id, text, deadline, responsible, site_id, company_id FROM ("
+        f"  SELECT DISTINCT ON (a.stable_id) a.stable_id, a.text, a.deadline, "
+        f"  a.responsible, a.site_id, a.status, s.company_id, s.archived_at "
+        f"  FROM action_items a "
+        f"  JOIN topics t ON t.id = a.topic_id "
+        f"  JOIN sites s ON s.id = a.site_id "
+        f"  WHERE {visible_topics_predicate('t')} "
+        f"  ORDER BY a.stable_id, a.created_at DESC"
+        f") live "
+        f"WHERE status = 'open' AND deadline IS NOT NULL AND deadline < %s "
+        f"AND archived_at IS NULL ORDER BY stable_id",
+        (today_nz,),
+    ).fetchall()
+
+
 def get_live_by_stable_id(conn, stable_id, *, for_update=False) -> dict | None:
     """The one LIVE action item addressed by `stable_id` (action packs, spec §14 S12) --
     mirrors topic_questions.get_live_by_stable_id: joined to its topic for

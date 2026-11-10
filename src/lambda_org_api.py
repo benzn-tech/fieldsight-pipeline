@@ -5614,48 +5614,29 @@ def _hms_len(clock):
     return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
 
 
+def _org_gaps(gaps):
+    """org-api's gaps: notCovered + failed only (the shared reader also names the
+    checklists whose gaps are known, for the decision scan)."""
+    if gaps is None:
+        return None
+    return {"notCovered": gaps["notCovered"], "failed": gaps["failed"]}
+
+
 def _checklist_gaps(result):
     """What the inspector did not do, summed over the report's checklists
     (owner, 2026-10-16), or None when the result says nothing about it.
-
-    None, never two empty lists, unless at least one checklist carries `gaps`:
-    a result from before gaps were recorded, or `checklists: {}`, must not read
-    as "all items covered". Never raises -- a malformed result only loses its
-    gaps, never its status."""
-    try:
-        checklists = result.get("checklists")
-        if not isinstance(checklists, dict):
-            return None
-        out, known = {"notCovered": [], "failed": []}, False
-        for title, rep in checklists.items():
-            gaps = rep.get("gaps") if isinstance(rep, dict) else None
-            if not isinstance(gaps, dict):
-                continue
-            nc, failed = gaps.get("not_covered"), gaps.get("failed")
-            if not isinstance(nc, list) or not isinstance(failed, list):
-                continue
-            known = True
-            out["notCovered"] += [dict(g, checklist=title) for g in nc if isinstance(g, dict)]
-            out["failed"] += [dict(g, checklist=title) for g in failed if isinstance(g, dict)]
-        return out if known else None
-    except Exception:
-        logger.exception("checklist gaps unreadable")
-        return None
+    checklist_reports.checklist_gaps is the one implementation (shared with the
+    decision scan); never raises."""
+    return _org_gaps(checklist_reports.checklist_gaps(result))
 
 
 def _checklist_report_status(result_key):
     """(status, error, gaps) of one auto report -- status pending | done | error,
     read off the worker's result (no presign here -- the download goes through
-    /days/{date}/report/status, which re-checks deletions first)."""
-    try:
-        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
-            return "pending", None, None
-        raise
-    result = json.loads(obj["Body"].read().decode("utf-8"))
-    status = result.get("status") or "pending"
-    return status, result.get("error"), (_checklist_gaps(result) if status == "done" else None)
+    /days/{date}/report/status, which re-checks deletions first). The reading is
+    checklist_reports.read_result_status (shared with the decision scan)."""
+    status, err, gaps = checklist_reports.read_result_status(result_key, s3(), LAKE_BUCKET)
+    return status, err, _org_gaps(gaps)
 
 
 def _checklist_report_payload(r):
