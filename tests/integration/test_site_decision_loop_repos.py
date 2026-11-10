@@ -154,21 +154,25 @@ def test_claim_due_skips_locked_rows(committed):
     mine = [se.insert(conn, _ev(co, site))[0]["event_id"] for _ in range(3)]
     a = psycopg.connect(url)
     b = psycopg.connect(url)
+    # A SKIP LOCKED regression would make the second claimer wait on the row locks: fail fast.
+    a.execute("SET lock_timeout = '2s'")
+    b.execute("SET lock_timeout = '2s'")
+    a.commit()
+    b.commit()
+    mine_set = set(mine)
     try:
-        got_a = [r["event_id"] for r in se.claim_due(a, NOW, limit=1000)
-                 if r["company_id"] == co["id"]]          # holds row locks, uncommitted
-        assert sorted(got_a) == sorted(mine)
-        got_b = [r["event_id"] for r in se.claim_due(b, NOW, limit=1000)
-                 if r["company_id"] == co["id"]]
-        assert got_b == []                                 # skipped, did not block
-        a.rollback()
-        got_b2 = [r["event_id"] for r in se.claim_due(b, NOW, limit=2)
-                  if r["company_id"] == co["id"]]
-        assert set(got_b2) <= set(mine)
-        got_a2 = [r["event_id"] for r in se.claim_due(a, NOW, limit=1000)
-                  if r["company_id"] == co["id"]]
-        assert set(got_a2).isdisjoint(got_b2)              # second claim gets none of b's
-        assert set(got_a2) | set(got_b2) == set(mine)
+        # Global claims: other tests' leftover queued rows may come back too, so every
+        # assertion is about the intersection with this test's own ids.
+        got_a = {r["event_id"] for r in se.claim_due(a, NOW, limit=100000)} & mine_set
+        assert got_a == mine_set                           # holds row locks, uncommitted
+        got_b = {r["event_id"] for r in se.claim_due(b, NOW, limit=100000)} & mine_set
+        assert got_b == set()                              # skipped, did not block
+        a.rollback()                                       # a's locks released
+        b.rollback()
+        got_b2 = {r["event_id"] for r in se.claim_due(b, NOW, limit=100000)} & mine_set
+        assert got_b2 == mine_set                          # now b holds them
+        got_a2 = {r["event_id"] for r in se.claim_due(a, NOW, limit=100000)} & mine_set
+        assert got_a2 == set()                             # second claim gets none of b's
     finally:
         a.rollback()
         b.rollback()
@@ -376,3 +380,51 @@ def test_ledger_decided_ignores_defaulted_and_superseded(db):
     assert dl.decided(db, co["id"], other_site["id"], subj) is None
     assert dl.decided(db, co["id"], site["id"], "report:r1:item:4") is None
 
+
+
+def test_ledger_superseded_row_loses_even_when_it_is_newest(db):
+    """A decided t1, B decided t3, C decided t2 superseding B -> C. ORDER BY alone would
+    pick B (the newest); only the supersession clause makes C win."""
+    co, site = _world(db)
+    subj = "report:r3:item:1"
+    t1, t2, t3 = (NOW - dt.timedelta(hours=h) for h in (3, 2, 1))
+    dl.append(db, _ledger(co, site, subj, decision="a", decided_at=t1))
+    b = dl.append(db, _ledger(co, site, subj, decision="b", decided_at=t3))
+    c = dl.append(db, _ledger(co, site, subj, decision="c", kind="declined", decided_at=t2,
+                              supersedes_entry_id=b["entry_id"]))
+    assert dl.decided(db, co["id"], site["id"], subj)["entry_id"] == c["entry_id"]
+
+
+def test_ledger_defaulted_or_foreign_pointer_does_not_supersede(db):
+    co, site = _world(db)
+    other_co, other_site = _world(db, "b")
+    subj = "report:r4:item:1"
+    a = dl.append(db, _ledger(co, site, subj, decided_at=NOW - dt.timedelta(hours=2)))
+    # a default pointing at A is not a change of mind
+    dl.append(db, _ledger(co, site, subj, kind="defaulted", source="timeout_default",
+                          supersedes_entry_id=a["entry_id"]))
+    assert dl.decided(db, co["id"], site["id"], subj)["entry_id"] == a["entry_id"]
+    # another tenant's decided row pointing at A does not hide it
+    dl.append(db, _ledger(other_co, other_site, subj, decision="no", kind="declined",
+                          supersedes_entry_id=a["entry_id"]))
+    assert dl.decided(db, co["id"], site["id"], subj)["entry_id"] == a["entry_id"]
+
+
+def test_runs_start_raises_when_an_event_cannot_be_linked(db):
+    co, site = _world(db)
+    other_co, other_site = _world(db, "b")
+    mine, _ = se.insert(db, _ev(co, site))
+    foreign, _ = se.insert(db, _ev(other_co, other_site))
+    with pytest.raises(ValueError):
+        er.start(db, co["id"], site["id"], [mine["event_id"], foreign["event_id"]], 1, "x")
+    with pytest.raises(ValueError):
+        er.start(db, co["id"], site["id"], [uuid.uuid4()], 1, "x")
+    # the same event listed twice counts once
+    run = er.start(db, co["id"], site["id"], [mine["event_id"], mine["event_id"]], 1, "x")
+    assert run["run_id"] is not None
+
+
+def test_insert_rejects_duplicate_status(db):
+    co, site = _world(db)
+    with pytest.raises(ValueError):
+        se.insert(db, _ev(co, site, status="duplicate"))

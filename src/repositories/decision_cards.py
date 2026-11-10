@@ -63,7 +63,8 @@ def supersede(conn, company_id, site_id, card_key):
 
 
 def bump(conn, card_id, company_id, site_id, consequence):
-    """version + 1 with a new consequence. None for another tenant's card."""
+    """version + 1 with a new consequence. None for another tenant's card. Intentionally NO
+    status filter: the hub bumps the fault card by id whatever its status."""
     return conn.cursor(row_factory=dict_row).execute(
         "UPDATE decision_cards SET version = version + 1, consequence = %s "
         f"WHERE card_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",

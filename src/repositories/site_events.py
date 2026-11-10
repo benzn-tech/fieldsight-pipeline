@@ -38,7 +38,12 @@ def insert(conn, ev):
     """(row, is_new). The caller supplies every field, including status, dedupe_key, bucket and
     a tz-aware received_at/occurred_at; event_id is generated when absent. A dedupe_key that a
     live row already holds is stored again as status 'duplicate' with dedupe_key
-    '<key>|dup|<event_id>', and is_new is False."""
+    '<key>|dup|<event_id>', and is_new is False.
+
+    ValueError when ev['status'] is 'duplicate': such a row sits outside the partial unique
+    index and would bypass dedupe. Only the dedupe path below writes duplicate rows."""
+    if ev["status"] == "duplicate":
+        raise ValueError("site_events.insert: status 'duplicate' is reserved for the dedupe path")
     event_id = ev.get("event_id") or uuid.uuid4()
     cur = conn.cursor(row_factory=dict_row)
     row = cur.execute(
@@ -55,7 +60,7 @@ def insert(conn, ev):
 
 def claim_due(conn, now, limit=50):
     """Pop up to `limit` queued events whose not_before is NULL or <= now, lowest seq first,
-    and mark them 'running'. FOR UPDATE SKIP LOCKED: a concurrent claimer skips rows another
+    and mark them 'running'. FOR UPDATE: a concurrent claimer skips rows another
     transaction holds rather than waiting. attempts is NOT touched (the caller counts
     failures). Rows come back in seq order."""
     rows = conn.cursor(row_factory=dict_row).execute(

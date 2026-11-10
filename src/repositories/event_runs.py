@@ -11,13 +11,18 @@ _COLS = ("run_id, company_id, site_id, attempt, handler, claim_id, lease_until, 
 
 
 def start(conn, company_id, site_id, event_ids, attempt, handler):
-    """Insert the run (started_at = now()) and link each event of THIS tenant to it."""
+    """Insert the run (started_at = now()) and link each event of THIS tenant to it.
+    ValueError when fewer distinct events were linked than given (an unknown event or one of
+    another tenant); the run row is then already inserted, so the caller rolls back."""
     run = conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO event_runs (company_id, site_id, attempt, handler, started_at) "
         f"VALUES (%s,%s,%s,%s,now()) RETURNING {_COLS}",
         (company_id, site_id, attempt, handler)).fetchone()
-    for event_id in event_ids:
-        add_event(conn, run["run_id"], event_id, company_id, site_id)
+    wanted = list(dict.fromkeys(str(e) for e in event_ids))
+    linked = sum(add_event(conn, run["run_id"], e, company_id, site_id) for e in wanted)
+    if linked < len(wanted):
+        raise ValueError(f"event_runs.start: linked {linked} of {len(wanted)} events "
+                         "(unknown or another tenant's)")
     return run
 
 

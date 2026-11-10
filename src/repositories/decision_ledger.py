@@ -11,14 +11,20 @@ _COLS = ("entry_id, company_id, site_id, card_id, subject_ref, decision, kind, d
 
 def decided(conn, company_id, site_id, subject_ref):
     """The latest 'decided' or 'declined' row for this subject that no other row supersedes,
-    or None. 'defaulted' rows never count as a decision. ANY row whose supersedes_entry_id
-    points at an entry hides that entry, whatever the superseding row's kind."""
+    or None. 'defaulted' rows never count as a decision.
+
+    Supersession is by pointer only (no decided_at comparison), and only a person's new row
+    can supersede: a row of kind 'decided'/'declined' of the SAME company and site. A
+    'defaulted' row's supersedes_entry_id is ignored (a default is never a change of mind),
+    and so is a pointer from another tenant."""
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_COLS} FROM decision_ledger l "
         "WHERE l.company_id = %s AND l.site_id = %s AND l.subject_ref = %s "
         "AND l.kind IN ('decided', 'declined') "
         "AND NOT EXISTS (SELECT 1 FROM decision_ledger n "
-        "                WHERE n.supersedes_entry_id = l.entry_id) "
+        "                WHERE n.supersedes_entry_id = l.entry_id "
+        "                  AND n.kind IN ('decided', 'declined') "
+        "                  AND n.company_id = l.company_id AND n.site_id = l.site_id) "
         "ORDER BY l.decided_at DESC, l.entry_id DESC LIMIT 1",
         (company_id, site_id, subject_ref)).fetchone()
 
