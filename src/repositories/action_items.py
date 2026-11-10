@@ -175,15 +175,21 @@ def overdue_open(conn, today_nz) -> list[dict]:
     newest row, as get_live_by_stable_id does. An archived site's items are left out.
     `company_id` is the SITE's company (project-owned tenancy). Items with no deadline are
     never overdue. Every company: this is the scan's global read."""
+    # The newest live row per stable_id is picked FIRST (get_live_by_stable_id's ordering),
+    # and only then filtered on open/overdue: an older open row behind a newer done one is
+    # not overdue.
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT DISTINCT ON (a.stable_id) a.stable_id, a.text, a.deadline, a.responsible, "
-        f"a.site_id, s.company_id "
-        f"FROM action_items a "
-        f"JOIN topics t ON t.id = a.topic_id "
-        f"JOIN sites s ON s.id = a.site_id "
-        f"WHERE a.status = 'open' AND a.deadline IS NOT NULL AND a.deadline < %s "
-        f"AND s.archived_at IS NULL AND {visible_topics_predicate('t')} "
-        f"ORDER BY a.stable_id, a.created_at DESC",
+        f"SELECT stable_id, text, deadline, responsible, site_id, company_id FROM ("
+        f"  SELECT DISTINCT ON (a.stable_id) a.stable_id, a.text, a.deadline, "
+        f"  a.responsible, a.site_id, a.status, s.company_id, s.archived_at "
+        f"  FROM action_items a "
+        f"  JOIN topics t ON t.id = a.topic_id "
+        f"  JOIN sites s ON s.id = a.site_id "
+        f"  WHERE {visible_topics_predicate('t')} "
+        f"  ORDER BY a.stable_id, a.created_at DESC"
+        f") live "
+        f"WHERE status = 'open' AND deadline IS NOT NULL AND deadline < %s "
+        f"AND archived_at IS NULL ORDER BY stable_id",
         (today_nz,),
     ).fetchall()
 

@@ -90,12 +90,14 @@ def _new_event(company_id, site_id, source, type_, subject_ref, occurred_at, now
 
 # --------------------------------------------------------------------------- emitters
 
-def emit_todo_overdue(conn, today_nz, now):
-    """One todo.overdue event per live open item whose deadline is before today_nz.
+def emit_todo_overdue(conn, now):
+    """One todo.overdue event per live open item whose deadline is before the NZ day of
+    `now` (derived here, so the bucket can never disagree with received_at).
     occurred_at = received_at = now (the scan); company = the item's site's company.
     Each item in its own savepoint: one bad item is counted in errors and the rest of the
     day's events are kept."""
     out = _counts()
+    today_nz = nz_time.to_nz(now).date()
     for item in action_items.overdue_open(conn, today_nz):
         try:
             with conn.transaction():
@@ -430,11 +432,10 @@ def lambda_handler(event, context):
         # Fail loudly once, not as a per-report error on every scan forever.
         raise RuntimeError("decision-scan: LAKE_BUCKET is not set")
     now = datetime.now(timezone.utc)
-    today_nz = nz_time.to_nz(now).date()
     result = _counts()
     with get_connection(autocommit=True) as conn:
         if scan == "todo_overdue":
-            got = emit_todo_overdue(conn, today_nz, now)
+            got = emit_todo_overdue(conn, now)
         elif scan == "checklist_gap":
             got = emit_checklist_gaps(
                 conn, lambda key: checklist_reports.read_result_status(key, _s3(), bucket),

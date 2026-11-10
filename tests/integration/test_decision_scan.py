@@ -236,15 +236,15 @@ def test_overdue_item_becomes_one_open_card_per_item(db):
     closed = _overdue_item(db, site, "Closed one")
     db.execute("UPDATE action_items SET status = 'done' WHERE id = %s", (closed["id"],))
 
-    day1 = lds.emit_todo_overdue(db, TODAY, NOW)
+    day1 = lds.emit_todo_overdue(db, NOW)
     assert (day1["emitted"], day1["duplicates"]) == (2, 0)
-    again = lds.emit_todo_overdue(db, TODAY, NOW)                      # same day: dedupe
+    again = lds.emit_todo_overdue(db, NOW)                      # same day: dedupe
     assert (again["emitted"], again["duplicates"]) == (0, 2)
     p1 = lds.process(db, NOW)
     assert p1["cards"] == 2
 
     now2 = NOW + dt.timedelta(days=1)
-    day2 = lds.emit_todo_overdue(db, TODAY + dt.timedelta(days=1), now2)
+    day2 = lds.emit_todo_overdue(db, now2)
     assert (day2["emitted"], day2["duplicates"]) == (2, 0)              # new bucket
     p2 = lds.process(db, now2)
     assert p2["cards"] == 0
@@ -485,7 +485,7 @@ def test_inactive_company_blocks(db, monkeypatch, status):
     co, site, pm, admin = _world(db)
     _overdue_item(db, site)
     db.execute("UPDATE companies SET status = %s WHERE id = %s", (status, co["id"]))
-    assert lds.emit_todo_overdue(db, TODAY, NOW)["emitted"] == 1
+    assert lds.emit_todo_overdue(db, NOW)["emitted"] == 1
     out = lds.process(db, NOW)
     assert out["processed"] == 1 and out["cards"] == 0
     [ev] = _events(db, co["id"])
@@ -509,7 +509,7 @@ def test_decided_subject_gets_no_card(db):
                    "subject_ref": str(item["stable_id"]), "decision": "done",
                    "kind": "decided", "decided_by": None, "authority_basis": "pm",
                    "evidence": [], "supersedes_entry_id": None, "source": "card"})
-    lds.emit_todo_overdue(db, TODAY, NOW)
+    lds.emit_todo_overdue(db, NOW)
     out = lds.process(db, NOW)
     assert out["cards"] == 0
     [ev] = _events(db, co["id"])
@@ -774,7 +774,7 @@ def test_one_bad_overdue_item_keeps_the_rest(db, monkeypatch):
             conn.execute("SELECT 1/0")                        # aborts like a real SQL error
         return real(conn, ev, today_nz)
     monkeypatch.setattr(lds, "_insert_event", insert)
-    out = lds.emit_todo_overdue(db, TODAY, NOW)
+    out = lds.emit_todo_overdue(db, NOW)
     assert (out["emitted"], out["errors"]) == (1, 1)
     assert [e["subject_ref"] for e in _events(db, co["id"])] == [str(a["stable_id"])]
 
@@ -827,3 +827,35 @@ def test_malformed_claimed_row_is_a_failed_attempt(db):
     assert st[bad["event_id"]]["attempts"] == 1
     assert "payload" in st[bad["event_id"]]["last_error"]
     assert st[good["event_id"]]["status"] == "done"
+
+
+# ---------------------------------------------------------------- final fix wave
+
+def test_overdue_uses_the_newest_live_row_per_stable_id(db):
+    co, site, pm, admin = _world(db)
+    old = _overdue_item(db, site, "Order the rebar")
+    newer = _overdue_item(db, site, "Order the rebar")
+    # newer live row of the same item (same stable_id), marked done
+    db.execute("UPDATE action_items SET stable_id = %s, status = 'done', "
+               "created_at = now() + interval '1 minute' WHERE id = %s",
+               (old["stable_id"], newer["id"]))
+    rows = [r for r in action_items.overdue_open(db, TODAY) if r["company_id"] == co["id"]]
+    assert rows == []
+    assert lds.emit_todo_overdue(db, NOW)["emitted"] == 0
+    # and the other way round: the newer row is open -> one row, the newer one
+    db.execute("UPDATE action_items SET status = 'open', text = 'Order the rebar (v2)' "
+               "WHERE id = %s", (newer["id"],))
+    db.execute("UPDATE action_items SET status = 'done' WHERE id = %s", (old["id"],))
+    rows = [r for r in action_items.overdue_open(db, TODAY) if r["company_id"] == co["id"]]
+    assert [(r["stable_id"], r["text"]) for r in rows] == [
+        (old["stable_id"], "Order the rebar (v2)")]
+
+
+def test_overdue_bucket_is_the_nz_day_of_now(db):
+    co, site, pm, admin = _world(db)
+    item = _overdue_item(db, site, deadline=dt.date(2026, 11, 5))
+    late_utc = dt.datetime(2026, 11, 6, 11, 30, tzinfo=UTC)         # 00:30 NZDT 7 Nov
+    assert lds.emit_todo_overdue(db, late_utc)["emitted"] == 1
+    [ev] = _events(db, co["id"])
+    assert ev["bucket"] == "2026-11-07" and ev["received_at"] == late_utc
+    assert ev["subject_ref"] == str(item["stable_id"])

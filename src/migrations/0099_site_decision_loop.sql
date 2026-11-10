@@ -18,8 +18,10 @@
 -- answered card frees the key.
 --
 -- Tenancy: site_events, event_runs, run_events, decision_cards and decision_ledger carry
--- company_id + site_id (NOT NULL); repositories write company_id from sites.company_id,
--- never from the caller. decision_scan_seen is the one exemption: an internal scan cursor
+-- company_id + site_id (NOT NULL). The repositories store the company_id their caller
+-- gives; the emitters (lambda_decision_scan) resolve it from sites.company_id (the SITE's
+-- company, never the recorder's), and a nightly invariant checks that it matches.
+-- decision_scan_seen is the one exemption: an internal scan cursor
 -- keyed on checklist_reports.id, never read by an API, holding no customer content, and a
 -- report can resolve to 0..n sites, so it has no single site to carry. FKs to companies/sites/users are plain (no
 -- CASCADE), as in 0095: the ledger is an archive, and a CASCADE into it would be rejected by

@@ -284,3 +284,21 @@ def test_fault_card_and_keys():
     assert deep.kind == "fault" and deep.recipient_roles == ["company_admin", "ops"]
     assert hub.fault_card_key("c-1", "s-1", "ch-5", "too_deep") == \
         "c-1|s-1|hub.fault|ch-5|too_deep"
+
+
+# --- today_nz at the NZ-midnight boundary -----------------------------------
+
+@pytest.mark.parametrize("utc, nz_day", [
+    # NZDT (UTC+13): 11:30Z on 6 Nov is 00:30 on 7 Nov in NZ
+    (datetime(2026, 11, 6, 11, 30, tzinfo=timezone.utc), date(2026, 11, 7)),
+    (datetime(2026, 11, 6, 10, 59, tzinfo=timezone.utc), date(2026, 11, 6)),
+    # NZST (UTC+12): 12:30Z on 10 Jul is 00:30 on 11 Jul; 11:30Z is still 10 Jul
+    (datetime(2026, 7, 10, 12, 30, tzinfo=timezone.utc), date(2026, 7, 11)),
+    (datetime(2026, 7, 10, 11, 30, tzinfo=timezone.utc), date(2026, 7, 10)),
+])
+def test_today_nz_of_at_the_nz_midnight_boundary(utc, nz_day):
+    e = _overdue(received_at=utc)
+    assert hub.today_nz_of(e) == nz_day
+    # the overdue dedupe bucket follows the event's NZ day
+    assert RULES["todo.overdue"].bucket(e, hub.today_nz_of(e)) == nz_day.isoformat()
+    assert hub.dedupe_key(e, hub.today_nz_of(e)).endswith("|" + nz_day.isoformat())
