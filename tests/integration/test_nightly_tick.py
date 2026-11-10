@@ -72,6 +72,15 @@ class FakeS3:
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
         return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
 
+    def get_paginator(self, op):
+        """For the worker's transcript key discovery (session_turns)."""
+        fake = self
+
+        class P:
+            def paginate(self, Bucket, Prefix):
+                yield fake.list_objects_v2(Bucket, Prefix)
+        return P()
+
     def requests(self):
         return [k for k in self.puts if k.startswith(nr.PREFIX)]
 
@@ -667,3 +676,76 @@ def test_shadow_writes_no_requested_items_row(db):
     assert len(fake.requests()) == 1
     assert db.execute("SELECT count(*) FROM nightly_requested_items WHERE site_id = %s",
                       (s.site["id"],)).fetchone()[0] == 0
+
+
+
+# ------------------------------------------------- unanswerable requests are answered
+
+class InProcessWriter:
+    """A Lambda client whose invoke runs the real in-VPC writer on the test connection."""
+
+    def __init__(self, db):
+        self.db, self.payloads = db, []
+
+    def invoke(self, FunctionName, InvocationType, Payload):
+        import lambda_nightly_support_writer as writer
+        event = json.loads(Payload)
+        self.payloads.append(event)
+        out = writer.write_support(self.db, event)
+        return {"StatusCode": 200, "Payload": io.BytesIO(json.dumps(out).encode("utf-8"))}
+
+
+def test_request_with_no_transcript_is_answered_and_not_resent(db):
+    """Final review I1: a request that can never produce a pick (its transcripts are gone)
+    is answered with abstained records and no model call, so the next night's breaker
+    counts it answered and sessions_needing_support does not re-send its items."""
+    import lambda_nightly_turn_pick as worker
+    s = Seed(db)
+    sessions = [s.session() for _ in range(nr.BREAKER_AT)]
+    fake = FakeS3()
+    ctx = s.ctx("on", fake)
+    nr.run_counts(db, s.event(), ctx)
+    keys = fake.requests()
+    assert len(keys) == nr.BREAKER_AT
+
+    lam = InProcessWriter(db)
+    for key in keys:                     # no transcripts in the fake: every one is no_transcript
+        out = worker.process_request("lake", key, fake.body(key), s3_client=fake,
+                                     lambda_client=lam, model_client=object())
+        assert out["no_transcript"] == 1 and out["writer"]["records"] == 1
+    recs = db.execute(
+        "SELECT subject_stable_id::text, auto_outcome, output, input_key FROM decision_records "
+        "WHERE site_id = %s AND kind = 'nightly_support'", (s.site["id"],)).fetchall()
+    assert sorted(r[0] for r in recs) == sorted(x["rows"][0]["stable_id"] for x in sessions)
+    assert {(r[1], json.dumps(r[2], sort_keys=True)) for r in recs} == {
+        ("abstained", json.dumps({"guard": "no_transcript", "turn": None}, sort_keys=True))}
+    assert sorted(r[3] for r in recs) == sorted(keys)
+    run = db.execute("SELECT model_calls, models, tokens_in, cost_usd FROM event_runs "
+                     "WHERE run_id = %s", (ctx.run_id,)).fetchone()
+    assert run == (0, None, 0, None)                  # no model call was counted
+
+    # the following night: breaker closed (all answered), nothing re-sent
+    nxt = NOW + dt.timedelta(days=1)
+    assert nightly.sessions_needing_support(
+        db, company_id=s.co["id"], site_id=s.site["id"],
+        since_utc=nxt - dt.timedelta(days=7)) == []
+    before = set(fake.requests())
+    outcome, counts = nr.run_counts(db, s.event(night=NIGHT + dt.timedelta(days=1), now=nxt),
+                                    s.ctx("on", fake, now=nxt))
+    assert counts["j2_breaker_open"] == 0
+    assert counts["j2_sessions"] == 0 and set(fake.requests()) == before
+
+
+def test_breaker_still_opens_when_requests_go_unanswered(db):
+    """The control for the test above: the same five requests with no writer invoke leave
+    the breaker open the next night."""
+    s = Seed(db)
+    for _ in range(nr.BREAKER_AT):
+        s.session()
+    fake = FakeS3()
+    nr.run_counts(db, s.event(), s.ctx("on", fake))
+    assert len(fake.requests()) == nr.BREAKER_AT
+    nxt = NOW + dt.timedelta(days=1)
+    outcome, counts = nr.run_counts(db, s.event(night=NIGHT + dt.timedelta(days=1), now=nxt),
+                                    s.ctx("on", fake, now=nxt))
+    assert counts["j2_breaker_open"] == 1

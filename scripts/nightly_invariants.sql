@@ -15,13 +15,15 @@ WHERE e.method LIKE 'nightly\_%' ESCAPE '\'
                   WHERE d.id = e.decision_record_id AND d.kind = 'nightly_support');
 
 -- name: two_nightly_links_for_one_source_row
-SELECT e.site_id, e.src_kind,
+-- Not grouped by site: two nightly links on one source row are a violation even when the
+-- links name different sites. site_id (the first; uuid has no min()) is kept for scoping.
+SELECT (array_agg(e.site_id ORDER BY e.site_id))[1] AS site_id, e.src_kind,
        COALESCE(e.src_action_item_id, e.src_finding_id, e.src_decision_id,
                 e.src_question_id) AS src_row_id,
        count(*) AS links
 FROM event_links e
 WHERE e.method LIKE 'nightly\_%' ESCAPE '\'
-GROUP BY e.site_id, e.src_kind,
+GROUP BY e.src_kind,
          COALESCE(e.src_action_item_id, e.src_finding_id, e.src_decision_id, e.src_question_id)
 HAVING count(*) > 1;
 

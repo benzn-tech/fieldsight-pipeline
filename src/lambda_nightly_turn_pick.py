@@ -11,12 +11,21 @@ nightly_rematch handler). For one request:
   2. Find THIS session's transcript keys with the extractor's own key discovery and rebuild
      its turns with the extractor's own chain (session_turns), so chunk `sid…` sessions
      resolve exactly as they do in extraction. A group (`grp…`) session has no single-session
-     keys and is not handled in v1: counted, no call.
+     keys and is not handled in v1: no call; its items are answered abstained (below).
   3. nightly_turn_pick.build_request -> render_prompt -> ONE model call (registry entry
      `nightly_turn_pick`, Claude API with ANTHROPIC_API_KEY, SDK retries off) ->
      parse_answer -> apply_guards.
   4. Invoke the in-VPC writer (lambda_nightly_support_writer) RequestResponse with ids,
      enums, locators and usage -- never text.
+
+Every `on` request with a session is answered (the writer is invoked), so the hub's circuit
+breaker sees an answer and J2's no-re-ask rule stops a nightly re-send. Items the model is
+never asked about go to the writer as rows with outcome `abstained`, turn None, no locator
+and a guard naming the reason: `no_transcript` (no segments left), `unsupported_session`
+(a group session), or build_request's own `no_text` / `no_window`. When no model call was
+made at all, the usage is zero tokens, cost None and `model_call: false` (the run's
+model_calls is not incremented). build_request's `over_cap` items get no row: they stay
+askable on a later night.
 
 Fail closed (raise, so the S3 event's single retry runs; the template sets
 MaximumRetryAttempts 1): segments listed but no readable turns, a model API error, a
@@ -147,25 +156,69 @@ def _writer_rows(rows, turns):
     return out
 
 
+def _abstained_rows(items, guard=None):
+    """Writer rows (outcome abstained, no turn, no locator) for items the model is never
+    asked about. `guard` names the reason; None takes each item's own `reason`
+    (build_request's `skipped_items`)."""
+    return [{"stable_id": it.get("stable_id"), "row_id": it.get("row_id"),
+             "kind": it.get("kind"), "turn": None, "outcome": "abstained",
+             "guard": guard or it.get("reason"), "cross_language": False, "locator": None}
+            for it in items]
+
+
+def _payload(request, key, rows, usage):
+    return {"site_id": request.get("site_id"), "run_id": request.get("run_id"),
+            "extraction_key": request.get("extraction_key"),
+            "session_base": request.get("session_base") or "",
+            "question_set": ntp.PROMPT_HASH, "input_key": key, "rows": rows, "usage": usage}
+
+
+# Usage for an answer given without a model call: zero tokens, cost NULL (not 0), and
+# model_call False so the run's model_calls / models stay honest.
+NO_CALL_USAGE = {"tokens_in": 0, "tokens_out": 0, "model": None, "cost_usd": None,
+                 "model_call": False}
+
+
+def _answer_without_call(lambda_client, request, key, rows, counts, reason):
+    """Every `on` request is answered: items the model can never be asked about go to the
+    writer as abstained rows, so the hub's breaker sees an answer and J2 does not re-send
+    the session every night."""
+    result = _invoke_writer(lambda_client, json.dumps(
+        _payload(request, key, rows, dict(NO_CALL_USAGE))))
+    logger.info("nightly turn pick: answered without a call key=%s site=%s reason=%s rows=%d "
+                "writer=%s", key, request.get("site_id"), reason, len(rows),
+                json.dumps(result, sort_keys=True))
+    return dict(counts, abstained_without_call=len(rows), writer=result)
+
+
 def process_request(bucket, key, request, *, s3_client, lambda_client, model_client=None):
     """One request body -> a counts dict. Raises to fail closed (module docstring)."""
     site_id = request.get("site_id")
     base = request.get("session_base") or ""
     counts = {"key": key, "site_id": site_id}
+    req_items = list(request.get("items") or [])
 
     if (request.get("flag") or "off") != "on":
         logger.info("nightly turn pick: idle (flag=%s) key=%s", request.get("flag"), key)
         return dict(counts, idle=1)
-    if not base or base.startswith("grp"):
-        logger.info("nightly turn pick: session kind not handled key=%s", key)
+    if not base:
+        # Malformed: the writer needs a session to write against. The hub never writes one.
+        logger.warning("nightly turn pick: request has no session_base key=%s", key)
         return dict(counts, unsupported_session=1)
+    if base.startswith("grp"):
+        logger.info("nightly turn pick: session kind not handled key=%s", key)
+        return _answer_without_call(lambda_client, request, key,
+                                    _abstained_rows(req_items, "unsupported_session"),
+                                    dict(counts, unsupported_session=1), "unsupported_session")
 
     seg_keys = session_turns.gather_session_segments(
         bucket, request["user_folder"], request["date"], base, s3_client=s3_client)
     if not seg_keys:
         # The transcripts were removed since the extraction read them: nothing to match.
         logger.warning("nightly turn pick: no transcript segments key=%s", key)
-        return dict(counts, no_transcript=1)
+        return _answer_without_call(lambda_client, request, key,
+                                    _abstained_rows(req_items, "no_transcript"),
+                                    dict(counts, no_transcript=1), "no_transcript")
     turns, _sources, _stats = session_turns.assemble_session_turns(
         bucket, seg_keys, s3_client=s3_client)
     if not turns:
@@ -174,21 +227,20 @@ def process_request(bucket, key, request, *, s3_client, lambda_client, model_cli
         raise RuntimeError(f"nightly turn pick {key}: {len(seg_keys)} segment(s) listed but "
                            f"no readable turns")
 
-    req = ntp.build_request(list(request.get("items") or []), turns, request["date"])
+    req = ntp.build_request(req_items, turns, request["date"])
     counts.update(items=len(req["items"]), skipped=req["skipped"], turns=len(turns))
+    skipped_rows = _abstained_rows(req["skipped_items"])
     if not req["items"]:
         logger.info("nightly turn pick: no item to ask key=%s skipped=%s", key, req["skipped"])
-        return counts
+        return _answer_without_call(lambda_client, request, key, skipped_rows, counts,
+                                    "no_item_to_ask")
 
     entry = model_registry.get(REGISTRY_TASK)
     client = model_client or make_model_client()
     text, tokens_in, tokens_out, stop = call_model(client, entry, ntp.render_prompt(req, turns))
-    payload = {"site_id": site_id, "run_id": request.get("run_id"),
-               "extraction_key": request.get("extraction_key"), "session_base": base,
-               "question_set": ntp.PROMPT_HASH, "input_key": key, "rows": [],
-               "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out,
-                         "model": entry["model"],
-                         "cost_usd": model_registry.cost_usd(entry, tokens_in, tokens_out)}}
+    payload = _payload(request, key, [], {
+        "tokens_in": tokens_in, "tokens_out": tokens_out, "model": entry["model"],
+        "cost_usd": model_registry.cost_usd(entry, tokens_in, tokens_out)})
 
     failure, picks = None, None
     if stop in ("max_tokens", "refusal"):
@@ -211,7 +263,8 @@ def process_request(bucket, key, request, *, s3_client, lambda_client, model_cli
         raise failure
 
     rows = ntp.apply_guards(req, picks, turns)
-    payload["rows"] = _writer_rows(rows, turns)
+    # The items build_request skipped are answered too (abstained), in the same invoke.
+    payload["rows"] = _writer_rows(rows, turns) + skipped_rows
     result = _invoke_writer(lambda_client, json.dumps(payload))
 
     outcomes = {}

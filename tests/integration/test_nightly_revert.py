@@ -79,6 +79,15 @@ def test_revert_dry_run_deletes_nothing(db):
     assert after == before and len(before[0]) == 1 and len(before[1]) == 1
 
 
+def test_revert_plan_refuses_unknown_site(db):
+    """The dry run refuses a site that does not exist, as apply does -- an all-zero plan for
+    a mistyped id would read as "nothing to revert"."""
+    import uuid
+    rv = _revert()
+    with pytest.raises(ValueError, match="no site"):
+        rv.plan(db, site_id=uuid.uuid4(), since=SINCE)
+
+
 def test_revert_deletes_only_nightly(db):
     rv = _revert()
     s = wt.Seed(db)
@@ -164,7 +173,22 @@ def test_revert_dry_run_connection_is_read_only(monkeypatch, migrated_db_url, ca
     finally:
         conn.rollback()
         conn.close()
-    assert rv.main(["--site", "00000000-0000-0000-0000-000000000001",
-                    "--since", "2026-11-01"]) == 0
+    # an unknown site is refused (plan reads sites, as apply does) ...
+    with pytest.raises(ValueError, match="no site"):
+        rv.main(["--site", "00000000-0000-0000-0000-000000000001", "--since", "2026-11-01"])
+    # ... a real one with no nightly links plans zero. The site is committed (main opens
+    # its own connection) and deleted afterwards.
+    import uuid
+    from db.connection import get_connection
+    from repositories import companies, sites
+    seed = get_connection(migrated_db_url, autocommit=True)
+    co = companies.create_company(seed, f"NightlyR-Commit-{uuid.uuid4().hex[:8]}")
+    site = sites.create_site(seed, co["id"], f"NightlyR-Site-{uuid.uuid4().hex[:8]}")
+    try:
+        assert rv.main(["--site", str(site["id"]), "--since", "2026-11-01"]) == 0
+    finally:
+        seed.execute("DELETE FROM sites WHERE id = %s", (site["id"],))
+        seed.execute("DELETE FROM companies WHERE id = %s", (co["id"],))
+        seed.close()
     out = capsys.readouterr().out
     assert '"links": 0' in out and "nothing was written" in out

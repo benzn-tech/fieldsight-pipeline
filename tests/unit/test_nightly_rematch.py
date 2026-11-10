@@ -236,3 +236,18 @@ def test_worker_timeout_covers_the_model_call_and_the_writer_wait(doc):
     assert w.MODEL_TIMEOUT_S <= 150
     assert w.WRITER_READ_TIMEOUT_S > _props(doc, WRITER)["Timeout"]
     assert w.MODEL_TIMEOUT_S + w.WRITER_READ_TIMEOUT_S + 15 <= timeout
+
+
+def test_lifecycle_script_expires_nightly_requests_at_14_days():
+    """The request artifacts live in the data bucket (outside the stack), so their expiry
+    is in scripts/wire-bucket-lifecycle.sh. The script refuses rules it does not manage,
+    so the rule's ID must also be in its exclusion query (or the next run refuses)."""
+    script = io.open(os.path.join(REPO, "scripts", "wire-bucket-lifecycle.sh"),
+                     encoding="utf-8").read()
+    body = re.search(r"--lifecycle-configuration '(\{.*?\})'", script, re.S).group(1)
+    rules = {r["ID"]: r for r in json.loads(body)["Rules"]}
+    rule = rules.get("nightly-requests-expiry")
+    assert rule and rule["Status"] == "Enabled"
+    assert rule["Filter"]["Prefix"] == "nightly_requests/"
+    assert rule["Expiration"]["Days"] == 14
+    assert "ID!=`nightly-requests-expiry`" in script

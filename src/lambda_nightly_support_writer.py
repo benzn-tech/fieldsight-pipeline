@@ -19,7 +19,14 @@ Event (the worker builds it; ids, enums, locators and counts only -- never text)
    "rows": [{"stable_id", "row_id", "kind", "turn" ("T<n>"|null), "outcome"
              (accepted|rejected|abstained), "guard" (enum|null), "cross_language" (bool),
              "locator" ({source_stem, start_sec, end_sec, speaker_label, quote_status}|null)}],
-   "usage": {"tokens_in", "tokens_out", "model", "cost_usd"}}
+   "usage": {"tokens_in", "tokens_out", "model", "cost_usd", "model_call" (bool, default
+             true)}}
+
+An `abstained` row with a guard such as `no_transcript`, `unsupported_session`, `no_text` or
+`no_window` and no locator is an item the worker never asked the model about; it gets its
+nightly_support record like any other live row (so J2 does not re-ask it and the breaker
+counts the request answered). `usage.model_call: false` means no model call was made: the
+run's model_calls and models are left as they are (event_runs.add_usage model_call=False).
 
 Return: {"written": n, "records": n, "skipped": {"gone": n, "linked": n, "moved_site": n},
          "errors": n}
@@ -180,7 +187,7 @@ def write_support(conn, event):
         run = event_runs.add_usage(
             conn, run_id, company_id, site_id, tokens_in=usage.get("tokens_in"),
             tokens_out=usage.get("tokens_out"), model=usage.get("model"),
-            cost_usd=usage.get("cost_usd"))
+            cost_usd=usage.get("cost_usd"), model_call=usage.get("model_call") is not False)
     if run is None:
         raise RuntimeError(f"nightly support writer: run {run_id} is not a run of site "
                            f"{site_id}; nothing written")

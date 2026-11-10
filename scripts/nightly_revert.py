@@ -11,8 +11,14 @@ that still hold a link (or whose basis says none_close), but a row whose only li
 deleted nightly one is in neither arm and would keep a basis naming a link that no longer
 exists. Such rows (basis `link_id` = a deleted link, no supported_by link left) are first
 reset to what `claim_type.derive` gives an item with no support (claim_type NULL). The
-pre-nightly support status (e.g. none_close -> inferred) is not stored anywhere, so it is not
-restored: NULL means unknown, never a claim the evidence does not back.
+pre-nightly support status (e.g. none_close -> inferred) is not in the DB: it lives only in
+the extraction JSON on S3, which this script does not re-read, so it is not restored. A row
+that was none_close before its nightly link therefore shows claim_type NULL until the session
+is re-extracted: NULL means unknown, never a claim the evidence does not back.
+
+Reverted items are NOT re-asked by the nightly J2 pass: their nightly_support records stay
+(each stands for one paid call), and J2 never re-asks an item that has a record since its
+row was written. Only a re-extraction (a new row) makes them askable again.
 
 DRY-RUN BY DEFAULT: without `--apply` the connection is read-only (the server refuses any
 write) and only the counts an apply would delete are printed. With `--apply` the delete, the
@@ -72,9 +78,20 @@ def _stem(key):
     return name[:-len(".json")] if name.endswith(".json") else None
 
 
+def _site_company(conn, site):
+    """The site's company id; ValueError for an unknown site (plan and apply alike)."""
+    owner = conn.execute("SELECT company_id::text FROM sites WHERE id = %s",
+                         (site,)).fetchone()
+    if owner is None:
+        raise ValueError(f"no site {site}")
+    return owner[0]
+
+
 def plan(conn, *, site_id, since, rule_version=None) -> dict:
-    """What an apply would delete: `{links, sessions, by_rule_version}`. Reads only."""
+    """What an apply would delete: `{links, sessions, by_rule_version}`. Reads only.
+    An unknown site raises ValueError, as apply does."""
     p = _params(site_id, since, rule_version)
+    _site_company(conn, p["site"])
     rows = conn.execute(
         f"SELECT e.rule_version, e.source_s3_key FROM event_links e WHERE {_NIGHTLY}",
         p).fetchall()
@@ -95,11 +112,7 @@ def apply(conn, *, site_id, since, rule_version=None) -> dict:
     from repositories.event_links import KIND_SRC_COLUMN, KIND_TABLE
 
     p = _params(site_id, since, rule_version)
-    owner = conn.execute("SELECT company_id::text FROM sites WHERE id = %s",
-                         (p["site"],)).fetchone()
-    if owner is None:
-        raise ValueError(f"no site {p['site']}")
-    company_id = owner[0]
+    company_id = _site_company(conn, p["site"])
 
     deleted = conn.execute(
         f"DELETE FROM event_links e WHERE {_NIGHTLY} RETURNING e.id::text, e.src_kind, "

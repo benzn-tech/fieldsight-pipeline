@@ -263,6 +263,32 @@ def test_writer_rows_empty_records_usage_only(db):
     assert _records(db, s) == [] and _links(db, it) == []
 
 
+def test_writer_records_abstained_rows_answered_without_a_call(db):
+    """Final review I1: the worker answers a request it never asked the model about with
+    abstained rows (a guard naming why, no turn, no locator) and model_call False. Each
+    still-live row gets its nightly_support record; a gone row gets none; the run's
+    model_calls / models are untouched."""
+    import lambda_nightly_turn_pick as worker
+    s = Seed(db)
+    a, b, gone = s.item("action_item"), s.item("finding"), s.item("decision")
+    db.execute(f"DELETE FROM {event_links.KIND_TABLE['decision']} WHERE id = %s", (gone["row_id"],))
+    event = s.event(worker._abstained_rows([a, b, gone], "no_transcript"))
+    event["usage"] = dict(worker.NO_CALL_USAGE)
+    out = writer.write_support(db, event)
+    assert out == {"written": 0, "records": 2,
+                   "skipped": {"gone": 1, "linked": 0, "moved_site": 0}, "errors": 0}
+    recs = _records(db, s)
+    assert sorted(r[5] for r in recs) == sorted([a["stable_id"], b["stable_id"]])
+    for r in recs:
+        assert r[6] is None                                   # object_ref: no locator
+        assert r[11] == {"turn": None, "guard": "no_transcript"}
+        assert r[12] == "abstained"
+    assert _links(db, a) == [] and _links(db, b) == []
+    run = db.execute("SELECT tokens_in, tokens_out, cost_usd, model_calls, models "
+                     "FROM event_runs WHERE run_id = %s", (s.run["run_id"],)).fetchone()
+    assert run == (0, 0, None, 0, None)
+
+
 def test_writer_record_model_is_the_registrys(db):
     s = Seed(db)
     it = s.item("finding")

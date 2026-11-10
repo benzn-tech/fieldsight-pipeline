@@ -47,7 +47,8 @@ def finish(conn, run_id, company_id, site_id, outcome, error=None, result_hash=N
         (outcome, error, result_hash, run_id, company_id, site_id)).fetchone()
 
 
-def add_usage(conn, run_id, company_id, site_id, *, tokens_in, tokens_out, model, cost_usd):
+def add_usage(conn, run_id, company_id, site_id, *, tokens_in, tokens_out, model, cost_usd,
+              model_call=True):
     """Add one model call's usage to THIS tenant's run: tokens summed (NULL counts as 0),
     model_calls + 1, model appended to the models array (in call order, repeats kept).
     Returns the row, or None (and changes nothing) when no run matches run_id AND
@@ -58,17 +59,25 @@ def add_usage(conn, run_id, company_id, site_id, *, tokens_in, tokens_out, model
 
     cost_usd None (cost unknown) leaves cost_usd as it is: a NULL is never turned into 0.
     Once any call of the run had an unknown cost, the stored cost_usd is therefore only a
-    LOWER BOUND of the run's cost (model_calls / models still count every call)."""
+    LOWER BOUND of the run's cost (model_calls / models still count every call).
+
+    model_call=False: no model call was made (an answer given without asking the model).
+    model_calls and models are left as they are; tokens and cost are still added (callers
+    pass 0 / None). The UPDATE still runs and returns the row, so the tenant check above
+    holds either way."""
+    call = bool(model_call)
     return conn.cursor(row_factory=dict_row).execute(
         "UPDATE event_runs SET "
         "  tokens_in = COALESCE(tokens_in, 0) + COALESCE(%s::int, 0), "
         "  tokens_out = COALESCE(tokens_out, 0) + COALESCE(%s::int, 0), "
         "  cost_usd = CASE WHEN %s::numeric IS NULL THEN cost_usd "
         "                  ELSE COALESCE(cost_usd, 0) + %s::numeric END, "
-        "  model_calls = model_calls + 1, "
-        "  models = COALESCE(models, '[]'::jsonb) || jsonb_build_array(%s::text) "
+        "  model_calls = model_calls + CASE WHEN %s::boolean THEN 1 ELSE 0 END, "
+        "  models = CASE WHEN %s::boolean "
+        "                THEN COALESCE(models, '[]'::jsonb) || jsonb_build_array(%s::text) "
+        "                ELSE models END "
         f"WHERE run_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",
-        (tokens_in, tokens_out, cost_usd, cost_usd, model, run_id, company_id,
+        (tokens_in, tokens_out, cost_usd, cost_usd, call, call, model, run_id, company_id,
          site_id)).fetchone()
 
 

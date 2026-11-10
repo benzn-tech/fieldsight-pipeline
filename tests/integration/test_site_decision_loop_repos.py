@@ -297,6 +297,28 @@ def test_add_usage_accumulates(db):
                         tokens_out=1, model="m-a", cost_usd=None) is None
 
 
+def test_add_usage_without_a_model_call(db):
+    """model_call=False (the worker answered without asking the model): the row is returned
+    (the writer's tenant gate) but model_calls and models stay as they are."""
+    co, site = _world(db)
+    other_co, _ = _world(db, "b")
+    run = er.start(db, co["id"], site["id"], [], 1, "nightly.due")
+    r0 = er.add_usage(db, run["run_id"], co["id"], site["id"], tokens_in=0, tokens_out=0,
+                      model=None, cost_usd=None, model_call=False)
+    assert r0 is not None
+    assert (r0["model_calls"], r0["models"], r0["cost_usd"]) == (0, None, None)
+    assert (r0["tokens_in"], r0["tokens_out"]) == (0, 0)
+    r1 = er.add_usage(db, run["run_id"], co["id"], site["id"], tokens_in=10, tokens_out=2,
+                      model="m-a", cost_usd=None)
+    r2 = er.add_usage(db, run["run_id"], co["id"], site["id"], tokens_in=0, tokens_out=0,
+                      model=None, cost_usd=None, model_call=False)
+    assert (r1["model_calls"], r1["models"]) == (1, ["m-a"])
+    assert (r2["model_calls"], r2["models"], r2["tokens_in"]) == (1, ["m-a"], 10)
+    # still tenant-scoped with no call
+    assert er.add_usage(db, run["run_id"], other_co["id"], site["id"], tokens_in=0,
+                        tokens_out=0, model=None, cost_usd=None, model_call=False) is None
+
+
 def test_add_usage_is_tenant_scoped(db):
     co, site = _world(db)
     other_co, other_site = _world(db, "b")

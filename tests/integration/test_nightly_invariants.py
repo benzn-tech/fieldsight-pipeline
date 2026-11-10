@@ -191,6 +191,24 @@ def test_invariant_catches_planted_row(db, name):
     assert name in bad and len(bad[name]) >= 1
 
 
+def test_two_nightly_links_across_sites_are_caught(db):
+    """A duplicate whose two links name different sites is still one source row with two
+    nightly links: the invariant does not group by site."""
+    s, _ = _clean_world(db)
+    other = wt.Seed(db)
+    it = s.item("action_item")
+    _plant_two_links(db, s, it)
+    db.execute("UPDATE event_links SET site_id = %s WHERE id = ("
+               "SELECT id FROM event_links WHERE src_action_item_id = %s "
+               "ORDER BY created_at DESC, id LIMIT 1)", (other.site["id"], it["row_id"]))
+    sites = {r[0] for r in db.execute(
+        "SELECT site_id::text FROM event_links WHERE src_action_item_id = %s",
+        (it["row_id"],)).fetchall()}
+    assert len(sites) == 2
+    bad = invariants(db)
+    assert len(bad.get("two_nightly_links_for_one_source_row", [])) == 1
+
+
 def test_dropped_reemits_on_two_nights_are_not_a_violation(db):
     """The dropped-request arm (no L) is once per (line, N, night) by design."""
     s = wt.Seed(db)

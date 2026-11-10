@@ -73,17 +73,28 @@ def build_request(items, turns, session_date):
     Items with blank text are counted as `no_text`, items whose window is empty as
     `no_window`; both before the cap is applied. `topics` is keyed by
     `str(topic_index)` so the request survives a JSON round trip unchanged.
+
+    `skipped_items` names the `no_text` / `no_window` items (stable_id, row_id, kind,
+    reason) so the worker can record them as answered (abstained) without a model call.
+    `over_cap` items are not listed: they stay askable on a later night.
     """
     kept, no_text, no_window, over_cap = [], 0, 0, 0
-    topics = {}
+    topics, skipped_items = {}, []
+
+    def _skip(it, reason):
+        skipped_items.append({"stable_id": it.get("stable_id"), "row_id": it.get("row_id"),
+                              "kind": it.get("kind"), "reason": reason})
+
     for it in items:
         text = (it.get("text") or "").strip()
         if not text:
             no_text += 1
+            _skip(it, "no_text")
             continue
         window = _window_turns(it.get("time_range"), session_date, turns)
         if not window:
             no_window += 1
+            _skip(it, "no_window")
             continue
         if len(kept) >= MAX_ITEMS:
             over_cap += 1
@@ -98,7 +109,8 @@ def build_request(items, turns, session_date):
             topics[key] = [{"n": f"T{k}", "turn_index": i}
                            for k, i in enumerate(window, start=1)]
     return {"items": kept, "topics": topics, "session_date": session_date,
-            "skipped": {"no_window": no_window, "over_cap": over_cap, "no_text": no_text}}
+            "skipped": {"no_window": no_window, "over_cap": over_cap, "no_text": no_text},
+            "skipped_items": skipped_items}
 
 
 def _topic_key(topic_index):

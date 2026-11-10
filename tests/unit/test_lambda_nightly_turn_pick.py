@@ -241,13 +241,70 @@ def test_worker_raises_on_truncated_or_refused_answer(stop):
     _usage_only(lam)
 
 
-def test_worker_no_windowed_items_makes_no_call():
+def _no_call_answer(lam, guard, n=1):
+    """The one writer invoke for a request answered without a model call: n abstained rows
+    with `guard`, no turn, no locator, zero usage and model_call False."""
+    [inv] = lam.calls
+    p = json.loads(inv["Payload"])
+    assert p["usage"] == {"tokens_in": 0, "tokens_out": 0, "model": None, "cost_usd": None,
+                          "model_call": False}
+    assert p["input_key"] == KEY and p["site_id"] == "site-1"
+    assert p["run_id"] == _request()["run_id"] and p["session_base"]
+    assert len(p["rows"]) == n
+    for r in p["rows"]:
+        assert (r["outcome"], r["guard"], r["turn"], r["locator"]) == (
+            "abstained", guard, None, None)
+        assert r["row_id"] and r["stable_id"] and r["kind"]
+    assert ORIGIN_TEXT not in inv["Payload"] and "slab" not in inv["Payload"]
+    return p
+
+
+def test_worker_no_windowed_items_answers_abstained_without_a_call():
     req = _request()
     req["items"][0]["time_range"] = "not a range"
     lam, client = FakeLambda(), FakeClient(ANSWER)
     out, *_ = _run(client=client, lam=lam, request=req)
-    assert client.messages.calls == [] and lam.calls == []
+    assert client.messages.calls == []
     assert out["skipped"]["no_window"] == 1
+    _no_call_answer(lam, "no_window")
+
+
+def test_worker_no_transcript_answers_abstained_without_a_call():
+    """The transcripts are gone: nothing to match, but the request is still answered (the
+    breaker sees it, J2 does not re-send it every night)."""
+    s3 = _s3()
+    for k in (SEG, OTHER_SEG, LEGACY_SEG):
+        del s3.objects[k]
+    req = _request()
+    req["items"].append(dict(req["items"][0], stable_id="44444444-4444-4444-4444-444444444444",
+                             row_id="55555555-5555-5555-5555-555555555555", kind="finding"))
+    s3.objects[KEY] = json.dumps(req)
+    lam, client = FakeLambda(), FakeClient(ANSWER)
+    out, *_ = _run(s3=s3, client=client, lam=lam)
+    assert client.messages.calls == []
+    assert out["no_transcript"] == 1 and out["abstained_without_call"] == 2
+    _no_call_answer(lam, "no_transcript", n=2)
+
+
+def test_worker_partial_skip_sends_skipped_items_with_the_call():
+    """One askable item and one with no window: one model call, and the writer gets both --
+    the skipped one abstained with guard no_window, under the call's real usage."""
+    req = _request()
+    req["items"].append(dict(req["items"][0], stable_id="44444444-4444-4444-4444-444444444444",
+                             row_id="55555555-5555-5555-5555-555555555555",
+                             time_range="not a range"))
+    lam, client = FakeLambda(), FakeClient(ANSWER)
+    out, *_ = _run(client=client, lam=lam, request=req)
+    assert len(client.messages.calls) == 1
+    [inv] = lam.calls
+    p = json.loads(inv["Payload"])
+    assert p["usage"]["tokens_in"] == 1500 and "model_call" not in p["usage"]
+    by_row = {r["row_id"]: r for r in p["rows"]}
+    assert len(by_row) == 2
+    skipped = by_row["55555555-5555-5555-5555-555555555555"]
+    assert (skipped["outcome"], skipped["guard"], skipped["turn"], skipped["locator"]) == (
+        "abstained", "no_window", None, None)
+    assert by_row["33333333-3333-3333-3333-333333333333"]["outcome"] == "accepted"
 
 
 def test_worker_listed_segments_but_no_turns_fails_closed():
@@ -257,11 +314,20 @@ def test_worker_listed_segments_but_no_turns_fails_closed():
         _run(s3=s3)
 
 
-def test_worker_group_session_makes_no_call():
+def test_worker_group_session_answers_abstained_without_a_call():
     lam, client = FakeLambda(), FakeClient(ANSWER)
     out, *_ = _run(client=client, lam=lam, request=_request(session_base="grp" + "c" * 32))
-    assert client.messages.calls == [] and lam.calls == []
+    assert client.messages.calls == []
     assert out["unsupported_session"] == 1
+    _no_call_answer(lam, "unsupported_session")
+
+
+def test_worker_no_call_answer_raises_on_writer_function_error():
+    """Fail closed on the no-call path too: a crashed writer is never "answered"."""
+    s3 = _s3()
+    del s3.objects[SEG]
+    with pytest.raises(RuntimeError, match="FunctionError"):
+        _run(s3=s3, lam=FakeLambda(function_error="Unhandled"))
 
 
 def test_make_client_reads_key_and_disables_sdk_retries(monkeypatch):
