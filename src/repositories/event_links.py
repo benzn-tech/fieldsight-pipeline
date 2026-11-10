@@ -102,7 +102,7 @@ def insert_continues(conn, *, site_id, src_kind, src_row_id, src_stable_id, dst_
                      source_s3_key, rule_version, decision_record_id, method="llm_echo"):
     """Write one item -> item `continues` edge (cross-day continuity, spec 2026-11-09 X8).
     Returns the new link id, or None when the (src_stable_id, dst_stable_id) edge already
-    exists (ON CONFLICT DO NOTHING on migration 0099's partial unique index).
+    exists (ON CONFLICT DO NOTHING on migration 0101's partial unique index).
 
     The FK column of `src_kind` is set to `src_row_id`, so deleting the source pass
     (topics.delete_topics_for_source) cascades the edge. The dst is the same kind as the src

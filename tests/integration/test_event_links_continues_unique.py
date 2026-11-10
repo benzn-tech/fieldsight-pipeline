@@ -1,4 +1,4 @@
-"""Integration: migration 0099 makes a `continues` edge unique per (src, dst) on real Postgres.
+"""Integration: migration 0101 makes a `continues` edge unique per (src, dst) on real Postgres.
 
 The cross-day continuity writer inserts with ON CONFLICT DO NOTHING on this index, so a
 re-run never duplicates an edge. Other link types (supported_by) must stay unaffected.
@@ -103,7 +103,7 @@ def test_supported_by_rows_with_the_same_src_are_unaffected(db):
 
 def test_reapplying_the_migration_sql_raises_nothing(db):
     path = os.path.join(os.path.dirname(__file__), "..", "..", "src", "migrations",
-                        "0099_event_links_continues_unique.sql")
+                        "0101_event_links_continues_unique.sql")
     with open(path, encoding="utf-8") as fh:
         db.execute(fh.read())
     n = db.execute(

@@ -37,7 +37,7 @@
 ### Task 1: Migration — partial unique index for `continues`
 
 **Files:**
-- Create: `src/migrations/0099_event_links_continues_unique.sql` (use the next free number at execution; 0098 is the last today)
+- Create: `src/migrations/0101_event_links_continues_unique.sql` (renumbered from 0099 at the develop merge: 0099/0100 were taken by status pick cards / site decision loop)
 - Test: `tests/integration/test_event_links_continues_unique.py`
 
 **Interfaces:**

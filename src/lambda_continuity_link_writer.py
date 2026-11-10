@@ -43,7 +43,7 @@ Skip reasons (X8), per link:
                 continuity_xday.recorded_earlier). The dst's order is RE-READ from the DB --
                 its first-seen row's topic report_date, as item_history.find_items derives
                 first_date -- never the request's copy and never created_at;
-  duplicate  -- the edge already exists (ON CONFLICT DO NOTHING, migration 0099).
+  duplicate  -- the edge already exists (ON CONFLICT DO NOTHING, migration 0101).
 
 The src row is looked up under the request's extraction key only, so the link's FK names a
 row of that pass and `delete_topics_for_source(extraction_key)` cascades it. When the src is
