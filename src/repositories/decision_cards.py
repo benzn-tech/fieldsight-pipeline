@@ -2,8 +2,9 @@
 'open' unless superseded, and a platform admin labels each card; labelling never changes
 status. One OPEN card per card_key (partial unique index), so a superseded card frees its key.
 
-Every function is scoped by company_id and site_id except list_shadow, shadow_summary_rows
-(platform-admin reads across every company) and set_label (platform-admin write by card id)."""
+Every function is scoped by company_id and site_id except list_shadow, get_shadow,
+evidence_sources, shadow_summary_rows (platform-admin reads across every company) and
+set_label (platform-admin write by card id)."""
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -96,6 +97,34 @@ def list_shadow(conn, limit, offset, label=None):
         "JOIN sites s ON s.id = c.site_id "
         f"{where}ORDER BY c.created_at DESC, c.card_id DESC LIMIT %s OFFSET %s",
         (*params, limit, offset)).fetchall()
+
+
+def get_shadow(conn, card_id):
+    """Platform-admin read: one card in list_shadow's shape (with company_name and
+    site_name), or None."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_C_COLS}, co.name AS company_name, s.name AS site_name "
+        "FROM decision_cards c JOIN companies co ON co.id = c.company_id "
+        "JOIN sites s ON s.id = c.site_id WHERE c.card_id = %s",
+        (card_id,)).fetchone()
+
+
+def evidence_sources(conn, card_ids):
+    """Platform-admin read, ONE query for a page of cards: where each card's evidence came
+    from -- card -> originating event (same tenant) -> the checklist report its payload
+    names. Rows of (card_id, user_folder, report_date, session); a card with no event, or
+    whose event names no existing report, has no row. The report id is compared as text,
+    so a malformed payload value matches nothing instead of aborting the transaction."""
+    if not card_ids:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT c.card_id, cr.user_folder, cr.report_date, cr.session "
+        "FROM decision_cards c "
+        "JOIN site_events e ON e.event_id = c.event_id "
+        "  AND e.company_id = c.company_id AND e.site_id = c.site_id "
+        "JOIN checklist_reports cr ON cr.id::text = e.payload->>'report_id' "
+        "WHERE c.card_id = ANY(%s::uuid[]) ORDER BY c.created_at, c.card_id",
+        ([str(i) for i in card_ids],)).fetchall()
 
 
 def shadow_summary_rows(conn):
