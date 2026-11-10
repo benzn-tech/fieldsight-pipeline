@@ -92,23 +92,34 @@ def _new_event(company_id, site_id, source, type_, subject_ref, occurred_at, now
 
 def emit_todo_overdue(conn, today_nz, now):
     """One todo.overdue event per live open item whose deadline is before today_nz.
-    occurred_at = received_at = now (the scan); company = the item's site's company."""
+    occurred_at = received_at = now (the scan); company = the item's site's company.
+    Each item in its own savepoint: one bad item is counted in errors and the rest of the
+    day's events are kept."""
     out = _counts()
-    with conn.transaction():
-        for item in action_items.overdue_open(conn, today_nz):
-            deadline = item.get("deadline")
-            ev = _new_event(
-                item["company_id"], item["site_id"], "action_items", OVERDUE_TYPE,
-                str(item["stable_id"]), now, now,
-                {"text": item.get("text"),
-                 "deadline": deadline.isoformat() if deadline is not None else None,
-                 "responsible": item.get("responsible")})
-            if _insert_event(conn, ev, today_nz):
-                out["emitted"] += 1
-            else:
-                out["duplicates"] += 1
+    for item in action_items.overdue_open(conn, today_nz):
+        try:
+            with conn.transaction():
+                _emit_overdue_item(conn, item, today_nz, now, out)
+        except Exception as exc:  # noqa: BLE001 - one bad item never stops the scan
+            out["errors"] += 1
+            logger.warning("decision-scan overdue: item %s not emitted: %r",
+                           item.get("stable_id"), exc)
     logger.info("decision-scan todo_overdue %s", out)
     return out
+
+
+def _emit_overdue_item(conn, item, today_nz, now, out):
+    deadline = item.get("deadline")
+    ev = _new_event(
+        item["company_id"], item["site_id"], "action_items", OVERDUE_TYPE,
+        str(item["stable_id"]), now, now,
+        {"text": item.get("text"),
+         "deadline": deadline.isoformat() if deadline is not None else None,
+         "responsible": item.get("responsible")})
+    if _insert_event(conn, ev, today_nz):
+        out["emitted"] += 1
+    else:
+        out["duplicates"] += 1
 
 
 def _report_midnight_utc(report_date):
@@ -141,7 +152,8 @@ def _emit_report(conn, rep, gaps, company_id, site_id, now, out):
             titles.append(title)
         payload = {"checklist": title, "item": g.get("text"), "kind": kind,
                    "comment": g.get("comment"), "session": session,
-                   "report_date": str(report_date)[:10], "n": g.get("n")}
+                   "report_date": str(report_date)[:10], "n": g.get("n"),
+                   "report_id": str(rep["id"])}
         if g.get("quote"):
             payload["quote"] = g["quote"]
         if g.get("responsible"):
@@ -155,11 +167,14 @@ def _emit_report(conn, rep, gaps, company_id, site_id, now, out):
             out["emitted"] += 1
         else:
             out["duplicates"] += 1
-    # A gap that was on this report's checklist and is gone now: its open card is
-    # superseded. Only checklists the result names with known gaps are judged.
+    # A gap that was on THIS report's checklist and is gone now: its open card is
+    # superseded. Only checklists the result names with known gaps are judged, and only
+    # cards whose originating event came from this report (report_id), so two reports of
+    # one template in one session never close each other's cards, whatever the scan order.
     for title in titles:
         for card in decision_cards.open_for_subject_prefix(
-                conn, company_id, site_id, GAP_TYPE, f"{session}|{title}|"):
+                conn, company_id, site_id, GAP_TYPE, f"{session}|{title}|",
+                report_id=str(rep["id"])):
             if card["card_key"] not in current:
                 decision_cards.supersede(conn, company_id, site_id, card["card_key"])
     checklist_reports.mark_seen(conn, rep["id"], rep["result_key"])
@@ -198,10 +213,17 @@ def emit_checklist_gaps(conn, read_result, now):
 # --------------------------------------------------------------------------- process
 
 def _event_of(row):
+    """The hub Event of a claimed row. ValueError on a row the hub cannot read (payload not
+    an object, received_at not a timestamp)."""
+    payload = row["payload"] if row["payload"] is not None else {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"payload is {type(payload).__name__}, not an object")
+    if not isinstance(row["received_at"], datetime):
+        raise ValueError("received_at is not a timestamp")
     return Event(event_id=row["event_id"], company_id=row["company_id"],
                  site_id=row["site_id"], source=row["source"], type=row["type"],
                  subject_ref=row["subject_ref"], occurred_at=row["occurred_at"],
-                 received_at=_utc(row["received_at"]), payload=row["payload"] or {},
+                 received_at=_utc(row["received_at"]), payload=payload,
                  chain_id=row["chain_id"], chain_depth=row["chain_depth"] or 0)
 
 
@@ -295,6 +317,20 @@ def _fail(conn, row, ev, exc, now, out):
         site_events.set_status(conn, ev.event_id, cid, sid, "queued", attempts=attempts,
                                last_error=err,
                                not_before=now + timedelta(seconds=backoff_seconds(attempts)))
+    if attempts == FAULT_AT or attempts >= STOP_AT:
+        # Own savepoint: a fault-card failure (e.g. a recipient lookup) must never undo the
+        # run row / attempts / backoff above, or the batch would stall on this event.
+        try:
+            with conn.transaction():
+                _fault_step(conn, ev, attempts, out)
+        except Exception:  # noqa: BLE001 - logged; the attempt itself stays recorded
+            logger.exception("decision-scan process: fault card for event %s (attempt %d) "
+                             "not written", ev.event_id, attempts)
+
+
+def _fault_step(conn, ev, attempts, out):
+    """The fault card at FAULT_AT; its bump (or a stopped card if none is open) at STOP_AT."""
+    cid, sid = ev.company_id, ev.site_id
     if attempts == FAULT_AT:
         if _insert_fault(conn, ev, fault_card(ev, attempts, False), "fault", ev.event_id):
             out["faults"] += 1
@@ -308,12 +344,27 @@ def _fail(conn, row, ev, exc, now, out):
             out["faults"] += 1
 
 
+def _bare_event(row, now):
+    """A minimal Event for recording the failure of a row _event_of could not read."""
+    return Event(event_id=row["event_id"], company_id=row["company_id"],
+                 site_id=row["site_id"], source=str(row.get("source") or ""),
+                 type=str(row.get("type") or ""), subject_ref=str(row.get("subject_ref") or ""),
+                 occurred_at=None, received_at=now, payload={}, chain_id=row.get("chain_id"),
+                 chain_depth=0)
+
+
 def _process_one(conn, row, now, out):
-    ev = _event_of(row)
+    """A row _event_of cannot read (malformed payload/timestamps) is a failed attempt like
+    a handler failure: it goes through _fail (backoff, fault at 3, stop at 5)."""
+    try:
+        ev = _event_of(row)
+    except Exception as exc:  # noqa: BLE001
+        _fail(conn, row, _bare_event(row, now), exc, now, out)
+        return
     cid, sid = ev.company_id, ev.site_id
-    today_nz = nz_time.to_nz(ev.received_at).date()
     try:
         with conn.transaction():
+            today_nz = nz_time.to_nz(ev.received_at).date()
             # Pre-dispatch outcomes start no run.
             if tenancy_status.company_status(conn, cid) != tenancy_status.ACTIVE:
                 site_events.set_status(conn, ev.event_id, cid, sid, "blocked")
@@ -373,8 +424,11 @@ def lambda_handler(event, context):
         return {"skipped": "flag off"}
     scan = (event or {}).get("scan")
     if scan not in ("checklist_gap", "todo_overdue", "process"):
-        logger.warning("decision-scan: unknown scan %r", scan)
-        return {"error": f"unknown scan: {scan!r}"}
+        raise ValueError(f"decision-scan: unknown scan {scan!r}")
+    bucket = os.environ.get("LAKE_BUCKET", "")
+    if scan == "checklist_gap" and not bucket:
+        # Fail loudly once, not as a per-report error on every scan forever.
+        raise RuntimeError("decision-scan: LAKE_BUCKET is not set")
     now = datetime.now(timezone.utc)
     today_nz = nz_time.to_nz(now).date()
     result = _counts()
@@ -382,7 +436,6 @@ def lambda_handler(event, context):
         if scan == "todo_overdue":
             got = emit_todo_overdue(conn, today_nz, now)
         elif scan == "checklist_gap":
-            bucket = os.environ.get("LAKE_BUCKET", "")
             got = emit_checklist_gaps(
                 conn, lambda key: checklist_reports.read_result_status(key, _s3(), bucket),
                 now)

@@ -479,11 +479,12 @@ def test_late_gap_is_not_carded(db):
 
 # ---------------------------------------------------------------- process
 
-def test_inactive_company_blocks(db, monkeypatch):
+@pytest.mark.parametrize("status", ["suspended", "exited"])
+def test_inactive_company_blocks(db, monkeypatch, status):
     monkeypatch.delenv("COMPANY_STATUS_ENFORCE", raising=False)
     co, site, pm, admin = _world(db)
     _overdue_item(db, site)
-    db.execute("UPDATE companies SET status = 'suspended' WHERE id = %s", (co["id"],))
+    db.execute("UPDATE companies SET status = %s WHERE id = %s", (status, co["id"]))
     assert lds.emit_todo_overdue(db, TODAY, NOW)["emitted"] == 1
     out = lds.process(db, NOW)
     assert out["processed"] == 1 and out["cards"] == 0
@@ -700,3 +701,129 @@ def test_overlapping_process_runs_do_not_double_process(committed, monkeypatch):
         b.rollback()
         a.close()
         b.close()
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_unknown_scan_raises(monkeypatch):
+    monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
+    monkeypatch.setattr(lds, "get_connection", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("connection opened for an unknown scan")))
+    for bad in ({"scan": "nope"}, {}, None):
+        with pytest.raises(ValueError):
+            lds.lambda_handler(bad, None)
+
+
+def test_gap_scan_without_lake_bucket_raises_before_scanning(monkeypatch):
+    monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
+    monkeypatch.setattr(lds, "get_connection", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("connection opened without LAKE_BUCKET")))
+    for value in (None, ""):
+        if value is None:
+            monkeypatch.delenv("LAKE_BUCKET", raising=False)
+        else:
+            monkeypatch.setenv("LAKE_BUCKET", value)
+        with pytest.raises(RuntimeError, match="LAKE_BUCKET"):
+            lds.lambda_handler({"scan": "checklist_gap"}, None)
+
+
+def test_fault_card_failure_does_not_stall_the_batch(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    bad = _queued(db, co, site)
+    good_subjects = []
+    real = lds._handle
+
+    def handle(conn, event, rule, now):
+        if str(event.event_id) == str(bad["event_id"]):
+            raise RuntimeError("handler exploded")
+        return real(conn, event, rule, now)
+
+    def broken_route(*a, **k):
+        raise RuntimeError("recipient lookup exploded")
+    monkeypatch.setattr(lds, "_handle", handle)
+    monkeypatch.setattr(lds, "_insert_fault", broken_route)
+
+    t = NOW
+    last_nb = None
+    for attempt in range(1, 4):
+        good = _queued(db, co, site, received_at=t, occurred_at=t)   # healthy, same batch
+        good_subjects.append(good["subject_ref"])
+        out = lds.process(db, t)
+        assert out["processed"] == 2
+        row = next(e for e in _events(db, co["id"]) if e["event_id"] == bad["event_id"])
+        assert row["attempts"] == attempt and row["status"] == "queued"
+        assert last_nb is None or row["not_before"] > last_nb
+        last_nb = row["not_before"]
+        t = row["not_before"]
+        st = next(e for e in _events(db, co["id"]) if e["event_id"] == good["event_id"])
+        assert st["status"] == "done"
+    open_refs = {c["subject_ref"] for c in _cards(db, co["id"], "open")}
+    assert open_refs == set(good_subjects)                    # healthy cards; no fault card
+    failed_runs = [r for r in _runs(db, co["id"]) if r["outcome"] == "failed"]
+    assert len(failed_runs) == 3
+
+
+def test_one_bad_overdue_item_keeps_the_rest(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    a = _overdue_item(db, site, "Good one")
+    b = _overdue_item(db, site, "Bad one")
+    real = lds._insert_event
+
+    def insert(conn, ev, today_nz):
+        if ev.subject_ref == str(b["stable_id"]):
+            conn.execute("SELECT 1/0")                        # aborts like a real SQL error
+        return real(conn, ev, today_nz)
+    monkeypatch.setattr(lds, "_insert_event", insert)
+    out = lds.emit_todo_overdue(db, TODAY, NOW)
+    assert (out["emitted"], out["errors"]) == (1, 1)
+    assert [e["subject_ref"] for e in _events(db, co["id"])] == [str(a["stable_id"])]
+
+
+@pytest.mark.parametrize("order", ["first_then_second", "second_then_first"])
+def test_two_reports_of_one_template_do_not_supersede_each_other(db, order):
+    co, site, folder, session = _gap_world(db)
+    fake = FakeS3({"k-first": _done(**{"Pre-pour": _gaps(nc=[(3, "Cover checked")])}),
+                   "k-second": _done(**{"Pre-pour": _gaps()})})          # all covered
+    first = _report(db, co["id"], folder, session, "k-first")
+    lds.emit_checklist_gaps(db, _reader(fake), NOW)
+    lds.process(db, NOW)
+    second = _report(db, co["id"], folder, session, "k-second")          # other start_at
+    if order == "second_then_first":
+        # re-queue the first too, so the scan reads second, then first
+        db.execute("UPDATE checklist_reports SET result_key = 'k-first2', "
+                   "created_at = now() + interval '1 second' WHERE id = %s", (first,))
+        fake.bodies["k-first2"] = fake.bodies["k-first"]
+    lds.emit_checklist_gaps(db, _reader(fake), NOW)
+    assert _seen(db, second) == 1
+    [card] = _cards(db, co["id"], "open")
+    assert card["subject_ref"] == f"{session}|Pre-pour|3|Cover checked"
+    assert _cards(db, co["id"], "superseded") == []
+    [ev] = [e for e in _events(db, co["id"]) if e["status"] != "duplicate"]
+    assert ev["payload"]["report_id"] == str(first)
+
+
+def test_report_scoped_supersede_still_closes_its_own_card(db):
+    co, site, folder, session = _gap_world(db)
+    fake = FakeS3({"k1": _done(**{"Pre-pour": _gaps(nc=[(3, "Cover checked")])}),
+                   "k2": _done(**{"Pre-pour": _gaps()})})
+    rid = _report(db, co["id"], folder, session, "k1")
+    lds.emit_checklist_gaps(db, _reader(fake), NOW)
+    lds.process(db, NOW)
+    db.execute("UPDATE checklist_reports SET result_key = 'k2', created_at = now() "
+               "WHERE id = %s", (rid,))
+    lds.emit_checklist_gaps(db, _reader(fake), NOW)
+    assert _cards(db, co["id"], "open") == []
+    assert len(_cards(db, co["id"], "superseded")) == 1
+
+
+def test_malformed_claimed_row_is_a_failed_attempt(db):
+    co, site, pm, admin = _world(db)
+    bad = _queued(db, co, site, payload=["not", "an", "object"])
+    good = _queued(db, co, site)
+    out = lds.process(db, NOW)
+    assert out["processed"] == 2 and out["cards"] == 1
+    st = {e["event_id"]: e for e in _events(db, co["id"])}
+    assert st[bad["event_id"]]["status"] == "queued"
+    assert st[bad["event_id"]]["attempts"] == 1
+    assert "payload" in st[bad["event_id"]]["last_error"]
+    assert st[good["event_id"]]["status"] == "done"

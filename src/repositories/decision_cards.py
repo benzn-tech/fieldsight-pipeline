@@ -44,14 +44,27 @@ def _like_prefix(prefix):
     return esc + "%"
 
 
-def open_for_subject_prefix(conn, company_id, site_id, rule_id, prefix):
+def open_for_subject_prefix(conn, company_id, site_id, rule_id, prefix, report_id=None):
     """Open cards of this tenant and rule whose subject_ref starts with `prefix` (literal: LIKE
-    wildcards in the prefix are escaped), oldest first."""
+    wildcards in the prefix are escaped), oldest first.
+
+    `report_id` (checklist.gap): only cards whose originating event (decision_cards.event_id,
+    same tenant) carries payload report_id = that id -- so one checklist report never closes
+    another report's cards. A card with no event never matches when report_id is given."""
+    if report_id is None:
+        return conn.cursor(row_factory=dict_row).execute(
+            f"SELECT {_COLS} FROM decision_cards "
+            "WHERE company_id = %s AND site_id = %s AND rule_id = %s AND status = 'open' "
+            "AND subject_ref LIKE %s ORDER BY created_at, card_id",
+            (company_id, site_id, rule_id, _like_prefix(prefix))).fetchall()
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM decision_cards "
-        "WHERE company_id = %s AND site_id = %s AND rule_id = %s AND status = 'open' "
-        "AND subject_ref LIKE %s ORDER BY created_at, card_id",
-        (company_id, site_id, rule_id, _like_prefix(prefix))).fetchall()
+        f"SELECT {_C_COLS} FROM decision_cards c "
+        "JOIN site_events e ON e.event_id = c.event_id "
+        "  AND e.company_id = c.company_id AND e.site_id = c.site_id "
+        "WHERE c.company_id = %s AND c.site_id = %s AND c.rule_id = %s "
+        "AND c.status = 'open' AND c.subject_ref LIKE %s "
+        "AND e.payload->>'report_id' = %s ORDER BY c.created_at, c.card_id",
+        (company_id, site_id, rule_id, _like_prefix(prefix), str(report_id))).fetchall()
 
 
 def supersede(conn, company_id, site_id, card_key):
