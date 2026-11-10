@@ -47,14 +47,18 @@ def finish(conn, run_id, company_id, site_id, outcome, error=None, result_hash=N
         (outcome, error, result_hash, run_id, company_id, site_id)).fetchone()
 
 
-def add_usage(conn, run_id, *, tokens_in, tokens_out, model, cost_usd):
-    """Add one model call's usage to a run: tokens summed (NULL counts as 0), model_calls + 1,
-    model appended to the models array (in call order, repeats kept). cost_usd None (cost
-    unknown) leaves cost_usd as it is -- a NULL is never turned into 0. Returns the row, or
-    None for an unknown run.
+def add_usage(conn, run_id, company_id, site_id, *, tokens_in, tokens_out, model, cost_usd):
+    """Add one model call's usage to THIS tenant's run: tokens summed (NULL counts as 0),
+    model_calls + 1, model appended to the models array (in call order, repeats kept).
+    Returns the row, or None (and changes nothing) when no run matches run_id AND
+    company_id AND site_id -- an unknown run or another tenant's.
 
-    Keyed by run_id only: the caller is the run's own writer, which holds the run_id the
-    hub gave it (RunContext.run_id), never one taken from a request."""
+    run_id reaches the writer from the S3 request through the non-VPC worker, so it is
+    request input: the tenant columns in the WHERE are what keep it on its own run.
+
+    cost_usd None (cost unknown) leaves cost_usd as it is: a NULL is never turned into 0.
+    Once any call of the run had an unknown cost, the stored cost_usd is therefore only a
+    LOWER BOUND of the run's cost (model_calls / models still count every call)."""
     return conn.cursor(row_factory=dict_row).execute(
         "UPDATE event_runs SET "
         "  tokens_in = COALESCE(tokens_in, 0) + COALESCE(%s::int, 0), "
@@ -63,5 +67,6 @@ def add_usage(conn, run_id, *, tokens_in, tokens_out, model, cost_usd):
         "                  ELSE COALESCE(cost_usd, 0) + %s::numeric END, "
         "  model_calls = model_calls + 1, "
         "  models = COALESCE(models, '[]'::jsonb) || jsonb_build_array(%s::text) "
-        f"WHERE run_id = %s RETURNING {_COLS}",
-        (tokens_in, tokens_out, cost_usd, cost_usd, model, run_id)).fetchone()
+        f"WHERE run_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",
+        (tokens_in, tokens_out, cost_usd, cost_usd, model, run_id, company_id,
+         site_id)).fetchone()
