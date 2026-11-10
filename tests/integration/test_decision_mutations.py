@@ -97,6 +97,8 @@ MUTATIONS = {
     "wrong_company": (wrong_company, "site belongs to another company"),
     "skip_dedupe": (skip_dedupe, "dedupe_key"),
     "skip_late": (skip_late, "hub says late"),
+    # the same fault seen on the stale overdue item (rev 6): carded instead of 'late'
+    "skip_late_overdue": (skip_late, "todo.overdue): stored done, hub says late"),
     "duplicate_event": (duplicate_event, "dedupe_key"),
     "skip_attempt_counter": (skip_attempt_counter, "attempts"),
 }

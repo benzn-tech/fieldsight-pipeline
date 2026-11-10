@@ -211,7 +211,7 @@ def test_summary_precision_formula():
 def test_summary_empty_is_none():
     s = org.decision_shadow_summary([])
     assert s == {"labelled": 0, "needed": 0, "not_needed": 0, "wrong_evidence": 0,
-                 "precision": None, "cards_per_recipient_day_p95": None}
+                 "precision": None, "cards_per_recipient_day_p95": None, "since": None}
     only_wrong = org.decision_shadow_summary([_srow("wrong_evidence")])
     assert only_wrong["precision"] is None
 
@@ -230,6 +230,41 @@ def test_p95_nearest_rank_sunday_folds_into_monday_fault_excluded():
     assert s["cards_per_recipient_day_p95"] == 4.0
     assert org.decision_shadow_summary([_srow(kind="fault")])[
         "cards_per_recipient_day_p95"] is None
+
+
+def test_since_limits_labels_and_p95_to_nz_days_on_or_after_it():
+    from datetime import date
+    # NZDT = UTC+13. 2026-11-10 11:30Z is Wed 11 Nov 00:30 NZ; 10:30Z is Tue 10 Nov 23:30 NZ.
+    before = datetime(2026, 11, 10, 10, 30, tzinfo=timezone.utc)
+    after = datetime(2026, 11, 10, 11, 30, tzinfo=timezone.utc)
+    rows = ([_srow("needed", at=before) for _ in range(5)]
+            + [_srow("not_needed", at=after), _srow("needed", at=after), _srow("needed")])
+    rows[-1]["created_at"] = None
+    full = org.decision_shadow_summary(rows)
+    assert (full["labelled"], full["cards_per_recipient_day_p95"], full["since"]) == (
+        8, 5.0, None)
+    s = org.decision_shadow_summary(rows, since=date(2026, 11, 11))
+    assert (s["labelled"], s["needed"], s["not_needed"]) == (2, 1, 1)
+    assert s["precision"] == 0.5
+    assert s["cards_per_recipient_day_p95"] == 2.0
+    assert s["since"] == "2026-11-11"
+    assert org.decision_shadow_summary(rows, since=date(2026, 11, 12))[
+        "cards_per_recipient_day_p95"] is None
+
+
+def test_since_query_param_valid_invalid(env, monkeypatch):
+    rows = [_srow("needed", at=datetime(2026, 11, 9, 22, 0, tzinfo=timezone.utc))]
+    monkeypatch.setattr(org.decision_cards, "shadow_summary_rows", lambda conn: rows)
+    status, body = _call("GET", "/decision-shadow", query={"since": "2026-11-11"})
+    assert status == 200
+    assert body["summary"]["since"] == "2026-11-11" and body["summary"]["labelled"] == 0
+    assert len(body["cards"]) == 1                       # the card list is unchanged
+    status, body = _call("GET", "/decision-shadow", query={"since": ""})
+    assert status == 200 and body["summary"]["since"] is None
+    assert body["summary"]["labelled"] == 1
+    for bad in ("2026-13-01", "11/11/2026", "2026-11-1", "2026-11-11T00:00", "yesterday"):
+        status, body = _call("GET", "/decision-shadow", query={"since": bad})
+        assert (status, body.get("error")) == (400, "since must be YYYY-MM-DD"), bad
 
 
 def test_p95_uses_nz_day_not_utc_day():

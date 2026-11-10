@@ -268,3 +268,33 @@ def test_cards_per_recipient_day_p95(db, env):
     p95 = body["summary"]["cards_per_recipient_day_p95"]
     assert p95 >= 3.5
     assert p95 == 4.0
+
+
+def test_since_filters_labels_and_p95_but_not_the_list(db, env):
+    """Spec §12 rev 6: ?since=<NZ date> limits the summary (labels and p95) to cards created
+    on or after that NZ day; the card list is unchanged; a malformed value is a 400."""
+    co, site, admin = _world(db)
+    rid = str(uuid.uuid4())
+    recips = [{"user_id": rid, "role": "pm"}]
+    old = dt.datetime(2026, 11, 10, 10, 30, tzinfo=UTC)    # Tue 10 Nov 23:30 NZ
+    new = dt.datetime(2026, 11, 10, 11, 30, tzinfo=UTC)    # Wed 11 Nov 00:30 NZ
+    for i in range(5):
+        c = _card(db, co, site, recipients=recips)
+        _at(db, c, old + dt.timedelta(seconds=i))
+        dc.set_label(db, c["card_id"], "not_needed", None, admin["id"])
+    for i, label in enumerate(("needed", None)):
+        c = _card(db, co, site, recipients=recips)
+        _at(db, c, new + dt.timedelta(seconds=i))
+        if label:
+            dc.set_label(db, c["card_id"], label, None, admin["id"])
+    status, body = _call(db, admin, "GET", "/decision-shadow")
+    assert status == 200 and body["summary"]["since"] is None
+    assert (body["summary"]["labelled"], body["summary"]["cards_per_recipient_day_p95"]) == (
+        6, 5.0)
+    status, body = _call(db, admin, "GET", "/decision-shadow", query={"since": "2026-11-11"})
+    assert status == 200 and len(body["cards"]) == 7
+    s = body["summary"]
+    assert (s["since"], s["labelled"], s["needed"], s["not_needed"]) == ("2026-11-11", 1, 1, 0)
+    assert s["precision"] == 1.0 and s["cards_per_recipient_day_p95"] == 2.0
+    status, body = _call(db, admin, "GET", "/decision-shadow", query={"since": "11-11-2026"})
+    assert (status, body["error"]) == (400, "since must be YYYY-MM-DD")
