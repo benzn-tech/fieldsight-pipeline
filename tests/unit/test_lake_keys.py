@@ -82,6 +82,9 @@ CASES = [
     ("voice/%s/%s/a_b.m4a" % (U, S), dict(scope="tenant", kind="voice", company_id=U, site_id=S)),
     ("voiceprint_requests/%s/base1/r.json" % U, dict(scope="tenant", kind="voiceprint", company_id=U, session_base="base1")),
     ("match_requests/%s/%s/h.json" % (S, D), dict(scope="tenant", kind="match", site_id=S, day=D)),
+    # cross-day continuity request (hop 1): site-scoped like match
+    ("continuity_xday_requests/%s/%s/0123456789abcdef.json" % (S, D),
+     dict(scope="tenant", kind="xday_request", site_id=S, day=D, folder=None, company_id=None)),
     ("weather/%s/%s/actual.json" % (S, D), dict(scope="tenant", kind="weather", site_id=S, site_slug=None, day=D)),
     ("weather/tower-a/%s/actual.json" % D, dict(scope="tenant", kind="weather", site_id=None, site_slug="tower-a", day=D)),
     ("programmes/%s/programme.json" % S, dict(scope="tenant", kind="programme", site_id=S, site_slug=None)),

@@ -72,6 +72,10 @@ import status_suggestions
 from repositories import status_suggestions as status_suggestions_repo
 import index_request
 import continuity_records
+import continuity_xday
+import continuity_xday_request
+from deleted_predicates import visible_topics_predicate
+from repositories import item_history
 import item_continuity
 import lambda_ingest
 import keyframe_request
@@ -146,6 +150,12 @@ SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # default so the write path ships inert: this only ever writes rows to
 # topic_thread_suggestions, which nothing reads yet.
 SUGGEST_THREADS = os.environ.get("SUGGEST_THREADS", "false").lower() == "true"
+
+# Cross-day item continuity (spec 2026-11-09 X1): off | shadow | on. `shadow` and `on` both
+# build the hop-1 request inside the connection block and put it to S3 after the commit;
+# anything else (including a typo) is `off`, where no extra SQL runs and nothing is put.
+CROSS_DAY_CONTINUITY = os.environ.get("CROSS_DAY_CONTINUITY", "off").lower()
+_XDAY_MODES = ("shadow", "on")
 
 EXTRACTIONS_PREFIX = "extractions/"
 
@@ -1265,6 +1275,201 @@ def _emit_item_support_metric(key, items, counts):
         logger.warning("could not emit the item support metric for %s", key)
 
 
+# --- cross-day continuity, hop 1 (spec 2026-11-09 X2-X5) ------------------------------------
+
+# kind list name -> (child table, text column)
+_XDAY_TABLES = {
+    "action_items": ("action_items", "text"),
+    "questions": ("topic_questions", "question"),
+    "findings": ("findings", "observation"),
+}
+# X5: action items open|in_progress|blocked, questions open, findings unfiltered (find_items
+# refuses a status filter on findings, so they get no entry).
+_XDAY_STATUSES = {
+    "action_items": {"action_item": ["open", "in_progress", "blocked"]},
+    "questions": {"question": ["open"]},
+    "findings": None,
+}
+_XDAY_RECENCY = 20
+_XDAY_LEXICAL = 5
+# One recency read per kind fetches the whole window (find_items ranks in Python over every
+# live row anyway), so its length is the pre-cap count; at this ceiling it is a lower bound.
+_XDAY_POOL_LIMIT = 1000
+
+
+def _xday_recorded_at(conn, session_base):
+    """UTC recording start of this session's items, for their order key.
+
+    TODO(Track C): return the same `first_seen_recorded_at` rule find_items will expose
+    (meeting_session.opened_at by sid, else the transcript-stem timestamp) once it lands.
+    Until then None: a same-date candidate is then not ordered and is dropped (Ruling R3)."""
+    return None
+
+
+def _xday_str(value):
+    return None if value is None else str(value)
+
+
+def _xday_row(row):
+    """A find_items row with its uuids as strings (the request is JSON)."""
+    out = dict(row)
+    out["stable_id"] = _xday_str(row.get("stable_id"))
+    out["item_id"] = _xday_str(row.get("item_id"))
+    return out
+
+
+def _xday_new_items(conn, site_id, extraction_key):
+    """X4: the pass's live child rows of the three kinds, read back by key (so the nightly
+    caller, which has no topic ids, reads exactly what the writer would)."""
+    live = visible_topics_predicate("t")
+    out = {}
+    for ln in continuity_xday.XDAY_KINDS:
+        table, col = _XDAY_TABLES[ln]
+        rows = conn.execute(
+            f"SELECT c.stable_id::text, c.item_id::text, c.{col} FROM {table} c "
+            f"JOIN topics t ON t.id = c.topic_id "
+            f"WHERE t.source_s3_key = %s AND c.site_id = %s AND {live} "
+            f"ORDER BY c.{col}, c.stable_id", (extraction_key, site_id)).fetchall()
+        out[ln] = [{"stable_id": r[0], "item_id": r[1], "text": r[2]}
+                   for r in rows if r[0]][:continuity_xday.CAP_PER_KIND]
+    return out
+
+
+def _xday_order(row):
+    first_date, recorded_at = continuity_xday.order_key(row)
+    return (first_date or "", recorded_at or "", row.get("stable_id") or "")
+
+
+def _xday_chains(conn, site_id, rows_by_sid, own_sids):
+    """One query for the `continues` edges among the candidate (and own) stable_ids ->
+    {stable_id: its chain's newest member}. Newest by RECORDING order over the rows in hand
+    (ties broken by stable_id); a chain holding one of this session's own items is headed by
+    it, so select_candidates hides the whole chain."""
+    ids = sorted(set(rows_by_sid) | set(own_sids))
+    if not rows_by_sid:
+        return {}
+    edges = conn.execute(
+        "SELECT src_stable_id::text, dst_stable_id::text FROM event_links "
+        "WHERE site_id = %s AND link_type = 'continues' "
+        "AND src_stable_id = ANY(%s::uuid[]) AND dst_stable_id = ANY(%s::uuid[])",
+        (site_id, ids, ids)).fetchall()
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        parent[find(a)] = find(b)
+    groups = {}
+    for sid in parent:
+        groups.setdefault(find(sid), []).append(sid)
+    chains = {}
+    for members in groups.values():
+        own = sorted(m for m in members if m in own_sids)
+        if own:
+            head = own[0]
+        else:
+            known = [rows_by_sid[m] for m in members if m in rows_by_sid]
+            if not known:
+                continue
+            head = max(known, key=_xday_order)["stable_id"]
+        for m in members:
+            chains[m] = head
+    return chains
+
+
+def build_xday_request(conn, *, site, company_id, extraction, extraction_key, date,
+                       nonce=None, trigger="final"):
+    """Hop 1's request for one session's final pass, or None (skip, counted in the log).
+
+    Public: the item writer calls it inside its connection block (after number_new_items,
+    so stable_ids are final) and the nightly re-match agent calls it with a `nonce`;
+    `trigger` is written into the artifact only. Runs no SQL when it skips on its inputs
+    (no site, not a final, an incomplete final). Logs counts and keys, never item text."""
+    def skip(reason, **counts):
+        logger.info("xday request skipped: %s key=%s %s", reason, extraction_key,
+                    " ".join(f"{k}={v}" for k, v in counts.items()))
+        return None
+
+    if not site or not site.get("id"):
+        return skip("no_site")
+    if (extraction or {}).get("tier") != "final":
+        return skip("not_final")
+    if extraction.get("incomplete"):
+        return skip("incomplete")
+    site_id = str(site["id"])
+    company_id = str(company_id or site.get("company_id"))
+    day = continuity_xday._iso_date(date)
+    until = datetime.date.fromisoformat(day)
+    since = until - datetime.timedelta(days=continuity_xday.WINDOW_DAYS)
+    session_base = _parse_extraction_key(extraction_key)[2]
+
+    new_items = _xday_new_items(conn, site_id, extraction_key)
+    n_new = sum(len(v) for v in new_items.values())
+    if not n_new:
+        return skip("no_new_items")
+    recorded_at = _xday_recorded_at(conn, session_base)
+    # Every round of a session (late-chunk reopens included) writes under ONE extraction key:
+    # `-r{n}` names only the per-round request/brief/result markers, never the extraction.
+    exclude = [extraction_key]
+
+    calls = 0
+    pools, precap, rows_by_sid = {}, {}, {}
+    own_all = {}
+    for ln in continuity_xday.XDAY_KINDS:
+        news = new_items[ln]
+        if not news:
+            continue
+        kind = continuity_xday.record_type(ln)
+        own = {n["stable_id"]: (day, recorded_at) for n in news}
+        own_all.update(own)
+        base = dict(company_id=company_id, site_id=site_id, kinds=[kind],
+                    statuses=_XDAY_STATUSES[ln], since=since, until=until,
+                    exclude_source_keys=exclude)
+        calls += 1
+        rows = [_xday_row(r) for r in item_history.find_items(
+            conn, **base, limit=_XDAY_POOL_LIMIT)]
+        new_keys = list(own.values())
+        eligible = [r for r in rows if r["stable_id"] not in own and all(
+            continuity_xday.recorded_earlier(continuity_xday.order_key(r), k)
+            for k in new_keys)]
+        precap[ln] = len(eligible)
+        # newest RECORDED first (stable over find_items' order), never by write time
+        recency = sorted(eligible, key=_xday_order, reverse=True)[:_XDAY_RECENCY]
+        lexical = {}
+        for n in news:
+            if not (n.get("text") or "").strip():
+                continue
+            calls += 1
+            hits = item_history.find_items(conn, **base, query=n["text"], limit=_XDAY_LEXICAL)
+            # zero overlap is no lexical match: those rows would only be older recency
+            lexical[n["stable_id"]] = [_xday_row(r) for r in hits if r.get("score", 0) > 0]
+        for r in recency + [r for rs in lexical.values() for r in rs]:
+            rows_by_sid.setdefault(r["stable_id"], r)
+        pools[ln] = (recency, lexical, own)
+
+    calls += 1
+    chains = _xday_chains(conn, site_id, rows_by_sid, set(own_all))
+    candidates = {ln: continuity_xday.select_candidates(recency, lexical, own, chains)
+                  for ln, (recency, lexical, own) in pools.items()}
+    n_cand = sum(len(v) for v in candidates.values())
+    if not n_cand:
+        return skip("no_candidates", new=n_new, queries=calls)
+    request = continuity_xday.build_request(
+        site_id=site_id, company_id=company_id, extraction_key=extraction_key,
+        extracted_at=extraction.get("extracted_at"), date=day, new_items=new_items,
+        candidates=candidates, precap_counts=precap, nonce=nonce)
+    request["trigger"] = trigger
+    logger.info("xday request built: key=%s new=%d candidates=%d precap=%s queries=%d",
+                extraction_key, n_new, n_cand,
+                ",".join(str(precap.get(ln, 0)) for ln in continuity_xday.XDAY_KINDS), calls)
+    return request
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
@@ -1292,6 +1497,8 @@ def write_extraction_items(date, user_folder, extraction_key):
     # here; Task 4 reads it to carry stable ids and human edits from a retired row to the
     # row that replaced it.
     retired_topics = []
+    # Cross-day continuity's hop-1 request: built inside the block, put after the commit.
+    xday_request = None
 
     with get_connection() as conn:
         # I-3: serialize concurrent writers on this extraction key. Delete-
@@ -1871,6 +2078,23 @@ def write_extraction_items(date, user_folder, extraction_key):
         # SAVEPOINT; skipped before migration 0093; never fatal (number_new_items).
         carry_forward_apply.number_new_items(conn, new_topic_ids, site["id"], extraction_key)
 
+        # Cross-day continuity, hop 1 (spec 2026-11-09 X2): after carry-forward and the task
+        # numbers, so the new items' stable_ids are final. Reads only, in its OWN savepoint: a
+        # failed statement must not abort the transaction and lose the pass (X10). Off: not
+        # entered, no SQL. Gated here on tier/incomplete too, so a live pass costs nothing.
+        if (CROSS_DAY_CONTINUITY in _XDAY_MODES and extraction.get("tier") == "final"
+                and not extraction.get("incomplete")):
+            try:
+                with conn.transaction():
+                    xday_request = build_xday_request(
+                        conn, site=site, company_id=owner_company_id, extraction=extraction,
+                        extraction_key=extraction_key, date=date)
+            except Exception as e:  # noqa: BLE001 -- never fails the write (X10)
+                xday_request = None
+                # type only: a message could carry item text
+                logger.warning("xday request not built for %s: %s", extraction_key,
+                               type(e).__name__)
+
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
     # The updated email, AFTER the connection block commits: the merged topics
@@ -1912,6 +2136,14 @@ def write_extraction_items(date, user_folder, extraction_key):
     # anyway since collected_topics would be empty.
     if collected_topics:
         match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
+
+    # Cross-day continuity request (X3): post-commit like the matcher artifact above -- the
+    # stable_ids it names must be durable before the linker acts on them. Never fatal (X10).
+    if xday_request is not None:
+        try:
+            continuity_xday_request.emit(s3(), S3_BUCKET, xday_request)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("xday request not put for %s: %s", extraction_key, type(e).__name__)
 
     # Search index request: post-commit like the matcher artifact above, for the same reason
     # (the topic ids it names must be durable). Emitted even when topics_n == 0 -- a session

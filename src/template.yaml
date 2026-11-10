@@ -1306,6 +1306,16 @@ Parameters:
       second, thinking-off call states which new item continues which. Needs DeclareContinuity.
       Live passes unchanged. Off = today's final pass byte-for-byte.
 
+  CrossDayContinuity:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'shadow', 'on']
+    Description: >-
+      Spec 2026-11-09 (cross-day continuity): after a session's complete final pass, the item
+      writer builds a request of earlier same-site items that today's items may continue and puts
+      it to continuity_xday_requests/ after the commit. shadow = that request only (no model call,
+      no DB write); on = all hops. Off = no extra SQL, nothing put.
+
   StatusEvidenceFloorTokens:
     Type: Number
     Default: 5
@@ -5121,6 +5131,8 @@ Resources:
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
+          # Cross-day item continuity hop 1 (spec 2026-11-09 X1): off | shadow | on.
+          CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity
           # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
           # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
           # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
@@ -5164,6 +5176,11 @@ Resources:
               # above). Its own PutObject grant, gated to the disjoint prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
+              # Cross-day continuity (spec 2026-11-09 X3): post-commit request artifact for the
+              # non-VPC cross-day linker's S3 trigger (in-VPC, so S3 not invoke, BUG-36).
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/continuity_xday_requests/*
             - Effect: Allow
               # Phase C multi-device merge: once the merged topics are durable,
               # every member is told to look at them. Enqueued HERE and not by

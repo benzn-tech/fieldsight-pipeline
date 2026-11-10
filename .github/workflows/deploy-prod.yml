@@ -397,6 +397,7 @@ jobs:
               "DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}" \
               "StatusSuggestions=${{ vars.PROD_STATUS_SUGGESTIONS || 'false' }}" \
               "ContinuityLinker=${{ vars.PROD_CONTINUITY_LINKER || 'false' }}" \
+              "CrossDayContinuity=${{ vars.PROD_CROSS_DAY_CONTINUITY || 'off' }}" \
               "StatusEvidenceFloorTokens=${{ vars.PROD_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
               "ReportLocationsSection=${{ vars.PROD_REPORT_LOCATIONS_SECTION || 'false' }}" \
