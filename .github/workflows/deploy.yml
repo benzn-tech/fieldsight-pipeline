@@ -440,6 +440,7 @@ jobs:
               "DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \
               "StatusSuggestions=${{ vars.TEST_STATUS_SUGGESTIONS || 'false' }}" \
               "ReconcileStatus=${{ vars.TEST_RECONCILE_STATUS || 'false' }}" \
+              "SiteDecisionLoop=${{ vars.TEST_SITE_DECISION_LOOP || 'off' }}" \
               "ContinuityLinker=${{ vars.TEST_CONTINUITY_LINKER || 'false' }}" \
               "CrossDayContinuity=${{ vars.TEST_CROSS_DAY_CONTINUITY || 'off' }}" \
               "StatusEvidenceFloorTokens=${{ vars.TEST_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \

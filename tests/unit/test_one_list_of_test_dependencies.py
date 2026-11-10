@@ -23,7 +23,7 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LIST = os.path.join(REPO, "requirements-test.txt")
-TEST_WORKFLOWS = ("test.yml", "deploy-prod.yml")
+TEST_WORKFLOWS = ("test.yml", "deploy-prod.yml", "nightly-decision-loop.yml")
 
 
 def _listed():

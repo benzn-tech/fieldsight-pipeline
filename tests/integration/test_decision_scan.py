@@ -210,18 +210,38 @@ class _Borrowed:
         return False
 
 
-def test_handler_runs_a_scan_and_reports_every_count(db, monkeypatch):
+def test_overdue_scan_emits_and_processes_in_one_call(db, monkeypatch):
+    """There is no process schedule (Aurora must be able to pause): a scan call emits AND
+    runs the hub in the same invocation and connection, and reports both counts."""
     co, site, pm, admin = _world(db)
     _overdue_item(db, site)
     monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
     monkeypatch.setattr(lds, "get_connection", _Borrowed(db))
     out = lds.lambda_handler({"scan": "todo_overdue"}, None)
-    assert set(out) >= {"emitted", "duplicates", "skipped_ambiguous_site", "skipped_pending",
+    assert set(out) == {"emitted", "duplicates", "skipped_ambiguous_site", "skipped_pending",
                         "processed", "cards", "faults", "errors"}
-    assert out["emitted"] >= 1
-    out = lds.lambda_handler({"scan": "process"}, None)
-    assert out["processed"] >= 1 and out["cards"] >= 1
+    assert (out["emitted"], out["processed"], out["cards"], out["errors"]) == (1, 1, 1, 0)
     assert len(_cards(db, co["id"], "open")) == 1
+    assert [e["status"] for e in _events(db, co["id"], "todo.overdue")] == ["done"]
+    # The manual process invoke still works, and finds nothing left to do.
+    out = lds.lambda_handler({"scan": "process"}, None)
+    assert (out["emitted"], out["processed"], out["cards"]) == (0, 0, 0)
+
+
+def test_gap_scan_also_processes_in_the_same_call(db, monkeypatch):
+    calls = []
+    monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
+    monkeypatch.setenv("LAKE_BUCKET", "lake")
+    monkeypatch.setattr(lds, "get_connection", _Borrowed(db))
+    monkeypatch.setattr(lds, "emit_checklist_gaps",
+                        lambda conn, read, now: calls.append(("emit", conn)) or
+                        dict(lds._counts(), emitted=2, errors=1))
+    monkeypatch.setattr(lds, "process",
+                        lambda conn, now: calls.append(("process", conn)) or
+                        dict(lds._counts(), processed=2, cards=1, errors=1))
+    out = lds.lambda_handler({"scan": "checklist_gap"}, None)
+    assert calls == [("emit", db), ("process", db)]
+    assert (out["emitted"], out["processed"], out["cards"], out["errors"]) == (2, 2, 1, 2)
 
 
 # ---------------------------------------------------------------- todo.overdue

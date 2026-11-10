@@ -18,6 +18,12 @@ todo_overdue   one todo.overdue event per live open action item past its deadlin
 process        claims due queued events (FOR UPDATE SKIP LOCKED) and runs them through the
                hub: auth -> too_deep -> match -> late -> merge -> ledger -> open card.
 
+Each emit scan runs process right after it, in the same invocation and connection, and
+returns the summed counts. There is no process schedule: Aurora pauses after 600 s idle
+and a 5-minute tick would keep it awake (tests/unit/test_sweep_cadence_vs_autopause.py).
+{"scan": "process"} alone stays valid for a manual invoke. An event that failed and is
+backing off is retried at the next scan (checklist_gap every 30 minutes).
+
 P0 SENDS NOTHING: no SES, email, push, voice, Lambda invoke or model call happens here.
 Cards are routed (recipients computed) and stored with status 'open'.
 
@@ -434,13 +440,16 @@ def lambda_handler(event, context):
     now = datetime.now(timezone.utc)
     result = _counts()
     with get_connection(autocommit=True) as conn:
+        runs = []
         if scan == "todo_overdue":
-            got = emit_todo_overdue(conn, now)
+            runs.append(emit_todo_overdue(conn, now))
         elif scan == "checklist_gap":
-            got = emit_checklist_gaps(
+            runs.append(emit_checklist_gaps(
                 conn, lambda key: checklist_reports.read_result_status(key, _s3(), bucket),
-                now)
-        else:
-            got = process(conn, now)
-    result.update(got)
+                now))
+        # Always process, right after the emit: no separate schedule wakes the database.
+        runs.append(process(conn, now))
+    for got in runs:
+        for k in RESULT_KEYS:
+            result[k] += got.get(k, 0)
     return result
