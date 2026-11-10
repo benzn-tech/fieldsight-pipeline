@@ -1,6 +1,10 @@
 # Site decision loop: site events run themselves, only decisions reach a person
 
-Status: design, rev 5 (2026-11-08). Architecture research. Not built, no flag, no migration yet.
+Status: rev 6 (2026-11-11). P0 built and on TEST (pipeline#1278, #1282; migration 0100).
+Rev 6 records the owner's 2026-11-11 ruling on the first-day overdue backlog (option B,
+relayed by the web line session 前端优化v2): only newly overdue to-dos get their own card;
+the older backlog becomes one digest card (§6.5, §12). On TEST the first `todo.overdue`
+scan had carded all 58 overdue items at once to 3 people (p95 31 per day against ≤3).
 Rev 2 folds in a Fable builder check (§15): six grounding corrections and seven builder
 questions, answered as my calls where the owner had not ruled.
 Rev 5 re-baselines §2 on origin/develop 43dce308 (2026-11-08), after the owner had every line
@@ -361,6 +365,25 @@ migration and membership UI.
 - `todo.overdue` (P0): kind `choose`, question "'<item>' was due <date>, still open", options
   *remind the owner* (recommended) / *mark done* / *set a new date* / *no longer needed*,
   deadline end of the next NZ working day, timeout default: nothing changes.
+  **Rev 6 (owner, 2026-11-11, option B):** only a *newly* overdue item gets this card.
+  The event's `occurred_at` is the NZ midnight that starts the day after the deadline (the
+  moment the item became overdue) and the rule's `late_after_days` is 2 (my call: one daily
+  scan may be missed twice and the item is still carded). So an item is carded while
+  today_nz − (deadline + 1 day) ≤ 2, i.e. on its first three overdue NZ days; after that
+  its daily event is recorded as late, with no card. Every live overdue item is therefore
+  either carded alone (fresh) or listed in a digest (stale), never neither.
+- `todo.overdue_backlog` (P0, rev 6): one event per (company, site) per NZ day when the site
+  has at least one stale overdue item (one the rule above treats as late). subject_ref =
+  the site id. The payload holds the total count and the first 50 items by oldest deadline
+  (stable_id, text, deadline, responsible). Card: kind `fact`, question
+  "<n> to-dos on <site> are more than 3 days overdue", one option *open the list*
+  (recommended), no deadline, timeout default: nothing changes. Routed to the site's
+  `pm`/`site_manager`, like `todo.overdue`. The owner asked for one summary per person; a
+  card belongs to one site (`decision_cards.site_id` is NOT NULL, and the replay judge,
+  invariants and review page join `sites`), so this is one digest **per person per site**
+  (my call; a cross-site digest needs a migration and is the alternative). The card key
+  dedupes only while a card is open and P0 never closes cards, so in P0 each site gets one
+  digest, once. Refreshing it when the list changes is P1.
 - `checklist.gap` (P0): kind `choose`, options *remind <person> to recheck* (recommended) /
   *accept with reason* (reason required; a safety item also copies the company admin) /
   *reassign*. In P0 a safety item is one whose template section or item text names safety,
@@ -452,7 +475,7 @@ only when the device is online.
 
 | Phase | What | Gate to move on |
 |---|---|---|
-| P0 shadow | hub + rules + ledger tables; two deterministic rules (checklist gap, overdue to-do), no model calls; cards written and routed (recipients computed) but **not sent**; no card timers, status stays `open`; owner labels them on a shadow-review page | ≥50 shadow cards labelled by the owner: precision = needed / (needed + not_needed) ≥80 %; fabricated evidence = count(`wrong_evidence`) = 0; cards per would-be recipient per NZ working day ≤3 (p95). In P0 every card comes from a deterministic rule, so "handler-declared vs hub-checked" is first measured in P2. Engineering gate (borrowed): a replay judge that runs `site_events` in `seq` order through the pure hub (late, dedupe, match, gate) and must reproduce `decision_cards` modulo ids; invariants as SQL checks (no card without an event, no cross-company row, no two open cards with one key); mutation testing where each planted fault is caught (drop the company filter, skip dedupe, skip the late check, duplicate an event, skip the attempt counter); nightly. "No answer counted twice" cannot be exercised until P1 |
+| P0 shadow | hub + rules + ledger tables; two deterministic rules (checklist gap, overdue to-do), no model calls; cards written and routed (recipients computed) but **not sent**; no card timers, status stays `open`; owner labels them on a shadow-review page | ≥50 shadow cards labelled by the owner: precision = needed / (needed + not_needed) ≥80 %; fabricated evidence = count(`wrong_evidence`) = 0; cards per would-be recipient per NZ working day ≤3 (p95). In P0 every card comes from a deterministic rule, so "handler-declared vs hub-checked" is first measured in P2. Engineering gate (borrowed): a replay judge that runs `site_events` in `seq` order through the pure hub (late, dedupe, match, gate) and must reproduce `decision_cards` modulo ids; invariants as SQL checks (no card without an event, no cross-company row, no two open cards with one key); mutation testing where each planted fault is caught (drop the company filter, skip dedupe, skip the late check, duplicate an event, skip the attempt counter); nightly. Rev 6: the p95 counts cards created on or after the day option B (§6.5) reached the environment; the review route takes `since` (an NZ date) for it. TEST's 58 backlog cards of 2026-11-10 predate it. "No answer counted twice" cannot be exercised until P1 |
 | P1 internal | cards sent to FieldSight staff on Test Project, via a **web card inbox + email** (no push or Teams yet) | same metrics hold for 2 weeks; timeout defaults and pm → admin escalation fire correctly |
 | P2 one customer | one pilot company, PM + foreman | PM-rated useful ≥70 %; no outward action without approval (audited) |
 | P3 | more rules (device, inspection due, weather), more roles | per rule |
