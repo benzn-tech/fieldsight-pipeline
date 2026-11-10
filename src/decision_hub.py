@@ -58,6 +58,24 @@ class CardDraft:
     recipient_roles: list = field(default_factory=list)
 
 
+RUN_OUTCOMES = ("done", "nothing")
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """What a run-rule (Rule.run) gets besides the connection and the event. run_id is the
+    event_runs row the hub opened for this attempt; now_utc is the process clock; flag is
+    "shadow" or "on" (the hub never calls a run-rule with the flag off); s3_client and
+    bucket are None when the caller of process() did not pass them."""
+    run_id: Any
+    company_id: Any
+    site_id: Any
+    now_utc: datetime
+    flag: str
+    s3_client: Any
+    bucket: Optional[str]
+
+
 def today_nz_of(event: Event) -> date:
     """The event's NZ day: always the NZ date of received_at."""
     return nz_time.to_nz(event.received_at).date()

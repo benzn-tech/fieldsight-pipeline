@@ -65,10 +65,16 @@ def _kind(kind):
 
 def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id=None,
                         source_s3_key,
-                        dst_turn: dict, score: float, rule_version: str,
-                        method="lexical_v1"):
+                        dst_turn: dict, score: float | None, rule_version: str,
+                        method="lexical_v1", decision_record_id=None, on_conflict="raise"):
     """Write one item -> turn link; sets the FK column of `src_kind` to `src_row_id`.
     Returns the new link id.
+
+    `decision_record_id` is written to the column of that name (the nightly writer's
+    per-pick decision_records row; None for every per-session writer). `on_conflict`:
+    "raise" (default) lets a unique violation raise; "skip" adds ON CONFLICT DO NOTHING
+    and returns None when nothing was inserted -- the nightly writer's path onto the
+    one-nightly-link-per-row partial indexes (migration 0102).
 
     The link's site is the source row's own site: a `site_id` that differs from it (or a
     `src_row_id` that names no row of `src_kind`) raises ValueError instead of writing a
@@ -79,6 +85,8 @@ def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id=No
     the row's value; a non-None `src_stable_id` that differs from it raises ValueError."""
     kind = _kind(src_kind)
     table, col = KIND_TABLE[kind], KIND_SRC_COLUMN[kind]
+    if on_conflict not in ("raise", "skip"):
+        raise ValueError(f"on_conflict must be 'raise' or 'skip', got {on_conflict!r}")
     if not isinstance(dst_turn, dict):
         raise ValueError("dst_turn must be a dict")
     row = conn.execute(f"SELECT site_id::text, stable_id FROM {table} WHERE id = %s",
@@ -89,13 +97,17 @@ def insert_supported_by(conn, *, site_id, src_kind, src_row_id, src_stable_id=No
         raise ValueError(f"site_id {site_id} is not the {kind} row's site {row[0]}")
     if src_stable_id is not None and str(src_stable_id) != str(row[1]):
         raise ValueError(f"src_stable_id is not the {kind} row's current stable_id")
-    return conn.execute(
+    skip = " ON CONFLICT DO NOTHING" if on_conflict == "skip" else ""
+    inserted = conn.execute(
         f"INSERT INTO event_links (site_id, link_type, src_kind, src_stable_id, {col}, "
-        f"source_s3_key, dst_kind, dst_turn, method, score, rule_version) "
-        f"VALUES (%s,'supported_by',%s,%s,%s,%s,'turn',%s::jsonb,%s,%s,%s) RETURNING id",
+        f"source_s3_key, dst_kind, dst_turn, method, score, rule_version, "
+        f"decision_record_id) "
+        f"VALUES (%s,'supported_by',%s,%s,%s,%s,'turn',%s::jsonb,%s,%s,%s,%s){skip} "
+        f"RETURNING id",
         (row[0], kind, row[1], src_row_id, source_s3_key, json.dumps(dst_turn),
-         method, score, rule_version),
-    ).fetchone()[0]
+         method, score, rule_version, decision_record_id),
+    ).fetchone()
+    return inserted[0] if inserted is not None else None
 
 
 def insert_continues(conn, *, site_id, src_kind, src_row_id, src_stable_id, dst_stable_id,

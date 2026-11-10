@@ -237,7 +237,7 @@ def test_gap_scan_also_processes_in_the_same_call(db, monkeypatch):
                         lambda conn, read, now: calls.append(("emit", conn)) or
                         dict(lds._counts(), emitted=2, errors=1))
     monkeypatch.setattr(lds, "process",
-                        lambda conn, now: calls.append(("process", conn)) or
+                        lambda conn, now, **kw: calls.append(("process", conn)) or
                         dict(lds._counts(), processed=2, cards=1, errors=1))
     out = lds.lambda_handler({"scan": "checklist_gap"}, None)
     assert calls == [("emit", db), ("process", db)]
@@ -879,3 +879,154 @@ def test_overdue_bucket_is_the_nz_day_of_now(db):
     [ev] = _events(db, co["id"])
     assert ev["bucket"] == "2026-11-07" and ev["received_at"] == late_utc
     assert ev["subject_ref"] == str(item["stable_id"])
+
+
+# ---------------------------------------------------------------- run-rules (nightly Task 4)
+
+RUN_TYPE = "test.run"
+
+
+def _register_run_rule(monkeypatch, run):
+    """A test-only run-rule (no production rule is added here)."""
+    import decision_rules
+    monkeypatch.setitem(decision_rules.RULES, RUN_TYPE, decision_rules.Rule(
+        rule_id=RUN_TYPE, bucket=lambda event, today_nz: today_nz.isoformat(),
+        late_after_days=None, purpose="run", run=run))
+
+
+def _queued_run(conn, co, site, **over):
+    return _queued(conn, co, site, type=RUN_TYPE, subject_ref=str(site["id"]),
+                   source="test", payload={}, **over)
+
+
+@pytest.mark.parametrize("outcome", ["nothing", "done"])
+def test_run_rule_outcome_nothing_closes_without_card(db, monkeypatch, outcome):
+    co, site, pm, admin = _world(db)
+    ev = _queued_run(db, co, site)
+    # a ledger decision on the subject does not stop a run-rule (it skips the ledger)
+    dl.append(db, {"company_id": co["id"], "site_id": site["id"], "card_id": None,
+                   "subject_ref": str(site["id"]), "decision": "done",
+                   "kind": "decided", "decided_by": None, "authority_basis": "pm",
+                   "evidence": [], "supersedes_entry_id": None, "source": "card"})
+    seen = []
+
+    def run(conn, event, ctx):
+        seen.append((conn, event, ctx))
+        return outcome
+    _register_run_rule(monkeypatch, run)
+    monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+    s3 = object()
+    out = lds.process(db, NOW, s3_client=s3, bucket="lake")
+    assert (out["processed"], out["cards"], out["faults"]) == (1, 0, 0)
+    [(conn, event, ctx)] = seen
+    assert conn is db and str(event.event_id) == str(ev["event_id"])
+    [run_row] = _runs(db, co["id"])
+    assert isinstance(ctx, decision_hub.RunContext)
+    assert (ctx.run_id, ctx.company_id, ctx.site_id) == (run_row["run_id"], co["id"],
+                                                         site["id"])
+    assert (ctx.now_utc, ctx.flag, ctx.s3_client, ctx.bucket) == (NOW, "shadow", s3, "lake")
+    [row] = _events(db, co["id"])
+    assert row["status"] == outcome and row["rule_id"] == RUN_TYPE
+    assert run_row["outcome"] == outcome and run_row["handler"] == RUN_TYPE
+    assert run_row["ended_at"] is not None
+    assert _cards(db, co["id"]) == []
+
+
+def test_run_rule_gets_on_flag_and_none_storage_by_default(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    _queued_run(db, co, site)
+    seen = []
+    _register_run_rule(monkeypatch, lambda conn, event, ctx: seen.append(ctx) or "done")
+    monkeypatch.setenv("NIGHTLY_REMATCH", "on")
+    lds.process(db, NOW)
+    [ctx] = seen
+    assert (ctx.flag, ctx.s3_client, ctx.bucket) == ("on", None, None)
+
+
+@pytest.mark.parametrize("flag", [None, "off", "SHADOW", ""])
+def test_run_rule_with_flag_off_ends_nothing_without_running(db, monkeypatch, flag):
+    co, site, pm, admin = _world(db)
+    _queued_run(db, co, site)
+
+    def run(conn, event, ctx):
+        raise AssertionError("run-rule called with NIGHTLY_REMATCH off")
+    _register_run_rule(monkeypatch, run)
+    if flag is None:
+        monkeypatch.delenv("NIGHTLY_REMATCH", raising=False)
+    else:
+        monkeypatch.setenv("NIGHTLY_REMATCH", flag)
+    out = lds.process(db, NOW)
+    assert (out["processed"], out["cards"], out["faults"]) == (1, 0, 0)
+    [row] = _events(db, co["id"])
+    assert row["status"] == "nothing" and row["attempts"] == 0
+    [run_row] = _runs(db, co["id"])
+    assert run_row["outcome"] == "nothing"
+    assert _cards(db, co["id"]) == []
+
+
+def test_run_rule_bad_outcome_is_a_failed_attempt(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    _queued_run(db, co, site)
+    _register_run_rule(monkeypatch, lambda conn, event, ctx: "maybe")
+    monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+    lds.process(db, NOW)
+    [row] = _events(db, co["id"])
+    assert row["status"] == "queued" and row["attempts"] == 1
+    assert "not one of" in row["last_error"] and "maybe" not in row["last_error"]
+    assert [r["outcome"] for r in _runs(db, co["id"])] == ["failed"]
+
+
+def test_run_rule_raise_uses_backoff_and_fault_at_3(db, monkeypatch):
+    """A raising run-rule follows the build_card failure path exactly: its writes roll back
+    with the event's savepoint, attempts + 1, backoff, fault card at 3, stop at 5."""
+    co, site, pm, admin = _world(db)
+    ev = _queued_run(db, co, site)
+
+    def run(conn, event, ctx):
+        conn.execute("UPDATE event_runs SET model_calls = 99 WHERE run_id = %s",
+                     (ctx.run_id,))                    # rolled back with the savepoint
+        raise RuntimeError("job exploded")
+    _register_run_rule(monkeypatch, run)
+    monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+
+    t = NOW
+    for attempt in range(1, 6):
+        if attempt > 1:
+            assert lds.process(db, t - dt.timedelta(seconds=1))["processed"] == 0
+        out = lds.process(db, t)
+        assert out["processed"] == 1 and out["cards"] == 0
+        [row] = _events(db, co["id"])
+        assert row["attempts"] == attempt and "job exploded" in row["last_error"]
+        cards = _cards(db, co["id"])
+        assert all(c["rule_id"] == "hub.fault" for c in cards)
+        assert len(cards) == (0 if attempt < 3 else 1)
+        assert out["faults"] == (1 if attempt == 3 else 0)
+        if attempt < 5:
+            assert row["status"] == "queued"
+            assert row["not_before"] == t + dt.timedelta(
+                seconds=decision_hub.backoff_seconds(attempt))
+            t = row["not_before"]
+        else:
+            assert row["status"] == "failed"
+    [fault] = _cards(db, co["id"])
+    assert fault["version"] == 2 and "stopped" in fault["consequence"].lower()
+    assert fault["subject_ref"] == str(ev["event_id"])
+    runs = _runs(db, co["id"])
+    assert len(runs) == 5 and all(r["outcome"] == "failed" for r in runs)
+    assert all(r["model_calls"] == 0 for r in runs)
+    assert lds.process(db, t + dt.timedelta(days=30))["processed"] == 0
+
+
+def test_handler_passes_storage_to_process_only_with_a_bucket(db, monkeypatch):
+    got = []
+    monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
+    monkeypatch.setattr(lds, "get_connection", _Borrowed(db))
+    monkeypatch.setattr(lds, "_s3", lambda: "s3-client")
+    monkeypatch.setattr(lds, "process",
+                        lambda conn, now, **kw: got.append(kw) or lds._counts())
+    monkeypatch.delenv("LAKE_BUCKET", raising=False)
+    lds.lambda_handler({"scan": "process"}, None)
+    monkeypatch.setenv("LAKE_BUCKET", "lake")
+    lds.lambda_handler({"scan": "process"}, None)
+    assert got == [{"s3_client": None, "bucket": None},
+                   {"s3_client": "s3-client", "bucket": "lake"}]

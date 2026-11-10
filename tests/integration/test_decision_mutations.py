@@ -86,7 +86,8 @@ def skip_attempt_counter(mp):
         return real_site_events.set_status(conn, event_id, company_id, site_id, status,
                                            **fields)
     proxy = types.SimpleNamespace(**{n: getattr(real_site_events, n)
-                                     for n in ("insert", "claim_due", "queued_same_subject")})
+                                     for n in ("insert", "claim_due", "queued_same_subject",
+                                               "abandoned_running")})
     proxy.set_status = set_status
     mp.setattr(lds, "site_events", proxy)
 

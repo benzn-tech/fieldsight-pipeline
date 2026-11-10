@@ -42,6 +42,8 @@ _SITE_OR_COMPANY = [
     ("match",       rf"^match_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
     # cross-day continuity request (continuity_xday_request.key_for): site-scoped like match
     ("xday_request", rf"^continuity_xday_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
+    # The nightly J2 turn-pick request (nightly_rematch.request_key): site/night like match.
+    ("nightly_request", rf"^nightly_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
     # The status-reconcile request (reconcile_request.emit): the same site/day shape as match.
     ("reconcile",   rf"^reconcile_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
     # weather/ and programmes/ carry a site uuid, or the site slug as a fallback

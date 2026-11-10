@@ -215,6 +215,7 @@ def test_every_normalize_transcript_caller_rebases():
     # `lambda_extract_session` rebases through the sidecar it fetches itself -- it is the
     # one consumer that pre-dates the embedded map and still reads pre-change artifacts.
     EXEMPT = {"lambda_extract_session.py": "fetches the sidecar directly",
+              "session_turns.py": "the extractor's turn chain, lifted out of it; same sidecar fetch",
               "transcript_utils.py": "defines normalize_transcript"}
 
     def _name(node):

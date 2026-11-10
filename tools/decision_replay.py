@@ -50,6 +50,10 @@ replay() contract
   compared (membership changes over time).
 * Runs: a pre-dispatch or duplicate event has no run; a done / nothing event has exactly
   one non-failed run (a merged event only has to be in some run), and a 'done' event's run outcome is 'done' iff it has a card.
+* Run-rules (the matched rule has `run`, e.g. the nightly job): no card and no ledger. A
+  done / nothing event must have exactly one non-failed run whose outcome equals the
+  event status ('done' -> 'done', 'nothing' -> 'nothing', including the flag-off path,
+  which ends 'nothing' without calling run) and no card naming it.
 * Fault cards are judged through run_events / failed-run counts, not the hub: an event with
   >= FAULT_AT failed runs has exactly one 'fault' card (key fault_card_key(..., event_id,
   'fault')), marked stopped (version > 1 or 'stopped' in the consequence) once >= STOP_AT;
@@ -295,6 +299,13 @@ def replay(conn, company_id=None):
             out.append(f"{tag}: {status} but {len(own)} card(s) name it")
         rule = rule or prule
         if rule is None or status not in ("done", "nothing"):
+            continue
+        if rule.run is not None:
+            if own:
+                out.append(f"{tag}: run-rule event {status} but {len(own)} card(s) name it")
+            if ok_runs != [status]:
+                out.append(f"{tag}: run-rule event {status} with run outcome(s) {ok_runs}, "
+                           f"expected [{status!r}]")
             continue
         key = decision_hub.card_key(ev, rule)
         if status == "nothing":

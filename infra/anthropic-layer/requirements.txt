@@ -1,0 +1,4 @@
+# Anthropic SDK for NightlyTurnPickFunction (the nightly J2 turn-pick worker). Built by
+# `sam build` (Metadata BuildMethod python3.11) like infra/psycopg-layer. Pinned to the
+# version the J2 measurement environment runs (the worker sends output_config.effort).
+anthropic==2.7.0
