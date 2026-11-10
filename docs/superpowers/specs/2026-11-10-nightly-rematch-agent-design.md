@@ -176,10 +176,20 @@ its own pre-registration). The owner's ruling stands, so the order is:
    it links new items at extraction time, with no extra call.
 2. **J2 is the nightly fallback for what the locator cannot reach:**
    - items extracted before the locator was on, so no re-extraction is needed;
-   - items the locator refused (`no_locator`, `not_shown` under elision, `ambiguous_stamp`,
-     `outside_topic`).
-   J2's N0 run (pipeline#1276) waits for the locator's result. Its gold set is then restricted to
-   those two strata, and its call count is re-stated to the owner. If the locator alone clears the
+   - items the locator refused: `unparseable`, `not_shown` (elided), `no_line`, `ambiguous_stamp`,
+     `outside_topic`, and separately `no_locator`.
+   J2's N0 run (pipeline#1276) waits for the locator's result, then:
+   - **Strata are fixed per `item_ref` from the locator run's output**, on the same manifest
+     digest, recorded as a hashed input before J2 runs. Offline, every session predates the locator,
+     so only the refusal strata narrow the set.
+   - **`no_locator` is scored as its own stratum.** There the model said no single line raises the
+     item, so a nightly pick contradicts it. It is never pooled with stamp failures (Track C,
+     2026-11-10).
+   - **Size check before spending.** Bar 1 needs at least 59 accepted links per rep in the scored set,
+     and bar 2 needs at least 30 cross-language links. If the refused held-out subset cannot reach
+     that, J2 is reported "insufficient" without a paid run.
+   - The prompt still covers every item of a session, so calls drop only by the sessions with no
+     stratum item. The re-stated count goes to the owner before any call. If the locator alone clears the
    60% line and the owner sees no need to backfill history, J2 is not built.
 - J2, if built, is the **fallback writer**: it writes only where no live link of any method
   exists, and a per-session writer (lexical or prompt-index), if ever turned on, keeps first claim
