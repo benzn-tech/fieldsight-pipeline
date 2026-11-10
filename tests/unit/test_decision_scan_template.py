@@ -99,7 +99,10 @@ def test_function_exists_only_under_condition(doc):
     assert {"VPCAccessPolicy": {}} in p["Policies"]
 
 
-def test_three_schedules_with_inputs(doc):
+def test_two_schedules_with_inputs(doc):
+    # Two, not three: the handler runs process() after each emit in the same invocation,
+    # so no schedule wakes Aurora every few minutes (test_sweep_cadence_vs_autopause).
+    # {"scan": "process"} stays valid for a manual invoke but has no schedule.
     events = _props(doc, FN)["Events"]
     got = {}
     for ev in events.values():
@@ -107,9 +110,8 @@ def test_three_schedules_with_inputs(doc):
         pr = ev["Properties"]
         assert pr["State"] == {"If": ["ShouldEnableSchedules", "ENABLED", "DISABLED"]}
         got[json.loads(pr["Input"])["scan"]] = pr["Schedule"]
-    assert got == {"checklist_gap": "rate(15 minutes)",
-                   "todo_overdue": "cron(30 18 * * ? *)",
-                   "process": "rate(5 minutes)"}
+    assert got == {"checklist_gap": "rate(30 minutes)",
+                   "todo_overdue": "cron(30 18 * * ? *)"}
 
 
 def test_no_ses_or_invoke_permission(doc):

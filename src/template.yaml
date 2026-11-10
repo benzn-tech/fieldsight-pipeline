@@ -6024,8 +6024,9 @@ Resources:
 
   # ----------------------------------------------------------
   # Lambda: Decision Scan (site decision loop P0, shadow). In-VPC: the emitters
-  # (checklist_gap, todo_overdue) write site_events; process runs the hub and stores
-  # routed decision cards with status open. SENDS NOTHING: no SES, no invoke grant.
+  # (checklist_gap, todo_overdue) write site_events; each run then processes the queue
+  # through the hub and stores routed decision cards with status open. SENDS NOTHING:
+  # no SES, no invoke grant.
   # Reads only session_report_results/* in the lake bucket (checklist report results),
   # with ListBucket on that prefix so a result not written yet is a 404, not a 403.
   # Pinned by tests/unit/test_decision_scan_template.py.
@@ -6073,11 +6074,14 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - session_report_results/*
+      # Two schedules; each run also processes the queue (no process schedule). Every
+      # tick connects to Aurora, so none may run more often than twice its 600 s
+      # auto-pause (tests/unit/test_sweep_cadence_vs_autopause.py); 30 min clears that.
       Events:
         ChecklistGapScan:
           Type: Schedule
           Properties:
-            Schedule: rate(15 minutes)
+            Schedule: rate(30 minutes)
             Description: Decision loop - emit checklist.gap events from new checklist reports
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"scan": "checklist_gap"}'
@@ -6089,13 +6093,6 @@ Resources:
             Description: Decision loop - emit todo.overdue events for open items past deadline
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"scan": "todo_overdue"}'
-        ProcessQueue:
-          Type: Schedule
-          Properties:
-            Schedule: rate(5 minutes)
-            Description: Decision loop - run queued site events through the hub
-            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
-            Input: '{"scan": "process"}'
 
   # ----------------------------------------------------------
   # Lambda: Voice Audit (SP-Ask) — in-VPC write of one voice_ask_log row.
