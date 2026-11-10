@@ -1,4 +1,4 @@
-"""Integration: the site decision loop repositories against real Postgres (migration 0099).
+"""Integration: the site decision loop repositories against real Postgres (migration 0100).
 
 site_events, event_runs, decision_cards and decision_ledger. Every SQL path runs here -- a fake
 connection never executes SQL. The SKIP LOCKED test commits its seed rows (the `db` fixture

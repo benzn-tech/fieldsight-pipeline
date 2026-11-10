@@ -525,7 +525,7 @@ def read_result_status(result_key, s3_client, bucket):
     return status, result.get("error"), (checklist_gaps(result) if status == "done" else None)
 
 
-# --- Decision scan cursor (migration 0099 decision_scan_seen) ---------------------------
+# --- Decision scan cursor (migration 0100 decision_scan_seen) ---------------------------
 
 def unseen_reports(conn, max_age_hours=48):
     """checklist_reports rows created (or re-queued: both upserts re-stamp created_at)

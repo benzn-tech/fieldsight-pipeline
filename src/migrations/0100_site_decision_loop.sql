@@ -1,4 +1,4 @@
--- 0099: site decision loop P0 (shadow) -- the event hub, its runs, decision cards and the
+-- 0100: site decision loop P0 (shadow) -- the event hub, its runs, decision cards and the
 -- decision ledger (spec docs/superpowers/specs/2026-11-05-site-decision-loop-design.md §5).
 --
 -- site_events         one row per event a source emits for a site; seq is the replay order.

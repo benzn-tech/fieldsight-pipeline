@@ -1,4 +1,4 @@
-"""Integration: migration 0099 (site decision loop P0) -- site_events, event_runs, run_events,
+"""Integration: migration 0100 (site decision loop P0) -- site_events, event_runs, run_events,
 decision_scan_seen, decision_cards, decision_ledger -- enforces its constraints on real
 Postgres. A fake connection never executes the SQL.
 
@@ -15,19 +15,19 @@ from repositories import companies, sites
 
 pytestmark = pytest.mark.integration
 
-MIGRATION_0099 = os.path.join(os.path.dirname(__file__), "..", "..", "src", "migrations",
-                              "0099_site_decision_loop.sql")
+MIGRATION_0100 = os.path.join(os.path.dirname(__file__), "..", "..", "src", "migrations",
+                              "0100_site_decision_loop.sql")
 
 
 def _apply(db):
-    with open(MIGRATION_0099, encoding="utf-8") as fh:
+    with open(MIGRATION_0100, encoding="utf-8") as fh:
         db.execute(fh.read())
 
 
 def _seed(db):
     tag = uuid.uuid4().hex[:8]
-    co = companies.create_company(db, f"Co-0099-{tag}")
-    s = sites.create_site(db, co["id"], f"S-0099-{tag}")
+    co = companies.create_company(db, f"Co-0100-{tag}")
+    s = sites.create_site(db, co["id"], f"S-0100-{tag}")
     return co["id"], s["id"]
 
 

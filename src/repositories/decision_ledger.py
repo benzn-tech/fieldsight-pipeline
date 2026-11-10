@@ -1,4 +1,4 @@
-"""Decision ledger: what was decided, by whom, on what authority (migration 0099).
+"""Decision ledger: what was decided, by whom, on what authority (migration 0100).
 
 APPEND-ONLY (a trigger rejects UPDATE, DELETE and TRUNCATE). Changing one's mind is a new row
 whose supersedes_entry_id points at the row it replaces."""

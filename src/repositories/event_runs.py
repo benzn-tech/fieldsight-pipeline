@@ -1,4 +1,4 @@
-"""Event runs: one handler attempt over one or more site events (migration 0099).
+"""Event runs: one handler attempt over one or more site events (migration 0100).
 
 run_events joins a run to every event it handled and carries the event's company_id/site_id
 (tenancy columns, NOT NULL). The attempt count the fault and stop rules use is

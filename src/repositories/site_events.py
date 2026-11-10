@@ -1,4 +1,4 @@
-"""Site events: the decision loop's event hub (migration 0099, spec 2026-11-05 §5).
+"""Site events: the decision loop's event hub (migration 0100, spec 2026-11-05 §5).
 
 One row per event a source emits for a site; `seq` is the replay order. Dedupe is a partial
 unique index on dedupe_key among rows that are not 'duplicate': a repeat is still stored, as

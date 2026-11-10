@@ -1,4 +1,4 @@
-"""Decision cards: the question put to people (migration 0099). P0 is shadow: status stays
+"""Decision cards: the question put to people (migration 0100). P0 is shadow: status stays
 'open' unless superseded, and a platform admin labels each card; labelling never changes
 status. One OPEN card per card_key (partial unique index), so a superseded card frees its key.
 
