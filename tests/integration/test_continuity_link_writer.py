@@ -157,6 +157,19 @@ def test_a_gone_src_without_an_item_id_is_skipped(db):
     assert len(_records(db, continuity_xday.DECISION_KIND)) == 1
 
 
+def test_a_src_carried_by_two_live_rows_is_skipped(db):
+    seed = _seed(db)
+    twin = topics.upsert_topic(
+        db, seed["site"]["id"], _dt.date(2026, 7, 3), "Second topic", source_s3_key=KEY,
+        action_items=[{"text": "Something else"}])
+    db.execute("UPDATE action_items SET stable_id=%s WHERE topic_id=%s",
+               (seed["src"], twin["id"]))
+    out = lw.write_links(db, _event(seed))
+    assert out["inserted"] == 0
+    assert out["skipped"] == {"src_ambiguous": 1}
+    assert _links(db, seed["site"]["id"]) == []
+
+
 def test_a_src_from_another_session_is_not_linked(db):
     seed = _seed(db)
     # the request names the EARLIER session's item as its src: not under the extraction key
