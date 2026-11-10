@@ -167,12 +167,31 @@ extends `insert_supported_by`** with a `decision_record_id` parameter; today it 
 column (`event_links.py:66-98`). The writer re-reads each row through `deleted_predicates` and skips
 it when it is gone, superseded, already linked, or on another site.
 
-**Relation to Track C's next step and to the lexical linker.** Track C's planned next step for the
-same hole is the extractor citing a topic-quote index (+~3% output tokens, a prompt change, paid
-re-extraction to measure). My call: **measure J2 first, offline, on Track C's existing blind gold**
-(§7). It needs no prompt change and no re-extraction, and it can see across languages.
-- If J2 fails its bars, Track C's prompt option is next and J2 is dropped.
-- If J2 passes, J2 is the **fallback writer**: it writes only where no live link of any method
+**Relation to Track C's locator and to the lexical linker (corrected 2026-11-10).** Rev 2 said
+"measure J2 first". That contradicted an earlier owner ruling: Track C §9.2 (2026-11-08) says that
+below the 60% coverage line the next step is the extractor citing the transcript line. Track C built
+that as the **item quote locator** (pipeline#1277, `EMIT_ITEM_LOCATOR`, off; `method='locator_v1'`;
+its own pre-registration). The owner's ruling stands, so the order is:
+1. **The locator is measured first.** It is the per-session primary path: at about +3% output tokens
+   it links new items at extraction time, with no extra call.
+2. **J2 is the nightly fallback for what the locator cannot reach:**
+   - items extracted before the locator was on, so no re-extraction is needed;
+   - items the locator refused: `unparseable`, `not_shown` (elided), `no_line`, `ambiguous_stamp`,
+     `outside_topic`, and separately `no_locator`.
+   J2's N0 run (pipeline#1276) waits for the locator's result, then:
+   - **Strata are fixed per `item_ref` from the locator run's output**, on the same manifest
+     digest, recorded as a hashed input before J2 runs. Offline, every session predates the locator,
+     so only the refusal strata narrow the set.
+   - **`no_locator` is scored as its own stratum.** There the model said no single line raises the
+     item, so a nightly pick contradicts it. It is never pooled with stamp failures (Track C,
+     2026-11-10).
+   - **Size check before spending.** Bar 1 needs at least 59 accepted links per rep in the scored set,
+     and bar 2 needs at least 30 cross-language links. If the refused held-out subset cannot reach
+     that, J2 is reported "insufficient" without a paid run.
+   - The prompt still covers every item of a session, so calls drop only by the sessions with no
+     stratum item. The re-stated count goes to the owner before any call. If the locator alone clears the
+   60% line and the owner sees no need to backfill history, J2 is not built.
+- J2, if built, is the **fallback writer**: it writes only where no live link of any method
   exists, and a per-session writer (lexical or prompt-index), if ever turned on, keeps first claim
   on new pass rows. `write_pass` writes links for each pass's own new rows, so the two never compete
   for one row. Readers prefer a scored link (`BEST_LINK_ORDER` is `score DESC NULLS LAST`), and that
@@ -339,7 +358,7 @@ exists. This line pings the status line then.
 
 | Phase | What | Gate |
 |---|---|---|
-| N0 | J2 offline on Track C's gold (owner approves ~180 calls first), then owner adjudication of ~40 items | §7 J2 bars |
+| N0 | after Track C's locator measurement: J2 offline on the strata the locator leaves (owner approves the re-stated call count first), then owner adjudication | §7 J2 bars |
 | N1 | tick + hub handler in `shadow` on TEST (needs P0 Tasks 1-4) | 2 weeks of counts; errors under 2% of nights |
 | N2 | J3 `on`, and J2 `on` if N0 passed, on TEST | invariants hold; orphan count reported |
 | N3 | J1 `on` on TEST if its precondition is met and shadow counts justify it; J4 once cross-day continuity is `on` | §7 |
@@ -356,8 +375,8 @@ judgement.
 **My calls (the owner's standing delegation; change any):**
 1. Nightly does not re-implement continuity or reconcile; J1 re-feeds those lines' request paths (§1).
 2. J1 waits for both lines to order by recording time; without it J1 is dropped (§3).
-3. J2 is measured before Track C's prompt option, on the existing gold; if it passes it is the
-   fallback writer (§3 J2).
+3. J2 is the nightly fallback after Track C's locator (owner ruling Track C §9.2 puts the locator first);
+   it covers history and locator refusals, and is measured after the locator (§3 J2).
 4. J2's nightly scope is the last 7 nights; older history is an owner-approved backfill script.
 5. Nightly runs as a hub handler; this plan builds the minimal model-call-layer slice for J2 (§4.2).
 6. 01:00 site-local, NZ-only in v1, with one seam function for later time zones (§4.1).
