@@ -150,11 +150,26 @@ def _run(s3=None, client=None, lam=None, request=None):
 # The brief's worker tests
 # ---------------------------------------------------------------------------------------
 
+def _usage_only(lam):
+    """The one writer invoke after a failed paid call: rows [] and the call's usage."""
+    [inv] = lam.calls
+    p = json.loads(inv["Payload"])
+    assert p["rows"] == []
+    assert p["usage"] == {"tokens_in": 1500, "tokens_out": 200, "model": MODEL,
+                          "cost_usd": None}
+    assert p["run_id"] == _request()["run_id"] and p["site_id"] == "site-1"
+
+
 def test_worker_fails_closed_on_parse_error():
     lam = FakeLambda()
     with pytest.raises(RuntimeError, match="parse"):
         _run(client=FakeClient("this is not json"), lam=lam)
-    assert lam.calls == []
+    _usage_only(lam)
+
+
+def test_worker_failed_usage_invoke_still_raises_the_original_error():
+    with pytest.raises(RuntimeError, match="parse error"):
+        _run(client=FakeClient("this is not json"), lam=FakeLambda(function_error="Unhandled"))
 
 
 def test_worker_raises_on_writer_function_error():
@@ -223,7 +238,7 @@ def test_worker_raises_on_truncated_or_refused_answer(stop):
     lam = FakeLambda()
     with pytest.raises(RuntimeError, match=stop):
         _run(client=FakeClient(ANSWER, stop_reason=stop), lam=lam)
-    assert lam.calls == []
+    _usage_only(lam)
 
 
 def test_worker_no_windowed_items_makes_no_call():

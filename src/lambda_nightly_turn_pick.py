@@ -21,7 +21,9 @@ nightly_rematch handler). For one request:
 Fail closed (raise, so the S3 event's single retry runs; the template sets
 MaximumRetryAttempts 1): segments listed but no readable turns, a model API error, a
 truncated (`max_tokens`) or refused answer, an unparseable answer, a writer FunctionError or a
-non-200 invoke. Nothing is retried inside the worker.
+non-200 invoke. Nothing is retried inside the worker. After a paid call whose answer is
+unusable (truncated, refused, unparseable) the worker first invokes the writer with
+`rows: []` so the call's tokens land on the run, then raises the original error.
 
 What leaves for the model: the request's item text (Track C §5.2 whitelist) and this
 session's own turns inside each item's topic window, fenced as quoted data. Never `origin`,
@@ -91,7 +93,8 @@ def make_model_client():
 
 
 def call_model(client, entry, prompt):
-    """(text, tokens_in, tokens_out) of one call. Raises on a truncated or refused answer.
+    """(text, tokens_in, tokens_out, stop_reason) of one call. An API error propagates (no
+    response, so no usage to record).
 
     The request is built from the registry entry: model, max_tokens, output_config.effort;
     `temperature` only when the entry sets one (None = not sent)."""
@@ -106,12 +109,9 @@ def call_model(client, entry, prompt):
     tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
     tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
     stop = getattr(resp, "stop_reason", None)
-    if stop in ("max_tokens", "refusal"):
-        raise RuntimeError(f"model answer unusable: stop_reason={stop} "
-                           f"(tokens_out={tokens_out})")
     text = "".join(getattr(b, "text", "") or "" for b in (resp.content or [])
                    if getattr(b, "type", None) == "text")
-    return text, tokens_in, tokens_out
+    return text, tokens_in, tokens_out, stop
 
 
 def _invoke_writer(client, payload):
@@ -180,21 +180,36 @@ def process_request(bucket, key, request, *, s3_client, lambda_client, model_cli
 
     entry = model_registry.get(REGISTRY_TASK)
     client = model_client or make_model_client()
-    text, tokens_in, tokens_out = call_model(client, entry, ntp.render_prompt(req, turns))
-    try:
-        picks = ntp.parse_answer(text)
-    except ValueError:
-        # The answer is never put in the message: it may quote the transcript.
-        raise RuntimeError(f"nightly turn pick {key}: parse error ({len(text)} chars)") from None
-    rows = ntp.apply_guards(req, picks, turns)
-
+    text, tokens_in, tokens_out, stop = call_model(client, entry, ntp.render_prompt(req, turns))
     payload = {"site_id": site_id, "run_id": request.get("run_id"),
                "extraction_key": request.get("extraction_key"), "session_base": base,
-               "question_set": ntp.PROMPT_HASH, "input_key": key,
-               "rows": _writer_rows(rows, turns),
+               "question_set": ntp.PROMPT_HASH, "input_key": key, "rows": [],
                "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out,
                          "model": entry["model"],
                          "cost_usd": model_registry.cost_usd(entry, tokens_in, tokens_out)}}
+
+    failure, picks = None, None
+    if stop in ("max_tokens", "refusal"):
+        failure = RuntimeError(f"nightly turn pick {key}: model answer unusable: "
+                               f"stop_reason={stop} (tokens_out={tokens_out})")
+    else:
+        try:
+            picks = ntp.parse_answer(text)
+        except ValueError:
+            # The answer is never put in the message: it may quote the transcript.
+            failure = RuntimeError(f"nightly turn pick {key}: parse error ({len(text)} chars)")
+    if failure is not None:
+        # The call was paid: record its tokens (rows [] -> the writer only adds usage), then
+        # fail closed with the original error whatever that invoke did.
+        try:
+            _invoke_writer(lambda_client, json.dumps(payload))
+        except Exception as e:  # noqa: BLE001 -- the original error is the one raised
+            logger.warning("nightly turn pick: usage-only invoke failed key=%s site=%s: %s",
+                           key, site_id, type(e).__name__)
+        raise failure
+
+    rows = ntp.apply_guards(req, picks, turns)
+    payload["rows"] = _writer_rows(rows, turns)
     result = _invoke_writer(lambda_client, json.dumps(payload))
 
     outcomes = {}

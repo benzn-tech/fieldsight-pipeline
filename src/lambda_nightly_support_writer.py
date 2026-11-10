@@ -37,9 +37,13 @@ Order and transactions:
      site. None (an unknown run, or another tenant's) -> raise, nothing written. run_id is
      request input, so this is the tenant gate for the whole invocation.
   3. Each row in its own transaction, so one bad row does not lose the others.
-  4. recompute_session in its own transaction when written > 0. A failure there is logged
-     (type name only) and returned as `recompute: "failed"`; it does not raise, because a
-     raise would make the worker's S3 retry pay for a second model call.
+  4. recompute_session in its own transaction when written > 0. A failure or timeout is
+     logged (type name only), returned as `recompute: "failed" | "timed_out"`, and leaves a
+     claim_recompute_failures marker (own connection) so the nightly J3 scan retries it. It
+     does not raise: a raise would make the worker's S3 retry pay for a second model call.
+  The record's `model` is the registry's (model_registry), never the payload's; the usage
+  row takes the payload's usage as the worker reported it. A request with `rows: []` only
+  records usage (the worker sends one after a paid call that failed).
 
 A raise anywhere before the rows reaches the worker as a FunctionError, and the worker
 raises (fail closed). A re-delivered request writes a second record per item (each record
@@ -54,11 +58,15 @@ Environment Variables:
 import json
 import logging
 
+from psycopg.errors import QueryCanceled
+
 import model_registry
 import nightly_turn_pick
+import turn_name_overlay
 from db.connection import get_connection
 from deleted_predicates import visible_topics_predicate
-from repositories import claim_type_store, decision_records, event_links, event_runs, sites
+from repositories import (claim_type_store, decision_records, event_links, event_runs, nightly,
+                          sites)
 from repositories.event_links import KIND_SRC_COLUMN, KIND_TABLE
 from repositories.topics import _topic_not_hidden
 
@@ -180,7 +188,7 @@ def write_support(conn, event):
     ctx = {"site_id": site_id, "company_id": company_id, "extraction_key": extraction_key,
            "input_key": event.get("input_key"),
            "question_set": event.get("question_set") or nightly_turn_pick.PROMPT_HASH,
-           "model": usage.get("model"), "allow_cross_language": bool(
+           "model": entry["model"], "allow_cross_language": bool(
                entry.get("allow_cross_language"))}
     counts = {"written": 0, "records": 0, "gone": 0, "linked": 0, "moved_site": 0,
               "errors": 0}
@@ -203,21 +211,45 @@ def write_support(conn, event):
                        "moved_site": counts["moved_site"]},
            "errors": counts["errors"]}
     if counts["written"] > 0:
+        reason = None
         try:
             with conn.transaction():
-                claim_type_store.recompute_session(
+                result = claim_type_store.recompute_session(
                     conn, company_id=company_id, site_id=site_id, session_base=session_base,
                     statement_timeout="15s")
-            out["recompute"] = "done"
+            if isinstance(result, dict) and result.get("timed_out"):
+                reason = "timed_out"
+            elif isinstance(result, dict) and result.get("failed"):
+                reason = "failed"
+        except QueryCanceled:
+            reason = "timed_out"
         except Exception as e:  # noqa: BLE001 -- the links stand; see the module docstring
-            out["recompute"] = "failed"
+            reason = "failed"
             logger.warning("nightly support writer: recompute failed key=%s: %s",
                            extraction_key, type(e).__name__)
+        out["recompute"] = reason or "done"
+        if reason:
+            # J3's marker, so the nightly scan retries the recompute.
+            _mark_recompute_failed(company_id, session_base, reason)
 
     logger.info("nightly support writer: site=%s run=%s key=%s rows=%d written=%d records=%d "
                 "skipped=%s errors=%d", site_id, run_id, extraction_key, len(rows),
                 out["written"], out["records"], out["skipped"], out["errors"])
     return out
+
+
+def _mark_recompute_failed(company_id, session_base, reason):
+    """Upsert the session's claim_recompute_failures marker on a connection and transaction
+    of its own (as the voiceprint writer does: a cancelled statement can leave the writer's
+    connection unusable). Keyed like the voiceprint writer's marker (the normalised
+    `sid{32hex}`). Best-effort: a failure is logged by type and never raised."""
+    key = turn_name_overlay.session_base(session_base) or session_base
+    try:
+        with get_connection() as conn:
+            nightly.mark_recompute_failed(conn, company_id, key, reason)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("nightly support writer: recompute marker not written for %s: %s",
+                       key, type(e).__name__)
 
 
 def lambda_handler(event, _context):

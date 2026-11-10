@@ -246,3 +246,83 @@ def test_writer_moved_site_at_insert_rolls_the_row_back(db, monkeypatch):
     out = writer.write_support(db, s.event([s.row(it), s.row(other)]))
     assert out["skipped"]["moved_site"] == 1 and out["written"] == 1 and out["records"] == 1
     assert [r[5] for r in _records(db, s)] == [other["stable_id"]]
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_writer_rows_empty_records_usage_only(db):
+    """The worker's usage-only invoke after a failed paid call."""
+    s = Seed(db)
+    it = s.item("action_item")
+    out = writer.write_support(db, s.event([]))
+    assert out["written"] == 0 and out["records"] == 0 and out["errors"] == 0
+    assert "recompute" not in out
+    run = db.execute("SELECT tokens_in, tokens_out, cost_usd, model_calls FROM event_runs "
+                     "WHERE run_id = %s", (s.run["run_id"],)).fetchone()
+    assert run == (1200, 300, None, 1)
+    assert _records(db, s) == [] and _links(db, it) == []
+
+
+def test_writer_record_model_is_the_registrys(db):
+    s = Seed(db)
+    it = s.item("finding")
+    ev = s.event([s.row(it)])
+    ev["usage"]["model"] = "payload-model-must-be-ignored"
+    writer.write_support(db, ev)
+    assert _records(db, s)[0][8] == MODEL
+
+
+@pytest.mark.parametrize("result, reason", [
+    (RuntimeError("boom"), "failed"),
+    ({"rows": 1, "changed": 0, "timed_out": True}, "timed_out"),
+])
+def test_writer_marks_failed_recompute(db, monkeypatch, result, reason):
+    s = Seed(db)
+    it = s.item("action_item")
+
+    def recompute(conn, **kw):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    marks = []
+    monkeypatch.setattr(writer.claim_type_store, "recompute_session", recompute)
+    monkeypatch.setattr(writer, "_mark_recompute_failed", lambda *a: marks.append(a))
+    out = writer.write_support(db, s.event([s.row(it)]))
+    assert out["written"] == 1 and out["recompute"] == reason
+    assert marks == [(str(s.co["id"]), s.base, reason)]
+    assert len(_links(db, it)) == 1                 # the link stands
+
+
+def test_writer_recompute_ok_writes_no_marker(db, monkeypatch):
+    s = Seed(db)
+    it = s.item("action_item")
+    marks = []
+    monkeypatch.setattr(writer, "_mark_recompute_failed", lambda *a: marks.append(a))
+    out = writer.write_support(db, s.event([s.row(it)]))
+    assert out["recompute"] == "done" and marks == []
+
+
+@pytest.fixture
+def committed_company(migrated_db_url):
+    from db.connection import get_connection
+    seed = get_connection(migrated_db_url, autocommit=True)
+    co = companies.create_company(seed, f"NightlyW-Commit-{uuid.uuid4().hex[:8]}")
+    try:
+        yield migrated_db_url, seed, co
+    finally:
+        seed.execute("DELETE FROM claim_recompute_failures WHERE company_id = %s", (co["id"],))
+        seed.execute("DELETE FROM companies WHERE id = %s", (co["id"],))
+        seed.close()
+
+
+def test_mark_recompute_failed_writes_the_marker_on_its_own_connection(committed_company,
+                                                                       monkeypatch):
+    from db.connection import get_connection
+    url, seed, co = committed_company
+    monkeypatch.setattr(writer, "get_connection", lambda *a, **k: get_connection(url))
+    base = "sid" + "e" * 32
+    writer._mark_recompute_failed(co["id"], base + "-r2", "timed_out")   # normalised key
+    rows = seed.execute("SELECT session_base, reason, resolved_at FROM claim_recompute_failures "
+                        "WHERE company_id = %s", (co["id"],)).fetchall()
+    assert rows == [(base, "timed_out", None)]
