@@ -298,7 +298,7 @@ def unseen_reports(conn, max_age_hours=48):
     marked seen. Oldest first. A re-run under a new result_key is unseen again."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT r.id, r.company_id, r.user_folder, r.report_date, r.session, "
-        "r.template_name, r.check_name, r.result_key, r.walk_key, r.created_at "
+        "r.template_name, r.check_name, r.result_key, r.created_at "
         "FROM checklist_reports r "
         "WHERE r.created_at >= now() - make_interval(hours => %s) "
         "AND NOT EXISTS (SELECT 1 FROM decision_scan_seen s "
