@@ -162,7 +162,10 @@ find_items(conn, *, company_id, site_id, kinds,
     score, matched_terms,
     place (null in this slice),
     origin (null, or {source_stem, start_sec, end_sec, speaker_label, quote_status} from the live
-            row's supported_by link) }
+            row's supported_by link),
+    first_seen_recorded_at (aware UTC recording START of first_seen's session, or null:
+            meeting_session.opened_at for a sid{32hex} base, else the legacy stem's NZ wall
+            clock via nz_time, else null -- group extraction, other key, missing row) }
 ```
 
 - `company_id` and `site_id` are mandatory. Only live, unsuperseded, unredacted rows are returned, via
@@ -174,8 +177,8 @@ find_items(conn, *, company_id, site_id, kinds,
 - Target latency: under 2 s per call on a site's open items.
 - **What may leave the VPC** (agreed with the status line): a request artifact for a non-VPC worker
   carries, per candidate, only `kind, stable_id, text, status, responsible, deadline, first_seen
-  session date, recorded_by, score, matched_terms, place`. Never `origin`, never other sessions'
-  transcript text.
+  session date, first_seen_recorded_at, recorded_by, score, matched_terms, place`. Never `origin`,
+  never other sessions' transcript text.
 
 ### 5.3 `supported_by` by heuristic
 

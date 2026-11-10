@@ -17,8 +17,8 @@ import uuid
 
 import pytest
 
-from repositories import (action_items, companies, findings, redactions, sites,
-                          topic_decisions, topic_questions, topics, users)
+from repositories import (action_items, companies, findings, meeting_session, redactions,
+                          sites, topic_decisions, topic_questions, topics, users)
 from repositories.item_history import find_items
 
 pytestmark = pytest.mark.integration
@@ -28,7 +28,7 @@ T0 = _dt.datetime(2026, 10, 1, 9, 0, tzinfo=_dt.timezone.utc)
 
 KEYS = {"kind", "stable_id", "item_id", "text", "responsible", "deadline", "status",
         "first_seen", "source", "recorded_by", "carried_from", "score", "matched_terms",
-        "place", "origin"}
+        "place", "origin", "first_seen_recorded_at"}
 
 _TABLE = {"action_item": "action_items", "finding": "findings",
           "decision": "topic_decisions", "question": "topic_questions"}
@@ -417,3 +417,90 @@ def test_deleted_first_pass_does_not_supply_first_seen(db):
     r = s.find()[0]
     assert r["first_seen"] == _ts(30)
     assert r["source"]["source_s3_key"] == t2["source_s3_key"]
+
+
+# ---- first_seen_recorded_at -------------------------------------------------------------
+# The recording START of the first-seen row's session: meeting_session.opened_at for a
+# `sid{32hex}` base, else the legacy stem's NZ wall clock, else None. Never guessed.
+
+UTC = _dt.timezone.utc
+
+
+def _open_session(s, sid, opened_at):
+    meeting_session.ensure_open(s.db, sid, s.co["id"], s.user["id"], s.site["id"],
+                                "audio", opened_at)
+
+
+def _recorded_at(s, text):
+    return {r["text"]: r for r in s.find()}[text]["first_seen_recorded_at"]
+
+
+def test_recorded_at_from_meeting_session_opened_at(db):
+    s = Seed(db)
+    sid = uuid.uuid4().hex
+    opened = _dt.datetime(2026, 10, 1, 1, 0, 0, tzinfo=UTC)
+    _open_session(s, sid, opened)
+    s.action(s.topic(D1, f"sid{sid}"), "Session item", 1)
+
+    got = _recorded_at(s, "Session item")
+
+    assert got == opened
+    assert got.utcoffset() == _dt.timedelta(0), "returned as UTC, not session-tz"
+
+
+def test_recorded_at_is_the_first_seen_session_not_the_live_one(db):
+    s = Seed(db)
+    sid_first, sid_live = uuid.uuid4().hex, uuid.uuid4().hex
+    _open_session(s, sid_first, _dt.datetime(2026, 10, 1, 1, 0, tzinfo=UTC))
+    _open_session(s, sid_live, _dt.datetime(2026, 10, 5, 3, 0, tzinfo=UTC))
+    t1 = s.topic(D1, f"sid{sid_first}")
+    old = s.action(t1, "Carried item", 1)
+    s.supersede(t1)
+    new = s.action(s.topic(D2, f"sid{sid_live}"), "Carried item again", 30)
+    s.carry("action_item", new, old)
+
+    assert _recorded_at(s, "Carried item again") == _dt.datetime(2026, 10, 1, 1, 0,
+                                                                 tzinfo=UTC)
+
+
+def test_recorded_at_none_when_meeting_session_row_missing(db):
+    """A sid base carries no wall clock, so a missing session row has no stem to fall to."""
+    s = Seed(db)
+    s.action(s.topic(D1, f"sid{uuid.uuid4().hex}"), "Orphan session item", 1)
+
+    assert _recorded_at(s, "Orphan session item") is None
+
+
+def test_recorded_at_none_when_opened_at_null(db):
+    s = Seed(db)
+    sid = uuid.uuid4().hex
+    _open_session(s, sid, None)
+    s.action(s.topic(D1, f"sid{sid}"), "Unopened session item", 1)
+
+    assert _recorded_at(s, "Unopened session item") is None
+
+
+def test_recorded_at_from_legacy_stem_dst_and_standard_time(db):
+    s = Seed(db)
+    # 2026-10-01 is NZDT (+13); 2026-06-15 is NZST (+12). Same wall clock both.
+    s.action(s.topic("2026-10-01", "Dev1_2026-10-01_10-00-00"), "Summer stem item", 1)
+    s.action(s.topic("2026-06-15", "Dev1_2026-06-15_10-00-00"), "Winter stem item", 2)
+
+    assert _recorded_at(s, "Summer stem item") == _dt.datetime(2026, 9, 30, 21, 0,
+                                                               tzinfo=UTC)
+    assert _recorded_at(s, "Winter stem item") == _dt.datetime(2026, 6, 14, 22, 0,
+                                                               tzinfo=UTC)
+
+
+def test_recorded_at_none_for_group_extraction(db):
+    s = Seed(db)
+    s.action(s.topic(D1, f"grp{uuid.uuid4().hex}"), "Group item", 1)
+
+    assert _recorded_at(s, "Group item") is None
+
+
+def test_recorded_at_none_for_non_extraction_key(db):
+    s = Seed(db)
+    s.action(s.topic(D1, "x", key=f"reports/{D1}/{s.folder}/daily.json"), "Report item", 1)
+
+    assert _recorded_at(s, "Report item") is None

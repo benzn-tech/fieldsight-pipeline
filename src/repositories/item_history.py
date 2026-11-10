@@ -18,6 +18,15 @@ Visibility comes from deleted_predicates and is never inlined: the live row carr
 lacks the source-prefix arm, and a deletion read with one arm leaks the next night), the
 first-seen row carries the two deletion arms without the live one.
 
+`first_seen_recorded_at` is when the first-seen row's session STARTED recording, as an
+aware UTC datetime; `first_seen` is only when that row was written. Python picks the rule
+from lake_keys.parse(first_key), and SQL only fetches the candidate: a `sid{32hex}` base
+reads meeting_session.opened_at (one LEFT JOIN on the session id the key names, no extra
+round trip); a legacy base is the device's transcript stem, `{device}_{YYYY-MM-DD}_
+{HH-MM-SS}` in NZ wall-clock time, converted through nz_time; a group extraction, any
+other key, or a sid with no session row / NULL opened_at is None. A sid base carries no
+wall clock, so a missing session row has nothing to fall back to.
+
 Ranking is Python over the SQL candidates, with item_text_match.overlap -- the same
 tokeniser the evidence chain uses, ASCII words plus CJK bigrams, so a Chinese item is
 never scored zero for being Chinese.
@@ -27,6 +36,8 @@ import datetime as _dt
 from psycopg.rows import dict_row
 
 import lake_keys
+import nz_time
+import transcript_utils
 from deleted_predicates import (
     DELETED_SOURCE_PREDICATE,
     DELETED_TOPIC_PREDICATE,
@@ -105,7 +116,7 @@ def _kind_sql(kind, live_predicate, status_filtered):
         f"SELECT c.id, c.stable_id, c.item_id, c.{text_col} AS text, {resp} AS responsible, "
         f"{deadline} AS deadline, {status} AS status, c.carried_from, c.created_at, "
         f"t.source_s3_key AS live_key, fs.first_seen, fs.first_key, fs.first_date, "
-        f"o.dst_turn AS origin "
+        f"o.dst_turn AS origin, ms.opened_at AS first_opened_at "
         f"FROM {table} c "
         f"JOIN topics t ON t.id = c.topic_id "
         f"JOIN sites s ON s.id = c.site_id "
@@ -115,6 +126,11 @@ def _kind_sql(kind, live_predicate, status_filtered):
         f"AND {DELETED_TOPIC_PREDICATE.format(alias='tx')} "
         f"AND {DELETED_SOURCE_PREDICATE.format(alias='tx')} "
         f"ORDER BY x.created_at ASC, x.id ASC LIMIT 1) fs ON true "
+        # The session the first-seen key's FILE name carries (lake_keys._sid_from_name):
+        # session_id is the table's primary key and the key names this item's own
+        # recording, so the join reads one timestamp and widens nothing.
+        f"LEFT JOIN meeting_session ms ON ms.session_id = "
+        f"substring(split_part(fs.first_key, '/', 4) from 'sid([0-9a-f]{{32}})') "
         f"LEFT JOIN LATERAL (SELECT e.dst_turn FROM event_links e "
         f"WHERE e.{link_col} = c.id AND e.link_type = 'supported_by' AND e.dst_kind = 'turn' "
         f"ORDER BY {BEST_LINK_ORDER} LIMIT 1) o ON true "
@@ -137,6 +153,29 @@ def _source(first_key, first_date):
             "source_s3_key": first_key}
 
 
+def recorded_at_from_stem(session_base):
+    """The recording start a legacy session_base names, as aware UTC, or None.
+
+    The base is the device's transcript stem (`{device}_{YYYY-MM-DD}_{HH-MM-SS}` or the
+    hyphen-only variant), named with the device's NZ wall clock; transcript_utils reads
+    the timestamp exactly as the extractor does and nz_time converts it (never +13)."""
+    if not session_base:
+        return None
+    local = transcript_utils.extract_base_time_from_filename(session_base)
+    if local is None:
+        return None
+    return nz_time.from_nz(local).replace(tzinfo=_dt.timezone.utc)
+
+
+def _recorded_at(first_key, opened_at):
+    parsed = lake_keys.parse(first_key)
+    if not parsed or parsed["kind"] != "extraction" or parsed["group_id"]:
+        return None
+    if parsed["sid"]:
+        return opened_at.astimezone(_dt.timezone.utc) if opened_at is not None else None
+    return recorded_at_from_stem(parsed["session_base"])
+
+
 def _origin(turn):
     if not isinstance(turn, dict):
         return None
@@ -155,7 +194,8 @@ def find_items(conn, *, company_id, site_id, kinds, statuses=None, since=None, u
     Returns dicts with exactly: kind, stable_id, item_id (the extractor's lineage id, not
     the row id), text, responsible, deadline, status, first_seen, source {user_folder,
     date, session_base, source_s3_key}, recorded_by, carried_from, score, matched_terms,
-    place (always None in this slice), origin.
+    place (always None in this slice), origin, first_seen_recorded_at (aware UTC
+    recording start of the first-seen row's session, or None -- module docstring).
 
     * `statuses`: {kind: [status, ...]}; a kind absent from it is unfiltered. An empty
       list, or a filter on 'decision' or 'finding', raises ValueError.
@@ -223,6 +263,7 @@ def find_items(conn, *, company_id, site_id, kinds, statuses=None, since=None, u
             "matched_terms": list(matched),
             "place": None,
             "origin": _origin(row["origin"]),
+            "first_seen_recorded_at": _recorded_at(row["first_key"], row["first_opened_at"]),
         })
 
     # Three stable sorts, least significant key first: stable_id ASC, first_seen DESC,
