@@ -330,6 +330,8 @@ NOT_EXPORTED = (
     ("nightly_reemits", "the nightly agent's record of requests it sent again"),
     ("claim_recompute_failures", "sessions whose claim-type recompute is to be retried "
                                  "overnight"),
+    ("nightly_requested_items", "per-site count of items the nightly agent sent for a "
+                                "check each night (budget bookkeeping)"),
     # Speaker identification
     ("speaker_voiceprints", "voiceprints (biometric)"),
     ("speaker_voiceprint_samples", "voiceprint samples (biometric)"),

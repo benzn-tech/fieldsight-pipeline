@@ -14,12 +14,15 @@ with a RunContext. `run` does, for the event's site:
      flag=on that have no nightly_support record (input_key = the artifact key) are
      "unanswered"; at BREAKER_AT or more the worker is failing, so no J2 request is written
      tonight and one alert line is logged. Shadow artifacts never count.
-  3. J2 request build. The site's finals of the last 7 days with unsupported live items
+  3. J2 request build (only items never asked since their row was written; see
+     repositories.nightly.sessions_needing_support). The site's finals of the last 7 days with unsupported live items
      (at most 20 sessions). Per session: drop group (`grp…`) sessions, sessions whose
      meeting_session is not final yet, items with no text or no parseable time_range, cap
      at the worker's MAX_ITEMS; skip a session whose request key is already answered or
      already exists in S3 (so a hub retry never re-PUTs a key and S3 never fires twice for
-     one session); stop at the per-company daily item budget. The artifacts are written
+     one session); stop at the per-company daily item budget (today's nightly_support records
+     plus the items the company's other sites requested tonight, nightly_requested_items,
+     which only `on` writes). The artifacts are written
      LAST, after every read that can raise, each stamped with the flag. In shadow the
      worker is not wired, so nothing reads them.
 
@@ -144,6 +147,10 @@ def run_counts(conn, event, ctx, *, clock=time.monotonic):
     else:
         planned = _plan_j2(conn, ctx, night, counts, started, clock)
 
+    if planned and ctx.flag == "on":
+        # The budget across sites (in the run's transaction; shadow writes nothing extra).
+        nightly.add_requested_items(conn, site_id=site_id, company_id=company_id,
+                                    night=night, items=sum(len(b["items"]) for _, b in planned))
     # Last: nothing below can be undone by a later raise for these sessions.
     for key, body in planned:
         lake_put(ctx.bucket, key, json.dumps(body, ensure_ascii=False), client=ctx.s3_client,
@@ -305,6 +312,7 @@ def _plan_j2(conn, ctx, night, counts, started, clock):
     budget = _budget()
     used = nightly.nightly_support_count_today(
         conn, ctx.company_id, nz_time.to_nz(ctx.now_utc).date())
+    used += nightly.requested_items_other_sites(conn, ctx.company_id, ctx.site_id, night)
     planned = []
     for i, (key, sess, items) in enumerate(keyed):
         if key in answered or _exists(ctx.s3_client, ctx.bucket, key):

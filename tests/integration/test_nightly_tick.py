@@ -119,10 +119,10 @@ class Seed:
                               str(self.site["id"]), now, now, {"night": night.isoformat()})
 
 
-def _record(db, s, key, *, created=None):
+def _record(db, s, key, *, created=None, subject=None):
     rec = decision_records.insert(
         db, company_id=s.co["id"], site_id=s.site["id"], kind="nightly_support",
-        subject_type="action_item", subject_stable_id=str(uuid.uuid4()),
+        subject_type="action_item", subject_stable_id=subject or str(uuid.uuid4()),
         provider="anthropic", output={"turn": None, "guard": None},
         auto_outcome="abstained", input_key=key)
     if created is not None:
@@ -313,7 +313,8 @@ def test_shadow_writes_artifacts_and_no_db_rows_besides_hub(db, monkeypatch):
     monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
     fake = FakeS3()
     before = {t: db.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
-              for t in ("decision_records", "event_links", "nightly_reemits")}
+              for t in ("decision_records", "event_links", "nightly_reemits",
+                        "nightly_requested_items")}
     lds.process(db, NOW, s3_client=fake, bucket="lake")
 
     [row] = _events(db, s.site["id"])
@@ -544,3 +545,125 @@ def test_handler_nightly_tick_emits_then_processes(db, monkeypatch):
     monkeypatch.delenv("LAKE_BUCKET")
     with pytest.raises(RuntimeError):
         lds.lambda_handler({"scan": "nightly_tick"}, None)
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_answered_items_are_not_asked_again(db):
+    """Spec §2.2: a night with no new finals costs no call. An item with a nightly_support
+    record since its row was written is not requested again; a row written after its last
+    record (a re-extraction) is asked once more."""
+    s = Seed(db)
+    answered = s.session(written=NOW - dt.timedelta(hours=3))
+    row = answered["rows"][0]
+    _record(db, s, "nightly_requests/last-night.json", subject=row["stable_id"],
+            created=NOW - dt.timedelta(hours=1))
+    db.execute("UPDATE action_items SET created_at = %s WHERE id = %s",
+               (NOW - dt.timedelta(hours=3), row["row_id"]))
+    fake = FakeS3()
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("on", fake))
+    assert outcome == "nothing" and fake.puts == [] and counts["j2_sessions"] == 0
+
+    # the row was rewritten after the record: asked once more
+    db.execute("UPDATE action_items SET created_at = %s WHERE id = %s",
+               (NOW - dt.timedelta(minutes=30), row["row_id"]))
+    fake = FakeS3()
+    nr.run_counts(db, s.event(), s.ctx("on", fake))
+    assert fake.requests() == [nr.request_key(s.site["id"], NIGHT, answered["key"])]
+
+    # a record of ANOTHER company for the same stable id does not count
+    t = Seed(db)
+    other = t.session()
+    decision_records.insert(
+        db, company_id=s.co["id"], site_id=s.site["id"], kind="nightly_support",
+        subject_type="action_item", subject_stable_id=other["rows"][0]["stable_id"],
+        provider="anthropic", output={}, auto_outcome="abstained", input_key="x")
+    fake = FakeS3()
+    nr.run_counts(db, t.event(), t.ctx("on", fake))
+    assert len(fake.requests()) == 1
+
+
+def test_run_rule_raise_keeps_the_committed_run_named_in_the_artifact(db, monkeypatch):
+    s = Seed(db)
+    s.session(written=NOW - dt.timedelta(hours=3))
+    s.session(written=NOW - dt.timedelta(hours=4))
+    lds._insert_event(db, s.event(), dt.date(2026, 11, 11))
+
+    class SecondPutFails(FakeS3):
+        def put_object(self, Bucket, Key, Body, **kw):
+            if Key.startswith(nr.PREFIX) and self.requests():
+                raise RuntimeError("s3 put failed")
+            return super().put_object(Bucket, Key, Body, **kw)
+    fake = SecondPutFails()
+    monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+    lds.process(db, NOW, s3_client=fake, bucket="lake")
+    [key] = fake.requests()                                  # the first put landed
+    run_id = fake.body(key)["run_id"]
+    [ev] = _events(db, s.site["id"])
+    assert ev["status"] == "queued" and ev["attempts"] == 1
+    runs = db.execute(
+        "SELECT r.run_id::text, r.outcome, r.ended_at IS NOT NULL FROM event_runs r "
+        "JOIN run_events re ON re.run_id = r.run_id WHERE re.event_id = %s",
+        (ev["event_id"],)).fetchall()
+    assert runs == [(run_id, "failed", True)]
+    assert sum(1 for r in runs if r[1] == "failed") == ev["attempts"]
+
+
+def test_abandoned_run_rule_run_is_recorded_as_a_failed_attempt(db, monkeypatch):
+    s = Seed(db)
+    lds._insert_event(db, s.event(), dt.date(2026, 11, 11))
+    [ev] = _events(db, s.site["id"])
+    se.set_status(db, ev["event_id"], s.co["id"], s.site["id"], "running")
+    run = event_runs.start(db, s.co["id"], s.site["id"], [ev["event_id"]], 1, "nightly.due")
+    event_runs.set_lease(db, run["run_id"], s.co["id"], s.site["id"],
+                         NOW - dt.timedelta(minutes=1))
+    # a live run (lease in the future) is left alone
+    t = Seed(db)
+    lds._insert_event(db, t.event(), dt.date(2026, 11, 11))
+    [tev] = _events(db, t.site["id"])
+    se.set_status(db, tev["event_id"], t.co["id"], t.site["id"], "running")
+    trun = event_runs.start(db, t.co["id"], t.site["id"], [tev["event_id"]], 1, "nightly.due")
+    event_runs.set_lease(db, trun["run_id"], t.co["id"], t.site["id"],
+                         NOW + dt.timedelta(minutes=5))
+    monkeypatch.setenv("NIGHTLY_REMATCH", "shadow")
+    lds.process(db, NOW, s3_client=FakeS3(), bucket="lake")
+    [ev] = _events(db, s.site["id"])
+    assert ev["status"] == "queued" and ev["attempts"] == 1
+    assert "abandoned" in ev["last_error"]
+    outcomes = db.execute(
+        "SELECT r.run_id, r.outcome FROM event_runs r JOIN run_events re "
+        "ON re.run_id = r.run_id WHERE re.event_id = %s", (ev["event_id"],)).fetchall()
+    assert outcomes == [(run["run_id"], "failed")]
+    [tev] = _events(db, t.site["id"])
+    assert tev["status"] == "running" and tev["attempts"] == 0
+
+
+def test_budget_counts_the_companys_other_sites_tonight(db, monkeypatch):
+    a = Seed(db)
+    b = Seed(db, co=a.co)
+    a.session(items=2)
+    b.session(items=2)
+    monkeypatch.setenv("NIGHTLY_MAX_ITEMS_PER_COMPANY_DAY", "3")
+    fa = FakeS3()
+    nr.run_counts(db, a.event(), a.ctx("on", fa))
+    assert len(fa.requests()) == 1
+    assert db.execute("SELECT site_id::text, night, company_id::text, items "
+                      "FROM nightly_requested_items WHERE company_id = %s",
+                      (a.co["id"],)).fetchall() == [
+        (str(a.site["id"]), NIGHT, str(a.co["id"]), 2)]
+    fb = FakeS3()
+    outcome, counts = nr.run_counts(db, b.event(), b.ctx("on", fb))
+    assert fb.requests() == [] and counts["budget_paused"] == 1
+    # a site's own row never counts against itself
+    assert nightly.requested_items_other_sites(db, a.co["id"], a.site["id"], NIGHT) == 0
+    assert nightly.requested_items_other_sites(db, a.co["id"], b.site["id"], NIGHT) == 2
+
+
+def test_shadow_writes_no_requested_items_row(db):
+    s = Seed(db)
+    s.session(items=2)
+    fake = FakeS3()
+    nr.run_counts(db, s.event(), s.ctx("shadow", fake))
+    assert len(fake.requests()) == 1
+    assert db.execute("SELECT count(*) FROM nightly_requested_items WHERE site_id = %s",
+                      (s.site["id"],)).fetchone()[0] == 0

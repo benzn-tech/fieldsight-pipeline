@@ -147,3 +147,19 @@ def test_company_and_site_delete_cascade(db):
     db.execute("DELETE FROM companies WHERE id = %s", (co["id"],))
     assert db.execute("SELECT count(*) FROM claim_recompute_failures WHERE company_id = %s",
                       (co["id"],)).fetchone()[0] == 0
+
+
+def test_nightly_requested_items_table(db):
+    _apply(db)
+    co, site, _topic = _seed(db)
+    db.execute("INSERT INTO nightly_requested_items (site_id, night, company_id, items) "
+               "VALUES (%s,%s,%s,3)", (site["id"], DAY, co["id"]))
+    with pytest.raises(UniqueViolation):
+        with db.transaction():
+            db.execute("INSERT INTO nightly_requested_items (site_id, night, company_id, "
+                       "items) VALUES (%s,%s,%s,1)", (site["id"], DAY, co["id"]))
+    with pytest.raises(CheckViolation):
+        with db.transaction():
+            db.execute("INSERT INTO nightly_requested_items (site_id, night, company_id, "
+                       "items) VALUES (%s,%s,%s,-1)",
+                       (site["id"], DAY + _dt.timedelta(days=1), co["id"]))

@@ -70,3 +70,12 @@ def add_usage(conn, run_id, company_id, site_id, *, tokens_in, tokens_out, model
         f"WHERE run_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",
         (tokens_in, tokens_out, cost_usd, cost_usd, model, run_id, company_id,
          site_id)).fetchone()
+
+
+def set_lease(conn, run_id, company_id, site_id, lease_until):
+    """Set THIS tenant's run's lease_until: the time by which an open run (ended_at NULL)
+    must have finished, after which the hub treats it as abandoned. Returns the row or None."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE event_runs SET lease_until = %s "
+        f"WHERE run_id = %s AND company_id = %s AND site_id = %s RETURNING {_COLS}",
+        (lease_until, run_id, company_id, site_id)).fetchone()

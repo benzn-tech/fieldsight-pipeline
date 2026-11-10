@@ -41,3 +41,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_event_links_nightly_de ON event_links (src_
   WHERE method LIKE 'nightly_%' AND src_decision_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_event_links_nightly_qu ON event_links (src_question_id)
   WHERE method LIKE 'nightly_%' AND src_question_id IS NOT NULL;
+
+-- J2 budget across sites: per site and night, how many items the nightly handler put into
+-- requests (flag `on` only, written in the run's transaction). The per-company daily
+-- budget adds the company's other sites' rows for the night to the nightly_support records
+-- of the day, so two sites cannot each spend the whole budget.
+CREATE TABLE IF NOT EXISTS nightly_requested_items (
+  site_id     uuid NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  night       date NOT NULL,
+  company_id  uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  items       integer NOT NULL CHECK (items >= 0),
+  created_at  timestamptz DEFAULT now(),
+  PRIMARY KEY (site_id, night)
+);
+CREATE INDEX IF NOT EXISTS idx_nightly_requested_items_company_night
+  ON nightly_requested_items (company_id, night);

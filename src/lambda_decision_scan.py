@@ -42,10 +42,16 @@ Transactions: never conn.commit() here. Each unit of work is `with conn.transact
 under the handler's connection that is a real BEGIN/COMMIT, under a caller's open
 transaction a savepoint. process() claims and handles a batch in ONE transaction, each
 event in its own savepoint; a Lambda crash rolls the whole batch back, so no row is ever
-left 'running'. Run-rule events are the exception: each is claimed and run in its OWN
-transaction (claim limit 1), before the batches, so a timeout mid-way never rolls back a
-site whose run already finished -- and whose S3 request artifacts, which no rollback
-undoes, are already written.
+left 'running'. Run-rule events are the exception, handled before the batches, one event at
+a time in two transactions:
+  A  claim (limit 1), pre-dispatch checks, merge, start the run row with a lease -> COMMIT,
+     so anything the job writes outside the database (the nightly S3 requests) names a run
+     that exists;
+  B  rule.run, event status, run finish -> COMMIT. A raise rolls B back and _fail finishes
+     THAT run as 'failed' (one failed run per attempt, as for card rules).
+A Lambda that dies inside B leaves the event 'running' with an open run; once the run's
+lease (RUN_LEASE) has passed, the next process() records it as a failed attempt
+(abandoned_running -> _fail on that run) and the event is retried with backoff.
 
 Hub functions are imported BY NAME and called unqualified: mutation tests patch
 `lambda_decision_scan.<name>`.
@@ -81,6 +87,9 @@ MAX_RUN_EVENTS = 200       # run-rule events per invocation, one transaction eac
 # Start no new run-rule event this long after process() began: the Lambda Timeout is 120 s and
 # one nightly run is bounded by nightly_rematch.RUN_BUDGET_S (45 s).
 RUN_EVENTS_WINDOW_S = 30.0
+# An open run-rule run older than this is abandoned (its Lambda died): longer than the scan
+# Lambda's 120 s Timeout, so a live run is never taken for a dead one.
+RUN_LEASE = timedelta(minutes=10)
 NIGHTLY_TYPE = nightly_rematch.EVENT_TYPE
 GAP_TYPE = "checklist.gap"
 OVERDUE_TYPE = "todo.overdue"
@@ -348,9 +357,8 @@ def _run_job(conn, ev, rule, run_id, now, job):
     return outcome, outcome, None
 
 
-def _dispatch(conn, row, ev, rule, now, job=(None, None, None)):
-    """Merge, run, handle -- inside the event's savepoint. Returns (status, outcome, card).
-    job = (NIGHTLY_REMATCH value, s3_client, bucket), used only by run-rules."""
+def _merge_and_start(conn, row, ev, rule):
+    """Merge the queued events of the same subject into a new run of this event; the run."""
     cid, sid = ev.company_id, ev.site_id
     others = [r["event_id"] for r in site_events.queued_same_subject(
         conn, cid, sid, ev.type, ev.subject_ref) if r["event_id"] != ev.event_id]
@@ -360,6 +368,14 @@ def _dispatch(conn, row, ev, rule, now, job=(None, None, None)):
     for eid in merged:
         site_events.set_status(conn, eid, cid, sid, "merged", rule_id=rule.rule_id)
         event_runs.add_event(conn, run["run_id"], eid, cid, sid)
+    return run
+
+
+def _dispatch(conn, row, ev, rule, now, job=(None, None, None)):
+    """Merge, run, handle -- inside the event's savepoint. Returns (status, outcome, card).
+    job = (NIGHTLY_REMATCH value, s3_client, bucket), used only by run-rules."""
+    cid, sid = ev.company_id, ev.site_id
+    run = _merge_and_start(conn, row, ev, rule)
     if rule.run is not None:
         status, outcome, card = _run_job(conn, ev, rule, run["run_id"], now, job)
     else:
@@ -376,18 +392,20 @@ def _insert_fault(conn, ev, draft, purpose, subject_ref):
         _route(conn, draft, ev.company_id, ev.site_id)))
 
 
-def _fail(conn, row, ev, exc, now, out):
+def _fail(conn, row, ev, exc, now, out, run_id=None):
     """Record a failed attempt in the OUTER transaction (the event's savepoint is already
     rolled back): a failed run row, attempts + 1, backoff or terminal 'failed', and the
-    fault card at FAULT_AT, bumped at STOP_AT."""
+    fault card at FAULT_AT, bumped at STOP_AT. run_id: a run-rule's already committed run
+    of this attempt, finished as 'failed' instead of opening another."""
     cid, sid = ev.company_id, ev.site_id
     attempts = (row["attempts"] or 0) + 1
     err = f"{type(exc).__name__}: {exc}"[:1000]
     logger.warning("decision-scan process: event %s attempt %d failed: %s",
                    ev.event_id, attempts, err)
-    run = event_runs.start(conn, cid, sid, [ev.event_id], attempts,
-                           row.get("rule_id") or ev.type)
-    event_runs.finish(conn, run["run_id"], cid, sid, "failed", error=err)
+    if run_id is None:
+        run_id = event_runs.start(conn, cid, sid, [ev.event_id], attempts,
+                                  row.get("rule_id") or ev.type)["run_id"]
+    event_runs.finish(conn, run_id, cid, sid, "failed", error=err)
     if attempts >= STOP_AT:
         site_events.set_status(conn, ev.event_id, cid, sid, "failed", attempts=attempts,
                                last_error=err)
@@ -439,33 +457,89 @@ def _process_one(conn, row, now, out, job=(None, None, None)):
     except Exception as exc:  # noqa: BLE001
         _fail(conn, row, _bare_event(row, now), exc, now, out)
         return
-    cid, sid = ev.company_id, ev.site_id
     try:
         with conn.transaction():
-            today_nz = nz_time.to_nz(ev.received_at).date()
-            # Pre-dispatch outcomes start no run.
-            if tenancy_status.company_status(conn, cid) != tenancy_status.ACTIVE:
-                site_events.set_status(conn, ev.event_id, cid, sid, "blocked")
-                return
-            if too_deep(ev):
-                site_events.set_status(conn, ev.event_id, cid, sid, "too_deep")
-                chain = ev.chain_id or ev.event_id
-                if _insert_fault(conn, ev, too_deep_card(ev), "too_deep", chain):
-                    out["faults"] += 1
-                return
-            rule = match(ev)
+            rule = _pre_dispatch(conn, ev, out)
             if rule is None:
-                site_events.set_status(conn, ev.event_id, cid, sid, "unmatched")
-                return
-            if is_late(ev, rule, today_nz):
-                site_events.set_status(conn, ev.event_id, cid, sid, "late",
-                                       rule_id=rule.rule_id)
                 return
             _status, _outcome, card = _dispatch(conn, row, ev, rule, now, job)
             if card is not None:
                 out["cards"] += 1
     except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
         _fail(conn, row, ev, exc, now, out)
+
+
+def _pre_dispatch(conn, ev, out):
+    """Pre-dispatch outcomes (blocked, too_deep, unmatched, late) start no run: the status
+    is set and None returned. Otherwise the matched rule."""
+    cid, sid = ev.company_id, ev.site_id
+    today_nz = nz_time.to_nz(ev.received_at).date()
+    if tenancy_status.company_status(conn, cid) != tenancy_status.ACTIVE:
+        site_events.set_status(conn, ev.event_id, cid, sid, "blocked")
+        return None
+    if too_deep(ev):
+        site_events.set_status(conn, ev.event_id, cid, sid, "too_deep")
+        chain = ev.chain_id or ev.event_id
+        if _insert_fault(conn, ev, too_deep_card(ev), "too_deep", chain):
+            out["faults"] += 1
+        return None
+    rule = match(ev)
+    if rule is None:
+        site_events.set_status(conn, ev.event_id, cid, sid, "unmatched")
+        return None
+    if is_late(ev, rule, today_nz):
+        site_events.set_status(conn, ev.event_id, cid, sid, "late", rule_id=rule.rule_id)
+        return None
+    return rule
+
+
+def _start_run_event(conn, row, now, out):
+    """Transaction A of a run-rule event (the caller holds it): pre-dispatch, merge, start
+    the run with its lease. (ev, rule, run) to run in transaction B, or None when the event
+    ended here (pre-dispatch status, or a failed attempt already recorded)."""
+    try:
+        ev = _event_of(row)
+    except Exception as exc:  # noqa: BLE001
+        _fail(conn, row, _bare_event(row, now), exc, now, out)
+        return None
+    try:
+        with conn.transaction():
+            rule = _pre_dispatch(conn, ev, out)
+            if rule is None:
+                return None
+            run = _merge_and_start(conn, row, ev, rule)
+            event_runs.set_lease(conn, run["run_id"], ev.company_id, ev.site_id,
+                                 now + RUN_LEASE)
+            return ev, rule, run
+    except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
+        _fail(conn, row, ev, exc, now, out)
+        return None
+
+
+def _finish_run_event(conn, row, ev, rule, run, now, out, job):
+    """Transaction B (the caller holds it): rule.run, then the event status and the run's
+    outcome. A raise rolls the job's writes back and finishes THIS run as failed."""
+    cid, sid = ev.company_id, ev.site_id
+    try:
+        with conn.transaction():
+            status, outcome, _card = _run_job(conn, ev, rule, run["run_id"], now, job)
+            site_events.set_status(conn, ev.event_id, cid, sid, status, rule_id=rule.rule_id)
+            event_runs.finish(conn, run["run_id"], cid, sid, outcome)
+    except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
+        _fail(conn, row, ev, exc, now, out, run_id=run["run_id"])
+
+
+def _recover_abandoned(conn, now, out, run_types):
+    """A run-rule attempt whose Lambda died in transaction B: its run is open past its lease
+    and the event is still 'running'. Record it as a failed attempt on THAT run."""
+    with conn.transaction():
+        for row in site_events.abandoned_running(conn, now, run_types):
+            try:
+                ev = _event_of(row)
+            except Exception:  # noqa: BLE001
+                ev = _bare_event(row, now)
+            _fail(conn, row, ev, RuntimeError("run abandoned: lease expired without a finish"),
+                  now, out, run_id=row["run_id"])
 
 
 def _run_types():
@@ -484,16 +558,22 @@ def process(conn, now, *, s3_client=None, bucket=None, clock=None):
     job = (os.environ.get(RUN_FLAG), s3_client, bucket)
     run_types = _run_types()
     started = clock()
+    if run_types:
+        _recover_abandoned(conn, now, out, run_types)
     for _ in range(MAX_RUN_EVENTS if run_types else 0):
         if clock() - started > RUN_EVENTS_WINDOW_S:
             break
-        with conn.transaction():
+        started_run = None
+        with conn.transaction():                                  # A
             rows = site_events.claim_due(conn, now, 1, only_types=run_types)
-            for row in rows:
+            if rows:
                 out["processed"] += 1
-                _process_one(conn, row, now, out, job)
+                started_run = _start_run_event(conn, rows[0], now, out)
         if not rows:
             break
+        if started_run is not None:
+            with conn.transaction():                              # B
+                _finish_run_event(conn, rows[0], *started_run, now, out, job)
     for _ in range(MAX_BATCHES):
         with conn.transaction():
             rows = site_events.claim_due(conn, now, BATCH, exclude_types=run_types)

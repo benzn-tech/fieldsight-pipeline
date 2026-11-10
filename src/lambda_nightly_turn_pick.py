@@ -58,8 +58,10 @@ PREFIX = "nightly_requests/"
 REGISTRY_TASK = "nightly_turn_pick"
 # The writer's Timeout is 120 s: wait for it, and never let botocore retry the invoke.
 WRITER_READ_TIMEOUT_S = 130
-# Upper bound on the model call (seconds); the Lambda Timeout bounds it too.
-MODEL_TIMEOUT_S = 600.0
+# Upper bound on the model call (seconds). The function Timeout (template: 300) must cover
+# this + the writer wait (WRITER_READ_TIMEOUT_S) + the turn rebuild; a call cut off by the
+# Lambda Timeout would be paid twice (the S3 retry). Pinned by tests/unit/test_nightly_rematch.py.
+MODEL_TIMEOUT_S = 150.0
 
 _s3_client = None
 _lambda_client = None

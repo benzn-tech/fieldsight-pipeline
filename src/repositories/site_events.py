@@ -108,3 +108,22 @@ def queued_same_subject(conn, company_id, site_id, type, subject_ref):
         "WHERE company_id = %s AND site_id = %s AND type = %s AND subject_ref = %s "
         "AND status = 'queued' ORDER BY seq",
         (company_id, site_id, type, subject_ref)).fetchall()
+
+
+def abandoned_running(conn, now, types):
+    """'running' events of `types` whose open run (ended_at NULL) has a lease_until before
+    `now`: a run-rule attempt whose Lambda died after its run row was committed. Each row is
+    the event's columns plus `run_id` (that open run), locked FOR UPDATE SKIP LOCKED so two
+    scans never recover the same event."""
+    types = list(types or [])
+    if not types:
+        return []
+    cols = ", ".join("e." + c.strip() for c in _COLS.split(","))
+    rows = conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {cols}, r.run_id AS run_id FROM site_events e "
+        "JOIN run_events re ON re.event_id = e.event_id "
+        "JOIN event_runs r ON r.run_id = re.run_id "
+        "WHERE e.status = 'running' AND e.type = ANY(%s) AND r.ended_at IS NULL "
+        "AND r.lease_until IS NOT NULL AND r.lease_until < %s "
+        "ORDER BY e.seq FOR UPDATE OF e SKIP LOCKED", (types, now)).fetchall()
+    return rows

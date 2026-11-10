@@ -57,7 +57,14 @@ def _needing_sql(kind):
         f"AND {visible_topics_predicate('t')} "
         f"AND {_topic_not_hidden('t')} "
         f"AND NOT EXISTS (SELECT 1 FROM event_links e WHERE e.{col} = c.id "
-        f"AND e.link_type = 'supported_by')"
+        f"AND e.link_type = 'supported_by') "
+        # Asked already: a nightly_support record for this item since this row was written.
+        # A re-extracted row (new created_at) is asked once more; nothing else is re-asked,
+        # so a night with no new finals costs no model call (spec §2.2).
+        f"AND NOT EXISTS (SELECT 1 FROM decision_records dr "
+        f"WHERE dr.company_id = %(company_id)s AND dr.kind = '{NIGHTLY_SUPPORT_KIND}' "
+        f"AND dr.subject_type = '{kind}' AND dr.subject_stable_id = c.stable_id "
+        f"AND dr.created_at >= c.created_at)"
     )
 
 
@@ -72,7 +79,9 @@ def sessions_needing_support(conn, *, company_id, site_id, since_utc, limit=20) 
     session is included -- its final supersedes it and the writer then skips the row.
     `topic_index` is the topic's 0-based ordinal within the session (topic write order),
     `time_range` the topic's own string. Only live items with no supported_by link of any
-    method on their own row; sessions with no such item are omitted."""
+    method on their own row, and not asked already: no nightly_support record for the item
+    created at or after the row's created_at (a re-extracted row is asked once more).
+    Sessions with no such item are omitted."""
     if not company_id or not site_id:
         raise ValueError("company_id and site_id are required")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
@@ -217,3 +226,25 @@ def live_session_ids(conn, session_ids) -> set:
         "SELECT session_id FROM meeting_session WHERE session_id = ANY(%s) "
         "AND status <> ALL(%s)", (ids, list(FINAL_MEETING_STATUSES))).fetchall()
     return {r[0] for r in rows}
+
+
+def add_requested_items(conn, *, site_id, company_id, night, items):
+    """Record that this site's nightly run put `items` items into requests for `night`
+    (added to any earlier count of the same site and night: a retry adds only what it newly
+    requested). Flag `on` only; the caller holds the run's transaction."""
+    conn.execute(
+        "INSERT INTO nightly_requested_items (site_id, night, company_id, items) "
+        "VALUES (%s,%s,%s,%s) ON CONFLICT (site_id, night) DO UPDATE SET "
+        "items = nightly_requested_items.items + EXCLUDED.items",
+        (site_id, night, company_id, int(items)))
+
+
+def requested_items_other_sites(conn, company_id, site_id, night) -> int:
+    """Items the company's OTHER sites put into requests for `night`: the part of tonight's
+    spend the nightly_support records do not show yet. Counted whether or not the worker has
+    answered (so an answered request counts twice -- conservative: the budget pauses early,
+    never late)."""
+    return conn.execute(
+        "SELECT COALESCE(sum(items), 0) FROM nightly_requested_items "
+        "WHERE company_id = %s AND night = %s AND site_id <> %s",
+        (company_id, night, site_id)).fetchone()[0]

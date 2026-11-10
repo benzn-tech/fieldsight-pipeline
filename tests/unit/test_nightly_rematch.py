@@ -226,3 +226,13 @@ def test_wire_script_routes_nightly_requests_only_when_the_operator_asks():
     # gated: never added just because the function exists (it exists in shadow too)
     block = text[text.index("nightly_turn_pick_mode()"):]
     assert 'WIRE_NIGHTLY_TURN_PICK:-}" = "true"' in block[:400]
+
+
+def test_worker_timeout_covers_the_model_call_and_the_writer_wait(doc):
+    """A call cut off by the Lambda Timeout is paid twice (the S3 retry): the function's
+    Timeout must cover the model call, the writer wait and the turn rebuild."""
+    import lambda_nightly_turn_pick as w
+    timeout = _props(doc, WORKER)["Timeout"]
+    assert w.MODEL_TIMEOUT_S <= 150
+    assert w.WRITER_READ_TIMEOUT_S > _props(doc, WRITER)["Timeout"]
+    assert w.MODEL_TIMEOUT_S + w.WRITER_READ_TIMEOUT_S + 15 <= timeout
