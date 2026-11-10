@@ -15,6 +15,9 @@ from datetime import datetime
 import pytest
 
 ex = pytest.importorskip("lambda_extract_session", reason="requires the lambda deps")
+# The turn chain lives in session_turns (the extractor delegates to it); its helpers are
+# patched there. The S3 client is still the extractor's own `s3`, passed through.
+import session_turns as st  # noqa: E402
 
 
 def _normalized(name, n=1):
@@ -45,9 +48,9 @@ def two_segments(monkeypatch):
             return _P()
 
     monkeypatch.setattr(ex, "s3", lambda: _S3())
-    monkeypatch.setattr(ex, "normalize_transcript",
+    monkeypatch.setattr(st, "normalize_transcript",
                         lambda data, filename: payloads.get(filename))
-    monkeypatch.setattr(ex, "filter_device_announcements",
+    monkeypatch.setattr(st, "filter_device_announcements",
                         lambda turns: (turns, {"removed": 0, "texts": []}))
     return ["transcripts/a/d/one.json", "transcripts/a/d/two.json"]
 
@@ -81,10 +84,10 @@ def test_the_stamp_survives_dedup(monkeypatch, two_segments):
 
     def _spy(turns):
         seen["before"] = [t.get("source_filename") for t in turns]
-        return ex._dedup_turn_boundaries.__wrapped__(turns) if hasattr(
-            ex._dedup_turn_boundaries, "__wrapped__") else turns
+        return st._dedup_turn_boundaries.__wrapped__(turns) if hasattr(
+            st._dedup_turn_boundaries, "__wrapped__") else turns
 
-    monkeypatch.setattr(ex, "_dedup_turn_boundaries", _spy)
+    monkeypatch.setattr(st, "_dedup_turn_boundaries", _spy)
     turns, _, _ = ex.assemble_session_turns("bkt", two_segments)
     assert all(seen["before"]), "the stamp must be applied BEFORE dedup"
     assert all(t.get("source_filename") for t in turns)
@@ -112,10 +115,10 @@ def test_a_skipped_segment_does_not_shift_the_pairing(monkeypatch):
             return _P()
 
     monkeypatch.setattr(ex, "s3", lambda: _S3())
-    monkeypatch.setattr(ex, "normalize_transcript",
+    monkeypatch.setattr(st, "normalize_transcript",
                         lambda data, filename: payloads.get(filename))   # bad.json -> None
-    monkeypatch.setattr(ex, "_is_empty_transcript", lambda data: True)
-    monkeypatch.setattr(ex, "filter_device_announcements",
+    monkeypatch.setattr(st, "_is_empty_transcript", lambda data: True)
+    monkeypatch.setattr(st, "filter_device_announcements",
                         lambda turns: (turns, {"removed": 0, "texts": []}))
     turns, files, _ = ex.assemble_session_turns(
         "bkt", ["transcripts/a/d/bad.json", "transcripts/a/d/good.json"])
