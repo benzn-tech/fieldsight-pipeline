@@ -292,6 +292,10 @@ NOT_EXPORTED = (
     ("keyframe_events", "video keyframe events"),
     ("keyframe_tombstones", "deleted video keyframes"),
     ("redactions", "deletion / redaction records (deleted content is excluded above)"),
+    ("decision_cards", "questions the site decision loop put to people, and their "
+                       "review labels"),
+    ("decision_ledger", "decisions recorded by the site decision loop (who, on what "
+                        "authority, when)"),
     # Speaker identification
     ("speaker_voiceprints", "voiceprints (biometric)"),
     ("speaker_voiceprint_samples", "voiceprint samples (biometric)"),
@@ -309,6 +313,10 @@ NOT_EXPORTED = (
     ("devices", "recording devices"),
     ("device_upload_freezes", "device upload freezes"),
     ("ws_connections", "live websocket connections"),
+    ("site_events", "site decision loop event queue"),
+    ("event_runs", "site decision loop handler runs"),
+    ("run_events", "which events each site decision loop run handled"),
+    ("decision_scan_seen", "checklist reports the site decision loop has scanned"),
 )
 
 # compliance_resolutions' day tombstone is applied in Python from the Tombstones set
