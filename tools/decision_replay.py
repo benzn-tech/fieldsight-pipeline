@@ -48,8 +48,8 @@ replay() contract
   newest is 'superseded'. Card status is otherwise NOT recomputed: supersede is decided by
   the checklist scan from S3 content, which the database does not hold. Recipients are not
   compared (membership changes over time).
-* Runs: a pre-dispatch or duplicate event has no run; a done / nothing / merged event has
-  exactly one non-failed run, and a 'done' event's run outcome is 'done' iff it has a card.
+* Runs: a pre-dispatch or duplicate event has no run; a done / nothing event has exactly
+  one non-failed run (a merged event only has to be in some run), and a 'done' event's run outcome is 'done' iff it has a card.
 * Fault cards are judged through run_events / failed-run counts, not the hub: an event with
   >= FAULT_AT failed runs has exactly one 'fault' card (key fault_card_key(..., event_id,
   'fault')), marked stopped (version > 1 or 'stopped' in the consequence) once >= STOP_AT;

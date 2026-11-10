@@ -1659,7 +1659,7 @@ Parameters:
 
   # Site decision loop P0 (spec 2026-11-05-site-decision-loop-design rev 5). Pinned by
   # tests/unit/test_decision_scan_template.py: this Parameter -> ShouldRunDecisionLoop ->
-  # DecisionScanFunction (+ its three schedules), and SITE_DECISION_LOOP on OrgApiFunction
+  # DecisionScanFunction (+ its two schedules), and SITE_DECISION_LOOP on OrgApiFunction
   # (unconditional: org-api only reads the string). Set per environment by
   # TEST_SITE_DECISION_LOOP / PROD_SITE_DECISION_LOOP -- SAM keeps a stack's previous
   # value, so the workflow variable, not this Default, is what sets it.
