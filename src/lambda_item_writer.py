@@ -1341,7 +1341,9 @@ def _xday_order(row):
 
 
 def _xday_chains(conn, site_id, rows_by_sid, own_sids):
-    """One query for the `continues` edges among the candidate (and own) stable_ids ->
+    """One query for the `continues` edges touching the candidate (and own) stable_ids --
+    either end, so a chain still collapses through one member that is not a candidate
+    (closed, or outside the window) ->
     {stable_id: its chain's newest member}. Newest by RECORDING order over the rows in hand
     (ties broken by stable_id); a chain holding one of this session's own items is headed by
     it, so select_candidates hides the whole chain."""
@@ -1351,7 +1353,7 @@ def _xday_chains(conn, site_id, rows_by_sid, own_sids):
     edges = conn.execute(
         "SELECT src_stable_id::text, dst_stable_id::text FROM event_links "
         "WHERE site_id = %s AND link_type = 'continues' "
-        "AND src_stable_id = ANY(%s::uuid[]) AND dst_stable_id = ANY(%s::uuid[])",
+        "AND (src_stable_id = ANY(%s::uuid[]) OR dst_stable_id = ANY(%s::uuid[]))",
         (site_id, ids, ids)).fetchall()
     parent = {}
 

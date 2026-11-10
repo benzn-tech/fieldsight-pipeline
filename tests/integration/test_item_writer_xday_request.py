@@ -284,6 +284,31 @@ def test_a_chain_is_shown_once_as_its_newest_member(world):
     assert body["precap_counts"]["action_items"] == 2
 
 
+def test_a_chain_collapses_through_a_member_that_is_not_a_candidate(world):
+    """oldest <- middle <- newest, the middle one closed: the oldest and the newest are still
+    one chain, shown once as the newest."""
+    w = world
+    texts = {"a": "Order rebar for level two slab", "b": "Rebar order for level two slab sent",
+             "c": "Rebar order for level two slab confirmed"}
+    sids = {}
+    for name, d in (("a", "2026-10-20"), ("b", "2026-10-27"), ("c", EARLY)):
+        w["write"](d, name, _artifact("final", f"{d}T10:00:00Z", actions=[texts[name]]))
+        sids[name] = _live_stable_id(w, w["key_for"](d, name), "action_items", "text",
+                                     texts[name])
+    w["seed"].execute("UPDATE action_items SET status = 'done' WHERE stable_id = %s",
+                      (sids["b"],))
+    for src, dst in (("b", "a"), ("c", "b")):
+        w["seed"].execute(
+            "INSERT INTO event_links (site_id, link_type, src_kind, src_stable_id, dst_kind, "
+            "dst_stable_id, method, rule_version) VALUES "
+            "(%s, 'continues', 'action_item', %s, 'action_item', %s, 'llm_echo', 'xday_v1')",
+            (w["site"]["id"], sids[src], sids[dst]))
+    w["write"](DATE, "today", _artifact("final", "2026-11-09T11:00:00Z",
+                                        actions=TODAY["actions"]), mode="shadow")
+    body = w["s3"].puts[-1]["body"]
+    assert [c["stable_id"] for c in body["candidates"]] == [sids["c"]]
+
+
 @pytest.mark.parametrize("case", ["incomplete", "live_tier", "zero_candidates", "off"])
 def test_no_request(world, monkeypatch, case):
     w = world
