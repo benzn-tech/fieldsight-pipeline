@@ -636,8 +636,10 @@ def elide_middle(lines, limit, head_share=DEFAULT_HEAD_SHARE, sep="\n"):
     """Fit `lines` into `limit` chars by keeping the head AND the tail.
 
     Returns `(text, stats)` where stats is
-    `{chars, lines, lines_omitted, truncated}` — the record of what the model was
-    actually shown.
+    `{chars, lines, lines_omitted, truncated, head_lines, tail_lines}` — the record
+    of what the model was actually shown. `head_lines` / `tail_lines` count the
+    lines kept from each end (untruncated: all of them in the head, 0 in the tail),
+    so a caller can say exactly WHICH input lines were shown, not just how many.
 
     A meeting states its context at the start and lands its decisions and actions at
     the END. A bare head slice (`text[:limit]`) therefore drops exactly the part that
@@ -655,7 +657,8 @@ def elide_middle(lines, limit, head_share=DEFAULT_HEAD_SHARE, sep="\n"):
     """
     text = sep.join(lines)
     stats = {"chars": len(text), "lines": len(lines),
-             "lines_omitted": 0, "truncated": False}
+             "lines_omitted": 0, "truncated": False,
+             "head_lines": len(lines), "tail_lines": 0}
     if len(text) <= limit:
         return text, stats
 
@@ -683,7 +686,8 @@ def elide_middle(lines, limit, head_share=DEFAULT_HEAD_SHARE, sep="\n"):
     marker = (f"[... {omitted} line(s) from the middle of this transcript were "
               f"omitted to fit the prompt ...]")
     rendered = sep.join(head + [marker] + tail)
-    stats.update(truncated=True, lines_omitted=omitted, chars=len(rendered))
+    stats.update(truncated=True, lines_omitted=omitted, chars=len(rendered),
+                 head_lines=len(head), tail_lines=len(tail))
     logger.warning(
         "Transcript truncated (middle elided): %d chars / %d lines in, %d chars "
         "rendered, %d lines omitted (limit %d). What follows does not cover the "

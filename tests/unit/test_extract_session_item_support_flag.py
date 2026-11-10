@@ -145,7 +145,8 @@ def test_flag_on_final_tier_attaches_support(monkeypatch, caplog):
 
     assert len(calls) == 1
     _, kw = calls[0]
-    assert kw == {"floor": 0.5, "margin": 0.1, "nothing_close": 0.2}
+    assert kw == {"floor": 0.5, "margin": 0.1, "nothing_close": 0.2,
+                  "shown": {0}, "locator": False}
     children = list(_children(extraction))
     assert len(children) == 3
     # One turn inside the topic's time_range carrying every item's words: each must

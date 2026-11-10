@@ -289,6 +289,8 @@ NOT_EXPORTED = (
     ("topic_threads", "recurring-item threads across topics"),
     ("topic_thread_suggestions", "suggested links of topics to recurring-item threads"),
     ("action_status_suggestions", "suggested action item status changes awaiting review"),
+    ("status_pick_cards", "spoken status changes that could refer to several action items, "
+                          "awaiting a person's pick"),
     ("action_task_numbers", "the per-site task numbers (#N) shown for action items"),
     ("action_packs", "action agent runs (instruction, reading, conclusion, run state)"),
     ("action_pack_sources", "the records, documents and web pages an action agent run cited"),
@@ -321,6 +323,10 @@ NOT_EXPORTED = (
     ("keyframe_events", "video keyframe events"),
     ("keyframe_tombstones", "deleted video keyframes"),
     ("redactions", "deletion / redaction records (deleted content is excluded above)"),
+    ("decision_cards", "questions the site decision loop put to people, and their "
+                       "review labels"),
+    ("decision_ledger", "decisions recorded by the site decision loop (who, on what "
+                        "authority, when)"),
     # Speaker identification
     ("speaker_voiceprints", "voiceprints (biometric)"),
     ("speaker_voiceprint_samples", "voiceprint samples (biometric)"),
@@ -338,6 +344,10 @@ NOT_EXPORTED = (
     ("devices", "recording devices"),
     ("device_upload_freezes", "device upload freezes"),
     ("ws_connections", "live websocket connections"),
+    ("site_events", "site decision loop event queue"),
+    ("event_runs", "site decision loop handler runs"),
+    ("run_events", "which events each site decision loop run handled"),
+    ("decision_scan_seen", "checklist reports the site decision loop has scanned"),
 )
 
 # compliance_resolutions' day tombstone is applied in Python from the Tombstones set

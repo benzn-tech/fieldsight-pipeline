@@ -176,11 +176,11 @@ def test_linked_children_get_supported_by_rows(world, capsys):
         assert link[6]["source_stem"] == STEM
         # No names exist at write time: unknown, but the basis records the link.
         assert row[2] is None
-        assert row[3] == {"rule_version": "claim_v1", "support_status": "linked",
+        assert row[3] == {"rule_version": "claim_v2", "support_status": "linked",
                           "link_id": str(link[10])}
     assert links["decision"][6]["start_sec"] == 30.0
     assert links["decision"][7] == pytest.approx(0.85)
-    assert q[2] is None and q[3] == {"rule_version": "claim_v1", "support_status": "ambiguous"}
+    assert q[2] is None and q[3] == {"rule_version": "claim_v2", "support_status": "ambiguous"}
     emf = [json.loads(line) for line in capsys.readouterr().out.splitlines()
            if '"SupportLinked"' in line]
     assert len(emf) == 1
@@ -211,7 +211,7 @@ def test_none_close_child_written_inferred_without_link(world):
                                           "rule_version": "lexical-test"}))
     f = _live(w, "findings", "Synthetic finding one")
     assert f[2] == "inferred"
-    assert f[3] == {"rule_version": "claim_v1", "support_status": "none_close"}
+    assert f[3] == {"rule_version": "claim_v2", "support_status": "none_close"}
     assert _links(w) == []
     # the children with no support key are untouched
     assert _live(w, "action_items", "Synthetic task one")[2:] == (None, None)

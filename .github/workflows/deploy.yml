@@ -439,12 +439,14 @@ jobs:
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
               "DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \
               "StatusSuggestions=${{ vars.TEST_STATUS_SUGGESTIONS || 'false' }}" \
+              "ReconcileStatus=${{ vars.TEST_RECONCILE_STATUS || 'false' }}" \
               "ContinuityLinker=${{ vars.TEST_CONTINUITY_LINKER || 'false' }}" \
               "CrossDayContinuity=${{ vars.TEST_CROSS_DAY_CONTINUITY || 'off' }}" \
               "StatusEvidenceFloorTokens=${{ vars.TEST_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "ReportLocationsSection=${{ vars.TEST_REPORT_LOCATIONS_SECTION || 'true' }}" \
               "EmitItemSupport=${{ vars.TEST_EMIT_ITEM_SUPPORT || 'false' }}" \
+              "EmitItemLocator=${{ vars.TEST_EMIT_ITEM_LOCATOR || 'false' }}" \
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \

@@ -81,6 +81,7 @@ import item_text_match
 import lambda_ingest
 import keyframe_request
 import match_request
+import reconcile_request
 # NOT `match_request` above, which is the PROGRAMME matcher's request builder. Two unrelated
 # matchers, and the names are one word apart — spelled out here because importing the wrong
 # one would type-check, run, and write an artifact nothing consumes.
@@ -165,6 +166,12 @@ def _read_xday_flag():
 CROSS_DAY_CONTINUITY = _read_xday_flag()
 _XDAY_MODES = ("shadow", "on")
 
+#: Cross-session status reconcile (R0): after a FINAL pass, ask the matcher whether this
+#: session reports a status change on the recorder's open items from other sessions that day.
+#: Off by default (ships inert). The candidate cap (RECONCILE_CANDIDATE_CAP) is read by
+#: reconcile_request itself, so the nightly re-match job gets the same value.
+RECONCILE_STATUS = os.environ.get("RECONCILE_STATUS", "false").lower() == "true"
+
 EXTRACTIONS_PREFIX = "extractions/"
 
 _s3_client = None
@@ -247,6 +254,18 @@ def _group_for_session(conn, session_base):
         return None
     gid = row.get("group_id") or sid      # a lead carries no group_id of its own
     return session_group.get(conn, gid)
+
+
+def _in_a_group(conn, session_base):
+    """Is this session part of a multi-device group? For the reconcile gate only: the read
+    runs in its own savepoint, and a failure answers True (skip reconcile) rather than
+    aborting the item write's transaction."""
+    try:
+        with conn.transaction():
+            return _group_for_session(conn, session_base) is not None
+    except Exception:  # noqa: BLE001 -- reconcile must never cost the item write
+        logger.exception("reconcile: group lookup failed for %s; skipping", session_base)
+        return True
 
 
 def _read_merged_artifact(key):
@@ -1246,7 +1265,12 @@ def _write_item_support(conn, items, *, company_id, site_id, session_base, key,
 
 
 _SUPPORT_METRIC = {"linked": "SupportLinked", "none_close": "SupportNoneClose",
-                   "ambiguous": "SupportAmbiguous", "below_floor": "SupportBelowFloor"}
+                   "ambiguous": "SupportAmbiguous", "below_floor": "SupportBelowFloor",
+                   # locator refusals (locator spec §4.3)
+                   "no_locator": "SupportNoLocator", "unparseable": "SupportUnparseable",
+                   "not_shown": "SupportNotShown", "no_line": "SupportNoLine",
+                   "ambiguous_stamp": "SupportAmbiguousStamp",
+                   "outside_topic": "SupportOutsideTopic"}
 _CLAIM_METRIC = {"observed": "ClaimObserved", "stated": "ClaimStated",
                  "inferred": "ClaimInferred", "null": "ClaimNull"}
 
@@ -1587,6 +1611,7 @@ def write_extraction_items(date, user_folder, extraction_key, remaining_ms=None)
     # here; Task 4 reads it to carry stable ids and human edits from a retired row to the
     # row that replaced it.
     retired_topics = []
+    reconcile_body = None
 
     with get_connection() as conn:
         # I-3: serialize concurrent writers on this extraction key. Delete-
@@ -2159,6 +2184,18 @@ def write_extraction_items(date, user_folder, extraction_key, remaining_ms=None)
             # before anyone is emailed about them.
             member_contexts = _resolve_member_contexts(conn, extraction)
 
+        # Cross-session status reconcile R0: a read, after the item writes and BEFORE the
+        # task numbering below (whose per-site lock must be held only for the commit), in its
+        # own savepoint (reconcile_request.build) so a failure never aborts this transaction. A group
+        # member is skipped in R0: the merge replaces its record, and group passes (tier
+        # "group") are not reconciled either.
+        # The SITE's company, never the recorder's home one -- find_items answers [] otherwise.
+        if (RECONCILE_STATUS and extraction.get("tier") == "final"
+                and not _in_a_group(conn, session_base)):
+            reconcile_body = reconcile_request.build(
+                conn, extraction, extraction_key, site, owner_company_id,
+                user_folder=user_folder, date=date, session_base=session_base)
+
         # Task numbers ("#69", action packs spec §14 D1) for this pass's NEW action items --
         # after carry-forward (a carried row already wears its predecessor's numbered
         # stable_id) and as the LAST write of the transaction, so the per-site lock it takes
@@ -2207,6 +2244,14 @@ def write_extraction_items(date, user_folder, extraction_key, remaining_ms=None)
     # anyway since collected_topics would be empty.
     if collected_topics:
         match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
+
+    # The status-reconcile request, post-commit for the same reason: this pass's rows (and the
+    # candidates' current state) must be durable before the matcher's writer re-reads them.
+    if reconcile_body:
+        try:
+            reconcile_request.emit(s3(), S3_BUCKET, reconcile_body)
+        except Exception:  # noqa: BLE001 -- the rows are durable; a lost request is not fatal
+            logger.exception("reconcile request not written for %s", extraction_key)
 
     # Search index request: post-commit like the matcher artifact above, for the same reason
     # (the topic ids it names must be durable). Emitted even when topics_n == 0 -- a session
