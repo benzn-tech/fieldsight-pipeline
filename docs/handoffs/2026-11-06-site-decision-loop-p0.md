@@ -75,3 +75,60 @@ Out of scope for P0:
 | Prod migration, prod flag, merging ui `main`, labelling the 50 cards | owner |
 
 Open a release PR for the owner when P0 is verified on TEST. Do not turn prod on.
+
+## TEST result (2026-11-10, backend line)
+
+Built: pipeline#1278 (migration 0100, pure hub, repositories, scan code) and pipeline#1282
+(scan function, two schedules, review routes, replay judge, nightly workflow). Repo variable
+`TEST_SITE_DECISION_LOOP=shadow`. TEST deploy run 42735696613 applied
+`0100_site_decision_loop.sql`; run 42745342516 created `fieldsight-test-decision-scan`.
+
+Deviations from the plan, each recorded as a ruling in the build ledger:
+- **Migration 0100**, not 0097: 0097-0099 were taken by other lines first.
+- **Two schedules, not three.** `checklist_gap` every 30 min and `todo_overdue` at 18:30 UTC, each
+  followed by `process` in the same call. A 5-minute process schedule would keep Aurora from ever
+  auto-pausing (`test_sweep_cadence_vs_autopause`). Cost: a failed event retries at the next
+  30-minute tick.
+- TEST deploys with `EnableSchedules=false`, so the schedules exist on TEST but are disabled. TEST
+  cards come only from manual invokes.
+
+Manual invokes on TEST:
+
+| Input | Result |
+|---|---|
+| `checklist_gap` | emitted 0 (no checklist report finished in the last 48 h), errors 0 |
+| `todo_overdue` | emitted 58, processed 58, cards 58, faults 0, errors 0 |
+| `process` | nothing left to process |
+
+- SQL: 58 `site_events` `done`, 58 `event_runs` `done`, 58 `decision_cards`.
+  - The cards are all `choose`, `open`, urgency `normal`, on 2 sites in 2 companies.
+  - Every card has recipients: 62 pm and 27 site_manager slots across 3 people.
+  - Deadline = 23:59:59 NZ on the next working day.
+- Replay judge plus invariants, run against TEST read-only in one REPEATABLE READ snapshot: 0
+  findings. There are no moved-site rows to explain.
+- `GET /api/org/decision-shadow`, invoked directly as the platform admin: 200. The field names
+  match ui#469.
+
+**Finding for the owner: the first overdue scan carded the whole backlog at once.**
+- The deadlines on TEST run from 2026-08-07 to 2026-11-09, so 58 cards landed on 3 people in one
+  day. `cards_per_recipient_day_p95` is **31**, against the gate of ≤ 3.
+- The P0 plan has no per-day cap and no queue. The spec has both (§4.2 step 4 "per-day cap", step 6
+  queue), but they were not in P0's task list.
+- A prod shadow run would do the same on its first day.
+- Options:
+  - (a) a per-recipient daily cap with a queue (spec §4.2), before prod shadow;
+  - (b) card only items that became overdue since the flag went on (backlog stays in the report);
+  - (c) accept a one-off first-day spike and judge the gate from day 2.
+- The owner chooses. Nothing is sent in shadow either way.
+
+Not done by the backend line: labelling 3 cards on the review page (plan Task 9 Step 4). TEST's
+only platform admin is the owner, and labelling as the owner is the owner's act. The label POST is
+covered by integration tests on real Postgres (status stays `open`).
+
+Must fix before cards leave shadow (from the reviews):
+- evidence quotes are checked against the S3 deletion mirror only, not the Aurora tombstones or
+  redactions, and only for the report's own session (walk part sessions are not checked);
+- the gap card's "remind <name>" label is not checked against deletions;
+- empty item text renders `''` in a question.
+
+P0 gap cards carry no quote today, so evidence is `[]` on every card.
