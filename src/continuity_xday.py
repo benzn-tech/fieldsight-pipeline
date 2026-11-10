@@ -26,6 +26,9 @@ WINDOW_DAYS = 28
 RULE_VERSION = "xday_v1"
 DECISION_KIND = "item_continuity_xday"
 FUSE_FRACTION = 0.5
+# X7 rev 4: the fuse needs at least this many new items -- with fewer, "more than half" makes
+# 1 of 1 and 2 of 2 impossible, which would block short sessions, the main case.
+FUSE_MIN_NEW = 4
 
 XDAY_INSTRUCTION = (
     "Below are EARLIER items recorded in OTHER sessions on this same site in the last four weeks "
@@ -92,6 +95,13 @@ def order_key(row):
     return (_iso_date(first_date), _iso_instant(row.get("first_seen_recorded_at")))
 
 
+def sort_key(row):
+    """A total sort key in RECORDING order: `order_key` with None as "" (so it compares),
+    then the stable_id. Larger is newer."""
+    first_date, recorded_at = order_key(row)
+    return (first_date or "", recorded_at or "", str(row.get("stable_id") or ""))
+
+
 def _parse_date(value):
     try:
         return _dt.date.fromisoformat(str(value)[:10]) if value else None
@@ -131,7 +141,9 @@ def select_candidates(recency, lexical, new_first_seen, chains):
     session's own stable_ids); chains collapse to their newest member (`chains[sid]` -> newest
     stable_id) -- the head row if it survived, else the first surviving member stands for the
     chain, and a chain whose head is one of this session's new items is not shown at all;
-    deduped; at most CAP_PER_KIND.
+    deduped; at most CAP_PER_KIND. A chain whose head is missing from the pool or fails the
+    order filter is stood in for by its surviving member with the LATEST recording order
+    (`sort_key`), at the position of the chain's first survivor.
 
     `new_first_seen` maps a new stable_id to its order key `(first_date, recorded_at | None)`."""
     new_keys = list((new_first_seen or {}).values())
@@ -154,17 +166,23 @@ def select_candidates(recency, lexical, new_first_seen, chains):
             order.append(sid)
 
     chains = chains or {}
-    out, shown = [], set()
+    members, heads = {}, []   # head -> its surviving members; heads in first-survivor order
     for sid in order:
         head = chains.get(sid, sid)
-        if head in shown or head in own:
-            # head in `own`: this session already continues the chain (a re-run); showing an
-            # older member would let another new item branch it
+        if head in own:
+            # this session already continues the chain (a re-run); showing an older member
+            # would let another new item branch it
             continue
-        shown.add(head)
-        out.append(survivors.get(head, survivors[sid]))
-        if len(out) >= CAP_PER_KIND:
-            break
+        if head not in members:
+            members[head] = []
+            heads.append(head)
+        members[head].append(sid)
+    out = []
+    for head in heads[:CAP_PER_KIND]:
+        if head in survivors:
+            out.append(survivors[head])
+        else:
+            out.append(max((survivors[m] for m in members[head]), key=sort_key))
     return out
 
 
@@ -173,13 +191,24 @@ def _text_of(item):
     return text if isinstance(text, str) else ""
 
 
+def _hash_instant(value):
+    """extracted_at in ONE form for the run hash: a datetime and its ISO string (`Z` or
+    `+00:00`) hash the same. Naive means UTC; anything unparseable hashes as given."""
+    if value is None:
+        return ""
+    if isinstance(value, _dt.datetime):
+        return _iso_instant(value)
+    parsed = _parse_instant(value)
+    return _iso_instant(parsed) if parsed is not None else str(value)
+
+
 def build_request(*, site_id, company_id, extraction_key, extracted_at, date, new_items,
                   candidates, precap_counts, nonce=None):
     """The JSON-able request hop 1 writes to S3. Aliases A1/F1/Q1... per kind for candidates,
     refs N1... across kinds for new items, both in XDAY_KINDS order, at most CAP_PER_KIND each.
     Fields are picked explicitly: find_items' write time and dates never travel."""
     run_hash = hashlib.sha1(
-        (str(extraction_key) + str(extracted_at) + (nonce or "")).encode()).hexdigest()[:16]
+        (str(extraction_key) + _hash_instant(extracted_at) + (nonce or "")).encode()).hexdigest()[:16]
     news, cands = [], []
     for ln in XDAY_KINDS:
         for item in (new_items or {}).get(ln, [])[:CAP_PER_KIND]:
@@ -242,8 +271,8 @@ def judge(request, parsed):
     Guards, in order: malformed, existence, kind, self, echo_{empty,too_short,mismatch,ambiguous}
     (item_continuity's unique-prefix echo among same-kind candidates), then one_to_one in both
     directions (a ref listed more than once drops all its claims; two guard-passing claims on
-    one alias drop both), then the fuse: more than half of the request's new items (all kinds)
-    linked drops every link. There is no exact-text auto-accept: no claim, no link."""
+    one alias drop both), then the fuse: with at least FUSE_MIN_NEW new items (all kinds),
+    more than half of them linked drops every link. There is no exact-text auto-accept: no claim, no link."""
     news = {n["ref"]: n for n in request.get("new_items") or [] if isinstance(n, dict)}
     cands = {c["alias"]: c for c in request.get("candidates") or [] if isinstance(c, dict)}
     priors = {a: PriorItem(a, _RECORD_TYPE_TO_LIST.get(c["kind"]), _text_of(c), c.get("item_id"))
@@ -289,7 +318,7 @@ def judge(request, parsed):
             c[3] = "one_to_one"
 
     accepted = [c for c in claims if c[3] is None]
-    fuse = bool(news) and len(accepted) > FUSE_FRACTION * len(news)
+    fuse = len(news) >= FUSE_MIN_NEW and len(accepted) > FUSE_FRACTION * len(news)
     if fuse:
         for c in accepted:
             c[3] = "fuse"

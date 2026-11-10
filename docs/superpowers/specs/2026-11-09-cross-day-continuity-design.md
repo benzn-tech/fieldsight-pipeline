@@ -1,6 +1,6 @@
 # Cross-day item continuity: link today's items to the same work on earlier days
 
-**Date:** 2026-11-09 · **Revision:** 3 (rev 2 after Fable review 2026-11-09: 2 critical / 6 important / 8 minor, folded in; rev 3 2026-11-10: recording-time order, nightly re-emit interface; §8)
+**Date:** 2026-11-09 · **Revision:** 4 (rev 2 after Fable review 2026-11-09: 2 critical / 6 important / 8 minor, folded in; rev 3 2026-11-10: recording-time order, nightly re-emit interface; rev 4 2026-11-10 final review: fuse floor of 4 new items; §8)
 **Status:** design. No code yet.
 **Line:** continuity (jev TrackB). **Builds on:** `2026-09-30-extractor-declares-item-continuity-design.md`
 (same-session continuity), `2026-11-08-continuity-linker-design.md` (the linker call),
@@ -99,9 +99,11 @@ exist. It also leaves the just-measured same-session linker untouched.
   like any other pair (echo is then trivially satisfied). Then, from `item_continuity`'s pieces:
   existence, kind, echo (unique prefix among same-kind candidates; it disambiguates the alias, it
   does not prove sameness), one-to-one in both directions (two claims on one candidate, or one new
-  item claiming two, drop all of them). **Fuse:** if more than half of a request's new items are
-  linked, drop the whole request's links (counted) — a model treating everything as a
-  continuation is a failure, not a result.
+  item claiming two, drop all of them). **Fuse:** if the request has at least 4 new items (all
+  kinds) and more than half of them are linked, drop the whole request's links (counted) — a
+  model treating everything as a continuation is a failure, not a result. Below 4 new items the
+  fuse does not apply: "more than half" would make 1 of 1 and 2 of 2 impossible and block short
+  sessions, the main case; wrong links there are still caught by the §4 bars and the guards.
 - **X8. Write-time checks (link writer).** Per link: both endpoints have a live row on the
   request's site (src resolved by stable_id, falling back to `item_id` lineage when non-null;
   else skipped and counted); dst still recorded earlier than src (X5's order). Insert with
@@ -194,3 +196,6 @@ one tells a user two different jobs are the same.
   upload reversed edges → recording date + session start (X5, X8); public request builder with
   optional nonce, and a per-request processed record (X3, X9) for the nightly re-match design
   (pipeline#1272). Nightly never writes `continues` edges.
+- Rev 4 (2026-11-10 final review: fuse floor of 4 new items): the fuse trips only when the
+  request has >= 4 new items and more than half are linked (X7), so a 1- or 2-item session can
+  link at all.

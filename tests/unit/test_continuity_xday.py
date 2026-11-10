@@ -3,6 +3,8 @@ import datetime as dt
 import hashlib
 import json
 
+import pytest
+
 import continuity_xday as cx
 
 
@@ -57,9 +59,12 @@ def test_select_candidates_collapses_chain_to_newest_member():
     got = cx.select_candidates([old, mid], {"n1": [head]}, {"n1": NEW_KEY}, chains)
     assert [c["stable_id"] for c in got] == ["head"]
 
-    # the head is not in the pool: the first surviving member stands for the chain, once
+    # the head is not in the pool: the surviving member recorded LATEST stands for the chain,
+    # once, whatever the write order of the pool
     got = cx.select_candidates([old, mid], {}, {"n1": NEW_KEY}, {"old": "gone", "mid": "gone"})
-    assert [c["stable_id"] for c in got] == ["old"]
+    assert [c["stable_id"] for c in got] == ["mid"]
+    got = cx.select_candidates([mid, old], {}, {"n1": NEW_KEY}, {"old": "gone", "mid": "gone"})
+    assert [c["stable_id"] for c in got] == ["mid"]
 
     # the head is one of THIS session's new items (a re-run): the chain is not shown at all,
     # so no other new item can branch it; an unrelated candidate is unaffected
@@ -68,10 +73,13 @@ def test_select_candidates_collapses_chain_to_newest_member():
                                {"old": "n1", "mid": "n1"})
     assert [c["stable_id"] for c in got] == ["other"]
 
-    # the head survives the pool but not the order filter: an earlier member stands in
+    # the head survives the pool but not the order filter: the latest eligible member stands
+    # in, even when an older member comes first in the pool; the chain keeps the position of
+    # its first survivor
     late_head = _cand("head", first_date="2026-11-10")
-    got = cx.select_candidates([late_head, mid], {}, {"n1": NEW_KEY}, chains)
-    assert [c["stable_id"] for c in got] == ["mid"]
+    other = _cand("other", first_date="2026-10-25")
+    got = cx.select_candidates([late_head, old, other, mid], {}, {"n1": NEW_KEY}, chains)
+    assert [c["stable_id"] for c in got] == ["mid", "other"]
 
 
 def test_select_candidates_drops_not_strictly_earlier():
@@ -180,9 +188,10 @@ def test_build_request_assigns_aliases_per_kind_and_refs_across_kinds():
     assert req["rule_version"] == cx.RULE_VERSION == "xday_v1"
     assert req["question_set"] == cx.XDAY_QUESTION_SET
     assert req["run_hash"] == hashlib.sha1(
-        b"extractions/k.json2026-11-09T05:00:00Z").hexdigest()[:16]
+        b"extractions/k.json2026-11-09T05:00:00+00:00").hexdigest()[:16]
     assert _request(nonce="n1")["run_hash"] == hashlib.sha1(
-        b"extractions/k.json2026-11-09T05:00:00Zn1").hexdigest()[:16]
+        b"extractions/k.json2026-11-09T05:00:00+00:00n1").hexdigest()[:16]
+    assert req["extracted_at"] == "2026-11-09T05:00:00Z"   # the field travels as given
     assert req["site_id"] == "site-1" and req["company_id"] == "co-1"
     assert req["date"] == "2026-11-09" and req["extraction_key"] == "extractions/k.json"
 
@@ -191,6 +200,20 @@ def test_build_request_assigns_aliases_per_kind_and_refs_across_kinds():
                    candidates={"action_items": [_cand(f"c{i}") for i in range(45)]})
     assert len(big["new_items"]) == 40 and len(big["candidates"]) == 40
     assert big["candidates"][-1]["alias"] == "A40"
+
+
+def test_run_hash_is_the_same_for_a_datetime_and_its_iso_strings():
+    hashes = {_request(extracted_at=v)["run_hash"] for v in (
+        dt.datetime(2026, 11, 9, 5, 0, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 11, 9, 5, 0),                      # naive = UTC
+        dt.datetime(2026, 11, 9, 18, 0, tzinfo=dt.timezone(dt.timedelta(hours=13))),
+        "2026-11-09T05:00:00Z", "2026-11-09T05:00:00+00:00", "2026-11-09T18:00:00+13:00")}
+    assert len(hashes) == 1
+    assert _request(extracted_at="2026-11-09T05:00:01Z")["run_hash"] not in hashes
+    # unparseable / missing still hash deterministically
+    assert _request(extracted_at="garbage")["run_hash"] == _request(
+        extracted_at="garbage")["run_hash"]
+    assert _request(extracted_at=None)["run_hash"] == _request(extracted_at=None)["run_hash"]
 
 
 def test_render_prompt_has_dates_no_transcript_and_scrubs_fences():
@@ -311,22 +334,43 @@ def test_judge_guards():
     _assert_records_carry_no_text(req2, out["claims"], extra=[injected])
 
 
-def test_judge_fuse_drops_all_when_more_than_half_linked():
-    cands = {"action_items": [_cand("ca1", "order rebar chairs for level three"),
-                              _cand("ca2", "book the crane for friday lift")]}
-    links_in = {"links": [_link("N1", "A1", "order rebar chairs for"),
-                          _link("N2", "A2", "book the crane for")]}
-    three = _request(new_items={"action_items": [_new(f"n{i}", f"t{i}") for i in range(3)]},
-                     candidates=cands)
-    links, out = cx.judge(three, links_in)
-    assert links == [] and out["counts"]["fuse_tripped"] is True
-    assert [(c["outcome"], c["guard"]) for c in out["claims"]] == [("rejected", "fuse")] * 2
+_FUSE_CANDS = {"action_items": [_cand("ca1", "order rebar chairs for level three"),
+                                _cand("ca2", "book the crane for friday lift"),
+                                _cand("ca3", "move the skip bin off the footpath")]}
+_FUSE_LINKS = [_link("N1", "A1", "order rebar chairs for"),
+               _link("N2", "A2", "book the crane for"),
+               _link("N3", "A3", "move the skip bin")]
 
-    # denominator counts every kind
-    four = _request(new_items={"action_items": [_new(f"n{i}", f"t{i}") for i in range(3)],
-                               "findings": [_new("nf", "x")]}, candidates=cands)
-    links, out = cx.judge(four, links_in)
-    assert len(links) == 2 and out["counts"]["fuse_tripped"] is False
+
+def _fuse_case(n_new, n_links, findings=0):
+    news = {"action_items": [_new(f"n{i}", f"t{i}") for i in range(n_new - findings)],
+            "findings": [_new(f"nf{i}", "x") for i in range(findings)]}
+    req = _request(new_items=news, candidates=_FUSE_CANDS)
+    return cx.judge(req, {"links": _FUSE_LINKS[:n_links]})
+
+
+@pytest.mark.parametrize("n_new,n_links,findings,tripped", [
+    (1, 1, 0, False),    # a one-item session that continues earlier work links (rev 4)
+    (2, 2, 0, False),
+    (3, 2, 0, False),    # under the floor of 4 new items: kept
+    (4, 3, 0, True),     # 3 of 4 > half: tripped
+    (4, 2, 0, False),    # exactly half: kept
+    (4, 3, 1, True),     # the denominator counts every kind
+    (5, 3, 2, True),
+    (6, 3, 3, False),
+])
+def test_judge_fuse_needs_four_new_items_and_more_than_half_linked(n_new, n_links, findings,
+                                                                  tripped):
+    links, out = _fuse_case(n_new, n_links, findings)
+    assert out["counts"]["new_items"] == n_new
+    assert out["counts"]["fuse_tripped"] is tripped
+    if tripped:
+        assert links == []
+        assert [(c["outcome"], c["guard"]) for c in out["claims"]] == [
+            ("rejected", "fuse")] * n_links
+    else:
+        assert len(links) == n_links
+        assert all(c["outcome"] == "accepted" for c in out["claims"])
 
 
 def test_judge_tolerates_bad_json_shapes():
@@ -347,5 +391,6 @@ def test_question_set_hashes_instruction():
                                     + hashlib.sha256(cx.XDAY_INSTRUCTION.encode()).hexdigest()[:16])
     assert cx.XDAY_KINDS == ("action_items", "questions", "findings")
     assert (cx.CAP_PER_KIND, cx.WINDOW_DAYS, cx.DECISION_KIND) == (40, 28, "item_continuity_xday")
+    assert (cx.FUSE_MIN_NEW, cx.FUSE_FRACTION) == (4, 0.5)
     assert cx.XDAY_INSTRUCTION.startswith("Below are EARLIER items recorded in OTHER sessions")
     assert cx.XDAY_INSTRUCTION.endswith('Answer with one JSON object {"links": [...]} and nothing else.')
