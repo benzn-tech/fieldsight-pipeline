@@ -327,6 +327,9 @@ NOT_EXPORTED = (
                        "review labels"),
     ("decision_ledger", "decisions recorded by the site decision loop (who, on what "
                         "authority, when)"),
+    ("nightly_reemits", "the nightly agent's record of requests it sent again"),
+    ("claim_recompute_failures", "sessions whose claim-type recompute is to be retried "
+                                 "overnight"),
     # Speaker identification
     ("speaker_voiceprints", "voiceprints (biometric)"),
     ("speaker_voiceprint_samples", "voiceprint samples (biometric)"),

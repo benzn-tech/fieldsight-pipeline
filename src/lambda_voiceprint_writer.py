@@ -47,8 +47,8 @@ import os
 
 import turn_name_overlay
 from db.connection import get_connection
-from repositories import (claim_type_store, label_group_candidates, site_attendance,
-                          speaker_label_groups, speaker_name_proposals)
+from repositories import (claim_type_store, label_group_candidates, nightly,
+                          site_attendance, speaker_label_groups, speaker_name_proposals)
 from repositories.companies import list_companies, voiceprint_consent_basis
 from repositories.voiceprints import (EnrolmentAfterWithdrawal,
                                       EnrolmentBelongsToSomebodyElse, add_sample,
@@ -117,7 +117,10 @@ def _recompute_claims(company_id, session_base):
     of its own: best-effort by construction. A failure here rolls back only the recompute
     and is logged by exception TYPE (ids and counts only -- never a name or any text); the
     names already stand. The store resolves the session's sites from its topics, scoped to
-    `company_id`, so this needs no session-to-site lookup."""
+    `company_id`, so this needs no session-to-site lookup.
+
+    A recompute that raised, timed out or had a site fail leaves a marker row
+    (claim_recompute_failures) for the nightly J3 scan -- see _mark_recompute_failed."""
     key = turn_name_overlay.session_base(session_base) or session_base
     try:
         with get_connection() as conn:
@@ -127,7 +130,12 @@ def _recompute_claims(company_id, session_base):
                 deadline_s=RECOMPUTE_DEADLINE_S)
     except Exception as exc:
         logger.warning("claim recompute failed for %s: %s", key, type(exc).__name__)
+        _mark_recompute_failed(company_id, key, "failed")
         return None
+    if counts.get("timed_out"):
+        _mark_recompute_failed(company_id, key, "timed_out")
+    elif counts.get("failed"):
+        _mark_recompute_failed(company_id, key, "failed")
     if counts.get("failed"):
         # Per-site failures the store isolated: types only, never a message.
         logger.warning("claim recompute: %d site(s) failed for %s: %s", counts["failed"],
@@ -139,6 +147,19 @@ def _recompute_claims(company_id, session_base):
                 key, counts.get("rows", 0), counts.get("sites", 0),
                 counts.get("changed", 0))
     return counts
+
+
+def _mark_recompute_failed(company_id, key, reason):
+    """Upsert the session's recompute-failure marker on a connection and transaction of its
+    own: a QueryCanceled leaves the recompute's connection aborted, so nothing more can be
+    written there. Best-effort like the recompute itself: a failure is logged by type and
+    never raised into the names path. `timed_out` wins over `failed` when both hold."""
+    try:
+        with get_connection() as conn:
+            nightly.mark_recompute_failed(conn, company_id, key, reason)
+    except Exception as exc:
+        logger.warning("claim recompute marker not written for %s: %s",
+                       key, type(exc).__name__)
 
 
 def _rebind(event):
