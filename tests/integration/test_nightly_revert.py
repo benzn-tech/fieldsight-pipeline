@@ -8,9 +8,7 @@ decision_ledger row is written. All text is synthetic.
 Skipped without TEST_DATABASE_URL -- a skip is NOT a pass.
 """
 import datetime as _dt
-import importlib
 import os
-import sys
 
 import pytest
 
@@ -25,11 +23,14 @@ SINCE = _dt.date(2026, 1, 1)
 
 
 def _revert():
-    """Imported per test, so a missing script is a per-test failure, not a collection error."""
-    scripts = os.path.join(REPO, "scripts")
-    if scripts not in sys.path:
-        sys.path.insert(0, scripts)
-    return importlib.import_module("nightly_revert")
+    """Loaded by path per test (a missing script is a per-test failure, not a collection
+    error), so scripts/ never goes onto sys.path ahead of src for later test modules."""
+    import importlib.util
+    path = os.path.join(REPO, "scripts", "nightly_revert.py")
+    spec = importlib.util.spec_from_file_location("nightly_revert", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _write_nightly(db, s, items):

@@ -223,7 +223,7 @@ def test_mutation_drop_site_filter_caught(db, monkeypatch):
     _catcher_passes(db, lambda: catcher(db))
 
 
-def test_mutation_skip_window_guard_caught(monkeypatch):
+def test_mutation_skip_window_guard_caught(db, monkeypatch):
     """apply_guards' window check sees every turn as inside the topic window. Only the
     guard's call is mutated: build_request still numbers the real window turns."""
     real = ntp._window_turns
@@ -243,10 +243,11 @@ def test_mutation_skip_window_guard_caught(monkeypatch):
         pick_t.test_turn_from_other_topic_is_shape_drop()
     assert guard_calls, "the window guard no longer calls _window_turns: update the mutation"
     assert ntp._window_turns is real
+    assert invariants(db) == {}
     pick_t.test_turn_moved_out_of_window_is_window_drop()
 
 
-def test_mutation_skip_twin_guard_caught(monkeypatch):
+def test_mutation_skip_twin_guard_caught(db, monkeypatch):
     """No item has a twin and no place value ever disagrees: every twin arm is off."""
     real_twins, real_flags = ntp._twins, ntp.twin_flags
     with monkeypatch.context() as mp:
@@ -254,6 +255,7 @@ def test_mutation_skip_twin_guard_caught(monkeypatch):
         mp.setattr(ntp, "twin_flags", lambda item_text, turn_text: [])
         _catcher_fails(pick_t.test_twin_same_turn_both_rejected)
     assert ntp._twins is real_twins and ntp.twin_flags is real_flags
+    assert invariants(db) == {}
     pick_t.test_twin_same_turn_both_rejected()
 
 
