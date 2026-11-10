@@ -1,7 +1,7 @@
 """
 Lambda: decision-scan -- the site decision loop's emitters and hub loop (P0, shadow).
 
-Spec docs/superpowers/specs/2026-11-05-site-decision-loop-design.md (rev 5), plan Task 4.
+Spec docs/superpowers/specs/2026-11-05-site-decision-loop-design.md (rev 6), plan Task 4.
 
 Event:  {"scan": "checklist_gap" | "todo_overdue" | "process"}
 Result: {"emitted", "duplicates", "skipped_ambiguous_site", "skipped_pending", "processed",
@@ -14,7 +14,15 @@ checklist_gap  every checklist_reports row of the last 48 h not yet seen under i
                skipped, counted, never guessed), supersedes the open cards of gaps that are
                gone, and marks the report seen in the same transaction.
 todo_overdue   one todo.overdue event per live open action item past its deadline (bucket =
-               the scan's NZ day, so one event per item per day).
+               the scan's NZ day, so one event per item per day; occurred_at = the NZ
+               midnight that starts the day after the deadline, the moment it became
+               overdue). The rule's late_after_days (2) cards only a NEWLY overdue item
+               (its first three overdue NZ days); an older one is STALE and its event ends
+               'late'. Then one todo.overdue_backlog event per (company, site) with at
+               least one stale item (subject_ref = the site id, occurred_at = now): payload
+               {count, site_name, items: first 50 by deadline then stable_id}. Stale is
+               decided by the hub's own is_late on the built item event (spec 6.5 rev 6,
+               owner option B).
 process        claims due queued events (FOR UPDATE SKIP LOCKED) and runs them through the
                hub: auth -> too_deep -> match -> late -> merge -> ledger -> open card.
 
@@ -61,6 +69,8 @@ BATCH = 50          # events claimed per transaction
 MAX_BATCHES = 20    # per invocation; the next schedule picks up the rest
 GAP_TYPE = "checklist.gap"
 OVERDUE_TYPE = "todo.overdue"
+BACKLOG_TYPE = "todo.overdue_backlog"
+BACKLOG_MAX_ITEMS = 50     # items listed in one backlog digest's payload (count is the total)
 
 
 def _counts():
@@ -99,31 +109,67 @@ def _new_event(company_id, site_id, source, type_, subject_ref, occurred_at, now
 def emit_todo_overdue(conn, now):
     """One todo.overdue event per live open item whose deadline is before the NZ day of
     `now` (derived here, so the bucket can never disagree with received_at).
-    occurred_at = received_at = now (the scan); company = the item's site's company.
-    Each item in its own savepoint: one bad item is counted in errors and the rest of the
-    day's events are kept."""
+    occurred_at = 00:00 NZ of deadline + 1 day (tz-aware UTC), received_at = now;
+    company = the item's site's company. Then one todo.overdue_backlog event per
+    (company, site) holding at least one STALE item -- one the hub's is_late calls late
+    under RULES["todo.overdue"] (spec 6.5 rev 6). Each item and each site in its own
+    savepoint: one bad one is counted in errors and the rest of the day's events are kept."""
     out = _counts()
     today_nz = nz_time.to_nz(now).date()
+    stale = {}                                     # (company_id, site_id) -> [item]
     for item in action_items.overdue_open(conn, today_nz):
         try:
             with conn.transaction():
-                _emit_overdue_item(conn, item, today_nz, now, out)
+                if _emit_overdue_item(conn, item, today_nz, now, out):
+                    stale.setdefault((item["company_id"], item["site_id"]), []).append(item)
         except Exception as exc:  # noqa: BLE001 - one bad item never stops the scan
             out["errors"] += 1
             logger.warning("decision-scan overdue: item %s not emitted: %r",
                            item.get("stable_id"), exc)
+    for (company_id, site_id), items in stale.items():
+        try:
+            with conn.transaction():
+                _emit_overdue_backlog(conn, company_id, site_id, items, today_nz, now, out)
+        except Exception as exc:  # noqa: BLE001 - one bad site never stops the scan
+            out["errors"] += 1
+            logger.warning("decision-scan overdue: backlog of site %s not emitted: %r",
+                           site_id, exc)
     logger.info("decision-scan todo_overdue %s", out)
     return out
 
 
+def _overdue_since_utc(deadline):
+    """The moment an item due on `deadline` became overdue: 00:00 NZ of the next day."""
+    return _report_midnight_utc(deadline + timedelta(days=1))
+
+
 def _emit_overdue_item(conn, item, today_nz, now, out):
-    deadline = item.get("deadline")
+    """Insert the item's event; True when the item is STALE (the hub would call its event
+    late), so it belongs in the site's backlog digest instead of a card of its own."""
+    deadline = item["deadline"]
     ev = _new_event(
         item["company_id"], item["site_id"], "action_items", OVERDUE_TYPE,
-        str(item["stable_id"]), now, now,
+        str(item["stable_id"]), _overdue_since_utc(deadline), now,
         {"text": item.get("text"),
-         "deadline": deadline.isoformat() if deadline is not None else None,
+         "deadline": deadline.isoformat(),
          "responsible": item.get("responsible")})
+    if _insert_event(conn, ev, today_nz):
+        out["emitted"] += 1
+    else:
+        out["duplicates"] += 1
+    return is_late(ev, decision_rules.RULES[OVERDUE_TYPE], today_nz)
+
+
+def _emit_overdue_backlog(conn, company_id, site_id, items, today_nz, now, out):
+    items = sorted(items, key=lambda i: (i["deadline"], str(i["stable_id"])))
+    ev = _new_event(
+        company_id, site_id, "action_items", BACKLOG_TYPE, str(site_id), now, now,
+        {"count": len(items),
+         "site_name": items[0].get("site_name"),
+         "items": [{"stable_id": str(i["stable_id"]), "text": i.get("text"),
+                    "deadline": i["deadline"].isoformat(),
+                    "responsible": i.get("responsible")}
+                   for i in items[:BACKLOG_MAX_ITEMS]]})
     if _insert_event(conn, ev, today_nz):
         out["emitted"] += 1
     else:

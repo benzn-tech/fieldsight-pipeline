@@ -63,6 +63,35 @@ def _build_overdue(event: Event) -> CardDraft:
     )
 
 
+# --- todo.overdue_backlog ----------------------------------------------------
+
+def _build_overdue_backlog(event: Event) -> CardDraft:
+    """One digest per (company, site) per NZ day listing the site's stale overdue items
+    (spec 6.5 rev 6, owner option B). The payload holds the total count and at most 50 items;
+    the card only names the count and the site."""
+    p = event.payload or {}
+    site = _text(p.get("site_name")) or "this site"
+    try:
+        n = int(p.get("count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n == 1:
+        question = f"1 to-do on {site} is more than 3 days overdue"
+    else:
+        question = f"{n} to-dos on {site} are more than 3 days overdue"
+    return CardDraft(
+        kind="fact",
+        question=question,
+        consequence="They stay on the open to-do list until someone acts.",
+        options=[{"id": "open_list", "label": "Open the list", "recommended": True}],
+        evidence=[],
+        urgency="normal",
+        deadline_at=None,
+        timeout_default="nothing changes",
+        recipient_roles=["pm", "site_manager"],
+    )
+
+
 # --- checklist.gap ----------------------------------------------------------
 
 _GAP_KIND_WORDS = {"not_covered": "was not covered", "failed": "failed"}
@@ -115,8 +144,17 @@ RULES = {
     "todo.overdue": Rule(
         rule_id="todo.overdue",
         bucket=lambda event, today_nz: today_nz.isoformat(),
-        late_after_days=None,
+        # occurred_at is the NZ midnight the item became overdue (spec 6.5 rev 6): carded on
+        # its first three overdue NZ days, late (listed in the site digest) after that.
+        late_after_days=2,
         purpose="overdue",
         build_card=_build_overdue,
+    ),
+    "todo.overdue_backlog": Rule(
+        rule_id="todo.overdue_backlog",
+        bucket=lambda event, today_nz: today_nz.isoformat(),
+        late_after_days=1,
+        purpose="overdue_backlog",
+        build_card=_build_overdue_backlog,
     ),
 }

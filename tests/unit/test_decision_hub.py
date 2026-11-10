@@ -105,11 +105,60 @@ def test_late_gap_after_7_days():
     assert hub.is_late(_gap(report_date=date(2026, 11, 3)), rule, today) is False
 
 
-def test_overdue_never_late():
+def test_overdue_is_late_after_its_first_three_overdue_days():
+    """Rev 6 (option B): occurred_at = 00:00 NZ of deadline + 1 day; late_after_days = 2, so
+    an item is carded on its first three overdue NZ days and late (digest) after that."""
     rule = RULES["todo.overdue"]
-    old = _overdue(occurred_at=_utc(2025, 1, 1))
-    assert rule.late_after_days is None
-    assert hub.is_late(old, rule, date(2026, 11, 10)) is False
+    assert rule.late_after_days == 2
+    today = date(2026, 11, 10)
+
+    def item(deadline):
+        return _overdue(occurred_at=_nz_midnight(date.fromordinal(deadline.toordinal() + 1)),
+                        received_at=_utc(2026, 11, 10))
+    assert hub.is_late(item(date(2026, 11, 9)), rule, today) is False    # today - 1
+    assert hub.is_late(item(date(2026, 11, 7)), rule, today) is False    # today - 3
+    assert hub.is_late(item(date(2026, 11, 6)), rule, today) is True     # today - 4
+    assert hub.is_late(item(date(2025, 1, 1)), rule, today) is True
+
+
+def _backlog(payload=None, **kw):
+    received_at = _utc(2026, 11, 10)
+    base = dict(
+        event_id="e-3", company_id="c-1", site_id="s-1", source="action_items",
+        type="todo.overdue_backlog", subject_ref="s-1",
+        occurred_at=received_at, received_at=received_at,
+        payload=payload if payload is not None else
+        {"count": 7, "site_name": "UC PK", "items": []},
+        chain_id=None, chain_depth=0,
+    )
+    base.update(kw)
+    return Event(**base)
+
+
+def test_overdue_backlog_rule_and_card():
+    rule = RULES["todo.overdue_backlog"]
+    assert hub.match(_backlog()) is rule
+    assert (rule.rule_id, rule.purpose, rule.late_after_days) == (
+        "todo.overdue_backlog", "overdue_backlog", 1)
+    assert rule.bucket(_backlog(), date(2026, 11, 10)) == "2026-11-10"
+    assert hub.card_key(_backlog(), rule) == "c-1|s-1|todo.overdue_backlog|s-1|overdue_backlog"
+    card = rule.build_card(_backlog())
+    assert card.kind == "fact"
+    assert card.question == "7 to-dos on UC PK are more than 3 days overdue"
+    assert card.consequence == "They stay on the open to-do list until someone acts."
+    assert card.options == [{"id": "open_list", "label": "Open the list", "recommended": True}]
+    assert card.evidence == [] and card.urgency == "normal"
+    assert card.deadline_at is None
+    assert card.timeout_default == "nothing changes"
+    assert card.recipient_roles == ["pm", "site_manager"]
+
+
+def test_overdue_backlog_card_singular_and_unnamed_site():
+    rule = RULES["todo.overdue_backlog"]
+    one = rule.build_card(_backlog(payload={"count": 1, "site_name": None, "items": []}))
+    assert one.question == "1 to-do on this site is more than 3 days overdue"
+    many = rule.build_card(_backlog(payload={"count": 60, "site_name": "  ", "items": []}))
+    assert many.question == "60 to-dos on this site are more than 3 days overdue"
 
 
 def test_unknown_type_matches_nothing():

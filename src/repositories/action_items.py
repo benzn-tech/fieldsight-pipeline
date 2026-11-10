@@ -149,14 +149,16 @@ def overdue_open(conn, today_nz) -> list[dict]:
     later pass); a carried-forward chain shares one stable_id, so DISTINCT ON keeps the
     newest row, as get_live_by_stable_id does. An archived site's items are left out.
     `company_id` is the SITE's company (project-owned tenancy). Items with no deadline are
-    never overdue. Every company: this is the scan's global read."""
+    never overdue. Every company: this is the scan's global read. `site_name` (the site's
+    name) is for the per-site backlog digest (spec rev 6)."""
     # The newest live row per stable_id is picked FIRST (get_live_by_stable_id's ordering),
     # and only then filtered on open/overdue: an older open row behind a newer done one is
     # not overdue.
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT stable_id, text, deadline, responsible, site_id, company_id FROM ("
+        f"SELECT stable_id, text, deadline, responsible, site_id, company_id, site_name FROM ("
         f"  SELECT DISTINCT ON (a.stable_id) a.stable_id, a.text, a.deadline, "
-        f"  a.responsible, a.site_id, a.status, s.company_id, s.archived_at "
+        f"  a.responsible, a.site_id, a.status, s.company_id, s.archived_at, "
+        f"  s.name AS site_name "
         f"  FROM action_items a "
         f"  JOIN topics t ON t.id = a.topic_id "
         f"  JOIN sites s ON s.id = a.site_id "
