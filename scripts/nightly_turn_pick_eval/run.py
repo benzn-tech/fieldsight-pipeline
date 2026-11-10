@@ -20,6 +20,7 @@ outcomes only -- never item text, turn text or the model's answer text.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -50,6 +51,7 @@ DEFAULT_LABELS = r"C:\Users\camil\wt\track-c-eval\scripts\item_support_eval\labe
 
 SOURCES = ("src/nightly_turn_pick.py", "src/item_support.py", "src/item_text_match.py")
 WORDING_FREE = "src/nightly_turn_pick.py"     # may differ fit -> held-out (wording only)
+SANS_KEY = "nightly_turn_pick_sans_instruction"   # ... which this hash proves
 FAILED_PICK = "__failed__"
 _WORDING_LINE = re.compile(r"^prompt_hash:\s*([0-9a-f]{12})\s*$", re.MULTILINE)
 _RESUME_KEYS = ("model", "prompt_hash", "split", "reps", "hashes", "manifest_digest",
@@ -58,6 +60,11 @@ _RESUME_KEYS = ("model", "prompt_hash", "split", "reps", "hashes", "manifest_dig
 
 def refuse(msg):
     raise SystemExit(f"Refusing: {msg}")
+
+
+class SetupError(RuntimeError):
+    """401/403/404 from the API: a setup problem, not an outcome. The run aborts and the
+    (session, rep) is not recorded; fix the setup and --resume."""
 
 
 # ---------------------------------------------------------------------------------------
@@ -102,8 +109,29 @@ def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def sans_instruction_hash(source):
+    """sha256 of a module source with the INSTRUCTION assignment's value cut out (line
+    endings normalised), so a held-out run can prove the module changed in wording only.
+    Offsets are cut in UTF-8 bytes, which is what `ast` col offsets count."""
+    data = source.replace("\r\n", "\n").encode("utf-8")
+    for node in ast.parse(data).body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "INSTRUCTION" for t in node.targets):
+            lines = data.splitlines(keepends=True)
+            v = node.value
+            start = sum(len(x) for x in lines[:v.lineno - 1]) + v.col_offset
+            end = sum(len(x) for x in lines[:v.end_lineno - 1]) + v.end_col_offset
+            data = data[:start] + data[end:]
+            break
+    else:
+        raise RuntimeError("no INSTRUCTION assignment in the module source")
+    return hashlib.sha256(data).hexdigest()
+
+
 def file_hashes(data_dir, labels_dir):
     out = {rel: sha256_file(REPO_DIR / rel) for rel in SOURCES}
+    out[SANS_KEY] = sans_instruction_hash(
+        (REPO_DIR / WORDING_FREE).read_bytes().decode("utf-8"))
     out["labels/done.agent.jsonl"] = sha256_file(Path(labels_dir, "done.agent.jsonl"))
     out["data/manifest.json"] = sha256_file(Path(data_dir, "manifest.json"))
     return out
@@ -243,24 +271,34 @@ def session_rows(prep, picks=None, failed=False):
 # ---------------------------------------------------------------------------------------
 
 def make_client():
-    """(client, APIError class). Imports the SDK here, so nothing else needs it installed."""
+    """(client, APIError class, setup-error classes). Imports the SDK here, so nothing else
+    needs it installed."""
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
         refuse("ANTHROPIC_API_KEY is not set")
     import anthropic
-    return anthropic.Anthropic(max_retries=MAX_RETRIES), anthropic.APIError
+    return (anthropic.Anthropic(max_retries=MAX_RETRIES), anthropic.APIError,
+            (anthropic.AuthenticationError, anthropic.PermissionDeniedError,
+             anthropic.NotFoundError))
 
 
-def call_model(client, api_error, prompt):
+def _err_name(e):
+    status = getattr(e, "status_code", None)
+    return type(e).__name__ + (f":{status}" if status is not None else "")
+
+
+def call_model(client, api_error, prompt, setup_errors=()):
     """{text, stop_reason, input_tokens, output_tokens, error}. No sampling parameters, no
-    thinking parameter (adaptive is the model default), no fallbacks, no betas."""
+    thinking parameter (adaptive is the model default), no fallbacks, no betas. A setup error
+    (401/403/404) raises SetupError; any other APIError is a failed call."""
     try:
         resp = client.messages.create(model=MODEL, max_tokens=MAX_TOKENS,
                                       output_config={"effort": EFFORT},
                                       messages=[{"role": "user", "content": prompt}])
+    except tuple(setup_errors) as e:
+        raise SetupError(_err_name(e)) from None
     except api_error as e:
-        status = getattr(e, "status_code", None)
         return {"text": None, "stop_reason": None, "input_tokens": 0, "output_tokens": 0,
-                "error": type(e).__name__ + (f":{status}" if status is not None else "")}
+                "error": _err_name(e)}
     usage = getattr(resp, "usage", None)
     return {"text": "".join(b.text for b in resp.content if getattr(b, "type", None) == "text"),
             "stop_reason": resp.stop_reason,
@@ -269,10 +307,11 @@ def call_model(client, api_error, prompt):
             "error": None}
 
 
-def run_pair(prep, rep, client, api_error):
-    """One (session, rep): the log entry, with the item rows. Never raises for a failed call."""
+def run_pair(prep, rep, client, api_error, setup_errors=()):
+    """One (session, rep): the log entry, with the item rows. Never raises for a failed call
+    (only SetupError, which is not an outcome)."""
     prompt = ntp.render_prompt(prep["request"], prep["session"]["turns"])
-    res = call_model(client, api_error, prompt)
+    res = call_model(client, api_error, prompt, setup_errors)
     failure, picks = None, None
     if res["error"]:
         failure = "api_error"
@@ -321,14 +360,15 @@ def load_log(out):
     return entries
 
 
-def execute(todo, preps, client, api_error, workers, record):
+def execute(todo, preps, client, api_error, workers, record, setup_errors=()):
     """Call each (ref, rep) on `workers` threads; `record` runs on this thread only, so the
     log is written serially. On any exception the pending calls are cancelled, every call
     that did return is still recorded, and the exception propagates."""
     if not todo:
         return
     pool = ThreadPoolExecutor(max_workers=workers)
-    futures = [pool.submit(run_pair, preps[ref], rep, client, api_error) for ref, rep in todo]
+    futures = [pool.submit(run_pair, preps[ref], rep, client, api_error, setup_errors)
+               for ref, rep in todo]
     recorded = set()
     try:
         for f in as_completed(futures):
@@ -410,7 +450,7 @@ def main(argv=None):
     check_wording()
     if a.split == "heldout":
         check_fit_run(a.fit_run, hashes)
-    client, api_error = make_client()
+    client, api_error, setup_errors = make_client()
 
     base = {"model": MODEL, "prompt_hash": ntp.PROMPT_HASH, "split": a.split, "reps": a.reps,
             "hashes": hashes, "manifest_digest": digest, "max_tokens": MAX_TOKENS,
@@ -447,7 +487,11 @@ def main(argv=None):
             else:
                 record(no_call_entry(preps[ref], k))
     try:
-        execute(todo, preps, client, api_error, a.workers, record)
+        execute(todo, preps, client, api_error, a.workers, record, setup_errors)
+    except SetupError as e:
+        finalize(out, meta, entries, sorted(preps), a.reps)
+        refuse(f"setup error from the API ({e}); nothing recorded for that call. Fix the "
+               f"setup, then re-run with --resume")
     finally:
         meta = finalize(out, meta, entries, sorted(preps), a.reps)
     print(store.dumps({k: meta[k] for k in ("calls", "failed_calls", "usage", "complete")}))

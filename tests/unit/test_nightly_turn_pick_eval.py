@@ -112,7 +112,7 @@ class FakeClient:
 
 
 def _patch_client(monkeypatch, client):
-    monkeypatch.setattr(run, "make_client", lambda: (client, FakeAPIError))
+    monkeypatch.setattr(run, "make_client", lambda: (client, FakeAPIError, ()))
     return client
 
 
@@ -200,7 +200,7 @@ def test_real_run_writes_rows_for_every_item(env, monkeypatch):
     assert meta["max_tokens"] == 16000 and meta["max_retries"] == 2 and meta["effort"] == "high"
     assert set(meta["hashes"]) == {"src/nightly_turn_pick.py", "src/item_support.py",
                                    "src/item_text_match.py", "labels/done.agent.jsonl",
-                                   "data/manifest.json"}
+                                   "data/manifest.json", "nightly_turn_pick_sans_instruction"}
     text = "".join(p.read_text(encoding="utf-8") for p in (env.runs / "r1").iterdir())
     assert "pour slab" not in text and "crack" not in text
 
@@ -304,7 +304,7 @@ def test_call_sends_no_sampling_params(monkeypatch):
     importlib.reload(run)
     importlib.reload(score)
     client = FakeClient(lambda n, p: ("hello", "end_turn"))
-    out = run.call_model(client, FakeAPIError, "PROMPT")
+    out = run.call_model(client, FakeAPIError, "PROMPT")   # no setup errors given
     [kw] = client.calls
     assert kw == {"model": "claude-sonnet-5-5", "max_tokens": 16000,
                   "output_config": {"effort": "high"},
@@ -513,3 +513,48 @@ def test_bar3_by_gold_and_pairs_from_a_real_twin_pair():
     rows = [row(r3, "accepted", 0, True), row(r4, "accepted", 0, True)]
     _b1, _b2, b3 = score.judge_rep(rows, ctx, False)
     assert (b3["pairs"], b3["by_gold"], b3["verdict"]) == (0, 0, P)
+
+
+class FakeAuthError(FakeAPIError):
+    status_code = 401
+
+
+def test_auth_error_aborts_without_recording(env, monkeypatch):
+    def raises(n, p):
+        raise FakeAuthError("bad key")
+    client = FakeClient(raises)
+    monkeypatch.setattr(run, "make_client", lambda: (client, FakeAPIError, (FakeAuthError,)))
+    with pytest.raises(SystemExit) as e:
+        run.main(_args(env, "fit", "r1"))
+    assert "FakeAuthError" in str(e.value.code)
+    assert [x for x in store.read_jsonl(env.runs / "r1" / "log.jsonl")
+            if x["session"] == REF_A] == []
+    meta = json.loads((env.runs / "r1" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["complete"] is False and meta["calls"] == 0
+    good = _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "r1", "--resume"))
+    assert len(good.calls) == 3
+
+
+def test_sans_instruction_hash_ignores_only_the_wording():
+    src = 'import x\n\nINSTRUCTION = (\n    "a b 楼\\n"\n    "c"\n)\n\nY = 1\n'
+    reworded = src.replace('"c"', '"d e f"')
+    other = src.replace("Y = 1", "Y = 2")
+    h = run.sans_instruction_hash
+    assert h(src) == h(reworded) and h(src) != h(other)
+    assert h(src) == h(src.replace("\n", "\r\n"))
+
+
+def test_heldout_refuses_non_wording_change(env, monkeypatch):
+    client = _patch_client(monkeypatch, FakeClient())
+    run.main(_args(env, "fit", "fit0"))
+    meta_p = env.runs / "fit0" / "meta.json"
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    assert "nightly_turn_pick_sans_instruction" in meta["hashes"]
+    meta["hashes"]["nightly_turn_pick_sans_instruction"] = "0" * 64
+    meta_p.write_text(json.dumps(meta), encoding="utf-8")
+    n = len(client.calls)
+    with pytest.raises(SystemExit) as e:
+        run.main(_args(env, "heldout", "h1", "--fit-run", str(env.runs / "fit0")))
+    assert "sans_instruction" in str(e.value.code)
+    assert len(client.calls) == n
