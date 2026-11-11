@@ -316,6 +316,8 @@ LAKE_PUT_CALLERS = {
 IMPORTS_BUT_NEVER_WRITES = {
     "AskAgentFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
     "AskVoiceWorkerFunction": "runs AskAgent's code path; never flushes a trace",
+    "ActionAgentFunction": ("imports pipeline_trace via llm_usage; never flushes a trace "
+                            "(its only S3 write is web snapshots, recorded by org-api)"),
     "ApiFunction": "imports ask_voice_turn for its turn-store helpers only",
     "MatcherFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
     "SessionActivityFunction": "imports helpers; calls none of the writers",
@@ -323,6 +325,10 @@ IMPORTS_BUT_NEVER_WRITES = {
     "SpeakerEmbedFunction": "reads a raw window via batch_seal; never seals",
     "CheckGapsFunction": ("reads transcripts via extract_session's gather/assemble; "
                           "read-only by spec (check done 2026-10-20)"),
+    "DecisionScanFunction": ("imports pipeline_trace (and lambda_org_api lazily) via "
+                             "checklist_reports; calls only read_result_status, "
+                             "unseen_reports and mark_seen -- S3 read-only by spec "
+                             "(site decision loop P0, 2026-11-05)"),
 }
 
 

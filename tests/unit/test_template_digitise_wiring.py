@@ -95,6 +95,9 @@ def test_the_worker_may_read_its_inputs_and_write_only_its_result():
     assert ("s3:GetObject", "template_sources/*") in g
     assert ("s3:GetObject", "template_digitise_requests/*") in g
     assert ("s3:PutObject", "template_digitise_results/*") in g
+    # the upload audit (spec 2026-11-06 A5) stores its verdict beside the result
+    assert ("s3:PutObject", "template_digitise_audits/*") in g
+    assert ("s3:PutObject", "template_digitise_audit_stats/*") in g
     assert ("s3:PutObject", "lake_manifest/*") in g
     assert ("s3:PutObject", "template_sources/*") not in g
     assert ("s3:PutObject", "template_digitise_requests/*") not in g
@@ -123,23 +126,31 @@ def test_no_rule_fires_on_the_workers_own_output_or_the_uploads():
     # checked rather than a stale literal.
     import lake_put
     assert lake_put.MANIFEST_PREFIX == "lake_manifest/"
-    for out in ("template_digitise_results/", "template_sources/", lake_put.MANIFEST_PREFIX):
+    for out in ("template_digitise_results/", "template_digitise_audits/",
+                "template_digitise_audit_stats/", "template_sources/", lake_put.MANIFEST_PREFIX):
         assert not any(out.startswith(p) or p.startswith(out) for p in prefixes), out
 
 
-def test_the_three_prefixes_expire_after_ninety_days_and_the_script_still_reruns():
+def test_the_four_prefixes_expire_after_ninety_days_and_the_script_still_reruns():
+    # The audit holds customer item text, so it must not outlive the result it describes
+    # (spec 2026-11-06 A7).
     script = open(LIFECYCLE, encoding="utf-8").read()
     body = re.search(r"--lifecycle-configuration '(\{.*?\})'", script, re.S).group(1)
     rules = {r["ID"]: r for r in json.loads(body)["Rules"]}
     for rid, prefix in (("template-sources-expiry", "template_sources/"),
                         ("template-digitise-requests-expiry", "template_digitise_requests/"),
-                        ("template-digitise-results-expiry", "template_digitise_results/")):
+                        ("template-digitise-results-expiry", "template_digitise_results/"),
+                        ("template-digitise-audits-expiry", "template_digitise_audits/")):
         rule = rules.get(rid)
         assert rule and rule["Status"] == "Enabled", rid
         assert rule["Filter"]["Prefix"] == prefix
         assert rule["Expiration"]["Days"] == 90
         # the script refuses to run over rules it does not manage; its own must be listed
         assert "ID!=`%s`" % rid in script, f"{rid} missing from the exclusion query"
+    # the stats line holds no customer text and is the long-term record: no rule reaches it
+    for rule in rules.values():
+        prefix = (rule.get("Filter") or {}).get("Prefix", "")
+        assert not "template_digitise_audit_stats/".startswith(prefix), rule["ID"]
 
 
 def test_a_failed_run_is_not_retried_into_a_second_paid_model_call():
@@ -214,7 +225,7 @@ def test_the_settings_reach_the_worker_and_default_to_todays_request():
     assert params["TemplateDigitiseReasoning"]["Default"] == ""
     assert params["TemplateDigitiseProvider"]["Default"] == ""
     assert params["TemplateDigitisePdfModel"]["Default"] == ""
-    assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|low|medium|high)$"
+    assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|minimal|low|medium|high|xhigh|max)$"
 
 
 BACKSLASH = chr(92)  # the line continuation after a sam deploy argument
@@ -254,3 +265,79 @@ def test_both_workflows_pass_the_settings_from_repo_variables(env):
     for _, var, shell, _ in _SETTINGS[1:]:
         assert 'if [ -n "$%s" ]; then' % shell in text, (env, shell)
         assert '${%s_PARAM:+"$%s_PARAM"} ' % (var, var) + BACKSLASH in text, (env, var)
+
+
+# ---- the upload audit (spec 2026-11-06 A5/A6) -------------------------------------
+_AUDIT_KNOBS = {"TemplateDigitiseAudit": "TEMPLATE_DIGITISE_AUDIT",
+                "TemplateDigitiseAuditModel": "TEMPLATE_DIGITISE_AUDIT_MODEL",
+                "TemplateDigitiseAuditAltModel": "TEMPLATE_DIGITISE_AUDIT_ALT_MODEL"}
+
+
+def _plain(v):
+    """The loader hands back raw yaml nodes under an intrinsic; flatten them to values."""
+    if isinstance(v, _yaml.nodes.ScalarNode):
+        return v.value
+    if isinstance(v, _yaml.nodes.SequenceNode):
+        return [_plain(x) for x in v.value]
+    if isinstance(v, _yaml.nodes.MappingNode):
+        return {_plain(k): _plain(x) for k, x in v.value}
+    if isinstance(v, list):
+        return [_plain(x) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_plain(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    return v
+
+
+def test_the_audit_settings_reach_the_worker_and_are_inert_by_default():
+    """A manual deploy with nothing passed audits nothing; the workflows turn it on."""
+    params = _template()["Parameters"]
+    env = _fn()["Environment"]["Variables"]
+    for param, var in _AUDIT_KNOBS.items():
+        assert param in params, param
+        assert env[var] == param, f"{var} is not wired to {param}"
+    assert params["TemplateDigitiseAudit"]["Default"] == "false"
+    assert params["TemplateDigitiseAudit"]["AllowedValues"] == ["true", "false"]
+    assert params["TemplateDigitiseAuditModel"]["Default"] == "google/gemini-3.8-flash"
+    assert params["TemplateDigitiseAuditAltModel"]["Default"] == "meta/muse-spark-1.3-contributor"
+    # Its own chain, empty like the reader's: Globals' text chain must not leak in.
+    assert env["TEMPLATE_DIGITISE_AUDIT_FALLBACK_MODELS"] == ""
+    # The email subject names the stage.
+    assert env["STAGE"] == "Stage"
+
+
+def test_the_alert_topic_and_its_publish_grant_exist_only_with_the_topic():
+    """Copied from ExtractionBacklog: a stack without alerts gets neither, and the worker
+    then logs "no topic" instead of publishing."""
+    env = _fn()["Environment"]["Variables"]
+    assert _plain(env["ALERT_TOPIC_ARN"]) == ["ShouldCreateAlerts", "AlertTopic", "AWS::NoValue"]
+    conditional = [_plain(p) for p in _fn()["Policies"] if not isinstance(p, dict)]
+    assert conditional == [[
+        "ShouldCreateAlerts",
+        {"SNSPublishMessagePolicy": {"TopicName": "AlertTopic.TopicName"}},
+        "AWS::NoValue",
+    ]]
+
+
+_AUDIT_MODELS = (("TemplateDigitiseAuditModel", "TEMPLATE_DIGITISE_AUDIT_MODEL", "TDA_MODEL",
+                  "google/gemini-3.8-flash"),
+                 ("TemplateDigitiseAuditAltModel", "TEMPLATE_DIGITISE_AUDIT_ALT_MODEL",
+                  "TDA_ALT_MODEL", "meta/muse-spark-1.3-contributor"))
+
+
+@pytest.mark.parametrize("env,default", [("TEST", "true"), ("PROD", "false")])
+def test_both_workflows_pass_the_audit_settings(env, default):
+    """TEST audits from day one; prod stays off until the owner sets the variable (A6)."""
+    text = open(WORKFLOWS[env], encoding="utf-8").read()
+    line = '"TemplateDigitiseAudit=${{ vars.%s_TEMPLATE_DIGITISE_AUDIT || \'%s\' }}" ' % (
+        env, default) + BACKSLASH
+    assert line in text, f"{env} cannot set TemplateDigitiseAudit"
+    for param, var, shell, model in _AUDIT_MODELS:
+        assigned = _line_assigning(text, shell)
+        assert "vars.%s_%s || '%s'" % (env, var, model) in assigned, (env, var)
+        assert _STRIP in assigned, f"{env} {shell}: whitespace not stripped"
+        assert _LOWER not in assigned, f"{env} {shell}: a model id is case-sensitive"
+        assert '%s="${%s:-%s}"' % (shell, shell, model) in text, (env, shell)
+        assert '%s_PARAM="%s=$%s"' % (var, param, shell) in text, (env, param)
+        assert '"$%s_PARAM" ' % var + BACKSLASH in text, (env, var)

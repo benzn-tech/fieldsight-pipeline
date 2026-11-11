@@ -15,6 +15,18 @@ Free, exact and deterministic. The rule (the spike's truth reader, generalised -
     is not just a number. Its section is the header row's own label when that label names
     something ("Scaffolding | Y | N | NA"), else the paragraph just above the table (the
     usual heading), else untitled; merged single-cell rows inside it are sections as above.
+  * a COMBINED answer column (spec 2026-11-06 R1) is read the same way: one header cell,
+    a header label with no checkbox glyphs, that is only answer words joined by / | , or
+    spaces ("Yes / No / N/A", "Y/N/NA", "Pass / Fail / N/A"), naming at least a yes-word
+    and a no-word, is the answer column. A cell WITH boxes ("[] Pass [] Fail") is itself
+    being answered -- an outcome line, never a column label.
+  * a table whose every item row (by the cell rule) starts with a column label ("No.",
+    "#", "Item") is a header row reading "Yes No N/A", not items: the column reader
+    takes it.
+  * Pass / Fail words (R2) count as yes / no words in header cells only; the reader still
+    outputs item text alone. "OK" is a yes-word only when the header row also has a no-word.
+  * a legacy Word form checkbox (w:ffData with a w:checkBox child, R3) marks an answer
+    cell like a w14 checkbox does.
 The python-docx layer is cp312 (BUG-24); without it AVAILABLE is False and the worker
 answers "upload a PDF" instead of raising ImportError.
 """
@@ -34,9 +46,20 @@ _ANSWER = re.compile(r"^yes\s*no\s*n/?a$", re.IGNORECASE)
 _HEADER = re.compile(r"(yes\s*/\s*no|complies)", re.IGNORECASE)
 _BOXES = re.compile("[\u2610\u2611\u2612\u2713\u2714\u25a1\u25a0]")
 _W14_CHECKBOX = "{http://schemas.microsoft.com/office/word/2010/wordml}checkbox"
-_YES, _NO, _NA = {"yes", "y"}, {"no", "n"}, {"n/a", "na", "n.a.", "not applicable"}
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+# "ok" is safe here only because both header modes below also demand a no-word: "OK"
+# alone is too common in item text to name an answer column (R2).
+_YES = {"yes", "y", "pass", "passed", "complies", "compliant", "ok"}
+_NO = {"no", "n", "fail", "failed", "does not comply", "non-compliant"}
+_NA = {"n/a", "na", "n.a.", "not applicable"}
+# One header cell of answer words joined by / | , or spaces (R1). Longest first, so
+# "n/a" is one word and not "n" then "/a".
+_WORDS = "|".join(re.escape(w) for w in sorted(_YES | _NO | _NA, key=len, reverse=True))
+_SEP = r"[\s/|,]"
+_COMBINED = re.compile(rf"^(?:{_WORDS})(?:{_SEP}+(?:{_WORDS}))*$")
+_COMBINED_WORD = re.compile(rf"(?:^|(?<={_SEP}))({_WORDS})(?={_SEP}|$)")
 # What a ticked box holds once _BOXES glyphs are gone; anything longer is a written answer.
-_TICK = re.compile(r"^(x|y|n|yes|no|n/?a)?$", re.IGNORECASE)
+_TICK = re.compile(r"^(x|y|n|yes|no|n/?a|pass|passed|fail|failed|ok)?$", re.IGNORECASE)
 _NUMBER = re.compile(r"^[\d.()]*$")
 # Column labels that name no section ("Item | Yes | No"): the heading above names it.
 _GENERIC = {"", "#", "no", "no.", "item", "items", "description", "activity", "check",
@@ -59,10 +82,15 @@ def _text(cell):
     return " ".join(_BOXES.sub(" ", cell.text).split())
 
 
+def _has_checkbox(cell):
+    """A w14 checkbox content control, or a legacy form checkbox (w:ffData/w:checkBox)."""
+    return any(el.tag == _W14_CHECKBOX
+               or (el.tag == _W + "checkBox" and el.getparent().tag == _W + "ffData")
+               for el in cell._tc.iter())
+
+
 def _is_answer_cell(cell):
-    if _ANSWER.match(_text(cell)):
-        return True
-    return any(el.tag == _W14_CHECKBOX for el in cell._tc.iter())
+    return bool(_ANSWER.match(_text(cell))) or _has_checkbox(cell)
 
 
 def _kind(cells):
@@ -81,18 +109,30 @@ def _label(text):
     return " ".join(text.lower().split())
 
 
+def _is_combined(label):
+    """True when one header cell's label is only answer words, with a yes and a no."""
+    if not _COMBINED.match(label):
+        return False
+    words = set(_COMBINED_WORD.findall(label))
+    return bool(words & _NO) and bool(words & _YES)
+
+
 def _answer_columns(cells):
-    """Indexes of the Yes / No / N/A cells when `cells` is a column-header row with a
-    cell of its own for at least Yes and No; else None."""
+    """Indexes of the answer columns when `cells` is a column-header row: a cell of its
+    own for at least Yes and No, else one combined "Yes / No / N/A" cell; else None."""
     found = {}
-    for i, c in enumerate(cells):
-        label = _label(_text(c))
+    labels = [_label(_text(c)) for c in cells]
+    for i, label in enumerate(labels):
         for kind, words in (("yes", _YES), ("no", _NO), ("na", _NA)):
             if label in words and kind not in found:
                 found[kind] = i
-    if "yes" not in found or "no" not in found:
-        return None
-    return sorted(found.values())
+    if "yes" in found and "no" in found:
+        return sorted(found.values())
+    for i, label in enumerate(labels):
+        # Boxes mean the cell is itself answered (an outcome line), not a column label.
+        if _is_combined(label) and not _BOXES.search(cells[i].text) and not _has_checkbox(cells[i]):
+            return [i]
+    return None
 
 
 def _item_text(cells):
@@ -142,6 +182,39 @@ def _headings(document):
     return out
 
 
+_EMPTY_BOX = re.compile("[☐□]")
+_TICKED_BOX = re.compile("[☑☒✓✔■]")
+
+
+def _plain(text):
+    """Whitespace collapsed, checkbox glyphs written as [ ] / [x] for a text reader."""
+    return " ".join(_TICKED_BOX.sub(" [x] ", _EMPTY_BOX.sub(" [ ] ", text)).split())
+
+
+def render_text(source):
+    """The Word file as plain text in document order, for the model reader when no rule
+    above finds a row (spec 2026-11-06 R4): each non-empty paragraph a line; each table
+    "[table N]" then one line per non-blank row, its cells (merged ones once) joined
+    by " | "."""
+    document = docx.Document(source)
+    tables = iter(document.tables)  # the body's own tables, in the order iterchildren meets them
+    lines, n = [], 0
+    for el in document.element.body.iterchildren():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            text = _plain("".join(t.text or "" for t in el.iter() if t.tag.endswith("}t")))
+            if text:
+                lines.append(text)
+        elif tag == "tbl":
+            n += 1
+            lines.append(f"[table {n}]")
+            for row in next(tables).rows:
+                cells = [_plain(c.text) for c in _unique_cells(row)]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
 def read(source):
     """[{title, items: [str]}] in document order; [] when no checklist table is found."""
     document = docx.Document(source)
@@ -150,7 +223,8 @@ def read(source):
     for t, table in enumerate(document.tables):
         cells = [_unique_cells(r) for r in table.rows]
         rows = [_kind(c) for c in cells]
-        if not any(kind == "item" for kind, _ in rows):
+        items = [text for kind, text in rows if kind == "item"]
+        if not items or all(_label(text) in _GENERIC for text in items):
             by_columns = _read_by_columns(cells, headings[t] if t < len(headings) else "")
             if not by_columns or not any(kind == "item" for kind, _ in by_columns[1]):
                 continue

@@ -1,0 +1,356 @@
+"""The action agent's scope gate (spec 2026-11-05 §3.2.4; plan PR-4 Tasks 4.2-4.4).
+
+Runs in code after `action_pack_stages.validate_draft`, before the verifier. It decides
+which items a draft may change and keeps only the proposed fields whose source holds up.
+Every rejection is counted under a fixed code; the counts become
+`run_trace.scope_gate`.
+
+Rule 1 -- target scope. A close or update target must be open (`OPEN_STATUSES`) whatever
+the scope and whatever the field: a named target that is done or closed becomes an
+"already done" note (`demoted_target_closed`), any other is dropped
+(`drop_target_closed`). Under `change_scope = "named"` a target that is not a named
+target's resolved item is dropped (`drop_unasked_target`); under `tidy` any open item
+may be targeted (the site check stays the verifier's code check).
+
+Rule 2 -- named target mismatch. A `target_ref` whose target resolved to a different item
+is dropped (`drop_named_mismatch`: C4's look-alike). An action on an `ambiguous` or a
+`none` target is demoted to a note (`demoted_ambiguous`, `demoted_target_none`), never
+dropped silently. Rule 2 runs before rule 1's scope check, so a demotion is never lost
+to `drop_unasked_target`.
+
+Rule 3 -- field provenance. Every proposed field of a close, an update and a create's
+optional fields (its text keeps its refs rule) must pass its declared source, or it is
+removed (`field_unsourced__<field>`); a close/update left with nothing is dropped
+(`drop_no_sourced_fields`). Only a kept field's refs join the action's refs.
+    user             a stated value for (this target or none, field) must exist; the
+                     value BECOMES the stated one (`user_value_overridden__<field>` when
+                     the writer's differed, normalised); with nothing stated, the
+                     field falls back to the evidence rule over its own and the
+                     action's refs (`user_value_unstated__<field>` when it holds);
+    evidence         a ref of kind topic, chunk or document -- an item row never
+                     justifies a change, except the target's own row for a deadline it
+                     carries as deadline_text; web refs never set a field;
+    assumed_default  a deadline only, under a delegation covering the target, on an item
+                     with neither deadline nor deadline_text: the value BECOMES the
+                     item's raised_on (owner rule: the raised date, never today+N), and the
+                     action is marked `assumed = ["deadline"]` (`date_assumed`).
+A stated status still has to be a legal change for the type (`drop_illegal_after_gate`).
+
+Rule 5 -- an asked change (spec §3.5), under `named` only, after rules 1-2 and before rule
+3. `T` is every planner target that resolved to the action's item; `covering` the plan's
+sub-tasks whose targets meet `T` (with exactly one planner target, an untargeted sub-task
+covers it). With no sub-tasks or nothing covering, the action passes (no planner signal).
+A covering sub-task of a kind in `CHANGE_KINDS` passes it unchanged. Otherwise every field
+the user did not ask for -- no stated value and no delegation for (an id in `T` or null,
+that field) -- is removed (`field_unasked__<field>`), and a close/update left with none is
+dropped (`drop_unasked_change`): a question about an item is not a request to change it.
+
+Rule 4 -- deadline sanity. An `evidence` deadline carries `said_on` equal to the date of
+one of its source refs (a topic's or chunk's date; the target's own item row's raised_on)
+or is removed (`field_said_on_mismatch`); a deadline before that day is removed
+(`field_deadline_before_source`). Code checks the anchor only; the spoken date itself is
+the model's (no date parsing here).
+
+The action's planner target is its `target_ref`; with none, the target whose resolved
+item is the action's item, or -- under `named` only -- one whose ambiguous candidates
+include it (so it becomes a note, not `drop_unasked_target`). Under `tidy` an unnamed
+action on an ambiguous candidate is an ordinary tidy change.
+
+Pure: no I/O, no logging. Instruction text, stated values and item text never reach the
+counts.
+"""
+from __future__ import annotations
+
+import datetime as dt
+
+import action_pack_stages as st
+import action_pack_view
+import action_pack_targets as targets
+from action_pack_verify import OPEN_STATUSES
+
+TARGETED = ("close_item", "update_item")
+SOURCED = TARGETED + ("create_item",)
+CHANGE_KINDS = ("close", "update", "other")
+EVIDENCE_KINDS = ("topic", "chunk", "document")
+
+NOTE_SUFFIX = {
+    "en": {"ambiguous": "matches more than one item: {refs}",
+           "none": "named item not found",
+           "closed": "already done"},
+    "zh": {"ambiguous": "与多个事项匹配：{refs}",
+           "none": "未找到指定的事项",
+           "closed": "已完成"},
+}
+_NOTE_WRAP = {"en": "{text} ({suffix})", "zh": "{text}（{suffix}）"}
+
+
+def _bump(d, key, n=1):
+    d[key] = d.get(key, 0) + n
+
+
+def _named_target(a, resolution, *, ambiguous=True, counts=None):
+    """The planner target id this action acts on, or None (unnamed). `ambiguous`: also
+    infer it from an ambiguous target's candidates (not under `tidy`). A target_ref that
+    did not resolve to the action's item while ANOTHER target did is corrected to that
+    target (counted `target_ref_corrected` when `counts` is given): the item the user
+    named wins over the writer's label."""
+    ref = a.get("target_ref")
+    sid = a.get("target_stable_id")
+    resolved_here = [tid for tid, r in resolution.items()
+                     if r.kind == targets.RESOLVED and r.stable_id == sid]
+    if isinstance(ref, str) and ref in resolution:
+        r = resolution[ref]
+        if (r.kind == targets.RESOLVED and r.stable_id == sid) or not resolved_here:
+            return ref
+        if counts is not None:
+            _bump(counts, "target_ref_corrected")
+        return resolved_here[0]
+    if resolved_here:
+        return resolved_here[0]
+    for tid, r in resolution.items():
+        if ambiguous and r.kind == targets.AMBIGUOUS and sid in r.candidates:
+            return tid
+    return None
+
+
+def _note(a, lang, suffix_key, items, candidates=()):
+    """A demoted close/update: the rationale plus a fixed suffix, refs kept."""
+    refs = ", ".join(str((items.get(s) or {}).get("ref") or "?") for s in candidates)
+    suffix = NOTE_SUFFIX[lang][suffix_key].format(refs=refs)
+    text = _NOTE_WRAP[lang].format(text=a.get("rationale") or "", suffix=suffix)
+    return {"type": "note", "target_stable_id": None,
+            "proposed": {"text": text[:st.BODY_MAX_CHARS]},
+            "rationale": a.get("rationale"), "refs": list(a.get("refs") or [])}
+
+
+def _scope(a, *, plan, resolution, items, named_sids, lang, counts):
+    """Rules 1-2 for one close/update -> the action, a note, or None (dropped)."""
+    sid = a.get("target_stable_id")
+    tid = _named_target(a, resolution, ambiguous=plan.change_scope != "tidy",
+                        counts=counts)
+    r = resolution.get(tid) if tid is not None else None
+    if r is not None:
+        if r.kind == targets.AMBIGUOUS:
+            _bump(counts, "demoted_ambiguous")
+            return _note(a, lang, "ambiguous", items, r.candidates)
+        if r.kind == targets.NONE:
+            _bump(counts, "demoted_target_none")
+            return _note(a, lang, "none", items)
+        if r.stable_id != sid:
+            _bump(counts, "drop_named_mismatch")
+            return None
+    status = (items.get(sid) or {}).get("status") or "open"
+    if status not in OPEN_STATUSES:
+        if sid in named_sids:
+            _bump(counts, "demoted_target_closed")
+            return _note(a, lang, "closed", items)
+        _bump(counts, "drop_target_closed")
+        return None
+    if plan.change_scope != "tidy" and sid not in named_sids:
+        _bump(counts, "drop_unasked_target")
+        return None
+    return a
+
+
+def _asked(a, *, plan, resolution, counts):
+    """Rule 5 for one close/update that passed rules 1-2 -> the action with only its asked
+    fields, or None (dropped)."""
+    if plan.change_scope == "tidy":
+        return a
+    subs = getattr(plan, "sub_tasks", None) or []
+    if not subs:
+        return a
+    sid = a.get("target_stable_id")
+    tids = {tid for tid, r in resolution.items()
+            if r.kind == targets.RESOLVED and r.stable_id == sid}
+    single = len(getattr(plan, "targets", None) or []) == 1
+    covering = [s for s in subs if tids & set(s.get("targets") or ())
+                or (single and not s.get("targets"))]
+    if not covering or any(s.get("kind") in CHANGE_KINDS for s in covering):
+        return a
+    scope_ids = tids | {None}
+
+    def asked(fld):
+        return any(e["field"] == fld and e["target"] in scope_ids
+                   for e in list(getattr(plan, "stated_values", None) or [])
+                   + list(getattr(plan, "delegations", None) or []))
+
+    proposed = dict(a.get("proposed") or {})
+    for fld in [f for f in proposed if f != "text"]:
+        if not asked(fld):
+            proposed.pop(fld)
+            _bump(counts, f"field_unasked__{fld}")
+    if not [f for f in proposed if f != "text"]:
+        _bump(counts, "drop_unasked_change")
+        return None
+    sources = {k: v for k, v in (a.get("field_sources") or {}).items() if k in proposed}
+    return dict(a, proposed=proposed, field_sources=sources)
+
+
+def _day_iso(value):
+    """'YYYY-MM-DD' for a date, a datetime or an ISO date/timestamp string, else None."""
+    if isinstance(value, dt.datetime):
+        value = value.date()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    d = st._iso_date(str(value or "")[:10])
+    return d.isoformat() if d else None
+
+
+def _norm(fld, value):
+    """The comparison form of a field value: ISO for dates, lower-case for status and
+    priority, casefold for responsible."""
+    v = str(value if value is not None else "").strip()
+    if fld == "deadline":
+        return _day_iso(v) or v
+    return v.lower() if fld in ("status", "priority") else v.casefold()
+
+
+def _ref_day(entry, own_ref):
+    """The date a ref shows: a topic's or chunk's `date`; the target's own item row's
+    `raised_on`. None for anything else (a document, a web ref, another item)."""
+    it = entry.get("item") or {}
+    if entry.get("kind") in ("topic", "chunk"):
+        return _day_iso(it.get("date"))
+    if entry.get("kind") == "item" and entry.get("ref") == own_ref:
+        return _day_iso(it.get("raised_on"))
+    return None
+
+
+def _deadline_sane(value, fs, *, registry, own_ref):
+    """Rule 4 for an evidence deadline: None when it holds, else the removal code."""
+    said_on = fs.get("said_on")
+    days = {_ref_day(registry[r], own_ref) for r in fs.get("refs") or [] if r in registry}
+    if said_on is None or said_on not in days:
+        return "field_said_on_mismatch"
+    if _norm("deadline", value) < said_on:
+        return "field_deadline_before_source"
+    return None
+
+
+def _stated(plan, tid, fld):
+    """The planner's stated value for (target, field): the target's own entry first, then
+    a global one (target null). None when the user stated nothing for it."""
+    stated = [e for e in getattr(plan, "stated_values", None) or [] if e["field"] == fld]
+    for e in stated:
+        if tid is not None and e["target"] == tid:
+            return e["value"]
+    for e in stated:
+        if e["target"] is None:
+            return e["value"]
+    return None
+
+
+def _delegated(plan, tid, fld):
+    return any(e["field"] == fld and (e["target"] is None or e["target"] == tid)
+               for e in getattr(plan, "delegations", None) or [])
+
+
+def _field(fld, value, fs, *, tid, plan, item, registry, counts, action_refs=()):
+    """(value to keep, None) or (None, removal code) for one proposed field."""
+    src = fs.get("source") if isinstance(fs, dict) else None
+    unsourced = f"field_unsourced__{fld}"
+    if src == "user":
+        stated = _stated(plan, tid, fld)
+        if stated is None:
+            # A stated value OR evidence (spec §3.2.4): the planner may not have recorded
+            # what the user said, so the field may still stand on a record or document
+            # among its own and the action's refs, under the evidence rule.
+            refs = list(dict.fromkeys(list(fs.get("refs") or []) + list(action_refs)))
+            value, code = _field(fld, value, dict(fs, source="evidence", refs=refs),
+                                 tid=tid, plan=plan, item=item, registry=registry,
+                                 counts=counts)
+            if code is None:
+                _bump(counts, f"user_value_unstated__{fld}")
+            return value, code
+        if _norm(fld, value) != _norm(fld, stated):
+            _bump(counts, f"user_value_overridden__{fld}")
+        return stated, None
+    if src == "evidence":
+        refs = [r for r in fs.get("refs") or [] if r in registry]
+        own = (item or {}).get("ref")
+        ok = any(registry[r].get("kind") in EVIDENCE_KINDS for r in refs) or (
+            fld == "deadline" and item is not None and bool(item.get("deadline_text"))
+            and own in refs)
+        if not ok:
+            return None, unsourced
+        if fld == "deadline":
+            code = _deadline_sane(value, fs, registry=registry, own_ref=own)
+            if code is not None:
+                return None, code
+        return value, None
+    if src == "assumed_default":
+        raised = _day_iso((item or {}).get("raised_on"))
+        if (fld != "deadline" or item is None or raised is None
+                or item.get("deadline") or item.get("deadline_text")
+                or not _delegated(plan, tid, fld)):
+            return None, unsourced
+        return raised, None
+    return None, unsourced
+
+
+def _provenance(a, *, tid, plan, items, registry, counts):
+    """Rule 3 for one close/update/create -> the action with only its sourced fields, or
+    None (dropped)."""
+    atype, sid = a.get("type"), a.get("target_stable_id")
+    item = items.get(sid) if atype in TARGETED else None
+    sources = a.get("field_sources") or {}
+    proposed, assumed = dict(a.get("proposed") or {}), []
+    refs = list(a.get("refs") or [])
+    for fld in [f for f in proposed if f != "text"]:
+        value, code = _field(fld, proposed[fld], sources.get(fld), tid=tid, plan=plan,
+                             item=item, registry=registry, counts=counts,
+                             action_refs=a.get("refs") or [])
+        if code is not None:
+            proposed.pop(fld)
+            _bump(counts, code)
+            continue
+        proposed[fld] = value
+        for r in (sources.get(fld) or {}).get("refs") or []:     # a kept field's refs
+            if r in registry and r not in refs:
+                refs.append(r)
+        if (sources.get(fld) or {}).get("source") == "assumed_default":
+            assumed.append(fld)
+            _bump(counts, "date_assumed")
+    if atype in TARGETED:
+        if not proposed:
+            _bump(counts, "drop_no_sourced_fields")
+            return None
+        status = proposed.get("status")
+        legal = st.legal_change(atype, proposed, (item or {}).get("status"))
+        if legal is None or (atype == "close_item"
+                             and status not in action_pack_view.CLOSE_STATUSES):
+            _bump(counts, "drop_illegal_after_gate")
+            return None
+        proposed = legal
+    out = dict(a, proposed=proposed, refs=st.with_web_sources(refs, registry)[0])
+    if assumed:
+        out["assumed"] = assumed
+    return out
+
+
+def gate(draft: dict, *, plan, resolution: dict, items: dict, registry: dict):
+    """-> (the gated draft, counts, index_map). `resolution` is {target id: Resolution}
+    (round 1), `items` the run's items by stable_id, `registry` its refs. The conclusion
+    and the actions that change no item pass untouched. `index_map` is {old action index:
+    new index, or None when dropped}; a demoted action (now a note) keeps a new index --
+    the sub-task accounting (spec 2026-11-05 §4.2) follows it."""
+    counts, index_map = {}, {}
+    lang = st._lang_key(getattr(plan, "language", None))
+    named_sids = {r.stable_id for r in resolution.values() if r.kind == targets.RESOLVED}
+    out = []
+    for i, a in enumerate(draft.get("actions") or []):
+        if a.get("type") in TARGETED:
+            a = _scope(a, plan=plan, resolution=resolution, items=items,
+                       named_sids=named_sids, lang=lang, counts=counts)
+            if a is not None and a.get("type") in TARGETED:
+                a = _asked(a, plan=plan, resolution=resolution, counts=counts)
+        if a is not None and a.get("type") in SOURCED:
+            tid = (_named_target(a, resolution, ambiguous=False)
+                   if a["type"] in TARGETED else None)
+            a = _provenance(a, tid=tid, plan=plan, items=items, registry=registry,
+                            counts=counts)
+        index_map[i] = len(out) if a is not None else None
+        if a is not None:
+            out.append(a)
+    return dict(draft, actions=out), counts, index_map

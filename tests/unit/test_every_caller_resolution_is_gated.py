@@ -37,6 +37,8 @@ CLASSIFIED = {
     ("lambda_rag_search.py", "_tools"): (CALLER, "Ask tools batch; event sub is the caller"),
     ("lambda_rag_search.py", "_documents"): (CALLER, "project-documents search; the caller"),
     ("lambda_rag_search.py", "_search"): (CALLER, "records search; the caller"),
+    ("lambda_rag_search.py", "_items"): (
+        CALLER, "action-pack items tool; event sub is the run's creator"),
     ("lambda_ws_connect.py", "lambda_handler"): (CALLER, "WebSocket $connect authorizer sub"),
     ("lambda_voice_resolve.py", "lambda_handler"): (CALLER, "Site Voice sender sub"),
     ("lambda_check_gaps_db.py", "_facts"): (CALLER, "check-done presser's caller_sub"),

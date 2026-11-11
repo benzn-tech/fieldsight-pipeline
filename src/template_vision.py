@@ -29,6 +29,14 @@ Rules:
 - Do NOT include: column headers (Yes/No/NA, Comment, Due by...), answers/ticks, filled-in comments, names/dates, signature blocks, page footers, the project details box, or free-text observation registers.
 - A table repeated across a page break with the same heading is ONE section."""
 
+# A Word file no rule in template_docx can read goes to this same reader as text (spec
+# 2026-11-06 R4): the measured prompt with only its first line, which names page images,
+# replaced.
+TEXT_PROMPT = ("This text is a construction site checklist form exported from a Word file "
+               "(tables as rows of cells separated by |)\n" + PROMPT.split("\n", 1)[1])
+# Over this the rendered text is not sent: the worker keeps its old refusal (R4.5).
+MAX_TEXT_CHARS = 200_000
+
 DEFAULT_MODEL = "google/gemini-3.8-flash"
 FALLBACK_ENV = "TEMPLATE_DIGITISE_FALLBACK_MODELS"
 IMAGE_EDGE = 2000       # px, long edge: ruling R6
@@ -151,8 +159,17 @@ def read(pages, deadline=None):
     transport failure is not retried here (the chain in llm_utils already has), and
     neither is an answer cut off at max_tokens -- the same request would be cut off
     again."""
-    parts = build_parts(pages)
-    name = model_for(pages)
+    return _read_parts(build_parts(pages), model_for(pages), deadline)
+
+
+def read_text(text, deadline=None):
+    """read() for a Word file rendered as text (template_docx.render_text): the same
+    contract, the image reader's model and settings, TEXT_PROMPT then the text."""
+    parts = [{"type": "text", "text": TEXT_PROMPT}, {"type": "text", "text": text}]
+    return _read_parts(parts, model(), deadline)
+
+
+def _read_parts(parts, name, deadline):
     reasoning, provider = request_settings(name)
     started = time.monotonic()
     for attempt in range(2):

@@ -209,3 +209,191 @@ def test_a_yes_no_table_that_is_not_a_checklist_has_no_items():
     _row(t, "Attendee", "Yes", "No")
     _row(t, "", "", "")
     assert template_docx.read(_save(d)) == []
+
+
+# ---- combined answer column, Pass/Fail words, legacy checkboxes (spec 2026-11-06 R1-R3) --
+# A hand-made form on 2026-11-06 read as zero items: one answer column headed
+# "Yes / No / N/A", every answer cell blank. Council forms say Pass / Fail / N/A.
+
+def _combined_like(answer_header="Yes / No / N/A", items=("Bottom plates fixed to slab",
+                                                          "Studs at 600 centres",
+                                                          "Lintels sized to drawings")):
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "No.", "Item", answer_header, "Comment")
+    _row(t, "Wall Framing", merge=True)
+    for n, it in enumerate(items, start=1):
+        _row(t, str(n), it, "", "")
+    return d, t
+
+
+def test_combined_answer_column_reads_items():
+    d, _ = _combined_like()
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Bottom plates fixed to slab", "Studs at 600 centres",
+                                            "Lintels sized to drawings"]},
+    ]
+
+
+@pytest.mark.parametrize("header", ["Y/N/NA", "Yes/No", "Pass / Fail / N/A",
+                                    "Complies / Does not comply / N/A", "YES | NO | N/A"])
+def test_combined_column_variants(header):
+    d, _ = _combined_like(header, items=("Gate locked", "Signage up"))
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Gate locked", "Signage up"]}]
+
+
+def test_separate_pass_fail_columns():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=5)
+    _row(t, "Item", "Pass", "N/A", "Fail", "Comment")
+    _row(t, "Nogs fitted", "", "", "", "")
+    _row(t, "Bracing installed", "", "", "", "")
+    assert template_docx.read(_save(d)) == [
+        {"title": "", "items": ["Nogs fitted", "Bracing installed"]}]
+
+
+def test_filled_pass_fail_answers_keep_their_rows():
+    # A filled-in form: rows answered "Pass" / "Fail" / "OK" are still items. Before
+    # _TICK knew these words, those rows were dropped and the read looked complete.
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Item", "Pass / Fail / N/A", "Comments")
+    _row(t, "Check A", "Pass", "")
+    _row(t, "Check B", "", "")
+    _row(t, "Check C", "Fail", "")
+    _row(t, "Check D", "OK", "")
+    assert template_docx.read(_save(d)) == [
+        {"title": "", "items": ["Check A", "Check B", "Check C", "Check D"]}]
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "Item", "Pass", "Fail", "N/A")
+    _row(t, "Nogs fitted", "Pass", "", "")
+    _row(t, "Bracing installed", "", "Failed", "")
+    assert template_docx.read(_save(d)) == [
+        {"title": "", "items": ["Nogs fitted", "Bracing installed"]}]
+
+
+def test_ok_alone_is_not_an_answer_header():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Item", "OK", "Comment")
+    _row(t, "Nogs fitted", "", "")
+    assert template_docx.read(_save(d)) == []
+
+
+def test_pass_in_item_text_is_not_an_answer():
+    d, _ = _combined_like(items=("Pass-through sealed OK", "Studs at 600 centres"))
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Pass-through sealed OK", "Studs at 600 centres"]}]
+
+
+def test_written_answer_row_is_not_an_item():
+    d, t = _combined_like(items=("Gate locked",))
+    _row(t, "2", "Final walk-round", "Checked by J. Smith on site, all good", "")
+    assert template_docx.read(_save(d)) == [{"title": "Wall Framing", "items": ["Gate locked"]}]
+
+
+def test_legacy_form_checkbox_is_answer_cell():
+    from docx.oxml import parse_xml
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=2)
+    _row(t, "Gate locked", "")
+    # A legacy FORMCHECKBOX field: w:ffData with a w:checkBox child, no answer text.
+    t.rows[0].cells[1]._tc.append(parse_xml(
+        '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Check1"/><w:enabled/>'
+        '<w:checkBox><w:sizeAuto/><w:default w:val="0"/></w:checkBox></w:ffData></w:fldChar></w:r>'
+        '<w:r><w:instrText xml:space="preserve"> FORMCHECKBOX </w:instrText></w:r>'
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>'))
+    assert template_docx.read(_save(d)) == [{"title": "", "items": ["Gate locked"]}]
+
+
+def test_bicl_and_penina_layouts_unchanged():
+    assert template_docx.read(_bicl_like()) == [
+        {"title": "Site Boundaries",
+         "items": ["Site secured", "Hoardings established where appropriate"]},
+        {"title": "Emergency Procedures", "items": ["Evacuation plan displayed"]},
+    ]
+    assert template_docx.read(_penina_like()) == [
+        {"title": "General", "items": ["Site Hazard Identification Board display",
+                                       "Is the H&S Policy displayed?"]},
+        {"title": "Site Amenities",
+         "items": ["Is the toilet facility in a clean and sanitary state?"]},
+    ]
+
+
+# ---- the plain-text rendering the model fallback reads (spec 2026-11-06 R4) -----------
+
+def test_render_text_tables_and_paragraphs():
+    d = docx.Document()
+    d.add_paragraph("Wall Framing Checklist")
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Item", "Done", "Comment")
+    _row(t, "Section A", merge=True)
+    _row(t, "Gate locked", "☐", "")
+    _row(t, "Signage  up", "☑ Yes", "fine")
+    d.add_paragraph("")
+    d.add_paragraph("Signed: ____")
+    t2 = d.add_table(rows=0, cols=2)
+    _row(t2, "Project", "Penina")
+    assert template_docx.render_text(_save(d)) == "\n".join([
+        "Wall Framing Checklist",
+        "[table 1]",
+        "Item | Done | Comment",
+        "Section A",
+        "Gate locked | [ ] | ",
+        "Signage up | [x] Yes | fine",
+        "Signed: ____",
+        "[table 2]",
+        "Project | Penina",
+    ])
+
+
+# ---- checkbox cells are answers, not answer-column headers (fix after Tasks 1-2) -------
+# "☐ Pass ☐ Fail" reads "pass fail" once glyphs go, so an outcome / signature table looked
+# like a combined-column header with Inspector / Signature / Date as its items.
+
+def _add_outcome_table(d):
+    t = d.add_table(rows=0, cols=2)
+    _row(t, "Inspection Result", "☐ Pass ☐ Fail")
+    _row(t, "Reinspection required?", "☐ Yes ☐ No")
+    _row(t, "Inspector name", "")
+    _row(t, "Signature", "")
+    _row(t, "Date", "")
+
+
+def test_an_outcome_and_signature_table_alone_reads_nothing():
+    d = docx.Document()
+    d.add_paragraph("Council inspection")
+    _add_outcome_table(d)
+    assert template_docx.read(_save(d)) == []
+
+
+def test_an_outcome_table_after_a_checklist_adds_no_items():
+    d, _ = _combined_like(items=("Gate locked", "Signage up"))
+    _add_outcome_table(d)
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Gate locked", "Signage up"]}]
+
+
+def test_a_combined_header_with_a_checkbox_element_is_not_a_header():
+    from docx.oxml import parse_xml
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=2)
+    _row(t, "Inspection Result", "Pass / Fail")
+    _row(t, "Signature", "")
+    t.rows[0].cells[1]._tc.append(parse_xml(
+        '<w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">'
+        '<w:sdtPr><w14:checkbox/></w:sdtPr><w:sdtContent><w:p/></w:sdtContent></w:sdt>'))
+    # The w14 checkbox makes row 1 an item row by the cell rule ("Inspection Result"), as
+    # before; what matters is that "Signature" never becomes an item under it.
+    flat = [i for s in template_docx.read(_save(d)) for i in s["items"]]
+    assert "Signature" not in flat
+
+
+def test_a_space_joined_combined_header_is_a_header_not_an_item():
+    d, _ = _combined_like("Yes No N/A", items=("Gate locked", "Signage up"))
+    assert template_docx.read(_save(d)) == [
+        {"title": "Wall Framing", "items": ["Gate locked", "Signage up"]}]

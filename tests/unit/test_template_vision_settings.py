@@ -128,3 +128,51 @@ def test_no_pdf_model_means_a_pdf_goes_to_the_image_model(monkeypatch):
     template_vision.read([PDF])
     assert sent[0]["model"] == template_vision.DEFAULT_MODEL
     assert template_vision.model_for([PDF]) == template_vision.DEFAULT_MODEL
+
+
+# ---- a Word file no rule reads goes to the same reader as text (spec 2026-11-06 R4) ----
+# In this file and not test_template_vision.py: no image fixture, so no Pillow needed.
+
+def test_text_prompt_is_the_reader_prompt_with_only_its_first_line_changed():
+    first, rest = template_vision.PROMPT.split("\n", 1)
+    assert first.startswith("These page images are")
+    assert template_vision.TEXT_PROMPT == (
+        "This text is a construction site checklist form exported from a Word file "
+        "(tables as rows of cells separated by |)\n" + rest)
+    assert template_vision.MAX_TEXT_CHARS == 200_000
+
+
+def test_read_text_uses_text_prompt_and_reader_model(monkeypatch):
+    monkeypatch.setenv("TEMPLATE_DIGITISE_MODEL", DEEPSEEK)
+    monkeypatch.setenv("TEMPLATE_DIGITISE_REASONING", "low")
+    monkeypatch.setenv("TEMPLATE_DIGITISE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("TEMPLATE_DIGITISE_PDF_MODEL", MUSE)  # never a text read's model
+    calls = []
+
+    def fake(parts, **kw):
+        calls.append((parts, kw))
+        return '{"sections": [{"title": "T", "items": ["i"]}]}', None
+
+    monkeypatch.setattr(lu, "call_llm_parts", fake)
+    raw, err = template_vision.read_text("[table 1]\nGate locked | ", deadline=100.0)
+    assert err is None and raw == [{"title": "T", "items": ["i"]}]
+    assert len(calls) == 1
+    parts, kw = calls[0]
+    # The prompt, then the text in place of the pages: two text parts.
+    assert parts == [{"type": "text", "text": template_vision.TEXT_PROMPT},
+                     {"type": "text", "text": "[table 1]\nGate locked | "}]
+    assert kw["model"] == template_vision.model() == DEEPSEEK
+    reasoning, provider = template_vision.request_settings(DEEPSEEK)
+    assert kw["reasoning"] == reasoning == {"effort": "low"}
+    assert kw["provider"] == provider == {"only": ["coreweave/fp8"], "allow_fallbacks": False}
+    assert kw["max_tokens"] == template_vision.answer_tokens()
+    assert kw["fallback_env"] == template_vision.FALLBACK_ENV
+    assert 0 < kw["deadline"] <= 100.0
+
+
+def test_read_text_maps_errors_as_read_does(monkeypatch):
+    answers = [(None, lu.PARTS_CUT_OFF + " x"), (None, "boom"), ("nope", None), ("{}", None)]
+    monkeypatch.setattr(lu, "call_llm_parts", lambda parts, **kw: answers.pop(0))
+    assert template_vision.read_text("t") == (None, template_vision.MSG_TOO_LONG)
+    assert template_vision.read_text("t") == (None, template_vision.MSG_UNAVAILABLE)
+    assert template_vision.read_text("t") == (None, template_vision.MSG_BAD_ANSWER)
