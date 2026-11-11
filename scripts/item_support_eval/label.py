@@ -12,6 +12,9 @@ Locator measurement (spec 2026-11-10 section 6), a separate label set on B1 run 
                                                                # both done files exist
   answers: done.locator.agent.jsonl, done.owner.locator.jsonl (same shape as above),
            done.flags.owner.locator.jsonl {"flag_id", "confirmed": true|false}
+  Re-test (design 2026-11-12, C6): add `--wording w1|w2` to any of the three; the runs come
+  from runs/locator_v2/<wording>/ and the same file names live under labels/v2/<wording>/.
+  BLIND_LABEL_INSTRUCTION is unchanged.
 
 Files the labellers write back (one JSON object per line):
   labels/done.agent.jsonl            {"item_ref", "label": "turn"|"several"|"none", "turns": [i...]}
@@ -205,7 +208,7 @@ def owner_sample_locator(rows, seed=store.LOCATOR_OWNER_SEED, strata=LOCATOR_OWN
     return sorted((r for r in held if r["item_ref"] in chosen), key=lambda r: r["item_ref"])
 
 
-def _locator_rows(sessions, runs, runs_dir):
+def _locator_rows(sessions, runs, runs_dir, wording=None):
     """One row per B1 item (non-errored B1 run): the blind fields plus a transient status."""
     rows = []
     for s in sessions:
@@ -213,7 +216,8 @@ def _locator_rows(sessions, runs, runs_dir):
         if not isinstance(rec, dict) or rec.get("error") or not isinstance(rec.get("topics"),
                                                                            list):
             continue
-        sha = score_mod.file_sha(store.locator_run_path("B", 1, s["ref"], runs_dir=runs_dir))
+        sha = score_mod.file_sha(store.locator_run_path("B", 1, s["ref"], runs_dir=runs_dir,
+                                                        wording=wording))
         for r in score_mod.run_items(rec):
             rows.append({"item_ref": r["item_ref"], "split": s["split"], "kind": r["kind"],
                          "item_text": r["text"],
@@ -235,21 +239,24 @@ def _refuse_other_manifest(labels_dir, digest, todo):
 
 
 def export_locator(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
-                   labels_dir=store.LABELS_DIR):
+                   labels_dir=store.LABELS_DIR, wording=None):
     """Blind rows for every B1 item (todo.locator.agent.jsonl); never the flag file (see
     `export_locator_flags`). Re-run after the held-out half: answers are keyed by
-    item_ref and stay valid while the B1 run file is unchanged (score checks its sha)."""
+    item_ref and stay valid while the B1 run file is unchanged (score checks its sha).
+    With a wording (the re-test): B1 runs from runs/locator_v2/<wording>/, files under
+    labels/v2/<wording>/ with the same names."""
+    labels_dir = store.locator_labels_dir(labels_dir, wording)
     digest = store.manifest_digest(data_dir)
     _refuse_other_manifest(labels_dir, digest, LOCATOR_AGENT_TODO)
     sessions = store.load_sessions(data_dir)
-    runs = score_mod.load_locator_runs(sessions, runs_dir)
-    rows = _locator_rows(sessions, runs, runs_dir)
+    runs = score_mod.load_locator_runs(sessions, runs_dir, wording=wording)
+    rows = _locator_rows(sessions, runs, runs_dir, wording)
     store.write_jsonl(Path(labels_dir, LOCATOR_AGENT_TODO), [_blind(r, digest) for r in rows])
     return {"agent": len(rows), "empty_view": sum(1 for r in rows if not r["turns"])}
 
 
 def export_locator_flags(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
-                         labels_dir=store.LABELS_DIR):
+                         labels_dir=store.LABELS_DIR, wording=None):
     """The twin-flag candidates for the owner (flags.owner.locator.jsonl). The file shows the
     linked turn, i.e. the locator's answer, so it is written only once every blind todo that
     exists is fully answered: every item_ref of todo.locator.agent.jsonl (which must exist)
@@ -257,8 +264,8 @@ def export_locator_flags(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
     its item_refs in done.owner.locator.jsonl. At the fit stage there is no owner todo yet
     (the owner sample is held-out only, so fit flags cannot unblind it); without this the
     fit gate's bar 4 would wait on the held-out spend the gate decides. Otherwise it refuses
-    and writes nothing."""
-    d = Path(labels_dir)
+    and writes nothing. With a wording, the re-test's runs and labels/v2/<wording>/."""
+    d = store.locator_labels_dir(labels_dir, wording)
     owed = []
     for todo, done, required in ((LOCATOR_AGENT_TODO, "done.locator.agent.jsonl", True),
                                  (LOCATOR_OWNER_TODO, "done.owner.locator.jsonl", False)):
@@ -274,25 +281,34 @@ def export_locator_flags(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
         raise SystemExit(f"Refusing: {'; '.join(owed)}. The flag file shows the locator's "
                          f"linked turns; it waits until every blind todo is answered.")
     sessions = store.load_sessions(data_dir)
-    runs = score_mod.load_locator_runs(sessions, runs_dir)
+    runs = score_mod.load_locator_runs(sessions, runs_dir, wording=wording)
     flags_ = score_mod.locator_flags(sessions, runs)
     store.write_jsonl(d / LOCATOR_FLAGS, flags_)
     return {"flags": len(flags_)}
 
 
 def export_locator_owner(runs_dir=store.RUNS_DIR, data_dir=store.DATA_DIR,
-                         labels_dir=store.LABELS_DIR, seed=store.LOCATOR_OWNER_SEED):
+                         labels_dir=store.LABELS_DIR, seed=store.LOCATOR_OWNER_SEED,
+                         wording=None):
     """The owner's blind sample (todo.owner.locator.jsonl) from held-out B1 items of the
     sessions every bar reads (`score.session_status` == eligible). Give it to the owner
-    the flag file waits until this sample is answered."""
+    the flag file waits until this sample is answered. With a wording (the re-test), the
+    same 40-item strata and seed rule over runs/locator_v2/<wording>/, eligibility by the
+    primary each run file records (as `score --stage heldout` reads it), written under
+    labels/v2/<wording>/."""
+    labels_dir = store.locator_labels_dir(labels_dir, wording)
     digest = store.manifest_digest(data_dir)
     _refuse_other_manifest(labels_dir, digest, LOCATOR_OWNER_TODO)
     sessions = store.load_sessions(data_dir)
-    runs = score_mod.load_locator_runs(sessions, runs_dir)
-    primary = score_mod.primary_model(runs)
-    elig = [s for s in sessions
-            if score_mod.session_status(runs.get(s["ref"]) or {}, primary) == "eligible"]
-    rows = _locator_rows(elig, runs, runs_dir)
+    runs = score_mod.load_locator_runs(sessions, runs_dir, wording=wording)
+    if wording is None:
+        primary = score_mod.primary_model(runs)
+        elig = [s for s in sessions
+                if score_mod.session_status(runs.get(s["ref"]) or {}, primary) == "eligible"]
+    else:
+        elig = [s for s in sessions if s["split"] == "heldout"
+                and score_mod.session_status_recorded(runs.get(s["ref"]) or {}) == "eligible"]
+    rows = _locator_rows(elig, runs, runs_dir, wording)
     sample = owner_sample_locator(rows, seed)
     store.write_jsonl(Path(labels_dir, LOCATOR_OWNER_TODO), [_blind(r, digest) for r in sample])
     strata = {name: sum(1 for r in sample if _locator_stratum(r["status"]) == name)
@@ -315,6 +331,8 @@ def main(argv=None):
         sp.add_argument("--data", default=str(store.DATA_DIR))
         sp.add_argument("--runs", default=str(store.RUNS_DIR))
         sp.add_argument("--labels", default=str(store.LABELS_DIR))
+        sp.add_argument("--wording", default=None, choices=store.WORDINGS,
+                        help="Re-test: runs/locator_v2/<wording>/ -> labels/v2/<wording>/.")
     a = p.parse_args(argv)
     if a.cmd == "instruction":
         print(BLIND_LABEL_INSTRUCTION)
@@ -322,7 +340,7 @@ def main(argv=None):
     if a.cmd.startswith("locator-"):
         fn = {"locator-export": export_locator, "locator-owner": export_locator_owner,
               "locator-flags": export_locator_flags}[a.cmd]
-        out = fn(a.runs, data_dir=a.data, labels_dir=a.labels)
+        out = fn(a.runs, data_dir=a.data, labels_dir=a.labels, wording=a.wording)
         print(store.dumps(out))
         return out
     out = export() if a.cmd == "export" else \
