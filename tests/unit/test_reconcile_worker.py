@@ -238,3 +238,29 @@ def test_non_positive_deadline_raises_without_calling(faked):
     for d in (0, -5.0):
         with pytest.raises(RuntimeError):
             rw.process_request(_req(), KEY, call=call, bucket=BUCKET, deadline_s=d)
+
+
+def test_monologue_is_split_for_the_model_but_checked_on_whole_turns(faked, monkeypatch):
+    """TEST A/B run 2026-11-11: one speaker for 58 s was one line, and the model's whole-line
+    quote named four items. The prompt now carries one sentence per line; the quote check
+    still gets the original turn, so a one-sentence quote verifies and the offset is unchanged."""
+    mono = [{"abs_start_str": "10:00:05", "speaker": "Ben",
+             "text": f"Morning all. {QUOTE}. Timber is still not ordered.",
+             "source_filename": "F2SP_20261110_100000_sidabc.json"}]
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda bucket, keys: (list(mono), ["f.json"], {}))
+    seen = []
+    monkeypatch.setattr(les, "_check_status_quote",
+                        lambda quote, at, turns, date, user_folder: seen.append(turns) or
+                        {"status": "verified", "segment_key": "s.wav", "offset_sec": 5.0})
+    sent = []
+    raw = json.dumps({"hits": [{"candidate": "C1", "status": "done", "at": "10:00:05",
+                                "quote": f"{QUOTE}."}]})
+    out = rw.process_request(_req(), KEY, call=_call_returning(raw, sink=sent), bucket=BUCKET)
+
+    prompt = sent[0][0]
+    assert f"[10:00:05] Ben: {QUOTE}.\n" in prompt
+    assert "[10:00:05] Ben: Timber is still not ordered." in prompt
+    assert "Morning all. " + QUOTE not in prompt
+    assert seen == [mono]
+    assert [s["stable_id"][:8] for s in out["status_suggestions"]] == ["11111111"]

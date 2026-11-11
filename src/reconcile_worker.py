@@ -19,6 +19,11 @@ names extraction's render_transcript maps in. The quote check (_check_status_quo
 the same `turns`, so the text and the [HH:MM:SS] clock the model copies from are identical to
 what is verified; only the speaker column differs from the extraction prompt.
 
+The model sees status_reconcile.sentence_lines(turns): each turn split into sentences that
+keep its clock (TEST A/B run 2026-11-11: a one-speaker minute was one line, and its quote
+named four items). check_quote searches the concatenated window, so a one-sentence quote
+verifies against the original turns.
+
 The model call is bounded by the Lambda's remaining time (`deadline_s`, from the handler's
 context), not by raising LLM_HTTP_TIMEOUT on the matcher: that would change the programme
 path's calls too.
@@ -102,7 +107,9 @@ def process_request(req: dict, input_key: str, call=None, bucket=None,
     if deadline_s is not None and deadline_s <= 0:
         raise RuntimeError(f"reconcile {input_key}: no time left for the model call "
                            f"(deadline {deadline_s:.0f}s)")
-    prompt = status_reconcile.build_prompt(candidates, session_brief.render_turns(turns))
+    # One sentence per line for the model only; the check below keeps the whole turns.
+    prompt = status_reconcile.build_prompt(
+        candidates, session_brief.render_turns(status_reconcile.sentence_lines(turns)))
     raw, error = call(prompt, max_tokens=MAX_TOKENS, force_json=True, enable_thinking=True,
                       deadline=deadline_s, caller=CALLER)
     if raw is None:
