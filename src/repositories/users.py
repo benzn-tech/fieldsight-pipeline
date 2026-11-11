@@ -206,6 +206,26 @@ def folder_names_for_user_ids(conn, user_ids, company_id=None) -> set:
     return {r[0] for r in rows}
 
 
+def display_names_for_ids(conn, user_ids) -> dict:
+    """{user id (str): "first last" stripped} for every id that is a user, in ONE query.
+
+    Archived users keep their name (a stored card still names who it went to). A value
+    that is not a UUID is skipped before SQL (a cast error would abort the caller's
+    transaction); an unknown id is simply absent. Empty in -> empty out, no round-trip."""
+    ids = set()
+    for u in user_ids or ():
+        try:
+            ids.add(str(_uuid.UUID(str(u))))
+        except ValueError:
+            continue
+    if not ids:
+        return {}
+    rows = conn.execute(
+        "SELECT id, first_name, last_name FROM users WHERE id = ANY(%s::uuid[])",
+        (sorted(ids),)).fetchall()
+    return {str(r[0]): f"{r[1] or ''} {r[2] or ''}".strip() for r in rows}
+
+
 def list_all_users(conn, include_archived=False) -> list[dict]:
     """Cross-company user directory -- platform_admin (is_cross_company) only.
     Mirrors list_company_users WITHOUT the company_id filter so the platform

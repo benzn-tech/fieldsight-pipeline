@@ -325,6 +325,10 @@ IMPORTS_BUT_NEVER_WRITES = {
     "SpeakerEmbedFunction": "reads a raw window via batch_seal; never seals",
     "CheckGapsFunction": ("reads transcripts via extract_session's gather/assemble; "
                           "read-only by spec (check done 2026-10-20)"),
+    "DecisionScanFunction": ("imports pipeline_trace (and lambda_org_api lazily) via "
+                             "checklist_reports; calls only read_result_status, "
+                             "unseen_reports and mark_seen -- S3 read-only by spec "
+                             "(site decision loop P0, 2026-11-05)"),
 }
 
 
