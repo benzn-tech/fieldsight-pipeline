@@ -223,3 +223,28 @@ def test_history_alone_never_sends_a_voice_question_online(monkeypatch, caplog):
                         if r.getMessage().startswith("ASK_ROUTE ")][0][len("ASK_ROUTE "):])
     assert seen == [] and not route.get("web_intent_from_rewrite")
     assert route["policy"] != "required"
+
+
+def test_a_spoken_follow_up_that_asks_for_the_web_searches_the_rewrite(monkeypatch):
+    # TEST 2026-11-12: "And for a 2.4-metre opening, check online" sent only the fragment.
+    _rewrite_to(monkeypatch, "What size timber lintel does NZS 3604 give for a 2.4-metre "
+                             "opening? Check online.")
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block())
+    hist = [{"question": "Lintel sizes per NZS 3604?", "answer": "Tables 8.9 to 8.13."}]
+    run(voice_body("And for a 2.4-metre opening", web_intent=True, history=hist),
+        ScriptChat(final("Use table 8.9.", basis="web")), channel="voice")
+    assert seen == ["What size timber lintel does NZS 3604 give for a 2.4-metre opening?"]
+
+
+def test_the_screen_still_sends_the_original_words(monkeypatch):
+    _rewrite_to(monkeypatch, "What cover does the B2 slab need?")
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block())
+    from tests.unit.test_ask_orchestrator_judge import body
+    run(body("and the cover? search online",
+             history=[{"question": "what about B2", "answer": "poured"}]),
+        ScriptChat(final("x [R1]")))
+    assert seen == ["and the cover? search online"]
