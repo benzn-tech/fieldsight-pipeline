@@ -220,10 +220,11 @@ def test_start_restate_none(env):
 
 
 def test_start_slow_tts_gives_null_restatement_in_time(env):
-    env.mp.setattr(laa, "_tts", lambda text: time.sleep(2.5) or b"RIFF")
+    # Slower than RESTATE_TTS_TIMEOUT_S (2.5 s since 2026-11-12): start must not wait.
+    env.mp.setattr(laa, "_tts", lambda text: time.sleep(avt.RESTATE_TTS_TIMEOUT_S + 0.7) or b"RIFF")
     t = time.perf_counter()
     out = avt.start(start_body())
-    assert time.perf_counter() - t < 3.5
+    assert time.perf_counter() - t < avt.RESTATE_TTS_TIMEOUT_S + 0.6
     assert out["restatement"] is None and out["turn_id"]
 
 

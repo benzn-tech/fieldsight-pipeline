@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct"
+DEFAULT_PROVIDER = "groq"
 MAX_WORDS = 25
 
 # Verbatim from voice_llm/restate.mjs; test_voice_restate.py parses the Node file
@@ -92,6 +93,22 @@ def assemble(middle: str, web_intent: bool) -> str:
     return "Got it, %s. %s" % (middle, tail)
 
 
+def provider_pin():
+    """OpenRouter `provider` preference for the restate call, or None.
+
+    Unpinned, OpenRouter spread llama-3.1-8b over Cloudflare and DeepInfra at about 22
+    tok/s: measured 2026-11-12 (n=10) total p50 1.8-2.0 s, max 6.6 s, which is the
+    owner's 2.27 s restate timeout that morning. Pinned to Groq the same prompt took
+    p50 0.31-0.42 s (about 444 tok/s); CoreWeave 0.55-0.62 s. Fallbacks stay allowed:
+    a Groq outage should cost speed, not the restatement. VOICE_RESTATE_PROVIDER="none"
+    removes the pin."""
+    raw = (os.environ.get("VOICE_RESTATE_PROVIDER") or DEFAULT_PROVIDER).strip()
+    if not raw or raw.lower() == "none":
+        return None
+    return {"order": [p.strip() for p in raw.split(",") if p.strip()],
+            "allow_fallbacks": True}
+
+
 def _result(text, reason, started):
     return {"text": text, "reason": reason, "ms": int((time.monotonic() - started) * 1000)}
 
@@ -112,13 +129,17 @@ def restate(question: str, *, web_intent: bool, timeout_s: float = 1.2) -> dict:
     base = os.environ.get("QWEN_BASE_URL")
     if not key or not base:
         return _result(None, "no_key", started)
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": [{"role": "system", "content": RESTATE_SYSTEM},
                      {"role": "user", "content": "Current question: " + question}],
         "max_tokens": 40,
         "temperature": 0,
-    }).encode("utf-8")
+    }
+    pin = provider_pin()
+    if pin:
+        payload["provider"] = pin
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         base.rstrip("/") + "/chat/completions", data=body, method="POST",
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})

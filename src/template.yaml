@@ -296,6 +296,15 @@ Parameters:
       records miss into a spoken offer to search online, honouring a yes or no
       to it. Set via TEST_/PROD_ repo vars; unset is false.
 
+  AskVoiceAutoWeb:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Voice Ask: a question the records cannot answer searches the web at once
+      (pre-check first, records and project documents beside it) instead of
+      offering to. Owner 2026-11-12. Set via TEST_/PROD_ repo vars; unset is false.
+
   AskAgentic:
     Type: String
     Default: ''
@@ -2675,6 +2684,7 @@ Resources:
           ASK_TURN_BUCKET: !Ref DataBucketName
           ASK_VOICE_RESTATE: !Ref AskVoiceRestate
           ASK_VOICE_CONVO: !Ref AskVoiceConvo
+          ASK_VOICE_AUTO_WEB: !Ref AskVoiceAutoWeb
           VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
           # Read by /start so the restatement only says "searching online" when
           # the worker will actually search.
@@ -2816,6 +2826,7 @@ Resources:
           ASK_TURN_BUCKET: !Ref DataBucketName
           VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
           ASK_VOICE_CONVO: !Ref AskVoiceConvo
+          ASK_VOICE_AUTO_WEB: !Ref AskVoiceAutoWeb
           # Same flag as AskAgent (test_ask_voice_worker_template): the worker runs the
           # orchestrator, so the documents tool must agree with the Ask path's.
           PROJECT_DOCUMENTS: !Ref ProjectDocuments   # spec 2026-10-16 project documents

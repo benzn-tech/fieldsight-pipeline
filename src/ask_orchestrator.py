@@ -486,10 +486,14 @@ FINAL_RESERVE_S = 8.0
 FALLBACK_RESERVE_S = 6.0
 ANSWER_RESERVE_S = FINAL_RESERVE_S + FALLBACK_RESERVE_S
 PRECHECK_TIMEOUT_S = 6  # measured 2.5-2.9 s on TEST (2026-10-16); 3 s timed out
+PRECHECK_MAX_TOKENS = 30  # {"web": "yes"} is about 6 tokens; reasoning is off
 
 # "last / latest / when did / most recent": the question asks for the most
 # recent occurrence, so round 1 asks latest_activity instead of a plain search.
 _LATEST = re.compile(r"\b(?:last|latest|most\s+recent(?:ly)?|when\s+did)\b", re.I)
+# The caller's own mention of the web, for the rewrite-derived intent in `_answer`.
+_ONLINE_WORD = re.compile(r"\b(?:online|web|internet|google)\b", re.I)
+
 # A question about what the project REQUIRES: round 1 also searches the project's
 # documents when that tool is offered (spec ruling 14). The judge can still call it later.
 _REQUIREMENTS = re.compile(
@@ -528,7 +532,19 @@ def policy(channel, scoped, time_anchored, web_intent, offer_web=False) -> str:
         return "required"
     if scoped or time_anchored:
         return "never"
+    if channel == "voice" and _voice_auto_web():
+        return "auto"
     return "offer" if (channel == "voice" or offer_web) else "auto"
+
+
+def _voice_auto_web() -> bool:
+    """ASK_VOICE_AUTO_WEB (owner, 2026-11-12): a voice question the records cannot
+    answer searches the web at once instead of offering to. A caller who asked a
+    question rarely remembers to press the key again to say yes, and 20 s of
+    silence after "searching" reads as a broken device. Under `auto` the pre-check
+    keeps the team's own work (people, sites, days) off the web, and a dated
+    question is still `never` above. Read per call, never at import."""
+    return os.environ.get("ASK_VOICE_AUTO_WEB", "false").lower() == "true"
 
 
 PRECHECK_PROMPT = """Decide whether answering the question below needs a search of the open web.
@@ -567,17 +583,20 @@ def precheck(question, budget):
     One cheap call on the question text alone. True / False, or None when the
     reply was empty, unparseable or failed -- logged `precheck=failed` and
     treated as "no" by the caller. Never raises."""
-    import corroboration_client
-    import web_answer
+    # The judge's model and routing under a wall-clock limit (2026-11-12), not
+    # gemini through corroboration_client: that pairing let a 4 s rewrite run 13.2 s
+    # the same morning (llm_tools_client.complete_json_within), and voice `auto`
+    # puts this call in front of every undated voice question.
+    import llm_tools_client
     try:
-        reply = corroboration_client.call(
+        reply = llm_tools_client.complete_json_within(
             PRECHECK_PROMPT.format(question=sanitize(question)),
-            timeout=min(PRECHECK_TIMEOUT_S, budget), model=web_answer.CHEAP_MODEL,
-            max_tokens=512, effort="low", caller="ask_precheck")
+            seconds=min(PRECHECK_TIMEOUT_S, budget), caller="ask_precheck",
+            max_tokens=PRECHECK_MAX_TOKENS)
     except Exception as exc:                              # noqa: BLE001
         logger.warning("ask orch precheck=failed reason=raised:%s", type(exc).__name__)
         return None
-    if not reply.ok:
+    if reply.error:
         logger.warning("ask orch precheck=failed reason=%s",
                        "timeout" if reply.timed_out else "error")
         return None
@@ -594,9 +613,12 @@ def _scope_args(scope):
     return {k: scope[k] for k in ("site", "person") if scope and scope.get(k)}
 
 
-def round1_calls(asked, q_from, q_to, scope, documents=False) -> list:
+def round1_calls(asked, q_from, q_to, scope, documents=False, always_documents=False) -> list:
     """Spec §6.3: the deterministic round-1 bundle, no model. With `documents` (the tool is
-    offered) a requirements question also searches the project's documents."""
+    offered) a requirements question also searches the project's documents;
+    `always_documents` searches them for every question (voice `auto`, 2026-11-12: the
+    owner's "timber lintel size according to 3604" missed the requirements words, and the
+    judge then spent two more rounds finding the documents itself)."""
     extra = _scope_args(scope)
     if q_from:
         dates = {"date_from": q_from, "date_to": q_to or q_from}
@@ -606,7 +628,7 @@ def round1_calls(asked, q_from, q_to, scope, documents=False) -> list:
         calls = [{"name": "latest_activity", "args": {"query": asked, **extra}}]
     else:
         calls = [{"name": "search_records", "args": {"query": asked, **extra}}]
-    if documents and _REQUIREMENTS.search(asked or ""):
+    if documents and (always_documents or _REQUIREMENTS.search(asked or "")):
         site = {"site": extra["site"]} if extra.get("site") else {}
         calls.append({"name": "search_project_documents", "args": {"query": asked, **site}})
     return calls
@@ -736,9 +758,10 @@ def run_round1(req, ctx, tools=None, *, route=None, on_web_start=None):
     t0 = ctx.clock()
     pol = req.get("policy")
     asked = req.get("asked") or req.get("question")
-    calls = round1_calls(asked, req.get("q_from"), req.get("q_to"), req.get("scope"),
-                         documents=_documents_offered(tools))
     voice = req.get("channel") == "voice"
+    calls = round1_calls(asked, req.get("q_from"), req.get("q_to"), req.get("scope"),
+                         documents=_documents_offered(tools),
+                         always_documents=voice and _voice_auto_web())
 
     wstate = {}
     pool = ThreadPoolExecutor(max_workers=2)
@@ -1309,9 +1332,8 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     asked, rewritten = question, False
     if os.environ.get("ASK_CONVERSATION_MEMORY", "false").lower() == "true":
         import ask_rewrite
-        import corroboration_client
         asked, rewritten = ask_rewrite.standalone_question(
-            question, history, call=corroboration_client.call,
+            question, history, call=ask_rewrite.judge_call,
             timeout=min(laa.ASK_REWRITE_BUDGET, deadline - _clock()))
     route["history_turns"] = len(history)
 
@@ -1363,6 +1385,15 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     screen_opt = (not voice) and body.get("offer_web") is True
     if voice:
         wi = bool(body.get("web_intent")) and bool(body.get("voice_web"))
+        # The rewrite can make an online request explicit that the phrase list missed
+        # in the spoken words ("Yes, please. Checking online." became "Can you check
+        # online what size ... 3604?" on 2026-11-12 and still searched the records).
+        # Honoured only when the caller's own words name the web: a request inferred
+        # from history alone would send a project question online (#1120).
+        if (not wi and rewritten and body.get("voice_web")
+                and voice_web.detect_intent(asked)[0] and _ONLINE_WORD.search(question)):
+            wi = True
+            route["web_intent_from_rewrite"] = True
     else:
         wi = (voice_web.detect_intent(question)[0]
               or (screen_opt and body.get("web_intent") is True))
@@ -1376,6 +1407,10 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     # The web gets the asker's question with a "search online" phrase removed, as
     # the voice worker already does before this point (voice_web.detect_intent).
     web_question = voice_web.detect_intent(question)[1] if (wi and not voice) else question
+    if route.get("web_intent_from_rewrite"):
+        # The spoken words were a bare "yes, checking online": search the rewritten
+        # question, as a yes to a spoken offer already searches the offered `asked`.
+        web_question = voice_web.detect_intent(asked)[1]
 
     tools = tools or _real_tools()
     t = _Turn(question=question, asked=asked, rewritten=rewritten, today=today,

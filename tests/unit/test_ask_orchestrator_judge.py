@@ -14,6 +14,7 @@ import pytest
 import ask_orchestrator as orch
 import corroboration_client
 import lambda_ask_agent as laa
+import llm_tools_client
 import llm_utils
 import voice_web
 import web_answer
@@ -76,12 +77,13 @@ def env(monkeypatch):
         raise AssertionError("unexpected model call")
     monkeypatch.setattr(web_answer, "general_answer", no_web)
     monkeypatch.setattr(corroboration_client, "call", no_model)
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", no_model)
     monkeypatch.setattr(llm_utils, "call_llm", no_model)
 
 
 def precheck_says(monkeypatch, verdict):
-    monkeypatch.setattr(corroboration_client, "call", lambda *a, **k:
-                        corroboration_client.Reply(text=json.dumps({"web": verdict})))
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", lambda *a, **k:
+                        ChatTurn(text=json.dumps({"web": verdict})))
 
 
 def body(question="What did we pour on B2?", **kw):

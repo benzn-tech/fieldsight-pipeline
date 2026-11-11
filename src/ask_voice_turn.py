@@ -40,8 +40,13 @@ PREFIX = "ask_turns/"
 # took 0.81-1.16 s (n=7), so 1.2 would drop a share of them to the filler.
 # 2.0 after the owner's device test (2026-10-15): 2 of 5 restates timed out at
 # 1.52 s and 1.83 s, so the owner heard no restatement on those turns.
+# 2026-11-12: the restate call is now pinned to Groq (voice_restate.provider_pin,
+# p50 about 0.4 s), which frees time for the TTS: on the owner's first turn that
+# morning the restatement was written in 1.03 s and then dropped because its TTS took
+# the whole 1.8 s. STT (1-1.5 s) + restate + 2.5 s still lands inside the device's
+# 5 s restatement window.
 RESTATE_TIMEOUT_S = 2.0
-RESTATE_TTS_TIMEOUT_S = 1.8
+RESTATE_TTS_TIMEOUT_S = 2.5
 
 # Voice must never speak citation markers such as [1] or [1, 2].
 _CITATION = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
