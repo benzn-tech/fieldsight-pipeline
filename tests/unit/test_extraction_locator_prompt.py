@@ -168,7 +168,7 @@ def test_locator_on_adds_said_at_to_all_four_kinds(name):
     slices = _schema_kind_slices(prompt)
     for kind in KINDS:
         assert slices[kind].count('"said_at"') == 1, kind
-    assert ('"said_at": "HH:MM:SS of the line where this item was FIRST raised, or null"'
+    assert ('"said_at": "HH:MM:SS of the ONE line that states this item, or null"'
             in prompt)
     # Nothing outside the four child kinds gains the field in the schema.
     start = prompt.index("{\n  \"location_markers\"")
@@ -184,7 +184,7 @@ def test_locator_on_only_adds_the_block(name):
     assert on.count("\n8. SAID_AT.") == 1
     removed = re.sub(r',\n          "said_at": "[^"\n]*"', "", on)
     removed = removed.replace(
-        ', "said_at": "HH:MM:SS of the line where this item was FIRST raised, or null"', "")
+        ', "said_at": "HH:MM:SS of the ONE line that states this item, or null"', "")
     removed = re.sub(r"\n8\. SAID_AT\..*?(?=\n\n## Output Format)", "", removed, flags=re.S)
     assert removed == off
 
@@ -192,7 +192,19 @@ def test_locator_on_only_adds_the_block(name):
 def test_locator_on_wording():
     les.EMIT_EVIDENCE = True
     block = les._instructions_block(locator=True)
-    assert "FIRST raised" in block
+    assert "FIRST raised" not in block
+    # Re-test design 2026-11-12 C1: the stating line, not the first mention.
+    flat = " ".join(block.split())
+    assert "printed on the ONE line that states the item" in flat
+    assert "the line that says what the item says" in flat
+    assert "THE HOUR INCLUDED" in block
+    assert ("If the item is stated on more than one line, use the line that states it most "
+            "fully; if those are equal, use the earliest.") in " ".join(block.split())
+    assert ("Use null when no single line states it (it combines several lines, or is your "
+            "own conclusion).") in " ".join(block.split())
+    # Kept verbatim from the first wording.
+    assert ("`said_at` is not the `at` of a status_suggestion, which marks where a status was "
+            "reported,\n   usually later.") in block
     assert "null" in block
     sentences = re.split(r"(?<=[.:])\s+", " ".join(block.split()))
     assert any("status_suggestion" in s and "said_at" in s and "not" in s and "`at`" in s

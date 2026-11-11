@@ -47,7 +47,7 @@ def _resolve(said_at, turns=TURNS, shown=None, time_range="09:00 – 09:10", abs
 
 
 def test_constants():
-    assert loc.RULE_VERSION == "locator_v1"
+    assert loc.RULE_VERSION == "locator_v2"
     assert loc.STATUSES == ("linked", "no_locator", "unparseable", "not_shown", "no_line",
                             "ambiguous_stamp", "outside_topic")
     assert loc.LOCATOR_FIELD == "said_at"
@@ -59,8 +59,8 @@ def test_linked_exact_stamp_inside_range_has_slice1_locator_shape():
     assert {k: s[k] for k in DST_TURN_KEYS} == {
         "source_stem": "dev1_09-05-00_sidaaaa_c0001", "start_sec": 3.0, "end_sec": 7.0,
         "speaker_label": "spk_0", "quote_status": None}
-    assert s["method"] == "locator_v1"
-    assert s["rule_version"] == "locator_v1"
+    assert s["method"] == "locator_v2"
+    assert s["rule_version"] == "locator_v2"
     assert s["score"] is None
     assert s["range_checked"] is True
     assert set(s) == set(DST_TURN_KEYS) | {"status", "method", "rule_version", "score",
@@ -78,7 +78,7 @@ def test_unparseable_stamps():
                 "", 905, ["09:05:03"], "009:05:03", "09:5:03"):
         s = _resolve(bad)
         assert s["status"] == "unparseable", bad
-        assert s["method"] == s["rule_version"] == "locator_v1"
+        assert s["method"] == s["rule_version"] == "locator_v2"
         assert "source_stem" not in s
 
 
@@ -214,3 +214,89 @@ def test_strip_survives_malformed_shapes():
     assert loc.strip(None) == 0
     assert loc.strip("nope") == 0
     assert loc.strip([{"findings": "string"}, 3, None]) == 0
+
+
+# ---------------------------------------------------------------------------------------
+# locator_v2: the same-second tie-break (re-test design 2026-11-12, C2)
+# ---------------------------------------------------------------------------------------
+
+def _frag(text, fname, start, end, at, speaker):
+    t = _turn(text, fname, start, at, speaker=speaker)
+    t["end_sec"] = end
+    return t
+
+
+def _same_second(first, second, shown=None, time_range="09:00 – 09:10"):
+    turns = TURNS + [first, second]
+    return _resolve("09:07:30", turns=turns,
+                    shown=set(range(len(turns))) if shown is None else shown,
+                    time_range=time_range)
+
+
+def test_tie_break_links_the_one_turn_of_at_least_half_a_second():
+    frag = _frag("synthetic frag", F2, 150.0, 150.2, _dt(9, 7, 30), "spk_1")
+    full = _frag("synthetic full line", F2, 150.4, 156.0, _dt(9, 7, 30), "spk_0")
+    for a, b in ((frag, full), (full, frag)):          # order does not matter
+        s = _same_second(a, b)
+        assert s["status"] == "linked"
+        assert (s["start_sec"], s["end_sec"], s["speaker_label"]) == (150.4, 156.0, "spk_0")
+        assert s["method"] == s["rule_version"] == "locator_v2"
+
+
+def test_tie_break_boundary_is_inclusive_at_half_a_second():
+    frag = _frag("synthetic frag", F2, 150.0, 150.49, _dt(9, 7, 30), "spk_1")
+    exact = _frag("synthetic exact", F2, 150.5, 151.0, _dt(9, 7, 30), "spk_0")
+    s = _same_second(frag, exact)
+    assert s["status"] == "linked" and s["start_sec"] == 150.5
+
+
+def test_tie_break_two_long_turns_stay_ambiguous():
+    a = _frag("synthetic one", F2, 150.0, 151.0, _dt(9, 7, 30), "spk_1")
+    b = _frag("synthetic two", F1, 450.3, 452.0, _dt(9, 7, 30), "spk_0")   # two source files
+    s = _same_second(a, b)
+    assert s["status"] == "ambiguous_stamp" and "source_stem" not in s
+
+
+def test_tie_break_no_long_turn_stays_ambiguous():
+    a = _frag("synthetic one", F2, 150.0, 150.1, _dt(9, 7, 30), "spk_1")
+    b = _frag("synthetic two", F2, 150.2, 150.4, _dt(9, 7, 30), "spk_0")
+    assert _same_second(a, b)["status"] == "ambiguous_stamp"
+
+
+def test_tie_break_missing_or_non_numeric_times_count_as_zero():
+    full = _frag("synthetic full", F2, 150.4, 156.0, _dt(9, 7, 30), "spk_0")
+    for start, end in ((None, 156.0), (150.0, None), ("150.0", "156.0"), (True, 9.0),
+                       (150.0, float("nan")), (156.0, 150.0)):
+        other = _frag("synthetic odd", F2, 150.0, 151.0, _dt(9, 7, 30), "spk_1")
+        other["start_sec"], other["end_sec"] = start, end
+        s = _same_second(other, full)
+        assert s["status"] == "linked" and s["start_sec"] == 150.4, (start, end)
+    bare = _frag("synthetic bare", F2, 150.0, 151.0, _dt(9, 7, 30), "spk_1")
+    del bare["start_sec"], bare["end_sec"]
+    assert _same_second(bare, full)["start_sec"] == 150.4
+
+
+def test_tie_break_counts_shown_turns_only():
+    # Three turns share the second; the long one is elided, so the two shown are both short.
+    short_a = _frag("synthetic a", F2, 150.0, 150.1, _dt(9, 7, 30), "spk_1")
+    short_b = _frag("synthetic b", F2, 150.2, 150.3, _dt(9, 7, 30), "spk_2")
+    long_c = _frag("synthetic c", F2, 150.4, 156.0, _dt(9, 7, 30), "spk_0")
+    turns = TURNS + [short_a, short_b, long_c]
+    shown = set(range(len(TURNS) + 2))
+    assert _resolve("09:07:30", turns=turns, shown=shown)["status"] == "ambiguous_stamp"
+
+
+def test_tie_break_winner_still_faces_the_topic_range():
+    frag = _frag("synthetic frag", F2, 150.0, 150.2, _dt(9, 7, 30), "spk_1")
+    full = _frag("synthetic full", F2, 150.4, 156.0, _dt(9, 7, 30), "spk_0")
+    s = _same_second(frag, full, time_range="09:00 – 09:02")
+    assert s["status"] == "outside_topic" and s["range_checked"] is True
+
+
+def test_tie_break_floor_tolerates_float_noise():
+    # 0.57 - 0.07 is 0.49999999999999994 in binary floating point: still half a second.
+    assert 0.57 - 0.07 < 0.5
+    frag = _frag("synthetic frag", F2, 150.0, 150.1, _dt(9, 7, 30), "spk_1")
+    turn = _frag("synthetic line", F2, 0.07, 0.57, _dt(9, 7, 30), "spk_0")
+    s = _same_second(frag, turn)
+    assert s["status"] == "linked" and s["start_sec"] == 0.07

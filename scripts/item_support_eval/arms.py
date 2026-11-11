@@ -32,6 +32,27 @@ extractor's `status_suggestions` counts; main-stage runs record `status_suggesti
 (null on a path that reports none).
 
 Never logs item or transcript text: stdout carries counts only.
+
+Re-test (design 2026-11-12, C3/C4):
+
+    python -m scripts.item_support_eval.arms count --stage fit --wording w1 --arms B1
+    python -m scripts.item_support_eval.arms run --stage fit --wording w1 --arms B1 \
+        --emit-evidence true --confirm-count 30
+
+`--wording w1|w2` puts the runs under `runs/locator_v2/<wording>/` (same layout inside);
+without it everything is the first test's `runs/locator/`, unchanged. `--arms` (a comma list
+of A1, A2, B1, B2; default all four) restricts the jobs, and `count` and the confirm gate count
+the same subset. A re-test `run` also reads the deployed function's configuration before
+the extractor is imported and:
+  - refuses when TRANSCRIPT_TEXT_LIMIT, any EVIDENCE_* key or STATUS_EVIDENCE_FLOOR_TOKENS
+    differs from this process's environment (set-vs-unset counts as a difference);
+  - refuses when the function has no LLM_REASONING_EFFORT, unless --allow-default-effort;
+  - after `load_deployed_llm_env`, mirrors MIRRORED_LLM_KEYS (a key set but empty stays set
+    and empty; a key missing on the function is removed here) and reloads `llm_utils`;
+  - refuses when any B run already in the namespace records another B prompt sha;
+  - records in every run file `wording`, `reasoning_effort`, `fallback_models`,
+    `primary_model` (what `llm_utils` will call, read back after the reload) and
+    `deployed_env`, the copied key/value map without API keys (null = unset on the function).
 """
 from __future__ import annotations
 
@@ -39,6 +60,10 @@ import argparse
 import contextlib
 import copy
 import hashlib
+import importlib
+import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -56,6 +81,23 @@ REPS = (1, 2)
 EXTRACT_FUNCTION = "fieldsight-test-extract-session"
 CALLER = "item_locator_eval"
 _ERROR_CHARS = 500
+ARM_KEYS = ("A1", "A2", "B1", "B2")
+
+# Copied from the deployed function after `load_deployed_llm_env` (design 2026-11-12 C3):
+# the first test ran at the provider's default effort because none of these was copied.
+MIRRORED_LLM_KEYS = ("LLM_REASONING_EFFORT", "LLM_FALLBACK_MODELS",
+                     "LLM_REASONING_HEADROOM", "LLM_ANSWER_TOKEN_CEILING", "LLM_HTTP_TIMEOUT",
+                     "LLM_CHAIN_BUDGET_SECONDS", "QWEN_ENABLE_THINKING")
+# Read by lambda_extract_session at import: env key -> (module constant, parser, default).
+EXTRACTOR_ENV = {
+    "TRANSCRIPT_TEXT_LIMIT": ("TRANSCRIPT_TEXT_LIMIT", int, "300000"),
+    "EVIDENCE_WINDOW_SEC": ("EVIDENCE_WINDOW_SEC", float, "60"),
+    "EVIDENCE_FLOOR_TOKENS": ("EVIDENCE_FLOOR_TOKENS", int, "5"),
+    "EVIDENCE_FUZZY_THRESHOLD": ("EVIDENCE_FUZZY", float, "0.80"),
+    "STATUS_EVIDENCE_FLOOR_TOKENS": ("STATUS_EVIDENCE_FLOOR_TOKENS", int, "5"),
+}
+_EXTRACTOR_PREFIX = "EVIDENCE_"
+EFFORT_KEY = "LLM_REASONING_EFFORT"
 
 
 def _les():
@@ -91,17 +133,32 @@ def stage_digest(stage, data_dir=store.DATA_DIR):
     return side_digest(data_dir) if stage == "side" else store.manifest_digest(data_dir)
 
 
-def jobs(sessions):
+def parse_arms(value):
+    """`--arms` (comma list of A1, A2, B1, B2) -> the keys in ARM_KEYS order; None -> all."""
+    if value is None:
+        return ARM_KEYS
+    keys = {x.strip() for x in str(value).split(",") if x.strip()}
+    bad = sorted(keys - set(ARM_KEYS))
+    if bad or not keys:
+        raise SystemExit(f"Refusing: --arms takes a comma list of {', '.join(ARM_KEYS)} "
+                         f"(got {value!r}).")
+    return tuple(k for k in ARM_KEYS if k in keys)
+
+
+def jobs(sessions, arms=ARM_KEYS):
     """(session, arm, rep) in run order: per session A1, B1, A2, B2 (interleaved, so drift
-    over the hours a run takes falls on both arms alike)."""
-    return [(s, arm, rep) for s in sessions for rep in REPS for arm in ARMS]
+    over the hours a run takes falls on both arms alike), restricted to `arms`."""
+    return [(s, arm, rep) for s in sessions for rep in REPS for arm in ARMS
+            if f"{arm}{rep}" in arms]
 
 
-def plan_calls(stage, *, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR) -> int:
+def plan_calls(stage, *, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR, arms=ARM_KEYS,
+               wording=None) -> int:
     """The exact number of model calls `run --stage <stage>` would make now."""
     side = stage == "side"
-    return sum(1 for s, arm, rep in jobs(stage_sessions(stage, data_dir))
-               if not store.locator_run_path(arm, rep, s["ref"], side=side, runs_dir=runs_dir).exists())
+    return sum(1 for s, arm, rep in jobs(stage_sessions(stage, data_dir), arms)
+               if not store.locator_run_path(arm, rep, s["ref"], side=side, runs_dir=runs_dir,
+                                             wording=wording).exists())
 
 
 def n_segments(session):
@@ -147,9 +204,19 @@ def continuity_block(session, side):
 
 
 def _raw_said_at(topics):
-    return [{"item": f"{ti}:{ln}:{ci}", "said_at": child.get(item_locator.LOCATOR_FIELD)}
-            for ti, ln, ci, child, _t in store.iter_items(topics)
-            if item_locator.LOCATOR_FIELD in child]
+    """The model's raw `said_at` per child, before anything strips it. A child that also
+    carries a status_suggestion records its raw `at` as `status_at` (a main stage strips the
+    suggestion before the run file is written; the re-test reports how often the two match)."""
+    out = []
+    for ti, ln, ci, child, _t in store.iter_items(topics):
+        if item_locator.LOCATOR_FIELD not in child:
+            continue
+        row = {"item": f"{ti}:{ln}:{ci}", "said_at": child.get(item_locator.LOCATOR_FIELD)}
+        sugg = child.get("status_suggestion")
+        if isinstance(sugg, dict) and "at" in sugg:
+            row["status_at"] = sugg.get("at")
+        out.append(row)
+    return out
 
 
 def _suggestions(topics, session):
@@ -175,7 +242,7 @@ def _suggestions(topics, session):
         return {"error": True, "filter_error": type(e).__name__}
 
 
-def run_one(session, arm, rep, *, call, stage, digest, settings):
+def run_one(session, arm, rep, *, call, stage, digest, settings, extra=None):
     les = _les()
     side = stage == "side"
     locator = arm == "B"
@@ -186,6 +253,7 @@ def run_one(session, arm, rep, *, call, stage, digest, settings):
     shown = sorted(stats.get("shown") or ())
     rec = {"ref": session["ref"], "stage": stage, "arm": arm, "rep": rep,
            "prompt_sha": prompt_sha(locator), "manifest_digest": digest, **settings,
+           **(extra or {}),
            "n_segments": n_seg, "max_tokens": les.max_tokens_for(n_seg),
            "enable_thinking": True, "shown": shown, "topics": None, "usage": None,
            "model": None, "latency_s": None, "error": None}
@@ -238,17 +306,20 @@ def run_one(session, arm, rep, *, call, stage, digest, settings):
 
 
 def run_arm(sessions, arm, rep, *, dry_run, call=None, stage="fit",
-            runs_dir=store.RUNS_DIR, manifest_digest=None, emit_evidence=False):
+            runs_dir=store.RUNS_DIR, manifest_digest=None, emit_evidence=False, wording=None,
+            extra=None):
     """One arm/rep over `sessions`. dry_run builds each prompt and returns its sha and size,
     with no call and no write. Otherwise each missing run file is made (one call each); an
     existing one is skipped; an error is recorded in its run file and the run goes on.
+    `extra` (the re-test's deployed-config record) is merged into every run file.
     Returns one summary row per session (no text)."""
     les = _les()
     side = stage == "side"
     out = []
     with prompt_settings(emit_evidence) as settings:
         for s in sessions:
-            path = store.locator_run_path(arm, rep, s["ref"], side=side, runs_dir=runs_dir)
+            path = store.locator_run_path(arm, rep, s["ref"], side=side, runs_dir=runs_dir,
+                                          wording=wording)
             if dry_run:
                 prompt, _stats = les.build_extraction_prompt(
                     s["folder"], s["date"], s["base"], s["turns"], n_segments(s),
@@ -262,32 +333,172 @@ def run_arm(sessions, arm, rep, *, dry_run, call=None, stage="fit",
                 continue
             try:
                 rec = run_one(s, arm, rep, call=call, stage=stage, digest=manifest_digest,
-                              settings=settings)
+                              settings=settings, extra=extra)
             except Exception as e:
                 # Type name only: a message could carry item or transcript text.
                 rec = {"ref": s["ref"], "stage": stage, "arm": arm, "rep": rep,
                        "prompt_sha": prompt_sha(arm == "B"), "manifest_digest": manifest_digest,
-                       **settings, "topics": None, "error": f"exception: {type(e).__name__}"}
+                       **settings, **(extra or {}), "topics": None,
+                       "error": f"exception: {type(e).__name__}"}
             store.write_json(path, rec)
             out.append({"ref": s["ref"], "arm": arm, "rep": rep, "error": bool(rec["error"])})
     return out
 
 
 def run_stage(stage, *, call, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR,
-              emit_evidence, digest=None):
+              emit_evidence, digest=None, arms=ARM_KEYS, wording=None, extra=None):
     sessions = stage_sessions(stage, data_dir)
     digest = digest or stage_digest(stage, data_dir)
     rows = []
-    for s, arm, rep in jobs(sessions):
+    for s, arm, rep in jobs(sessions, arms):
         rows.extend(run_arm([s], arm, rep, dry_run=False, call=call, stage=stage,
                             runs_dir=runs_dir, manifest_digest=digest,
-                            emit_evidence=emit_evidence))
+                            emit_evidence=emit_evidence, wording=wording, extra=extra))
     return rows
 
 
-def _default_load_env(function_name, *, profile, region):
+# ---------------------------------------------------------------------------------------
+# The deployed configuration (re-test design 2026-11-12, C3)
+# ---------------------------------------------------------------------------------------
+
+def _is_secret(key):
+    k = key.upper()
+    return "API_KEY" in k or k.endswith("_KEY") or "SECRET" in k or "PASSWORD" in k
+
+
+def extractor_env_mismatches(deployed, environ=None, module=None):
+    """[{"key", "deployed", "local"}] for every extractor setting that differs.
+
+    Compared as strings against `environ` (None = unset on either side; both unset agree):
+    the EXTRACTOR_ENV keys and every EVIDENCE_* key either side sets. When `module` (an
+    already imported lambda_extract_session) is given, its import-time constants are also
+    compared with the deployed value parsed the extractor's way (`local` is then the
+    constant), since an imported module no longer reads the environment."""
+    environ = os.environ if environ is None else environ
+    keys = set(EXTRACTOR_ENV) | {k for k in set(deployed) | set(environ)
+                                 if k.startswith(_EXTRACTOR_PREFIX)}
+    out = []
+    for key in sorted(keys):
+        if deployed.get(key) != environ.get(key):
+            out.append({"key": key, "deployed": deployed.get(key), "local": environ.get(key)})
+            continue
+        if module is not None and key in EXTRACTOR_ENV:
+            attr, parse, default = EXTRACTOR_ENV[key]
+            try:
+                want = parse(deployed.get(key, default))
+            except (TypeError, ValueError):
+                want = None
+            if want is None or getattr(module, attr, None) != want:
+                out.append({"key": key, "deployed": deployed.get(key),
+                            "local": repr(getattr(module, attr, None))})
+    return out
+
+
+def mirror_deployed_keys(deployed, environ=None):
+    """Copy MIRRORED_LLM_KEYS from the deployed Variables into `environ`: present (even
+    empty) -> set to that string; missing -> removed. Returns {key: value or None}. The
+    caller reloads llm_utils (it reads most of these at import)."""
+    environ = os.environ if environ is None else environ
+    copied = {}
+    for key in MIRRORED_LLM_KEYS:
+        if key in deployed and deployed[key] is not None:
+            environ[key] = str(deployed[key])
+            copied[key] = str(deployed[key])
+        else:
+            environ.pop(key, None)
+            copied[key] = None
+    return copied
+
+
+def deployed_record(deployed, copied_names, mirrored, wording):
+    """What every re-test run file records about the configuration calls run under. The
+    effort, fallbacks and primary model are read back from the reloaded `llm_utils`, never
+    from os.environ, so they are the values calls use. No API key value is ever kept."""
+    import llm_utils
+    env = {k: deployed.get(k) for k in copied_names or () if not _is_secret(k)}
+    env.update({k: v for k, v in mirrored.items() if not _is_secret(k)})
+    return {"wording": wording,
+            "reasoning_effort": llm_utils.LLM_REASONING_EFFORT or None,
+            "fallback_models": list(llm_utils.fallback_models()),
+            "primary_model": llm_utils.active_model(enable_thinking=True),
+            "deployed_env": dict(sorted(env.items()))}
+
+
+class _Replay:
+    """A `subprocess.run` stand-in that returns one already-read configuration, so
+    `load_deployed_llm_env` copies from the same snapshot this module compared."""
+
+    def __init__(self, config):
+        self.stdout = json.dumps(config).encode("utf-8")
+
+    def __call__(self, *a, **kw):
+        return subprocess.CompletedProcess(a[0] if a else [], 0, stdout=self.stdout,
+                                           stderr=b"")
+
+
+def _default_read_env(function_name, *, profile, region, run=subprocess.run):
+    """The deployed function's Environment.Variables via the aws CLI (read only). Never
+    called by tests."""
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
+               AWS_CLI_FILE_ENCODING="UTF-8")
+    result = run(["aws", "lambda", "get-function-configuration", "--function-name",
+                  function_name, "--profile", profile, "--region", region, "--output", "json"],
+                 capture_output=True, env=env)
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace") \
+            if isinstance(result.stderr, bytes) else str(result.stderr)
+        raise SystemExit(f"Refusing: could not read {function_name}'s configuration: "
+                         f"{err.strip()[:2000]}")
+    out = result.stdout.decode("utf-8") if isinstance(result.stdout, bytes) else result.stdout
+    return dict((json.loads(out).get("Environment") or {}).get("Variables") or {})
+
+
+def _default_load_env(function_name, *, profile, region, deployed=None):
     from scripts.jev_eval.baseline import load_deployed_llm_env
-    return load_deployed_llm_env(function_name, profile=profile, region=region)
+    if deployed is None:
+        return load_deployed_llm_env(function_name, profile=profile, region=region)
+    return load_deployed_llm_env(function_name, profile=profile, region=region,
+                                 run=_Replay({"Environment": {"Variables": deployed}}))
+
+
+def require_b_prompt_unchanged(runs_dir, wording, emit_evidence):
+    """Re-test: refuse when any B run already in the wording's namespace (main or side)
+    records another prompt sha than the B prompt this run would send. A changed wording is
+    a new namespace (w2), never a mix inside one."""
+    with prompt_settings(emit_evidence):
+        current = prompt_sha(True)
+    base = store.locator_runs_base(runs_dir, wording)
+    for p in sorted(base.glob("**/B/*/*.json")):
+        recorded = store.read_json(p).get("prompt_sha")
+        if recorded != current:
+            _refuse(f"a B run under locator_v2/{wording}/ ({p.relative_to(base).as_posix()}) "
+                    f"records prompt_sha {recorded}; this run would send {current}. Use "
+                    f"another wording namespace.")
+
+
+def _refuse(msg):
+    print(f"Refusing: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def prepare_deployed_config(a, *, read_env, load_env):
+    """The re-test's config steps, in order, before the extractor is imported here. Returns
+    the record every run file carries. Refusals exit non-zero before any model call."""
+    deployed = read_env(a.function, profile=a.profile, region=a.region)
+    mism = extractor_env_mismatches(deployed, module=sys.modules.get("lambda_extract_session"))
+    if mism:
+        lines = "; ".join(f"{m['key']}: deployed={m['deployed']!r} local={m['local']!r}"
+                          for m in mism)
+        _refuse(f"the extractor settings differ from {a.function}'s ({lines}). Export the "
+                f"deployed values (unset what it does not set) and run again.")
+    if not str(deployed.get(EFFORT_KEY) or "").strip() and not a.allow_default_effort:
+        _refuse(f"{a.function} has no {EFFORT_KEY}; the run would use the provider's default "
+                f"effort. Pass --allow-default-effort to run anyway (it is recorded).")
+    copied = load_env(a.function, profile=a.profile, region=a.region, deployed=deployed)
+    mirrored = mirror_deployed_keys(deployed)
+    import llm_utils
+    importlib.reload(llm_utils)
+    return deployed_record(deployed, copied, mirrored, a.wording)
 
 
 def _default_call(*a, **kw):
@@ -295,7 +506,7 @@ def _default_call(*a, **kw):
     return llm_utils.call_llm(*a, **kw)
 
 
-def main(argv=None, *, call=None, load_env=None):
+def main(argv=None, *, call=None, load_env=None, read_env=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -304,7 +515,15 @@ def main(argv=None, *, call=None, load_env=None):
         sp.add_argument("--stage", required=True, choices=STAGES)
         sp.add_argument("--data", default=str(store.DATA_DIR))
         sp.add_argument("--runs", default=str(store.RUNS_DIR))
+        sp.add_argument("--wording", default=None, choices=store.WORDINGS,
+                        help="Re-test namespace runs/locator_v2/<wording>/ (design "
+                             "2026-11-12). Omitted: the first test's runs/locator/.")
+        sp.add_argument("--arms", default=None,
+                        help="Comma list of A1,A2,B1,B2 (default: all four).")
     r = sub.choices["run"]
+    r.add_argument("--allow-default-effort", action="store_true",
+                   help="Re-test only: run even when the deployed function sets no "
+                        "LLM_REASONING_EFFORT.")
     r.add_argument("--confirm-count", type=int, default=None)
     r.add_argument("--emit-evidence", choices=("true", "false"), default=None,
                    help="Required: the deployed TEST extract function's EMIT_EVIDENCE.")
@@ -315,11 +534,14 @@ def main(argv=None, *, call=None, load_env=None):
     r.add_argument("--region", default="ap-southeast-2")
     a = p.parse_args(argv)
 
-    total = len(stage_sessions(a.stage, a.data)) * len(ARMS) * len(REPS)
-    calls = plan_calls(a.stage, data_dir=a.data, runs_dir=a.runs)
+    sel = parse_arms(a.arms)
+    total = len(stage_sessions(a.stage, a.data)) * len(sel)
+    calls = plan_calls(a.stage, data_dir=a.data, runs_dir=a.runs, arms=sel, wording=a.wording)
     if a.cmd == "count":
         out = {"stage": a.stage, "calls": calls, "total": total,
                "skipped_existing": total - calls}
+        if a.wording is not None or a.arms is not None:
+            out.update({"wording": a.wording, "arms": list(sel)})
         print(store.dumps(out))
         return out
 
@@ -330,9 +552,9 @@ def main(argv=None, *, call=None, load_env=None):
     emit = a.emit_evidence == "true"
     if a.dry_run:
         rows = []
-        for s, arm, rep in jobs(stage_sessions(a.stage, a.data)):
+        for s, arm, rep in jobs(stage_sessions(a.stage, a.data), sel):
             rows.extend(run_arm([s], arm, rep, dry_run=True, stage=a.stage,
-                                runs_dir=a.runs, emit_evidence=emit))
+                                runs_dir=a.runs, emit_evidence=emit, wording=a.wording))
         out = {"stage": a.stage, "dry_run": True, "prompts": len(rows),
                "prompt_sha": {arm: sorted({x["prompt_sha"] for x in rows if x["arm"] == arm})
                               for arm in ARMS}}
@@ -344,13 +566,26 @@ def main(argv=None, *, call=None, load_env=None):
         raise SystemExit(2)
     store.require_eval_dir(a.runs)
     digest = stage_digest(a.stage, a.data)   # a missing manifest refuses before the config read
-    copied = (load_env or _default_load_env)(a.function, profile=a.profile, region=a.region)
+    if a.wording is None:
+        # The first test's path, unchanged.
+        copied = (load_env or _default_load_env)(a.function, profile=a.profile,
+                                                 region=a.region)
+        extra = None
+    else:
+        extra = prepare_deployed_config(a, read_env=read_env or _default_read_env,
+                                        load_env=load_env or _default_load_env)
+        copied = list(extra["deployed_env"])
+        require_b_prompt_unchanged(a.runs, a.wording, emit)
     rows = run_stage(a.stage, call=call or _default_call, data_dir=a.data, runs_dir=a.runs,
-                     emit_evidence=emit, digest=digest)
+                     emit_evidence=emit, digest=digest, arms=sel, wording=a.wording,
+                     extra=extra)
     out = {"stage": a.stage, "calls": sum(1 for x in rows if not x.get("skipped")),
            "errors": sum(1 for x in rows if x.get("error")),
            "skipped_existing": sum(1 for x in rows if x.get("skipped")),
            "env_keys": sorted(copied or [])}
+    if extra is not None:
+        out.update({"wording": a.wording, "arms": list(sel),
+                    "reasoning_effort": extra["reasoning_effort"]})
     print(store.dumps(out))
     return out
 

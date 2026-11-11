@@ -61,11 +61,11 @@ def _session(ref, split, n_turns=40):
 
 def _support(status, turn=None, turns=None, range_checked=True):
     if status != "linked":
-        return {"status": status, "method": "locator_v1", "rule_version": "locator_v1"}
+        return {"status": status, "method": "locator_v2", "rule_version": "locator_v2"}
     t = turns[turn]
     return {"status": "linked", "source_stem": _stem(t["source_filename"]),
             "start_sec": t["start_sec"], "end_sec": t["end_sec"], "speaker_label": t["speaker"],
-            "quote_status": None, "method": "locator_v1", "rule_version": "locator_v1",
+            "quote_status": None, "method": "locator_v2", "rule_version": "locator_v2",
             "score": None, "range_checked": range_checked}
 
 

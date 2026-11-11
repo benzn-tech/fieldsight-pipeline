@@ -16,6 +16,12 @@ labels; writes runs/locator/summary.<stage>.json (gitignored, counts only):
 
     python -m scripts.item_support_eval.score locator --stage fit    # the fit gate
     python -m scripts.item_support_eval.score locator --stage all    # bars 1-8, pooled + halves
+
+Locator re-test (design 2026-11-12, C5), over runs/locator_v2/<wording>/ and
+labels/v2/<wording>/; writes runs/locator_v2/<wording>/summary.<stage>.json:
+
+    python -m scripts.item_support_eval.score locator --stage tune --wording w1     # fit, B1
+    python -m scripts.item_support_eval.score locator --stage heldout --wording w1
 """
 from __future__ import annotations
 
@@ -496,15 +502,20 @@ def run_items(rec):
     topics = rec.get("topics") if isinstance(rec, dict) else None
     if not isinstance(topics, list):
         return []
-    raw = {r.get("item"): r.get("said_at") for r in rec.get("_raw_said_at") or []
-           if isinstance(r, dict)}
+    raw_rows = {r.get("item"): r for r in rec.get("_raw_said_at") or [] if isinstance(r, dict)}
     out = []
     for ti, ln, ci, child, topic in store.iter_items(topics):
         sup = child.get("support")
+        raw = raw_rows.get(f"{ti}:{ln}:{ci}") or {}
+        # The child's own status_suggestion `at`: recorded raw before a main stage strips the
+        # suggestion (re-test runs), else read off a suggestion that survived (side set).
+        sugg = child.get("status_suggestion")
+        status_at = raw.get("status_at") if "status_at" in raw else \
+            (sugg.get("at") if isinstance(sugg, dict) else None)
         out.append({"item_ref": store.item_ref(rec["ref"], ti, ln, ci), "kind": ln,
                     "text": store.item_text(ln, child),
                     "support": sup if isinstance(sup, dict) else None,
-                    "said_at": raw.get(f"{ti}:{ln}:{ci}"), "topic": topic})
+                    "said_at": raw.get("said_at"), "status_at": status_at, "topic": topic})
     return out
 
 
@@ -940,16 +951,245 @@ def score_locator(sessions, runs, *, gold, owner_gold=None, owner_todo=None,
 
 
 # ---------------------------------------------------------------------------------------
+# Locator re-test (design 2026-11-12, C5): runs/locator_v2/<wording>/, tune and held-out
+# ---------------------------------------------------------------------------------------
+#
+# Eligibility reads the deployed primary each re-test run file records (`primary_model`,
+# read back from llm_utils at run time), never a mode over A1 runs: the tune step has no A
+# runs at all. The tune decision is section 4 step 2's rule.
+
+CONTINUE, ASK_OWNER, STOP, PENDING_LABELS = "continue", "ask_owner", "stop", "pending_labels"
+TUNE_CONTINUE_MAX_WRONG = 5    # continue: wrong <= 5 and coverage >= 60%
+TUNE_STOP_ABOVE_WRONG = 9      # stop: wrong > 9 or coverage < 60%; ask_owner in between
+B1_ONLY = ("B1",)
+A_KEYS = ("A1", "A2")
+_FIRST_TEST_EFFORT = ("not recorded: the first test copied no LLM_REASONING_EFFORT and ran "
+                      "at the provider default (design 2026-11-12 section 1)")
+
+
+def session_status_recorded(four, keys=RUN_KEYS):
+    """eligible, or why not, for re-test runs: missing, errored, model_unknown (the run
+    reports no answering model), primary_unknown (the run file records no deployed primary),
+    fallback (answered by a model other than the deployed primary it records)."""
+    recs = [four.get(k) for k in keys]
+    if any(r is None for r in recs):
+        return "missing"
+    if any(r.get("error") or not isinstance(r.get("topics"), list) for r in recs):
+        return "errored"
+    if any(r.get("model") is None for r in recs):
+        return "model_unknown"
+    if any(r.get("primary_model") is None for r in recs):
+        return "primary_unknown"
+    if any(r.get("model") != r.get("primary_model") for r in recs):
+        return "fallback"
+    return "eligible"
+
+
+def _recorded_counts(sessions, status, runs, keys):
+    c = Counter(status[s["ref"]] for s in sessions)
+    recs = [runs.get(s["ref"], {}).get(k) for s in sessions for k in keys]
+    recs = [r for r in recs if isinstance(r, dict)]
+    return {"scored": len(sessions), "eligible": c.get("eligible", 0),
+            "fallback_excluded": c.get("fallback", 0),
+            "model_unknown_excluded": c.get("model_unknown", 0),
+            "primary_unknown_excluded": c.get("primary_unknown", 0),
+            "errored_excluded": c.get("errored", 0), "missing_excluded": c.get("missing", 0),
+            "primary_models": sorted({str(r.get("primary_model")) for r in recs}),
+            "reasoning_effort": sorted({str(r.get("reasoning_effort")) for r in recs})}
+
+
+def tune_decision(wrong, coverage, missing_gold=0):
+    """Section 4 step 2. A link without gold makes the count unknown: pending_labels, never
+    a decision on partial gold. No items at all: insufficient."""
+    if missing_gold:
+        return PENDING_LABELS
+    if coverage is None:
+        return INSUFFICIENT
+    if wrong > TUNE_STOP_ABOVE_WRONG or coverage < COVERAGE_LINE - _EPS:
+        return STOP
+    return CONTINUE if wrong <= TUNE_CONTINUE_MAX_WRONG else ASK_OWNER
+
+
+def status_at_diagnostic(rows):
+    """Reported only: links whose `said_at` equals the child's own status_suggestion `at`
+    (both parsed as stamps). rows: B1 item rows (`run_items`)."""
+    linked = [r for r in rows if item_status(r) == "linked"]
+    with_at = [r for r in linked
+               if item_locator._parse_stamp(str(r.get("status_at"))) is not None]
+    equal = sum(1 for r in with_at
+                if item_locator._parse_stamp(str(r.get("said_at"))) is not None
+                and item_locator._parse_stamp(str(r["said_at"]))
+                == item_locator._parse_stamp(str(r["status_at"])))
+    return {"links": len(linked), "with_status_at": len(with_at), "equal": equal,
+            "share_of_links": equal / len(linked) if linked else None,
+            "share_of_with_status_at": equal / len(with_at) if with_at else None,
+            "verdict": REPORTED}
+
+
+def _link_rows(b1_rows, gold):
+    """(bar-3 rows with gold, missing-gold count) over (session, item row) pairs."""
+    rows, missing = [], 0
+    for s, r in b1_rows:
+        if item_status(r) != "linked":
+            continue
+        g = gold.get(r["item_ref"])
+        if g is None:
+            missing += 1
+            continue
+        rows.append({"correct": locator_link_correct(linked_turn(r["support"], s["turns"]), g)})
+    return rows, missing
+
+
+def admission_early(sessions, a_runs, b_runs, b_status):
+    """Reported only, 0 calls: the first test's fit A1/A2 (A sha unchanged) against the
+    re-test's B1. Sessions: B1 eligible here and A1/A2 both eligible in the first test (its
+    own fallback rule: the mode over its A1 runs). Shares pooled as in bar 1; the item delta
+    is B1's mean items per session against the mean of A1 and A2."""
+    primary = primary_model(a_runs)
+    used, matched_ab, denom_ab, matched_aa, denom_aa = [], 0, 0.0, 0, 0.0
+    n_a, n_b = 0, 0
+    for s in sessions:
+        a = a_runs.get(s["ref"]) or {}
+        recs = [a.get(k) for k in A_KEYS]
+        if b_status.get(s["ref"]) != "eligible" or any(
+                r is None or r.get("error") or not isinstance(r.get("topics"), list)
+                or (primary is not None and r.get("model") != primary) for r in recs):
+            continue
+        a1, a2 = (run_items(r) for r in recs)
+        b1 = run_items(b_runs[s["ref"]]["B1"])
+        used.append(s["ref"])
+        matched_ab += len(match_items(a1, b1))
+        denom_ab += (len(a1) + len(b1)) / 2
+        matched_aa += len(match_items(a1, a2))
+        denom_aa += (len(a1) + len(a2)) / 2
+        n_a += len(a1) + len(a2)
+        n_b += len(b1)
+    k = len(used)
+    mean_a = n_a / (2 * k) if k else None
+    mean_b = n_b / k if k else None
+    b_effort = sorted({str((b_runs[r]["B1"]).get("reasoning_effort")) for r in used})
+    a_effort = sorted({str(rec.get("reasoning_effort")) for r in used
+                       for rec in (a_runs[r]["A1"], a_runs[r]["A2"])
+                       if rec.get("reasoning_effort") is not None})
+    return {"sessions": k,
+            "share": {"A1_B1": matched_ab / denom_ab if denom_ab else None,
+                      "A1_A2_first_test": matched_aa / denom_aa if denom_aa else None},
+            "matched": {"A1_B1": matched_ab, "A1_A2_first_test": matched_aa},
+            "items_per_session": {"A": mean_a, "B1": mean_b},
+            "item_delta": (mean_b - mean_a) / mean_a if mean_a else None,
+            "a_primary_model": primary,
+            "effort": {"A": a_effort or _FIRST_TEST_EFFORT, "B1": b_effort,
+                       "note": "A and B ran at different reasoning effort; the share and "
+                               "delta mix the wording change with the effort change"},
+            "verdict": REPORTED}
+
+
+def score_locator_tune(sessions, runs, *, gold, flag_decisions=None, a_runs=None):
+    """`score locator --stage tune`: the fit half, B1 only. sessions: fit sessions; runs:
+    {ref: {"B1": rec}} from the wording's namespace; gold: the blind agent's answers;
+    a_runs: the first test's {ref: {"A1", "A2"}} for `admission_early` (None: not reported).
+    Bar 4 reads every non-errored B1 link, as `_bars` does (more links can only add flags)."""
+    decisions = flag_decisions or {}
+    status = {s["ref"]: session_status_recorded(runs.get(s["ref"]) or {}, B1_ONLY)
+              for s in sessions}
+    elig = [s for s in sessions if status[s["ref"]] == "eligible"]
+    b1_rows = [(s, row) for s in elig for row in run_items(runs[s["ref"]]["B1"])]
+    statuses = Counter(item_status(r) for _s, r in b1_rows)
+    link_rows, missing = _link_rows(b1_rows, gold)
+    b3 = score_link_precision(link_rows, missing)
+    b3["linked"] = len(link_rows) + missing
+    b4 = score_twins([{"flag_id": f["flag_id"], "confirmed": decisions.get(f["flag_id"])}
+                      for f in locator_flags(sessions, runs)])
+    cov = score_coverage(len(b1_rows), statuses.get("linked", 0))
+    decision = tune_decision(b3["wrong"], cov["coverage"], missing)
+    return {"stage": "tune",
+            "decision": decision,
+            "decision_rule": {"continue": f"wrong <= {TUNE_CONTINUE_MAX_WRONG} and coverage "
+                                          f">= {COVERAGE_LINE}",
+                              "ask_owner": f"wrong {TUNE_CONTINUE_MAX_WRONG + 1}-"
+                                           f"{TUNE_STOP_ABOVE_WRONG} and coverage >= "
+                                           f"{COVERAGE_LINE}",
+                              "stop": f"wrong > {TUNE_STOP_ABOVE_WRONG} or coverage < "
+                                      f"{COVERAGE_LINE}"},
+            "bars": {"link_precision": b3, "twin_hard_negatives": b4, "coverage": cov},
+            "refusals": {k: statuses[k] for k in LOCATOR_REFUSALS if statuses.get(k)},
+            "statuses": dict(sorted(statuses.items())),
+            "status_suggestion_at": status_at_diagnostic([r for _s, r in b1_rows]),
+            "admission_early": None if a_runs is None else
+            admission_early(sessions, a_runs, runs, status),
+            "sessions": _recorded_counts(sessions, status, runs, B1_ONLY)}
+
+
+def score_stability_several_aware(pairs):
+    """Bar 7, reported beside the strict share: a pair also counts when both picks fall
+    inside gold's `several` turns for the B1 item. pairs: [(B1 turn, B2 turn, gold|None)]."""
+    n = len(pairs)
+    same = sum(1 for a, b, g in pairs if a is not None and (
+        a == b or (g is not None and g["label"] == "several" and a in g["turns"]
+                   and b in g["turns"])))
+    return {"pairs": n, "same_or_both_in_several": same, "share": same / n if n else None,
+            "verdict": REPORTED}
+
+
+def score_locator_heldout(sessions, runs, *, gold, owner_gold=None, owner_todo=None,
+                          flag_decisions=None, side_runs=None):
+    """`score locator --stage heldout`: the held-out half from the wording's namespace.
+    Bars 1, 3, 4, 5, 7 gate (bar 7 strictly; the several-aware share is reported beside it),
+    bar 6 is reported only, bar 8 is the owner's agreement; the verdict order is unchanged
+    (fail > insufficient > pending_owner > pass)."""
+    owner_gold = owner_gold or {}
+    merged = merge_gold(gold, owner_gold)
+    status = {s["ref"]: session_status_recorded(runs.get(s["ref"]) or {}, RUN_KEYS)
+              for s in sessions}
+    bars = _bars(sessions, runs, status, merged, flag_decisions or {})
+    b6 = bars["inferred_precision"]
+    b6.update({"computed_verdict": b6["verdict"], "verdict": REPORTED_ONLY,
+               "inferred_on": False})
+
+    elig = [s for s in sessions if status[s["ref"]] == "eligible"]
+    pairs, b1_rows = [], []
+    for s in elig:
+        x = run_items(runs[s["ref"]]["B1"])
+        y = run_items(runs[s["ref"]]["B2"])
+        b1_rows.extend(x)
+        for i, j in match_items(x, y):
+            if item_status(x[i]) == "linked" and item_status(y[j]) == "linked":
+                pairs.append((linked_turn(x[i]["support"], s["turns"]),
+                              linked_turn(y[j]["support"], s["turns"]),
+                              merged.get(x[i]["item_ref"])))
+    bars["stability_several_aware"] = score_stability_several_aware(pairs)
+
+    todo = owner_todo or []
+    refs = [t["item_ref"] for t in todo]
+    agree = [(gold[r], owner_gold[r]) for r in refs if r in gold and r in owner_gold]
+    bars["agent_owner_agreement"] = score_owner_agreement(
+        agree, sum(1 for r in refs if r not in owner_gold),
+        sum(1 for r in refs if r in owner_gold and r not in gold))
+    gated = [bars[k]["verdict"] for k in ("admission", "link_precision",
+                                          "twin_hard_negatives", "coverage", "stability",
+                                          "agent_owner_agreement")]
+    if not elig:
+        gated.append(INSUFFICIENT)
+    return {"stage": "heldout", "verdict": combine_locator(gated), "bars": bars,
+            "status_suggestion_at": status_at_diagnostic(b1_rows),
+            "sessions": _recorded_counts(sessions, status, runs, RUN_KEYS),
+            "reported": locator_diagnostics(sessions, runs, status),
+            "side_set": side_table(side_runs) if side_runs else None}
+
+
+# ---------------------------------------------------------------------------------------
 # Locator glue over the real files
 # ---------------------------------------------------------------------------------------
 
-def load_locator_runs(sessions, runs_dir=store.RUNS_DIR):
-    """{ref: {"A1": rec, ..}} for the run files that exist."""
+def load_locator_runs(sessions, runs_dir=store.RUNS_DIR, *, wording=None, keys=RUN_KEYS):
+    """{ref: {"A1": rec, ..}} for the run files that exist (re-test: under the wording's
+    namespace; `keys` restricts which arms/reps are read)."""
     out = {}
     for s in sessions:
         four = {}
-        for key in RUN_KEYS:
-            p = store.locator_run_path(key[0], int(key[1]), s["ref"], runs_dir=runs_dir)
+        for key in keys:
+            p = store.locator_run_path(key[0], int(key[1]), s["ref"], runs_dir=runs_dir,
+                                       wording=wording)
             if p.exists():
                 four[key] = store.read_json(p)
         out[s["ref"]] = four
@@ -976,22 +1216,22 @@ def require_frozen_runs(runs, digest):
                          f"is frozen (a change is a dated addendum and a complete new run).")
 
 
-def require_labels_on_b1(todo_rows, runs_dir=store.RUNS_DIR):
+def require_labels_on_b1(todo_rows, runs_dir=store.RUNS_DIR, wording=None):
     """Labels are on B1 items, which exist only in one B1 output: refuse a todo row whose
     recorded B1 run sha differs from the B1 run file now on disk (a retried run)."""
     current = {}
     for row in todo_rows:
         ref = row["item_ref"].split(":")[0]
         if ref not in current:
-            p = store.locator_run_path("B", 1, ref, runs_dir=runs_dir)
+            p = store.locator_run_path("B", 1, ref, runs_dir=runs_dir, wording=wording)
             current[ref] = file_sha(p) if p.exists() else None
         if row.get("run_sha") != current[ref]:
             raise SystemExit("Refusing: locator labels were made on another B1 run than the "
                              "one on disk; re-export and relabel that session.")
 
 
-def _side_runs(data_dir, runs_dir):
-    base = Path(runs_dir, "locator", store.SIDE_SUBDIR)
+def _side_runs(data_dir, runs_dir, wording=None):
+    base = Path(store.locator_runs_base(runs_dir, wording), store.SIDE_SUBDIR)
     recs = [store.read_json(p) for p in sorted(base.glob("*/*/*.json"))]
     if not recs:
         return None
@@ -1002,11 +1242,107 @@ def _side_runs(data_dir, runs_dir):
     return recs
 
 
+def require_wording_on_runs(runs, wording):
+    """Refuse a re-test run file that records another wording than its namespace's."""
+    for four in runs.values():
+        for key, rec in four.items():
+            if rec.get("wording") != wording:
+                raise SystemExit(f"Refusing: a {key} run under locator_v2/{wording}/ records "
+                                 f"wording {rec.get('wording')!r}.")
+
+
+def require_one_config(recs):
+    """Refuse when the wording's runs record more than one reasoning_effort or more than one
+    deployed primary model (an unrecorded value counts as one of the values)."""
+    for field in ("reasoning_effort", "primary_model"):
+        seen = sorted({str(r.get(field)) for r in recs})
+        if len(seen) > 1:
+            raise SystemExit(f"Refusing: the wording's runs record more than one {field}: "
+                             f"{seen}. One configuration per wording.")
+
+
+def _b_sha(runs):
+    shas = {rec.get("prompt_sha") for four in runs.values() for key, rec in four.items()
+            if key[0] == "B" and rec.get("prompt_sha") is not None}
+    return shas.pop() if len(shas) == 1 else None
+
+
+def _retest_summary(stage, wording, *, data_dir, runs_dir, labels_dir, out_path):
+    """`tune` / `heldout` over runs/locator_v2/<wording>/ and labels/v2/<wording>/ ->
+    runs/locator_v2/<wording>/summary.<stage>.json (counts only).
+
+    Held-out also reads the wording's fit B1 runs: arm B must carry one prompt sha across
+    fit and held-out, and it must equal the `b_prompt_sha` the tune summary recorded."""
+    store.check_wording(wording)
+    digest = store.manifest_digest(data_dir)
+    split = "fit" if stage == "tune" else "heldout"
+    sessions = store.load_sessions(data_dir, split=split)
+    keys = B1_ONLY if stage == "tune" else RUN_KEYS
+    runs = load_locator_runs(sessions, runs_dir, wording=wording, keys=keys)
+    every = dict(runs)
+    side = None
+    if stage == "heldout":
+        fit_b1 = load_locator_runs(store.load_sessions(data_dir, split="fit"), runs_dir,
+                                   wording=wording, keys=B1_ONLY)
+        every.update({ref: four for ref, four in fit_b1.items() if four})
+        side = _side_runs(data_dir, runs_dir, wording)
+    require_frozen_runs(every, digest)      # one B sha across fit + held-out
+    require_wording_on_runs(every, wording)
+    require_one_config([rec for four in every.values() for rec in four.values()]
+                       + list(side or []))
+    if stage == "heldout":
+        tune_path = Path(store.locator_runs_base(runs_dir, wording), "summary.tune.json")
+        if not tune_path.exists():
+            raise SystemExit(f"Refusing: {tune_path} is missing; score --stage tune first "
+                             f"(its B prompt sha is checked here).")
+        tuned = store.read_json(tune_path).get("b_prompt_sha")
+        current = _b_sha(runs)
+        if tuned is None or tuned != current:
+            raise SystemExit(f"Refusing: the held-out B prompt sha {current} differs from "
+                             f"the tune's {tuned}.")
+    labels = store.locator_labels_dir(labels_dir, wording)
+    store.require_labels_on_manifest(labels, data_dir, store.LOCATOR_LABEL_FILES)
+    agent_todo = store.read_jsonl(labels / "todo.locator.agent.jsonl")
+    owner_todo = store.read_jsonl(labels / "todo.owner.locator.jsonl")
+    require_labels_on_b1(agent_todo + owner_todo, runs_dir, wording)
+    gold = gold_by_ref(store.read_jsonl(labels / "done.locator.agent.jsonl"))
+    decisions = flag_decisions(store.read_jsonl(labels / "done.flags.owner.locator.jsonl"))
+    if stage == "tune":
+        # The first test's fit A1/A2 (runs/locator/), for admission_early only.
+        a_runs = load_locator_runs(sessions, runs_dir, keys=A_KEYS)
+        if any(a_runs.values()):
+            require_frozen_runs(a_runs, digest)
+        else:
+            a_runs = None
+        summary = score_locator_tune(sessions, runs, gold=gold, flag_decisions=decisions,
+                                     a_runs=a_runs)
+    else:
+        summary = score_locator_heldout(
+            sessions, runs, gold=gold,
+            owner_gold=gold_by_ref(store.read_jsonl(labels / "done.owner.locator.jsonl")),
+            owner_todo=owner_todo, flag_decisions=decisions, side_runs=side)
+    summary.update({"wording": wording, "manifest_digest": digest,
+                    "b_prompt_sha": _b_sha(runs)})
+    store.write_json(out_path or Path(store.locator_runs_base(runs_dir, wording),
+                                      f"summary.{stage}.json"), summary)
+    return summary
+
+
 def locator_summary(stage, *, data_dir=store.DATA_DIR, runs_dir=store.RUNS_DIR,
-                    labels_dir=store.LABELS_DIR, out_path=None):
-    """Score the locator runs -> runs/locator/summary.<stage>.json (counts only)."""
+                    labels_dir=store.LABELS_DIR, out_path=None, wording=None):
+    """Score the locator runs -> runs/locator/summary.<stage>.json (counts only). The
+    re-test stages `tune` and `heldout` need a wording and read runs/locator_v2/<wording>/;
+    `fit` and `all` read the first test's runs/locator/ and take no wording."""
+    if stage in ("tune", "heldout"):
+        if wording is None:
+            raise SystemExit(f"Refusing: --stage {stage} needs --wording w1|w2.")
+        return _retest_summary(stage, wording, data_dir=data_dir, runs_dir=runs_dir,
+                               labels_dir=labels_dir, out_path=out_path)
     if stage not in ("fit", "all"):
         raise SystemExit(f"Unknown stage {stage!r}")
+    if wording is not None:
+        raise SystemExit(f"Refusing: --stage {stage} scores the first test (runs/locator/); "
+                         f"--wording is for tune and heldout only.")
     digest = store.manifest_digest(data_dir)
     sessions = store.load_sessions(data_dir)      # all stages: one primary, one exclusion set
     runs = load_locator_runs(sessions, runs_dir)
@@ -1042,7 +1378,9 @@ def main(argv=None):
     s.add_argument("--claim-type-json", default=None,
                    help="claim_type counts from TEST, if measured in-VPC")
     lo = sub.add_parser("locator")
-    lo.add_argument("--stage", required=True, choices=("fit", "all"))
+    lo.add_argument("--stage", required=True, choices=("fit", "all", "tune", "heldout"))
+    lo.add_argument("--wording", default=None, choices=store.WORDINGS,
+                    help="Re-test stages (tune, heldout): runs/locator_v2/<wording>/.")
     lo.add_argument("--data", default=str(store.DATA_DIR))
     lo.add_argument("--runs", default=str(store.RUNS_DIR))
     lo.add_argument("--labels", default=str(store.LABELS_DIR))
@@ -1052,7 +1390,7 @@ def main(argv=None):
         out = fit(a.grid)
     elif a.cmd == "locator":
         out = locator_summary(a.stage, data_dir=a.data, runs_dir=a.runs, labels_dir=a.labels,
-                              out_path=a.out)
+                              out_path=a.out, wording=a.wording)
     else:
         out = build_summary(run_a=a.run_a, run_b=a.run_b, out_path=a.out,
                             both_paths_run=a.both_paths_run,
