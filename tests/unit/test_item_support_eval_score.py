@@ -653,3 +653,26 @@ def test_a_done_row_carrying_another_digest_is_refused(tmp_path):
                         "manifest_digest": "0" * 64}])
     with pytest.raises(SystemExit):
         score.load_gold(labels, data)
+
+
+# ---------------------------------------------------------------------------------------
+# run.linked_turn_index: two turns can share (source_stem, start_sec) (re-test design C2)
+# ---------------------------------------------------------------------------------------
+
+def _twin_turns():
+    return [{"source_filename": "seg_a.json", "start_sec": 10.0, "end_sec": 10.2,
+             "speaker": "spk_1", "text": "synthetic fragment"},
+            {"source_filename": "seg_a.json", "start_sec": 10.0, "end_sec": 14.0,
+             "speaker": "spk_0", "text": "synthetic full line"},
+            {"source_filename": "seg_b.json", "start_sec": 10.0, "end_sec": 14.0,
+             "speaker": "spk_0", "text": "synthetic other file"}]
+
+
+def test_linked_turn_index_matches_end_sec_when_start_sec_is_shared():
+    turns = _twin_turns()
+    sup = {"status": "linked", "source_stem": "seg_a", "start_sec": 10.0, "end_sec": 14.0}
+    assert run.linked_turn_index(sup, turns) == 1
+    assert run.linked_turn_index({**sup, "end_sec": 10.2}, turns) == 0
+    assert run.linked_turn_index({**sup, "source_stem": "seg_b"}, turns) == 2
+    assert run.linked_turn_index({**sup, "end_sec": 99.0}, turns) is None
+    assert run.linked_turn_index({**sup, "status": "ambiguous_stamp"}, turns) is None

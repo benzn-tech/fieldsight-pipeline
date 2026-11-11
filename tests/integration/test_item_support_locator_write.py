@@ -146,10 +146,11 @@ def test_locator_supports_are_stored(world, capsys, monkeypatch):
     assert len(links) == 1
     link_id, src_kind, src_action, method, rule_version, score, dst_turn = links[0]
     assert (src_kind, src_action) == ("action_item", a[0])
-    assert method == "locator_v1" and rule_version == "locator_v1"
+    assert method == "locator_v2" and rule_version == "locator_v2"
     assert score is None
     assert set(dst_turn) == set(claim_type_store.DST_TURN_KEYS)
     assert dst_turn["source_stem"] == STEM and dst_turn["start_sec"] == 12.0
+    assert dst_turn["end_sec"] == 15.0
 
     # No names, flag false: both NULL; the bases record v2 and the status.
     assert a[1] is None and a[2] == {"rule_version": "claim_v2", "support_status": "linked",
@@ -192,3 +193,32 @@ def test_locator_supports_are_stored(world, capsys, monkeypatch):
     # Deleting the item row cascades its link (slice 1 FK).
     seed.execute("DELETE FROM action_items WHERE id = %s", (a[0],))
     assert _links(w) == []
+
+
+def test_locator_v2_tie_break_support_writes_and_reads_back(world):
+    """A locator_v2 support that the same-second tie-break produced (a 0.2 s fragment beside
+    the real line, both stamped 10:00:12) is stored, and the link reads back the long turn's
+    keys under `locator_v2` -- not the fragment's."""
+    from datetime import datetime
+
+    def turn(start, end, speaker):
+        at = datetime(2026, 11, 10, 10, 0, 12)
+        return {"text": "synthetic", "speaker": speaker, "source_filename": f"{STEM}.json",
+                "start_sec": start, "end_sec": end, "abs_start": at,
+                "abs_start_str": "10:00:12"}
+
+    turns = [turn(12.0, 12.2, "spk_2"), turn(12.4, 16.0, "spk_1")]
+    topic = {"topic_title": "Synthetic topic", "time_range": "10:00 – 10:05"}
+    support = item_locator.resolve({"said_at": "10:00:12"}, topic, turns, {0, 1}, DATE)
+    assert support["status"] == "linked" and support["rule_version"] == "locator_v2"
+
+    art = _artifact()
+    art["topics"][0]["action_items"][0]["support"] = support
+    assert world["write"](art) == {"skipped": False, "topics": 1}
+
+    links = _links(world)
+    assert len(links) == 1
+    _id, _kind, _src, method, rule_version, score, dst_turn = links[0]
+    assert (method, rule_version, score) == ("locator_v2", "locator_v2", None)
+    assert dst_turn == {"source_stem": STEM, "start_sec": 12.4, "end_sec": 16.0,
+                        "speaker_label": "spk_1", "quote_status": None}

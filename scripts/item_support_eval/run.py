@@ -52,12 +52,16 @@ def configured(paths):
 
 
 def linked_turn_index(support, turns):
-    """Whole-session index of the turn a `linked` support names, or None."""
+    """Whole-session index of the turn a `linked` support names, or None. Matches
+    (source_stem, start_sec, end_sec): two turns of one file can start in the same second
+    (a diarization fragment beside the real line), and the first of them is not necessarily
+    the one linked. A support without an `end_sec` key matches on stem and start only."""
     if not isinstance(support, dict) or support.get("status") != "linked":
         return None
     for i, t in enumerate(turns):
         if _stem(t.get("source_filename")) == support.get("source_stem") \
-                and t.get("start_sec") == support.get("start_sec"):
+                and t.get("start_sec") == support.get("start_sec") \
+                and ("end_sec" not in support or t.get("end_sec") == support["end_sec"]):
             return i
     return None
 

@@ -10,9 +10,15 @@ that stamp into the slice 1 turn locator, or refuses with a reason:
                      never saw that line, so the stamp is a guess that happens to exist;
   no_line         -- no turn has that stamp at all;
   ambiguous_stamp -- more than one shown turn starts in that second (two speakers, one
-                     file or two): they cannot be told apart, so nothing links;
+                     file or two) and the tie-break below does not single one out;
   outside_topic   -- the turn lies outside the topic's `time_range` widened by one
                      minute each side (a stamp copied from another topic's span).
+
+Same-second tie-break (locator_v2): when several shown turns start in the stamped second,
+the one turn lasting at least `MIN_TIE_DURATION_SEC` (end_sec - start_sec) links, if exactly
+one does. A missing or non-numeric start/end counts as duration 0. The usual case is a
+diarization fragment of a fraction of a second next to the real line; two real lines, or two
+fragments, still refuse. The winner still faces the topic range check.
 
 If the topic's `time_range` does not parse, the range check is skipped and the linked
 support records `range_checked: False`.
@@ -23,6 +29,7 @@ never stored on the item.
 The support object carries ids and offsets only -- never item or turn text. Pure: no
 AWS, no DB. Must not import `lambda_extract_session` (it imports this module).
 """
+import math
 import re
 from datetime import datetime, timedelta
 
@@ -30,7 +37,7 @@ from item_continuity import KINDS
 from topic_window import _topic_window
 from turn_name_overlay import _stem
 
-RULE_VERSION = "locator_v1"
+RULE_VERSION = "locator_v2"
 LOCATOR_FIELD = "said_at"
 STATUSES = ("linked", "no_locator", "unparseable", "not_shown", "no_line",
             "ambiguous_stamp", "outside_topic")
@@ -38,6 +45,8 @@ STATUSES = ("linked", "no_locator", "unparseable", "not_shown", "no_line",
 _STAMP = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})", re.ASCII)   # ASCII digits only
 # Each side of the topic's range, on top of `topic_window`'s inclusive end minute.
 _RANGE_WIDEN = timedelta(minutes=1)
+# The same-second tie-break's floor (re-test design 2026-11-12, C2), inclusive.
+MIN_TIE_DURATION_SEC = 0.5
 
 
 def _parse_stamp(value):
@@ -51,6 +60,19 @@ def _parse_stamp(value):
     if h >= 24 or mi >= 60 or s >= 60:
         return None
     return f"{h:02d}:{mi:02d}:{s:02d}"
+
+
+def _seconds(value):
+    """A finite int/float, else None (bool, None, strings and NaN are not times)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _duration(turn):
+    """end_sec - start_sec, or 0 when either is missing or not a number."""
+    start, end = _seconds(turn.get("start_sec")), _seconds(turn.get("end_sec"))
+    return 0.0 if start is None or end is None else end - start
 
 
 def _refuse(status, **extra):
@@ -84,7 +106,10 @@ def resolve(child, topic, turns, shown, session_date):
     if not shown_matches:
         return _refuse("not_shown" if matches else "no_line")
     if len(shown_matches) > 1:
-        return _refuse("ambiguous_stamp")
+        long_ = [i for i in shown_matches if _duration(turns[i]) >= MIN_TIE_DURATION_SEC]
+        if len(long_) != 1:
+            return _refuse("ambiguous_stamp")
+        shown_matches = long_
     turn = turns[shown_matches[0]]
     inside = _in_topic(turn, topic, turns, session_date)
     if inside is False:

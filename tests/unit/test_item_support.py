@@ -407,7 +407,7 @@ def test_attach_locator_runs_with_none_constants():
     d, q = topic["decisions"][0], topic["questions"][0]
     assert a["support"]["status"] == "linked" and a["support"]["start_sec"] == 10.0
     assert f["support"]["status"] == "linked" and f["support"]["start_sec"] == 20.0
-    assert a["support"]["method"] == a["support"]["rule_version"] == "locator_v1"
+    assert a["support"]["method"] == a["support"]["rule_version"] == "locator_v2"
     assert d["support"]["status"] == "no_locator"     # plain string normalised, no stamp
     assert q["support"]["status"] == "unparseable"
     assert counts["linked"] == 2 and counts["no_locator"] == 1 and counts["unparseable"] == 1
@@ -450,7 +450,7 @@ def test_counts_cover_every_locator_status(monkeypatch):
                                               for i in range(len(statuses))])]}
     seq = iter(statuses)
     monkeypatch.setattr(item_locator, "resolve",
-                        lambda *a, **k: {"status": next(seq), "method": "locator_v1"})
+                        lambda *a, **k: {"status": next(seq), "method": "locator_v2"})
     counts = isup.attach_support(result, [], DATE, floor=None, margin=None,
                                  nothing_close=None, shown=set(), locator=True)
     for s in statuses:

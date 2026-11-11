@@ -189,7 +189,7 @@ def test_write_pass_passes_the_support_method(monkeypatch):
         recorder_user_id=REC,
         items=[("action_item", 1, _locator_linked()), ("finding", 2, lexical),
                ("decision", 3, _refusal("no_line"))])
-    assert [c["method"] for c in calls] == ["locator_v1", "lexical_v1"]
-    assert calls[0]["score"] is None and calls[0]["rule_version"] == "locator_v1"
+    assert [c["method"] for c in calls] == ["locator_v2", "lexical_v1"]
+    assert calls[0]["score"] is None and calls[0]["rule_version"] == "locator_v2"
     assert counts["support"]["linked"] == 2 and counts["support"]["no_line"] == 1
     assert counts["links"] == 2

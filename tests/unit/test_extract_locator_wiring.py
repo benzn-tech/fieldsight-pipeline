@@ -117,7 +117,7 @@ def test_locator_and_support_on_link_and_strip(monkeypatch):
     children = list(_children(_written(fake_s3)))
     assert len(children) == 4
     for child in children:
-        assert child["support"]["method"] == "locator_v1"
+        assert child["support"]["method"] == "locator_v2"
         assert child["support"]["status"] == "linked"
         assert child["support"]["start_sec"] == 0.0
         assert "said_at" not in child
