@@ -329,12 +329,21 @@ def judge(hits, candidates, check) -> Outcome:
     # The anchor is the audio position AND the words: the offset is turn-granular, so every
     # sentence of a one-speaker minute shares it (TEST A/B run 2026-11-11), and keying on the
     # offset alone made three different sentences one "anchor" in conflict with itself.
-    groups = {}
+    # Copies of one sentence that differ by a word or two (a trimmed or fuzzy-verified copy)
+    # are still one anchor: same position and a word set that contains the other's or
+    # overlaps it by half (Jaccard >= 0.5).
+    clusters = []       # [position, word set, members]
     for p in passed:
-        key = (p[3].get("segment_key"), p[3].get("offset_sec"), frozenset(_toks(p[4])))
-        groups.setdefault(key, []).append(p)
+        pos, words = (p[3].get("segment_key"), p[3].get("offset_sec")), _toks(p[4])
+        for cl in clusters:
+            if cl[0] == pos and _same_utterance(cl[1], words):
+                cl[1] = cl[1] | words
+                cl[2].append(p)
+                break
+        else:
+            clusters.append([pos, set(words), [p]])
     picks, single = [], []
-    for group in groups.values():
+    for group in (cl[2] for cl in clusters):
         if len({p[2]["status"] for p in group}) > 1:
             drop("conflict", len(group))
             continue
@@ -350,15 +359,24 @@ def judge(hits, candidates, check) -> Outcome:
         else:
             single.extend(group)
 
-    # one_to_one, part 2: one candidate -> its latest status.
-    latest = {}
+    # one_to_one, part 2: one candidate -> its latest status. Sentences of one turn share its
+    # clock, so "latest" can be a tie; a tie with two statuses is a conflict, never decided
+    # by the order the model listed its hits in.
+    by_cand = {}
     for p in single:
-        i = p[1][0]
-        cur = latest.get(i)
-        if cur is None or _at_key(p[2]["at"]) >= _at_key(cur[2]["at"]):
-            latest[i] = p
-    if len(single) > len(latest):
-        drop("superseded", len(single) - len(latest))
+        by_cand.setdefault(p[1][0], []).append(p)
+    latest = {}
+    for i, ps in by_cand.items():
+        top = max(_at_key(p[2]["at"]) for p in ps)
+        tied = [p for p in ps if _at_key(p[2]["at"]) == top]
+        if len(ps) > len(tied):
+            drop("superseded", len(ps) - len(tied))
+        if len({p[2]["status"] for p in tied}) > 1:
+            drop("conflict", len(tied))
+            continue
+        latest[i] = tied[-1]
+        if len(tied) > 1:
+            drop("superseded", len(tied) - 1)
 
     suggestions = []
     for i, p in sorted(latest.items()):
@@ -374,6 +392,14 @@ def judge(hits, candidates, check) -> Outcome:
     counts = {"offered": len(hits), "kept": len(suggestions), "picks": len(picks),
               "dropped_by": dropped}
     return Outcome(suggestions, picks, counts)
+
+
+def _same_utterance(a, b):
+    """Two quotes at one position are one utterance when one's words contain the other's or
+    they share at least half their words."""
+    if not a or not b:
+        return a == b
+    return a <= b or b <= a or len(a & b) / len(a | b) >= 0.5
 
 
 def _anchor_card(group, union, candidates):

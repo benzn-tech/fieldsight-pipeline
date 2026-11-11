@@ -400,3 +400,33 @@ def test_sentence_lines_cjk_and_ellipsis():
 
 def test_sentence_lines_empty_text():
     assert [t["text"] for t in sr.sentence_lines([_turn(""), _turn("   ")])] == ["", ""]
+
+
+def test_same_clock_two_statuses_one_item_is_a_conflict_either_order():
+    """Review #1291: two sentences of one turn share its clock, so a tie must not be decided
+    by the order the model listed its hits in."""
+    cands = [cand("plumb", "Level 2 plumbing")]
+    a = hit("C1", "Started the level 2 plumbing", status="in_progress", at="10:00:00")
+    b = hit("C1", "Level 2 plumbing is done", status="done", at="10:00:00")
+    for hits in ([a, b], [b, a]):
+        out = sr.judge(hits, cands, check_by_at)
+        assert out.suggestions == [] and out.picks == []
+        assert out.counts["dropped_by"] == {"conflict": 2}
+        _assert_accounted(out)
+
+
+def test_trimmed_copy_of_one_sentence_is_one_anchor():
+    cands = [cand("plumb", "Level 2 plumbing")]
+    hits = [hit("C1", "Level 2 plumbing is done", status="done", at="10:00:00"),
+            hit("C1", "Level 2 plumbing is done, mostly", status="in_progress", at="10:00:00")]
+    out = sr.judge(hits, cands, check_by_at)
+    assert out.suggestions == [] and out.counts["dropped_by"] == {"conflict": 2}
+
+
+def test_near_duplicate_quotes_make_one_card():
+    cands = [cand("plumb", "Level 2 plumbing"), cand("tile", "Level 2 tiling")]
+    hits = [hit("C1", "Level 2 plumbing and tiling are done", at="10:00:00"),
+            hit("C2", "Level 2 plumbing and tiling are all done", at="10:00:00")]
+    out = sr.judge(hits, cands, check_by_at)
+    assert len(out.picks) == 1 and out.counts["dropped_by"].get("duplicate_card") == 1
+    _assert_accounted(out)
