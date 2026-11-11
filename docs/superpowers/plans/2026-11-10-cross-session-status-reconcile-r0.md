@@ -280,11 +280,11 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
 **Files:**
 - Modify: this plan file. Tick the boxes and record the TEST results at the bottom.
 
-- [ ] **Step 1:** Open a PR to `develop` with Tasks 1–5. Wait for CI green, then merge (it is my own develop PR). Wait for the TEST deploy.
-- [ ] **Step 2:** Ask the owner to set the repo var `TEST_RECONCILE_STATUS=true` and re-run the TEST deploy (`deploy.yml`), or do it myself if the var is TEST-only and allowed. Run `scripts/wire-s3-events.sh` for TEST. Verify:
+- [x] **Step 1:** Open a PR to `develop` with Tasks 1–5. Wait for CI green, then merge (it is my own develop PR). Wait for the TEST deploy.
+- [x] **Step 2:** Ask the owner to set the repo var `TEST_RECONCILE_STATUS=true` and re-run the TEST deploy (`deploy.yml`), or do it myself if the var is TEST-only and allowed. Run `scripts/wire-s3-events.sh` for TEST. Verify:
   - `aws s3api get-bucket-notification-configuration` lists `fs-status-reconcile`;
   - the ItemWriter env shows `RECONCILE_STATUS=true`.
-- [ ] **Step 3:** The owner records scripts A and B from `Dropbox/FieldSight-录音脚本/2026-11-10_跨录音对账脚本.md` on the same site and day. Verify in this order:
+- [x] **Step 3:** The owner records scripts A and B from `Dropbox/FieldSight-录音脚本/2026-11-10_跨录音对账脚本.md` on the same site and day. Verify in this order:
   - the item_writer log line `reconcile ... candidates=N` for B, where N covers A's 7 items;
   - the artifact under `reconcile_requests/`;
   - the matcher counts;
@@ -297,6 +297,52 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
   - pick cards: zero expected. Record any that appear, with the reason.
 - [ ] **Step 4:** Script C (day 2) at R0 gives zero suggestions and no artifact (no candidates, because of the date filter).
 - [ ] **Step 5:** Record the results table here: per statement, expected vs actual, and every miss with its cause (ASR, a guard by name, the model, duplicate, ordering). Report to the owner. The R1 decision is the owner's.
+
+### TEST results, run 1 (2026-11-11)
+
+Recordings (TEST, `Ben_Lin_test2`, site `d104ebbe…`):
+- A: `sid6fcef858…`, 13:36 NZ. GrandTime app.
+- B: `sid3aad34b3…`, 17:54 NZ, the same device.
+- An earlier attempt at A from the phone web app never uploaded. The device line has it; it is not a reconcile defect.
+
+What ran:
+- A's extraction wrote all 7 items. ASR heard "pre-line" as "purlin" for both units, so the twins stay symmetric.
+- B's request carried candidates=7: A's 7 items, nothing else.
+- The matcher made one model call: 46.4 s, 474 prompt tokens. That is well inside the 150 s per-attempt timeout.
+- Counts: offered=1, kept=0, picks=1.
+- DB:
+  - one `status_pick_cards` row: status done, 4 candidates (west copper, unit 4, as-built, skip bin), quote = the whole 58 s paragraph;
+  - zero `action_status_suggestions`.
+
+| B statement | Expected | Actual | Cause |
+|---|---|---|---|
+| west copper ordered | copper/west → done | in the pick card | transcript granularity (below) |
+| unit four cancelled | unit 4 → closed | in the pick card | the same |
+| skip bin stuck | skip bin → blocked | in the pick card | the same. ASR also heard "Skip the MRR for now" |
+| as-built tomorrow (plan) | none | listed in the pick card | the same |
+| paint "I heard" (hearsay) | none | none | |
+| gutter finished (never assigned) | none | none | |
+| "that's all done" | none | none | |
+| east PVC, unit 3 (twins) | none | none | |
+
+Wrong-item: 0. False positives: 0. Recall: 0 of 3.
+
+**Cause.**
+- B has one speaker, so the whole 58 s chunk was ONE turn.
+- The prompt asks for "the WHOLE transcript line", so the quote was the paragraph, and the anchor guard rightly found four items in it.
+- one_to_one also keyed the anchor on (segment_key, offset_sec). That offset is turn-granular, so every sentence of a monologue would have been one "anchor" in conflict with itself.
+
+**Fix (PR after #1275).**
+- The model sees `status_reconcile.sentence_lines(turns)`: the same turns, split into sentences, each keeping its turn's clock. The quote check still runs on the original turns.
+- The one_to_one anchor key adds the quote's token set.
+
+**Offline check on the real B transcript.** Real `_check_status_quote`, real candidates, synthetic hits:
+- copper → done, unit 4 → closed, skip bin → blocked: 3 kept, 0 cards;
+- the twin traps (the same quotes aimed at east PVC and unit 3): both dropped by label_conflict.
+
+**Still owed:**
+- a replay of B's request on TEST after the deploy, with the real model call;
+- Step 4 (C on 11-12).
 
 **Follow-ups, not in this plan:**
 - The UI pick card and its accept endpoint (UI line plus org-api). Until they exist, pick cards are visible only in the DB on TEST.

@@ -24,6 +24,30 @@ import item_text_match
 from status_suggestions import STATUSES
 
 _KEEP_EVIDENCE = ("verified", "verified_fuzzy")
+
+# --- sentence lines -------------------------------------------------------------------------
+# After a run of . ! ? only when whitespace follows (so "3.5", "e.g" and "..." mid-word stay
+# whole); after 。！？ directly, unless another terminator follows ("好！？" is one ending).
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])(?![。！？.!?])\s*")
+
+
+def sentence_lines(turns: list) -> list:
+    """The turns the MODEL sees, one sentence per line (TEST A/B run 2026-11-11).
+
+    A turn is one speaker's uninterrupted stretch, so a wearer talking alone for a minute is
+    one turn; asked for "the whole line", the model quoted four items at once and the only
+    honest outcome was a pick card. Each piece is a shallow copy keeping the turn's clock,
+    speaker and source; nothing is dropped or reordered, and the input is not touched.
+
+    Only the prompt uses these. The quote check runs on the original turns: check_quote
+    searches the concatenated window, so a one-sentence quote verifies against its turn and
+    the audio offset stays turn-granular, as it always was."""
+    out = []
+    for t in turns:
+        pieces = [" ".join(p.split()) for p in _SENTENCE_END.split(t.get("text") or "")]
+        pieces = [p for p in pieces if p] or [""]
+        out.extend(dict(t, text=p) for p in pieces)
+    return out
 PICK_CAP = 4
 _EPS = 1e-9
 
@@ -302,9 +326,13 @@ def judge(hits, candidates, check) -> Outcome:
 
     # one_to_one, part 1: one verified anchor -> at most one candidate and one status. Every
     # hit that passed evidence is grouped, cards included, before suggestion vs card is decided.
+    # The anchor is the audio position AND the words: the offset is turn-granular, so every
+    # sentence of a one-speaker minute shares it (TEST A/B run 2026-11-11), and keying on the
+    # offset alone made three different sentences one "anchor" in conflict with itself.
     groups = {}
     for p in passed:
-        groups.setdefault((p[3].get("segment_key"), p[3].get("offset_sec")), []).append(p)
+        key = (p[3].get("segment_key"), p[3].get("offset_sec"), frozenset(_toks(p[4])))
+        groups.setdefault(key, []).append(p)
     picks, single = [], []
     for group in groups.values():
         if len({p[2]["status"] for p in group}) > 1:

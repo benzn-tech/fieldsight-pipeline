@@ -169,10 +169,23 @@ def test_unverified_quote_dropped():
     assert out.counts["dropped_by"] == {"weak": 1}
 
 
-def test_one_anchor_two_candidates_becomes_pick():
+def test_one_offset_two_sentences_are_two_anchors():
+    """Two different sentences at one turn-granular offset (a one-speaker monologue, TEST A/B
+    run 2026-11-11) are two utterances, not one anchor in conflict with itself."""
     cands = [cand("skip", "Order skip bin"), cand("slab", "Pour level 1 slab")]
     hits = [hit("C1", "The skip bin order is done", at="10:00:00"),
             hit("C2", "The level 1 slab pour is done", at="10:00:00")]
+    out = sr.judge(hits, cands, check_by_at)
+    assert out.picks == []
+    assert sorted(s["stable_id"] for s in out.suggestions) == ["skip", "slab"]
+    assert all(s["offset_sec"] == 36000.0 for s in out.suggestions)
+    _assert_accounted(out)
+
+
+def test_one_sentence_two_candidates_becomes_pick():
+    cands = [cand("skip", "Order skip bin"), cand("slab", "Pour level 1 slab")]
+    q = "The skip bin and the level 1 slab are done"
+    hits = [hit("C1", q, at="10:00:00"), hit("C2", q, at="10:00:00")]
     out = sr.judge(hits, cands, check_by_at)
     assert out.suggestions == []
     assert len(out.picks) == 1
@@ -338,3 +351,52 @@ def test_side_word_before_a_place_noun_is_a_label():
     out = sr.judge([hit("C1", "the left wing handrail is done")],
                    [cand("it", "Fix handrail on the right wing"), SKIP], check)
     assert out.suggestions == [] and out.counts["dropped_by"] == {"label_conflict": 1}
+
+
+# --- sentence lines (TEST A/B run 2026-11-11: one speaker = one 58 s turn) -----------------
+# The real B paragraph, as ASR returned it. As one line, the model's "whole line" quote named
+# four items and the only honest outcome was a pick card. Split, each status has its own line.
+B_PARAGRAPH = (
+    "[wind blowing] [objects clanging] Quick update from this morning. The copper pipe for the "
+    "[door shutting] west block is ordered. That's done. Good. The purlin inspection for unit "
+    "four is canceled. [machine whirring] Canceled. Is it canceled? Council, city council merged "
+    "it with the final. [machine whirring] Skip the MRR for now. [coughs] Waiting for the... We "
+    "will send the as-built drawings tomorrow. I heard the paint color might be sorted. Not "
+    "sure. Oh, and the gutter on the garage is finished. And that's all done. [objects clanging]")
+
+
+def _turn(text, **kw):
+    t = {"text": text, "speaker": "spk_0", "abs_start_str": "17:54:17", "start_sec": 5.14,
+         "source_filename": "seg.json"}
+    t.update(kw)
+    return t
+
+
+def test_sentence_lines_split_a_monologue():
+    out = sr.sentence_lines([_turn(B_PARAGRAPH)])
+    texts = [t["text"] for t in out]
+    assert "The copper pipe for the [door shutting] west block is ordered." in texts
+    assert "The purlin inspection for unit four is canceled." in texts
+    assert "I heard the paint color might be sorted." in texts
+    # every piece keeps the turn's clock, speaker and source
+    assert all(t["abs_start_str"] == "17:54:17" and t["speaker"] == "spk_0"
+               and t["source_filename"] == "seg.json" for t in out)
+    # nothing is lost or reordered
+    assert " ".join(texts) == " ".join(B_PARAGRAPH.split())
+
+
+def test_sentence_lines_do_not_mutate_input_and_keep_short_turns():
+    turns = [_turn("Unit four is done."), _turn("no punctuation at all here")]
+    before = [dict(t) for t in turns]
+    out = sr.sentence_lines(turns)
+    assert turns == before
+    assert [t["text"] for t in out] == ["Unit four is done.", "no punctuation at all here"]
+
+
+def test_sentence_lines_cjk_and_ellipsis():
+    out = sr.sentence_lines([_turn("四号单元做完了。三号还没好！等一下... 好吧？")])
+    assert [t["text"] for t in out] == ["四号单元做完了。", "三号还没好！", "等一下...", "好吧？"]
+
+
+def test_sentence_lines_empty_text():
+    assert [t["text"] for t in sr.sentence_lines([_turn(""), _turn("   ")])] == ["", ""]
