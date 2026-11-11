@@ -19,6 +19,7 @@ import psycopg
 import pytest
 
 import checklist_reports
+import nz_time
 import decision_hub
 import lambda_decision_scan as lds
 from repositories import action_items, companies, memberships, sites, topics, users
@@ -220,7 +221,11 @@ def test_overdue_scan_emits_and_processes_in_one_call(db, monkeypatch):
     """There is no process schedule (Aurora must be able to pause): a scan call emits AND
     runs the hub in the same invocation and connection, and reports both counts."""
     co, site, pm, admin = _world(db)
-    _overdue_item(db, site)
+    # lambda_handler reads the real clock, so the item is due yesterday in REAL NZ time: a
+    # fixed date would turn stale (rev 6: no per-item card, plus a backlog digest) as the
+    # calendar moves on.
+    real_today = nz_time.to_nz(dt.datetime.now(UTC)).date()
+    _overdue_item(db, site, deadline=real_today - dt.timedelta(days=1))
     monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
     monkeypatch.setattr(lds, "get_connection", _Borrowed(db))
     out = lds.lambda_handler({"scan": "todo_overdue"}, None)
