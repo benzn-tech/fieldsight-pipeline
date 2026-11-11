@@ -146,7 +146,7 @@ DECLARE_CONTINUITY = os.environ.get('DECLARE_CONTINUITY', 'false').lower() == 't
 # template -> workflow -> env, like the two above.
 EMIT_ITEM_SUPPORT = os.environ.get('EMIT_ITEM_SUPPORT', 'false').lower() == 'true'
 # Item quote locator (spec 2026-11-10): on the FINAL single-session tier only, ask each child item
-# for `said_at`, the stamp of the line where it was first raised. Off: every prompt is
+# for `said_at`, the stamp of the line that states it. Off: every prompt is
 # byte-identical to before. Wired template -> workflow -> env, like EMIT_ITEM_SUPPORT.
 EMIT_ITEM_LOCATOR = os.environ.get('EMIT_ITEM_LOCATOR', 'false').lower() == 'true'
 LOCATOR_FIELD = "said_at"
@@ -934,7 +934,7 @@ _PROMPT_HEAD = (
 
 
 _LOCATOR_SCHEMA_LINE = (
-    f'"{LOCATOR_FIELD}": "HH:MM:SS of the line where this item was FIRST raised, or null"')
+    f'"{LOCATOR_FIELD}": "HH:MM:SS of the ONE line that states this item, or null"')
 
 # The last key of each child kind in EXTRACTION_SCHEMA: the locator line goes after it.
 _LOCATOR_ANCHORS = (
@@ -947,11 +947,15 @@ _LOCATOR_ANCHORS = (
 # Kept compact on purpose: it is paid for on every final call. It names status_suggestion
 # because an action item can carry both stamps, and a model that copies one into the other
 # silently loses suggestions. "not evidence" keeps the per-topic evidence rule uncontradicted.
+# It asks for the line that STATES the item (re-test design 2026-11-12 C1): asking for the
+# line where it was "first raised" pointed one turn early, before the item was said.
 _LOCATOR_RULE = """
 8. SAID_AT. For each action item, finding, decision and question, `said_at` is the [HH:MM:SS]
-   printed on the ONE line where that item was FIRST raised -- copied exactly as printed, THE
-   HOUR INCLUDED. Use null when no single line raises it (it combines several lines, or is your
-   own conclusion). It is a stamp, not evidence and not a quote; never copy words into it.
+   printed on the ONE line that states the item, meaning the line that says what the item
+   says -- copied exactly as printed, THE HOUR INCLUDED. If the item is stated on more than one
+   line, use the line that states it most fully; if those are equal, use the earliest. Use null
+   when no single line states it (it combines several lines, or is your own conclusion). It is
+   a stamp, not evidence and not a quote; never copy words into it.
    `said_at` is not the `at` of a status_suggestion, which marks where a status was reported,
    usually later."""
 
