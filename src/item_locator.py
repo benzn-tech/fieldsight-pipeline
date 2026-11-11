@@ -47,6 +47,8 @@ _STAMP = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})", re.ASCII)   # ASCII digits onl
 _RANGE_WIDEN = timedelta(minutes=1)
 # The same-second tie-break's floor (re-test design 2026-11-12, C2), inclusive.
 MIN_TIE_DURATION_SEC = 0.5
+# Float noise: 0.57 - 0.07 is 0.49999999999999994, still half a second.
+_TIE_EPS = 1e-9
 
 
 def _parse_stamp(value):
@@ -106,7 +108,8 @@ def resolve(child, topic, turns, shown, session_date):
     if not shown_matches:
         return _refuse("not_shown" if matches else "no_line")
     if len(shown_matches) > 1:
-        long_ = [i for i in shown_matches if _duration(turns[i]) >= MIN_TIE_DURATION_SEC]
+        long_ = [i for i in shown_matches if _duration(turns[i])
+                 >= MIN_TIE_DURATION_SEC - _TIE_EPS]
         if len(long_) != 1:
             return _refuse("ambiguous_stamp")
         shown_matches = long_

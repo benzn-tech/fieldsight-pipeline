@@ -291,3 +291,12 @@ def test_tie_break_winner_still_faces_the_topic_range():
     full = _frag("synthetic full", F2, 150.4, 156.0, _dt(9, 7, 30), "spk_0")
     s = _same_second(frag, full, time_range="09:00 – 09:02")
     assert s["status"] == "outside_topic" and s["range_checked"] is True
+
+
+def test_tie_break_floor_tolerates_float_noise():
+    # 0.57 - 0.07 is 0.49999999999999994 in binary floating point: still half a second.
+    assert 0.57 - 0.07 < 0.5
+    frag = _frag("synthetic frag", F2, 150.0, 150.1, _dt(9, 7, 30), "spk_1")
+    turn = _frag("synthetic line", F2, 0.07, 0.57, _dt(9, 7, 30), "spk_0")
+    s = _same_second(frag, turn)
+    assert s["status"] == "linked" and s["start_sec"] == 0.07
