@@ -107,11 +107,41 @@ def decode_turn(turn):
     return _dec(turn)
 
 
-def locator_run_path(arm, rep, ref, *, side=False, runs_dir=RUNS_DIR):
+# The locator re-test (design 2026-11-12, C4): its own namespace, one per wording, so the first
+# test's runs/locator/ and labels stay untouched and both wordings stay on record.
+LOCATOR_V2 = "locator_v2"
+WORDINGS = ("w1", "w2")
+
+
+def check_wording(wording):
+    """The wording, or SystemExit unless it is one of WORDINGS."""
+    if wording not in WORDINGS:
+        raise SystemExit(f"Refusing: --wording must be one of {', '.join(WORDINGS)} "
+                         f"(got {wording!r}).")
+    return wording
+
+
+def locator_runs_base(runs_dir=RUNS_DIR, wording=None):
+    """runs/locator/ (the first test), or runs/locator_v2/<wording>/ for the re-test."""
+    if wording is None:
+        return Path(runs_dir, "locator")
+    return Path(runs_dir, LOCATOR_V2, check_wording(wording))
+
+
+def locator_run_path(arm, rep, ref, *, side=False, runs_dir=RUNS_DIR, wording=None):
     """runs/locator/<arm>/<rep>/<ref>.json; the side set under runs/locator/side/ (a side
-    session can also be in the main set, and runs with a different prompt)."""
-    base = Path(runs_dir, "locator", *((SIDE_SUBDIR,) if side else ()))
+    session can also be in the main set, and runs with a different prompt). With a wording,
+    the same layout under runs/locator_v2/<wording>/."""
+    base = Path(locator_runs_base(runs_dir, wording), *((SIDE_SUBDIR,) if side else ()))
     return Path(base, arm, str(rep), f"{ref}.json")
+
+
+def locator_labels_dir(labels_dir=LABELS_DIR, wording=None):
+    """labels/ (the first test), or labels/v2/<wording>/ for the re-test: the same file names
+    inside, so every label function reads and writes them unchanged."""
+    if wording is None:
+        return Path(labels_dir)
+    return Path(labels_dir, "v2", check_wording(wording))
 
 
 def session_key(folder, date, base):
