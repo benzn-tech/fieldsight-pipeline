@@ -365,19 +365,38 @@ def test_score_tune_from_files_writes_the_v2_summary_only(tmp_path, capsys):
     assert "zeta" not in text and "f000" not in text
 
 
+def _tuned_and_held(tmp_path, wording="w2", mutate=None):
+    """Fit B1 + held-out four arms of one wording on disk, all labelled; `mutate(fit_runs,
+    held_runs)` edits the records before they are written."""
+    fit, fr = _b1_set(2, 30, wording=wording)
+    held, hr = _held_set(2, 30, wording=wording)
+    if mutate:
+        mutate(fr, hr)
+    data, runs_dir, labels = _write_v2(tmp_path, fit + held, {**fr, **hr}, wording=wording)
+    label.export_locator(runs_dir, data_dir=data, labels_dir=labels, wording=wording)
+    gold = {**_gold_for(fit, fr), **_gold_for(held, hr)}
+    _answer(Path(labels, "v2", wording), gold)
+    return data, runs_dir, labels, gold
+
+
 def test_score_heldout_from_files(tmp_path):
-    sessions, runs = _held_set(2, 30, wording="w2")
-    data, runs_dir, labels = _write_v2(tmp_path, sessions, runs, wording="w2")
-    label.export_locator(runs_dir, data_dir=data, labels_dir=labels, wording="w2")
+    data, runs_dir, labels, gold = _tuned_and_held(tmp_path)
     owner = label.export_locator_owner(runs_dir, data_dir=data, labels_dir=labels,
                                        wording="w2")
     assert owner["owner"] == 40
     v2 = Path(labels, "v2", "w2")
-    gold = _gold_for(sessions, runs)
-    _answer(v2, gold)
+    with pytest.raises(SystemExit, match="summary.tune.json"):
+        score.locator_summary("heldout", data_dir=data, runs_dir=runs_dir,
+                              labels_dir=labels, wording="w2")
+    tune = score.locator_summary("tune", data_dir=data, runs_dir=runs_dir, labels_dir=labels,
+                                 wording="w2")
+    assert tune["b_prompt_sha"] == "sha-B"
+    assert store.read_json(Path(runs_dir, "locator_v2", "w2", "summary.tune.json"))[
+        "b_prompt_sha"] == "sha-B"
     out = score.locator_summary("heldout", data_dir=data, runs_dir=runs_dir,
                                 labels_dir=labels, wording="w2")
     assert out["verdict"] == PO and out["bars"]["link_precision"]["verdict"] == P
+    assert out["b_prompt_sha"] == "sha-B"
     todo = store.read_jsonl(v2 / "todo.owner.locator.jsonl")
     store.write_jsonl(v2 / "done.owner.locator.jsonl",
                       [{"item_ref": t["item_ref"], **gold[t["item_ref"]]} for t in todo])
@@ -385,6 +404,68 @@ def test_score_heldout_from_files(tmp_path):
                                 labels_dir=labels, wording="w2")
     assert out["bars"]["agent_owner_agreement"]["verdict"] == P
     assert Path(runs_dir, "locator_v2", "w2", "summary.heldout.json").exists()
+
+
+def test_heldout_refuses_a_b_sha_that_differs_from_fit_b1(tmp_path):
+    def mutate(fr, hr):
+        for four in hr.values():
+            for k in ("B1", "B2"):
+                four[k]["prompt_sha"] = "sha-B-other"
+    data, runs_dir, labels, _ = _tuned_and_held(tmp_path, mutate=mutate)
+    score.locator_summary("tune", data_dir=data, runs_dir=runs_dir, labels_dir=labels,
+                          wording="w2")
+    with pytest.raises(SystemExit, match="prompt_sha"):
+        score.locator_summary("heldout", data_dir=data, runs_dir=runs_dir,
+                              labels_dir=labels, wording="w2")
+
+
+def test_heldout_refuses_when_the_tune_summary_records_another_b_sha(tmp_path):
+    data, runs_dir, labels, _ = _tuned_and_held(tmp_path)
+    score.locator_summary("tune", data_dir=data, runs_dir=runs_dir, labels_dir=labels,
+                          wording="w2")
+    p = Path(runs_dir, "locator_v2", "w2", "summary.tune.json")
+    store.write_json(p, dict(store.read_json(p), b_prompt_sha="sha-B-tuned-elsewhere"))
+    with pytest.raises(SystemExit, match="differs from the tune"):
+        score.locator_summary("heldout", data_dir=data, runs_dir=runs_dir,
+                              labels_dir=labels, wording="w2")
+
+
+@pytest.mark.parametrize("field,value", [("reasoning_effort", "medium"),
+                                         ("reasoning_effort", None),
+                                         ("primary_model", OTHER)])
+def test_tune_refuses_more_than_one_recorded_config(tmp_path, field, value):
+    sessions, runs = _b1_set(2, 5)
+    runs["f001"]["B1"][field] = value
+    if field == "primary_model":
+        runs["f001"]["B1"]["model"] = OTHER
+    data, runs_dir, labels = _write_v2(tmp_path, sessions, runs)
+    with pytest.raises(SystemExit, match=f"more than one {field}"):
+        score.locator_summary("tune", data_dir=data, runs_dir=runs_dir, labels_dir=labels,
+                              wording="w1")
+
+
+def test_heldout_refuses_a_config_that_differs_from_fit_b1(tmp_path):
+    def mutate(fr, hr):
+        for four in hr.values():
+            for rec in four.values():
+                rec["reasoning_effort"] = "medium"
+    data, runs_dir, labels, _ = _tuned_and_held(tmp_path, mutate=mutate)
+    with pytest.raises(SystemExit, match="more than one reasoning_effort"):
+        score.locator_summary("heldout", data_dir=data, runs_dir=runs_dir,
+                              labels_dir=labels, wording="w2")
+
+
+def test_tune_flags_read_every_non_errored_b1_not_only_eligible():
+    s = _session("f000", "fit")
+    s["turns"][0]["text"] = "fix the scaffold on level 3"
+    items = [_it(0, text="fix the scaffold on level 2")] + [_it(i) for i in range(1, 5)]
+    rec = _v2(_rec("f000", "B", 1, items, s["turns"], model=OTHER))   # a fallback session
+    out = score.score_locator_tune([s], {"f000": {"B1": rec}}, gold={})
+    assert out["sessions"]["eligible"] == 0
+    assert out["bars"]["twin_hard_negatives"]["flags"] == 1
+    rec["error"] = "x"
+    out = score.score_locator_tune([s], {"f000": {"B1": rec}}, gold={})
+    assert out["bars"]["twin_hard_negatives"]["flags"] == 0
 
 
 def test_owner_sample_v2_uses_recorded_eligibility(tmp_path):

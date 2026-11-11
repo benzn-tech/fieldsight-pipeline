@@ -1087,7 +1087,8 @@ def admission_early(sessions, a_runs, b_runs, b_status):
 def score_locator_tune(sessions, runs, *, gold, flag_decisions=None, a_runs=None):
     """`score locator --stage tune`: the fit half, B1 only. sessions: fit sessions; runs:
     {ref: {"B1": rec}} from the wording's namespace; gold: the blind agent's answers;
-    a_runs: the first test's {ref: {"A1", "A2"}} for `admission_early` (None: not reported)."""
+    a_runs: the first test's {ref: {"A1", "A2"}} for `admission_early` (None: not reported).
+    Bar 4 reads every non-errored B1 link, as `_bars` does (more links can only add flags)."""
     decisions = flag_decisions or {}
     status = {s["ref"]: session_status_recorded(runs.get(s["ref"]) or {}, B1_ONLY)
               for s in sessions}
@@ -1098,7 +1099,7 @@ def score_locator_tune(sessions, runs, *, gold, flag_decisions=None, a_runs=None
     b3 = score_link_precision(link_rows, missing)
     b3["linked"] = len(link_rows) + missing
     b4 = score_twins([{"flag_id": f["flag_id"], "confirmed": decisions.get(f["flag_id"])}
-                      for f in locator_flags(elig, runs)])
+                      for f in locator_flags(sessions, runs)])
     cov = score_coverage(len(b1_rows), statuses.get("linked", 0))
     decision = tune_decision(b3["wrong"], cov["coverage"], missing)
     return {"stage": "tune",
@@ -1250,17 +1251,55 @@ def require_wording_on_runs(runs, wording):
                                  f"wording {rec.get('wording')!r}.")
 
 
+def require_one_config(recs):
+    """Refuse when the wording's runs record more than one reasoning_effort or more than one
+    deployed primary model (an unrecorded value counts as one of the values)."""
+    for field in ("reasoning_effort", "primary_model"):
+        seen = sorted({str(r.get(field)) for r in recs})
+        if len(seen) > 1:
+            raise SystemExit(f"Refusing: the wording's runs record more than one {field}: "
+                             f"{seen}. One configuration per wording.")
+
+
+def _b_sha(runs):
+    shas = {rec.get("prompt_sha") for four in runs.values() for key, rec in four.items()
+            if key[0] == "B" and rec.get("prompt_sha") is not None}
+    return shas.pop() if len(shas) == 1 else None
+
+
 def _retest_summary(stage, wording, *, data_dir, runs_dir, labels_dir, out_path):
     """`tune` / `heldout` over runs/locator_v2/<wording>/ and labels/v2/<wording>/ ->
-    runs/locator_v2/<wording>/summary.<stage>.json (counts only)."""
+    runs/locator_v2/<wording>/summary.<stage>.json (counts only).
+
+    Held-out also reads the wording's fit B1 runs: arm B must carry one prompt sha across
+    fit and held-out, and it must equal the `b_prompt_sha` the tune summary recorded."""
     store.check_wording(wording)
     digest = store.manifest_digest(data_dir)
     split = "fit" if stage == "tune" else "heldout"
     sessions = store.load_sessions(data_dir, split=split)
     keys = B1_ONLY if stage == "tune" else RUN_KEYS
     runs = load_locator_runs(sessions, runs_dir, wording=wording, keys=keys)
-    require_frozen_runs(runs, digest)
-    require_wording_on_runs(runs, wording)
+    every = dict(runs)
+    side = None
+    if stage == "heldout":
+        fit_b1 = load_locator_runs(store.load_sessions(data_dir, split="fit"), runs_dir,
+                                   wording=wording, keys=B1_ONLY)
+        every.update({ref: four for ref, four in fit_b1.items() if four})
+        side = _side_runs(data_dir, runs_dir, wording)
+    require_frozen_runs(every, digest)      # one B sha across fit + held-out
+    require_wording_on_runs(every, wording)
+    require_one_config([rec for four in every.values() for rec in four.values()]
+                       + list(side or []))
+    if stage == "heldout":
+        tune_path = Path(store.locator_runs_base(runs_dir, wording), "summary.tune.json")
+        if not tune_path.exists():
+            raise SystemExit(f"Refusing: {tune_path} is missing; score --stage tune first "
+                             f"(its B prompt sha is checked here).")
+        tuned = store.read_json(tune_path).get("b_prompt_sha")
+        current = _b_sha(runs)
+        if tuned is None or tuned != current:
+            raise SystemExit(f"Refusing: the held-out B prompt sha {current} differs from "
+                             f"the tune's {tuned}.")
     labels = store.locator_labels_dir(labels_dir, wording)
     store.require_labels_on_manifest(labels, data_dir, store.LOCATOR_LABEL_FILES)
     agent_todo = store.read_jsonl(labels / "todo.locator.agent.jsonl")
@@ -1281,9 +1320,9 @@ def _retest_summary(stage, wording, *, data_dir, runs_dir, labels_dir, out_path)
         summary = score_locator_heldout(
             sessions, runs, gold=gold,
             owner_gold=gold_by_ref(store.read_jsonl(labels / "done.owner.locator.jsonl")),
-            owner_todo=owner_todo, flag_decisions=decisions,
-            side_runs=_side_runs(data_dir, runs_dir, wording))
-    summary.update({"wording": wording, "manifest_digest": digest})
+            owner_todo=owner_todo, flag_decisions=decisions, side_runs=side)
+    summary.update({"wording": wording, "manifest_digest": digest,
+                    "b_prompt_sha": _b_sha(runs)})
     store.write_json(out_path or Path(store.locator_runs_base(runs_dir, wording),
                                       f"summary.{stage}.json"), summary)
     return summary
