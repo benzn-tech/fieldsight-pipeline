@@ -124,11 +124,11 @@ jobs:
         #     topic on the first run. The sweep refuses to run without it, so a
         #     forgotten value fails closed rather than sweeping everything.
         # The NONWORK_* overrides use the same bare-"Key=" guard as the layer overrides.
+        # DB secret ARN: read from the db stack's export; passed as a plain
+        # parameter because {{resolve:secretsmanager:...}} can't compose
+        # with Fn::ImportValue (only with Parameters).
         run: |
           # A space inside any --parameter-overrides "Key=Value" breaks SAM's parser.
-          # DB secret ARN: read from the db stack's export; passed as a plain
-          # parameter because {{resolve:secretsmanager:...}} can't compose
-          # with Fn::ImportValue (only with Parameters).
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
           # SAM's --parameter-overrides REJECTS a bare "Key=" with an empty value, so the
           # ffmpeg-layer override is only appended when the var is actually set; unset =>
@@ -404,6 +404,7 @@ jobs:
               "EnableWebAnswer=${{ vars.TEST_ENABLE_WEB_ANSWER || 'false' }}" \
               "AskVoiceRestate=${{ vars.TEST_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.TEST_ASK_VOICE_CONVO || 'false' }}" \
+              "AskVoiceAutoWeb=${{ vars.TEST_ASK_VOICE_AUTO_WEB || 'false' }}" \
               "VoiceWebEnabled=${{ vars.TEST_VOICE_WEB_ENABLED || 'false' }}" \
               "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
               "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \

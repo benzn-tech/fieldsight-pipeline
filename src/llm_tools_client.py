@@ -763,3 +763,34 @@ def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
         break
     return ChatTurn(error=last_error or "no response", timed_out=last_timed_out,
                     model=chain[-1], requested_model="")
+
+
+def complete_json_within(prompt, *, seconds, caller, max_tokens=120) -> ChatTurn:
+    """`complete_json` on the judge's routing (model, provider pin, reasoning), bounded
+    by WALL-CLOCK `seconds`. Never raises.
+
+    The urllib3 timeout bounds each socket read, not the call: OpenRouter keeps a
+    non-streaming request alive while the model thinks, so on 2026-11-12 a rewrite
+    given 4 s came back after 13.2 s, having spent 1,515 tokens thinking under
+    effort "low". Here the call runs on a worker thread and is abandoned at the
+    limit; a late answer is dropped and the caller goes on without it. The small
+    `max_tokens` bounds the answer itself (a judge with reasoning off spends no
+    thinking tokens)."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+    if seconds is None or seconds < MIN_TIME_LEFT:
+        return ChatTurn(error="no time left", timed_out=True)
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = pool.submit(complete_json, prompt, max_tokens=max_tokens,
+                          deadline=_now() + seconds, attempt_timeout=seconds,
+                          caller=caller)
+        try:
+            return fut.result(timeout=seconds)
+        except _FutTimeout:
+            logger.warning("llm_tools json: wall-clock limit %.1fs reached caller=%s",
+                           seconds, caller)
+            return ChatTurn(error="wall-clock limit reached", timed_out=True)
+        except Exception as e:                    # noqa: BLE001
+            return ChatTurn(error=type(e).__name__)
+    finally:
+        pool.shutdown(wait=False)

@@ -1252,7 +1252,7 @@ def _rag_answer(body, on_web_start=None):
             _t_rewrite = time.monotonic()
             asked, rewritten = ask_rewrite.standalone_question(
                 question, history,
-                call=corroboration_client.call,
+                call=ask_rewrite.judge_call,
                 timeout=min(ASK_REWRITE_BUDGET, deadline_left))
             marks["rewrite"] = time.monotonic() - _t_rewrite
             logger.info("  Ask rewrite: history_turns=%d rewritten=%s",

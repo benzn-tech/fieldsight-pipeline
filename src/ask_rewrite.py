@@ -36,6 +36,8 @@ MIN_USEFUL_TIMEOUT = 2.0
 # repo, max_tokens=1200 produced 1197 reasoning tokens and content=''. A rewrite
 # needs ~30 tokens of answer and the rest is thinking room.
 MAX_TOKENS = int(os.environ.get("ASK_REWRITE_MAX_TOKENS", "2048"))
+# judge_call's answer budget: one JSON line of at most MAX_QUESTION_CHARS.
+JUDGE_MAX_TOKENS = 120
 
 PROMPT = """Rewrite the final question so it can be understood on its own, using the
 conversation only to resolve what words like "he", "it", "that" or "then"
@@ -53,6 +55,42 @@ Return only the question, on one line.
 ## Final question
 {question}
 """
+
+
+class _Reply:
+    """The slice of corroboration_client.Reply that `standalone_question` reads."""
+
+    def __init__(self, ok, text=None, error=None, timed_out=False):
+        self.ok, self.text, self.error, self.timed_out = ok, text, error, timed_out
+
+
+def judge_call(prompt, *, timeout, max_tokens=None, effort=None, caller="rewrite"):
+    """The rewrite's transport since 2026-11-12: the Ask judge's model and routing
+    (DeepSeek V4.1 Flash, provider pinned, reasoning off), JSON out, and a
+    wall-clock limit of `timeout`.
+
+    It replaced corroboration_client.call on gemini-3.8-flash, a reasoning model
+    that ignores effort "low" when it likes: on the owner's device that morning one
+    rewrite thought for 1,515 tokens and took 13.2 s against a 4 s budget, because
+    that client's timeout bounds each socket read and OpenRouter keeps the socket
+    busy while the model thinks. The judge model with reasoning off spent 0
+    reasoning tokens on every call the same day. `max_tokens` and `effort` are
+    accepted for the `call` signature and ignored: the answer is one line."""
+    import json
+    import llm_tools_client
+    turn = llm_tools_client.complete_json_within(
+        prompt + '\nReply with JSON only: {"question": "<the question>"}',
+        seconds=timeout, caller=caller, max_tokens=JUDGE_MAX_TOKENS)
+    if turn.error:
+        return _Reply(False, error=turn.error, timed_out=turn.timed_out)
+    try:
+        parsed = json.loads(turn.text)
+    except (TypeError, ValueError):
+        return _Reply(False, error="unparseable")
+    q = parsed.get("question") if isinstance(parsed, dict) else None
+    if not isinstance(q, str):
+        return _Reply(False, error="no question field")
+    return _Reply(True, text=q)
 
 
 def _history_block(history):

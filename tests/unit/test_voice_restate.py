@@ -92,6 +92,7 @@ def env(monkeypatch):
     monkeypatch.setenv("QWEN_API_KEY", "k-test")
     monkeypatch.setenv("QWEN_BASE_URL", "http://llm.test/v1/")
     monkeypatch.delenv("VOICE_RESTATE_MODEL", raising=False)
+    monkeypatch.delenv("VOICE_RESTATE_PROVIDER", raising=False)
 
 
 def patch_urlopen(monkeypatch, result):
@@ -118,7 +119,9 @@ def test_success_assembles_and_sends_exactly_the_contract(env, monkeypatch):
     assert req.get_header("Authorization") == "Bearer k-test"
     assert sent["timeout"] == 1.2
     body = json.loads(req.data)
-    assert set(body) == {"model", "messages", "max_tokens", "temperature"}
+    assert set(body) == {"model", "messages", "max_tokens", "temperature", "provider"}
+    # Pinned to Groq with fallbacks allowed (2026-11-12, provider_pin).
+    assert body["provider"] == {"order": ["groq"], "allow_fallbacks": True}
     assert body["model"] == "meta-llama/llama-3.1-8b-instruct"
     assert body["max_tokens"] == 40 and body["temperature"] == 0
     assert body["messages"] == [{"role": "system", "content": vr.RESTATE_SYSTEM},
@@ -128,6 +131,18 @@ def test_success_assembles_and_sends_exactly_the_contract(env, monkeypatch):
 def test_web_intent_changes_only_the_tail(env, monkeypatch):
     patch_urlopen(monkeypatch, FakeResp(completion(GOOD)))
     assert vr.restate(Q, web_intent=True)["text"].endswith("Searching online now.")
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("none", None), ("NONE", None),
+    ("coreweave/bf16", {"order": ["coreweave/bf16"], "allow_fallbacks": True}),
+    ("groq, coreweave/bf16", {"order": ["groq", "coreweave/bf16"], "allow_fallbacks": True}),
+])
+def test_provider_pin_is_read_at_call_time(env, monkeypatch, raw, expected):
+    sent = patch_urlopen(monkeypatch, FakeResp(completion(GOOD)))
+    monkeypatch.setenv("VOICE_RESTATE_PROVIDER", raw)
+    vr.restate(Q, web_intent=False)
+    assert json.loads(sent["req"].data).get("provider") == expected
 
 
 def test_model_is_read_at_call_time(env, monkeypatch):

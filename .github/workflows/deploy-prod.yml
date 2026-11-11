@@ -474,6 +474,7 @@ jobs:
               $PROVIDER_ORDER_PARAM \
               "AskVoiceRestate=${{ vars.PROD_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.PROD_ASK_VOICE_CONVO || 'false' }}" \
+              "AskVoiceAutoWeb=${{ vars.PROD_ASK_VOICE_AUTO_WEB || 'false' }}" \
               "VoiceWebEnabled=${{ vars.PROD_VOICE_WEB_ENABLED || 'false' }}" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
               "DashScopeApiKey=$DASHSCOPE_API_KEY" \

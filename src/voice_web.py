@@ -47,6 +47,18 @@ _PHRASES = (
     # Narrower than the spec list: "check online induction status" is ordinary
     # site speech, so this only counts before a clause word or at the end.
     r"check\s+online(?=\s+(?:what|whether|if|how|for|that|the|about)\b|[\s.,;:!?]*$)",
+    # 2026-11-12, from the owner's device: "Yes, please. Checking online." matched
+    # nothing above, so it was taken for a new question and the records were searched
+    # again. The -ing forms and "it/that" objects, under the same clause rule.
+    r"check(?:ing)?\s+(?:it\s+|that\s+)?online(?=\s+(?:what|whether|if|how|for|that|the|about)\b|[\s.,;:!?]*$)",
+    r"check(?:ing)?\s+the\s+(?:web|internet)",
+    r"search(?:ing)?\s+(?:for\s+)?(?:it|that)\s+online",
+    r"look(?:ing)?\s+(?:it\s+|that\s+)?up\s+on\s+the\s+(?:web|internet)",
+    r"look(?:ing)?\s+online",
+    # "and" goes with the phrase, so "Can you go online and find ..." strips to
+    # "Can you find ...", not "Can you and find ...".
+    r"go(?:ing)?\s+online\s+and",
+    r"go(?:ing)?\s+online(?=\s+(?:to|for|what|whether|if|how)\b|[\s.,;:!?]*$)",
 )
 # (?<![-\w]) / (?![-\w]) rather than \b: "the internet-connected panel" must not match.
 _ALT = r"(?<![-\w])(?:%s)(?![-\w])" % "|".join(_PHRASES)
@@ -95,12 +107,18 @@ def speakable(text) -> bool:
 # filler words. Every word of a reply must be in one of the three sets, so a
 # real question that merely starts with "yes" is never swallowed.
 _YES_PHRASES = (("look", "it", "up"), ("go", "ahead"), ("do", "it"),
-                ("search", "it"), ("search", "online"))
+                ("search", "it"), ("search", "online"),
+                # 2026-11-12: the owner's "Yes, please. Checking online." was not read
+                # as a yes. The -ing forms, and common ways of agreeing.
+                ("go", "for", "it"), ("please", "do"), ("do", "that"),
+                ("check", "online"), ("checking", "online"), ("searching", "online"),
+                ("go", "online"), ("look", "online"))
 _NO_PHRASES = (("never", "mind"),)
-_YES_WORDS = frozenset("yes yeah yep yup sure".split())
+_YES_WORDS = frozenset("yes yeah yep yup sure approved approve absolutely definitely".split())
 _NO_WORDS = frozenset("no nope nah cancel stop don't dont".split())
 _FILLER = frozenset(
-    "please thanks thank you ok okay it that go ahead do search online look up for".split())
+    "please thanks thank you ok okay it that go ahead do search online look up for "
+    "check checking searching".split())
 _REPLY_MAX_WORDS = 6
 _REPLY_STRIP = re.compile(r"[^\w\s']")
 

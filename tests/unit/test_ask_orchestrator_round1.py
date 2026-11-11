@@ -19,7 +19,9 @@ import pytest
 
 import ask_orchestrator as orch
 import corroboration_client
+import llm_tools_client
 import web_answer
+from llm_tools_client import ChatTurn
 
 
 # ------------------------------------------------------------- fake ask_tools
@@ -157,26 +159,28 @@ class _Spy:
     ('{"web": "maybe"}', None),
 ])
 def test_precheck_parses_or_returns_none(monkeypatch, text, expected):
-    spy = _Spy(corroboration_client.Reply(text=text))
-    monkeypatch.setattr(corroboration_client, "call", spy)
+    spy = _Spy(ChatTurn(text=text))
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", spy)
     assert orch.precheck("Is 40 mm cover enough?", 10) is expected
 
 
 def test_precheck_call_shape(monkeypatch):
-    spy = _Spy(corroboration_client.Reply(text='{"web": "no"}'))
-    monkeypatch.setattr(corroboration_client, "call", spy)
+    spy = _Spy(ChatTurn(text='{"web": "no"}'))
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", spy)
     orch.precheck("q one", 10)
     orch.precheck("q two", 1.5)
     (p1, kw1), (_, kw2) = spy.calls
     assert "q one" in p1
-    assert kw1 == {"timeout": orch.PRECHECK_TIMEOUT_S, "model": web_answer.CHEAP_MODEL, "max_tokens": 512,
-                   "effort": "low", "caller": "ask_precheck"}
-    assert kw2["timeout"] == 1.5
+    # The judge's routing under a wall-clock limit (2026-11-12), not gemini via
+    # corroboration_client.
+    assert kw1 == {"seconds": orch.PRECHECK_TIMEOUT_S, "caller": "ask_precheck",
+                   "max_tokens": orch.PRECHECK_MAX_TOKENS}
+    assert kw2["seconds"] == 1.5
 
 
 def test_precheck_failure_is_none_and_logged_without_text(monkeypatch, caplog):
-    monkeypatch.setattr(corroboration_client, "call",
-                        _Spy(corroboration_client.Reply(error="HTTP 500")))
+    monkeypatch.setattr(llm_tools_client, "complete_json_within",
+                        _Spy(ChatTurn(error="HTTP 500")))
     with caplog.at_level(logging.INFO):
         assert orch.precheck("secret question words", 10) is None
     assert "precheck=failed" in caplog.text
@@ -186,7 +190,7 @@ def test_precheck_failure_is_none_and_logged_without_text(monkeypatch, caplog):
 def test_precheck_raising_client_is_none(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("x")
-    monkeypatch.setattr(corroboration_client, "call", boom)
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", boom)
     assert orch.precheck("q", 10) is None
 
 
@@ -369,8 +373,8 @@ def test_round1b_runs_once_and_not_on_a_none_date(no_model):
 def test_auto_precheck_yes_runs_web_in_parallel_with_records(monkeypatch):
     web_started = threading.Event()
     overlap = {}
-    monkeypatch.setattr(corroboration_client, "call",
-                        lambda *a, **k: corroboration_client.Reply(text='{"web":"yes"}'))
+    monkeypatch.setattr(llm_tools_client, "complete_json_within",
+                        lambda *a, **k: ChatTurn(text='{"web":"yes"}'))
 
     def fake_general(question, budget, **kw):
         web_started.set()
@@ -390,11 +394,10 @@ def test_auto_precheck_yes_runs_web_in_parallel_with_records(monkeypatch):
     assert route["precheck"] == "yes" and route["web_ran"] is True
 
 
-@pytest.mark.parametrize("reply,flag", [(corroboration_client.Reply(text=""), "failed"),
-                                        (corroboration_client.Reply(text='{"web":"no"}'),
-                                         "no")])
+@pytest.mark.parametrize("reply,flag", [(ChatTurn(text=""), "failed"),
+                                        (ChatTurn(text='{"web":"no"}'), "no")])
 def test_auto_precheck_empty_or_no_means_no_web(monkeypatch, reply, flag):
-    monkeypatch.setattr(corroboration_client, "call", lambda *a, **k: reply)
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", lambda *a, **k: reply)
 
     def boom(*a, **k):
         raise AssertionError("web must not run")
