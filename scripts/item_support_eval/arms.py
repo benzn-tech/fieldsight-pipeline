@@ -49,6 +49,7 @@ the extractor is imported and:
   - refuses when the function has no LLM_REASONING_EFFORT, unless --allow-default-effort;
   - after `load_deployed_llm_env`, mirrors MIRRORED_LLM_KEYS (a key set but empty stays set
     and empty; a key missing on the function is removed here) and reloads `llm_utils`;
+  - refuses when any B run already in the namespace records another B prompt sha;
   - records in every run file `wording`, `reasoning_effort`, `fallback_models`,
     `primary_model` (what `llm_utils` will call, read back after the reload) and
     `deployed_env`, the copied key/value map without API keys (null = unset on the function).
@@ -460,6 +461,21 @@ def _default_load_env(function_name, *, profile, region, deployed=None):
                                  run=_Replay({"Environment": {"Variables": deployed}}))
 
 
+def require_b_prompt_unchanged(runs_dir, wording, emit_evidence):
+    """Re-test: refuse when any B run already in the wording's namespace (main or side)
+    records another prompt sha than the B prompt this run would send. A changed wording is
+    a new namespace (w2), never a mix inside one."""
+    with prompt_settings(emit_evidence):
+        current = prompt_sha(True)
+    base = store.locator_runs_base(runs_dir, wording)
+    for p in sorted(base.glob("**/B/*/*.json")):
+        recorded = store.read_json(p).get("prompt_sha")
+        if recorded != current:
+            _refuse(f"a B run under locator_v2/{wording}/ ({p.relative_to(base).as_posix()}) "
+                    f"records prompt_sha {recorded}; this run would send {current}. Use "
+                    f"another wording namespace.")
+
+
 def _refuse(msg):
     print(f"Refusing: {msg}", file=sys.stderr)
     raise SystemExit(2)
@@ -559,6 +575,7 @@ def main(argv=None, *, call=None, load_env=None, read_env=None):
         extra = prepare_deployed_config(a, read_env=read_env or _default_read_env,
                                         load_env=load_env or _default_load_env)
         copied = list(extra["deployed_env"])
+        require_b_prompt_unchanged(a.runs, a.wording, emit)
     rows = run_stage(a.stage, call=call or _default_call, data_dir=a.data, runs_dir=a.runs,
                      emit_evidence=emit, digest=digest, arms=sel, wording=a.wording,
                      extra=extra)

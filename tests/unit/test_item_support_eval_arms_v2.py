@@ -361,3 +361,36 @@ def test_default_read_env_parses_the_cli_output_with_a_fake_run():
 
     with pytest.raises(SystemExit):
         arms._default_read_env("fn", profile="p", region="r", run=fail)
+
+
+@pytest.mark.parametrize("side", [False, True])
+def test_run_refuses_when_a_b_run_in_the_namespace_has_another_prompt_sha(tmp_path, side):
+    data, runs = _dirs(tmp_path)
+    _write_set(data, 2, 0, n_side=1)
+    stage, n = ("side", "1") if side else ("fit", "2")
+    _main(["run", "--stage", stage, "--wording", "w1", "--arms", "B1",
+           "--emit-evidence", "false", "--confirm-count", n], data, runs)
+    p = sorted(Path(runs, "locator_v2", "w1").rglob("B/1/*.json"))[0]
+    store.write_json(p, dict(store.read_json(p), prompt_sha="sha-of-another-wording"))
+    call = FakeCall()
+    with pytest.raises(SystemExit) as e:
+        _main(["run", "--stage", "fit", "--wording", "w1", "--arms", "B2",
+               "--emit-evidence", "false", "--confirm-count", "2"], data, runs, call=call)
+    assert e.value.code == 2 and call.calls == []
+    # Another wording's namespace is not affected.
+    out = _main(["run", "--stage", "fit", "--wording", "w2", "--arms", "B1",
+                 "--emit-evidence", "false", "--confirm-count", "2"], data, runs)
+    assert out["calls"] == 2
+
+
+def test_run_refuses_when_emit_evidence_changes_the_b_prompt(tmp_path):
+    data, runs = _dirs(tmp_path)
+    _write_set(data, 2, 0)
+    _main(["run", "--stage", "fit", "--wording", "w1", "--arms", "B1",
+           "--emit-evidence", "false", "--confirm-count", "2"], data, runs)
+    with pytest.raises(SystemExit):
+        _main(["run", "--stage", "fit", "--wording", "w1", "--arms", "B2",
+               "--emit-evidence", "true", "--confirm-count", "2"], data, runs)
+    out = _main(["run", "--stage", "fit", "--wording", "w1", "--arms", "B2",
+                 "--emit-evidence", "false", "--confirm-count", "2"], data, runs)
+    assert out["calls"] == 2
