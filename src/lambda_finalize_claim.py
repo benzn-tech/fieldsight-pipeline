@@ -300,6 +300,17 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
         recipient = (ctx.get("recipient") or "").strip()
         if not recipient:
             continue          # already marked failed and named at claim time
+        if row.get("segment_count") == 0:
+            # NOT ONE CHUNK reached the server (TEST 2026-11-11: the phone opened the
+            # session, then held both chunks in its upload queue). An email would say
+            # "Nothing was captured" about audio that is still on the phone. Settle it
+            # without one; the idle close recorded NO_CHUNK_YET, so the first chunk
+            # that lands reopens the session and the normal path mails it then.
+            # `== 0`, not falsy: a row read without the column says nothing.
+            meeting_session.mark_sent(conn, session_id)
+            logger.warning("finalize: %s received no audio -- settled without an email; "
+                           "a late chunk reopens it", session_id)
+            continue
         rolling = read_rolling(ctx.get("folder"), ctx.get("date"), session_id) or {}
         # `rolling`, not `updated`: the subject rewrite and the `-updated` result
         # key belong to the merge alone, and a result on that key is invisible to

@@ -90,8 +90,10 @@ def test_mark_pending_close_bumps_version_and_guards_status():
     assert "status = 'pending_close'" in sql
     assert "version = version + 1" in sql
     assert "AND status IN ('open', 'pending_close')" in sql
-    # intent twice: once for close_intent, once for the idle-only closed_chunk_at snapshot
-    assert conn.calls[0]["params"] == ("2026-07-28T14:19:41", "end", "end", SID)
+    # intent twice: once for close_intent, once for the idle-only closed_chunk_at
+    # snapshot; then the stand-in for "no chunk yet" (see NO_CHUNK_YET)
+    assert conn.calls[0]["params"] == ("2026-07-28T14:19:41", "end", "end",
+                                       ms.NO_CHUNK_YET, SID)
 
 
 def test_claim_finalize_is_a_version_cas():

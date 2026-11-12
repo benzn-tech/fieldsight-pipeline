@@ -12,6 +12,8 @@ All writes are optimistic-lock guarded so a mis-touch (stop -> immediate resume)
 never finalizes early and never double-sends. FakeConn-testable: every function
 is a single `conn.cursor(row_factory=dict_row).execute(...)`.
 """
+from datetime import datetime, timezone
+
 from psycopg.rows import dict_row
 
 _COLS = (
@@ -250,22 +252,34 @@ def touch_segment(conn, session_id, at, chunk_at=None) -> dict | None:
     ).fetchone()
 
 
+#: closed_chunk_at for an idle close that had received no chunk at all. A real
+#: timestamp, not '-infinity': psycopg cannot load infinite datetimes into Python.
+NO_CHUNK_YET = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def mark_pending_close(conn, session_id, closed_at, intent) -> dict | None:
     """Stop signal received -> `pending_close`; bump `version` (the grace timer is
     scheduled against the returned version). No-op if already finalizing/sent.
 
     An IDLE close snapshots `last_chunk_at` into `closed_chunk_at`: the device
     time of the newest chunk the email will cover, which reopen_late compares a
-    later chunk against. An `end` close leaves it NULL (never reopened)."""
+    later chunk against. An `end` close leaves it NULL (never reopened).
+
+    An idle close with NO chunk yet (last_chunk_at NULL: the phone opened the
+    session, then held every chunk in its queue -- TEST 2026-11-11) snapshots
+    NO_CHUNK_YET instead of NULL. NULL means "closed before 0089, never reopen";
+    this session must reopen when its first chunk finally lands, and any real
+    chunk time is later than the epoch."""
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE meeting_session SET "
         f"status = 'pending_close', closed_at = %s, close_intent = %s, "
-        f"closed_chunk_at = CASE WHEN %s::text = 'idle' THEN last_chunk_at "
+        f"closed_chunk_at = CASE WHEN %s::text = 'idle' "
+        f"THEN COALESCE(last_chunk_at, %s) "
         f"ELSE closed_chunk_at END, "
         f"version = version + 1, updated_at = now() "
         f"WHERE session_id = %s AND status IN ('open', 'pending_close') "
         f"RETURNING {_COLS}",
-        (closed_at, intent, intent, session_id),
+        (closed_at, intent, intent, NO_CHUNK_YET, session_id),
     ).fetchone()
 
 
@@ -350,7 +364,7 @@ def list_finalizing(conn) -> list[dict]:
     same rows: a second query would be a second answer to one question."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT session_id, version, user_id, site_id, opened_at, closed_at, "
-        "finalizing_at, session_type, reopen_count "
+        "finalizing_at, session_type, reopen_count, segment_count "
         "FROM meeting_session WHERE status = 'finalizing'",
     ).fetchall()
 
