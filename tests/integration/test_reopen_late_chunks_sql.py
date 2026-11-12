@@ -206,3 +206,30 @@ def test_sweep_flag_on_reopens(db):
     row = _row(db)
     assert row["status"] == "open"
     assert row["reopen_count"] == 1
+
+
+def test_idle_close_with_no_chunk_snapshots_the_epoch_not_null(db):
+    """TEST 2026-11-11: the phone opened the session and held its chunks. NULL
+    would mean "closed before 0089, never reopen"."""
+    _session(db, status="open", close_intent=None, closed_at=None,
+             closed_chunk_at=None, last_chunk_at=None)
+    meeting_session.mark_pending_close(db, SID, _t(11, 0), "idle")
+    assert _row(db)["closed_chunk_at"] == meeting_session.NO_CHUNK_YET
+
+
+def test_end_close_with_no_chunk_still_leaves_null(db):
+    _session(db, status="open", close_intent=None, closed_at=None,
+             closed_chunk_at=None, last_chunk_at=None)
+    meeting_session.mark_pending_close(db, SID, _t(11, 0), "end")
+    assert _row(db)["closed_chunk_at"] is None
+
+
+def test_a_session_closed_with_no_chunk_reopens_when_its_first_chunk_lands(db):
+    _session(db, closed_chunk_at=meeting_session.NO_CHUNK_YET, last_chunk_at=_t(10, 6))
+    assert [r["session_id"] for r in meeting_session.reopen_late(db, 3, WINDOW)] == [SID]
+
+
+def test_list_finalizing_carries_segment_count(db):
+    _session(db, status="finalizing")
+    (row,) = meeting_session.list_finalizing(db)
+    assert row["segment_count"] == 0

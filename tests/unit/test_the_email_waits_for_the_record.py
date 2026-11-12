@@ -302,3 +302,30 @@ def test_the_backstop_runs_after_reconcile(monkeypatch):
 
     fc.lambda_handler({}, None)
     assert order == ["sweep", "reconcile", "backstop", "groups"]
+
+
+# ---- a session that never received audio (TEST 2026-11-11) ------------------
+
+def test_a_session_with_no_chunk_at_all_is_settled_without_an_email(monkeypatch):
+    """The phone opened the session and held its chunks in the upload queue. An
+    email would say "Nothing was captured" about audio still on the phone."""
+    settled = []
+    monkeypatch.setattr(fc.meeting_session, "mark_sent", lambda conn, sid: settled.append(sid))
+    mailed, written = _backstop([_row(waited_s=900, segment_count=0)])
+    assert mailed == [] and written == []
+    assert settled == [SID]
+
+
+def test_a_session_with_chunks_is_still_emailed(monkeypatch):
+    monkeypatch.setattr(fc.meeting_session, "mark_sent",
+                        lambda *a: pytest.fail("a session with audio must not be settled silently"))
+    mailed, written = _backstop([_row(waited_s=900, segment_count=2)])
+    assert mailed == [SID] and written
+
+
+def test_a_row_without_the_count_is_emailed_as_before(monkeypatch):
+    """Unknown is not zero: a row read without segment_count keeps today's email."""
+    monkeypatch.setattr(fc.meeting_session, "mark_sent",
+                        lambda *a: pytest.fail("unknown must not be read as no audio"))
+    mailed, _written = _backstop([_row(waited_s=900)])
+    assert mailed == [SID]
