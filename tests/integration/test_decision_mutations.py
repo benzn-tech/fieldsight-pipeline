@@ -126,3 +126,73 @@ def test_unmutated_day_has_no_findings(db):
     day = run_scripted_day(db)
     assert decision_replay.replay(db, company_id=day["companies"]) == []
     assert decision_replay.invariants(db, company_ids=day["companies"]) == []
+
+
+# ---------------------------------------------------------------- inbox answers (P1)
+# Planted faults in the org-api answer route (spec 2026-11-12 rev 2 §6). Each patches
+# lambda_org_api (or the decision table it reads) only while the scripted day's cards are
+# answered through the real POST route; the patch is undone before the judge runs, and the
+# judge reads decision_inbox.DECISION_OPTIONS -- the real table again by then.
+
+import decision_inbox  # noqa: E402
+import lambda_org_api as org  # noqa: E402
+from repositories import decision_cards as real_decision_cards  # noqa: E402
+from repositories import decision_ledger as real_decision_ledger  # noqa: E402
+from tests.integration.decision_scripted_day import answer_cards  # noqa: E402
+
+REAL_OPTIONS = dict(decision_inbox.DECISION_OPTIONS)
+
+
+def ledger_but_card_left_open(mp):
+    """The guarded UPDATE is skipped (the card stays open) but the route goes on as if it
+    had updated: the ledger row is written for a card that is still open."""
+    proxy = types.SimpleNamespace(**{n: getattr(real_decision_cards, n)
+                                     for n in dir(real_decision_cards)
+                                     if not n.startswith("__")})
+    proxy.answer = lambda conn, card_id, *a, **k: real_decision_cards.get_for_answer(
+        conn, card_id)
+    mp.setattr(org, "decision_cards", proxy)
+
+
+def decision_without_ledger(mp):
+    """A decision answer moves the card to answered but never writes its ledger row."""
+    mp.setattr(org, "decision_ledger", types.SimpleNamespace(append=lambda conn, row: None))
+
+
+def ledger_for_remind(mp):
+    """`remind` is treated as a decision: a ledger row silences the item."""
+    mp.setitem(decision_inbox.DECISION_OPTIONS, ("todo.overdue", "remind"), "decided")
+
+
+ANSWER_MUTATIONS = {
+    "ledger_but_card_left_open": (ledger_but_card_left_open,
+                                  "card ledger row (source card) on a card that is not answered"),
+    "decision_without_ledger": (decision_without_ledger,
+                                "answered with a decision option but no card ledger row"),
+    "ledger_for_remind": (ledger_for_remind,
+                          "card ledger row for an answer that is not a decision option"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ANSWER_MUTATIONS))
+def test_answer_mutations_are_all_caught(db, name):
+    patch, caught_by = ANSWER_MUTATIONS[name]
+    day = run_scripted_day(db)
+    answered = answer_cards(db, day, mutate=patch)
+    assert set(answered) == {"remind", "done", "accept"}, answered
+    # the patch is undone before the judge runs
+    assert org.decision_cards is real_decision_cards
+    assert org.decision_ledger is real_decision_ledger
+    assert decision_inbox.DECISION_OPTIONS == REAL_OPTIONS
+    findings = (decision_replay.real(decision_replay.replay(db, company_id=day["companies"]))
+                + decision_replay.invariants(db, company_ids=day["companies"]))
+    assert findings, f"mutation {name} was NOT caught"
+    assert any(caught_by in f for f in findings), (name, caught_by, findings)
+
+
+def test_unmutated_answers_have_no_findings(db):
+    """The control for the answer mutations: the same answers with no fault are clean."""
+    day = run_scripted_day(db)
+    answer_cards(db, day)
+    assert decision_replay.replay(db, company_id=day["companies"]) == []
+    assert decision_replay.invariants(db, company_ids=day["companies"]) == []
