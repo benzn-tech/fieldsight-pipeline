@@ -178,7 +178,7 @@ def _as_uuid(value):
         return None
 
 
-def overdue_open(conn, today_nz) -> list[dict]:
+def overdue_open(conn, today_nz, site_ids=None) -> list[dict]:
     """Every LIVE open action item whose deadline is before `today_nz` (an NZ date), one per
     stable_id, for the decision loop's todo.overdue scan (spec 2026-11-05 §6.3).
 
@@ -189,10 +189,21 @@ def overdue_open(conn, today_nz) -> list[dict]:
     archived site's items are left out.
     `company_id` is the SITE's company (project-owned tenancy). Items with no deadline are
     never overdue. Every company: this is the scan's global read. `site_name` (the site's
-    name) is for the per-site backlog digest (spec rev 6)."""
+    name) is for the per-site backlog digest (spec rev 6).
+
+    `site_ids` (the decision-card inbox's live digest count): only items whose newest live row
+    is on one of these sites -- the same predicate, filtered AFTER the newest row is picked
+    (so an item that moved site never counts under its old one); [] returns [] without a
+    query. None (the scan) runs the global statement exactly as before."""
     # The newest live row per stable_id is picked FIRST (get_live_by_stable_id's ordering),
     # and only then filtered on open/overdue: an older open row behind a newer done one is
     # not overdue.
+    if site_ids is not None:
+        site_ids = [str(s) for s in site_ids]
+        if not site_ids:
+            return []
+    site_filter = "AND site_id = ANY(%s::uuid[]) " if site_ids is not None else ""
+    params = (today_nz,) if site_ids is None else (today_nz, site_ids)
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT stable_id, text, deadline, responsible, site_id, company_id, site_name FROM ("
         f"  SELECT DISTINCT ON (a.stable_id) a.stable_id, a.text, a.deadline, "
@@ -205,8 +216,8 @@ def overdue_open(conn, today_nz) -> list[dict]:
         f"  ORDER BY a.stable_id, a.created_at DESC"
         f") live "
         f"WHERE shown AND status = 'open' AND deadline IS NOT NULL AND deadline < %s "
-        f"AND archived_at IS NULL ORDER BY stable_id",
-        (today_nz,),
+        f"AND archived_at IS NULL {site_filter}ORDER BY stable_id",
+        params,
     ).fetchall()
 
 

@@ -165,6 +165,9 @@ import extraction_pending
 import folder_key as folder_key_mod
 import nz_time
 import checklist_reports
+import decision_card_copy
+import decision_hub
+import decision_inbox
 import decision_rules
 import pipeline_trace
 import trace_views
@@ -180,6 +183,7 @@ import location_grouping
 import photo_binding
 import photo_rebind
 import session_scope
+import transcript_window
 import sweep_state
 import tenancy_status
 from db.connection import get_connection
@@ -209,7 +213,7 @@ import checklist
 import units as units_mod
 import walk_report
 from repositories import action_packs
-from repositories import decision_cards
+from repositories import decision_cards, decision_ledger
 import action_pack_view
 from repositories import project_docs
 from repositories import voice_note_photo
@@ -1674,12 +1678,6 @@ def label_decision_card(conn, caller, raw_card, body):
     return ok(_decision_card_views(conn, [row])[0])
 
 
-# The person-free remind label per rule, served in place of "Remind <name>..." when a card's
-# source is removed. The same wording the rules use when no person is known.
-_GENERIC_REMIND = {"checklist.gap": decision_rules.REMIND_INSPECTOR,
-                   "todo.overdue": decision_rules.REMIND_OWNER}
-
-
 def _session_under_prefixes(folder, date, session, prefixes):
     """Is `session` of (folder, date) under one of these recording tombstone prefixes
     (redactions.deleted_source_prefixes)? A tombstone's key is
@@ -1810,26 +1808,8 @@ def _decision_card_views(conn, rows):
     out = []
     for r in rows:
         cid = str(r["card_id"])
-        is_removed = cid in removed
-        question = r.get("question")
-        if is_removed and r.get("rule_id") == "todo.overdue":
-            question = decision_rules.removed_overdue_question(removed_due.get(cid))
-        generic_remind = _GENERIC_REMIND.get(r.get("rule_id")) if is_removed else None
-        options = []
-        for o in r.get("options") or []:
-            if not isinstance(o, dict):
-                continue
-            label = o.get("label")
-            if generic_remind is not None and o.get("id") == "remind":
-                label = generic_remind
-            view = {"id": o.get("id"), "label": label,
-                    "recommended": bool(o.get("recommended"))}
-            if "reason_required" in o:
-                view["reason_required"] = bool(o["reason_required"])
-            options.append(view)
-        evidence = [] if is_removed else [
-            {"quote": e.get("quote"), "at": e.get("at")}
-            for e in (r.get("evidence") or []) if isinstance(e, dict)]
+        question, options, evidence = decision_card_copy.redact(
+            r, cid in removed, removed_due.get(cid))
         recipients = [
             {"user_id": str(rc.get("user_id")), "role": rc.get("role"),
              "display_name": names.get(str(rc.get("user_id")), "")}
@@ -1843,6 +1823,206 @@ def _decision_card_views(conn, rows):
             "shadow_label": r.get("shadow_label"), "label_note": r.get("label_note"),
             "options": options, "evidence": evidence, "recipients": recipients})
     return out
+
+
+# ----------------------------------------------------------
+# Decision card inbox, P1 web route (spec 2026-11-12-decision-card-inbox-design rev 2).
+#   GET  /api/org/decision-cards                    -> {cards, digest, more}
+#   POST /api/org/decision-cards/{card_id}/answer   -> {status, applied}
+# Both 404 like an unknown route unless DECISION_INBOX=companies AND SITE_DECISION_LOOP=shadow
+# (read per call). Only cards of companies in DECISION_INBOX_COMPANIES are served, and only to
+# a caller who is still a recipient (`_inbox_recipient_roles`). Pure pieces: decision_inbox;
+# served copy: decision_card_copy.redact, shared with the shadow review.
+# ----------------------------------------------------------
+_DECISION_CARDS_RE = re.compile(r"^/decision-cards(?:/([^/]+)/answer)?$")
+
+
+def _decision_inbox_on():
+    return (os.environ.get("DECISION_INBOX") or "").strip().lower() == "companies"
+
+
+def _decision_inbox_companies():
+    raw = os.environ.get("DECISION_INBOX_COMPANIES") or ""
+    return {c.strip().lower() for c in raw.split(",") if c.strip()}
+
+
+def _inbox_now():
+    return datetime.now(timezone.utc)
+
+
+def decision_cards_route(conn, caller, event, method, route):
+    not_found = error("not found", 404)
+    if not _decision_inbox_on() or not _decision_loop_shadow_on():
+        return not_found
+    m = _DECISION_CARDS_RE.match(route)
+    if not m:
+        return not_found
+    raw_card = m.group(1)
+    if raw_card is None:
+        if method != "GET":
+            return not_found
+        return list_decision_inbox(conn, caller)
+    if method != "POST":
+        return not_found
+    return answer_decision_card(conn, caller, raw_card, parse_body(event))
+
+
+def _inbox_recipient_roles(conn, caller, rows):
+    """{card_id (str): the recipient role the caller still holds} for the rows the caller may
+    see (spec §4 "Still a recipient"); rows not in the map are not served.
+
+    The card's company must be allow-listed and active (tenancy_status evaluated for the
+    CARD's site: no caller exemption), and the caller's STORED recipient role must still
+    hold: pm / site_manager -> the caller is a member of the card's site with that role
+    (memberships.members_for_site: external members included, archived excluded);
+    company_admin -> same company and a decision_hub.COMPANY_ADMIN_GLOBAL_ROLES global role;
+    any other role -> not served. One membership query per distinct (company, site)."""
+    allow = _decision_inbox_companies()
+    inactive = tenancy_status.inactive_site_ids(conn) or set()
+    uid = str(caller["id"])
+    members, out = {}, {}
+    for r in rows:
+        if str(r["company_id"]).lower() not in allow or str(r["site_id"]) in inactive:
+            continue
+        role = next((rc.get("role") for rc in (r.get("recipients") or [])
+                     if isinstance(rc, dict) and str(rc.get("user_id")) == uid), None)
+        if role in ("pm", "site_manager"):
+            key = (str(r["company_id"]), str(r["site_id"]))
+            if key not in members:
+                members[key] = {(str(mb["id"]), mb.get("site_role")) for mb in
+                                memberships.members_for_site(conn, key[0], key[1])}
+            if (uid, role) in members[key]:
+                out[str(r["card_id"])] = role
+        elif role == "company_admin":
+            if (str(caller.get("company_id")) == str(r["company_id"])
+                    and caller.get("global_role") in decision_hub.COMPANY_ADMIN_GLOBAL_ROLES):
+                out[str(r["card_id"])] = role
+    return out
+
+
+def _has_answerable_option(row):
+    return any(isinstance(o, dict) and o.get("id") for o in row.get("options") or [])
+
+
+def _inbox_digest(conn, backlog_rows, now):
+    """{count, title, href} over the sites of the caller's visible backlog cards, counted
+    LIVE: the stale subset (decision_hub.is_late under RULES["todo.overdue"], on the scan's
+    own per-item event) of today's action_items.overdue_open for each site. None when no
+    site contributes. One overdue_open call, restricted in SQL to those sites."""
+    if not backlog_rows:
+        return None
+    from lambda_decision_scan import overdue_item_event   # the scan's builder, shared
+    today_nz = nz_time.to_nz(now).date()
+    rule = decision_rules.RULES["todo.overdue"]
+    names = {(str(r["company_id"]), str(r["site_id"])): r.get("site_name") or ""
+             for r in backlog_rows}
+    counts = dict.fromkeys(names, 0)
+    for item in action_items.overdue_open(conn, today_nz,
+                                          site_ids=sorted({k[1] for k in names})):
+        key = (str(item["company_id"]), str(item["site_id"]))
+        if key in counts and decision_hub.is_late(overdue_item_event(item, now), rule,
+                                                  today_nz):
+            counts[key] += 1
+    per_site = [(names[k], n) for k, n in counts.items()]
+    title = decision_inbox.digest_title(per_site)
+    if title is None:
+        return None
+    return {"count": sum(n for _, n in per_site), "title": title,
+            "href": decision_inbox.DIGEST_HREF}
+
+
+def _inbox_view(conn, rows):
+    """Card views for `rows` (already visible and ordered), with the shared redaction."""
+    removed, due = _removed_source_cards(conn, rows)
+    out = []
+    for r in rows:
+        cid = str(r["card_id"])
+        question, options, evidence = decision_card_copy.redact(r, cid in removed, due.get(cid))
+        out.append(decision_inbox.card_view(r, question, options, evidence,
+                                            r.get("site_name"), cid in removed))
+    return out
+
+
+def list_decision_inbox(conn, caller):
+    """GET /api/org/decision-cards (spec §4): the caller's open cards, ordered and capped on
+    the server, plus the live backlog digest. 200 with empty lists when nothing is served."""
+    rows = decision_cards.inbox_rows(conn, sorted(_decision_inbox_companies()), caller["id"])
+    roles = _inbox_recipient_roles(conn, caller, rows)
+    visible = [r for r in rows if str(r["card_id"]) in roles]
+    backlog = [r for r in visible if r.get("rule_id") == "todo.overdue_backlog"]
+    cards = []
+    for r in visible:
+        if decision_inbox.is_excluded(r):
+            continue
+        if not _has_answerable_option(r):
+            logger.warning("decision-inbox: card %s has no option; skipped", r["card_id"])
+            continue
+        cards.append(r)
+    shown, more = decision_inbox.order_and_cap(cards)
+    return ok({"cards": _inbox_view(conn, shown),
+               "digest": _inbox_digest(conn, backlog, _inbox_now()),
+               "more": more})
+
+
+def answer_decision_card(conn, caller, raw_card, body):
+    """POST /api/org/decision-cards/{card_id}/answer, body {option_id, reason?} (spec §5).
+
+    Every 404/400 is decided BEFORE any write (an error() return is a clean exit and the
+    request transaction commits). 404 (existence not leaked): unknown/malformed id, company
+    not allow-listed or inactive, excluded universe (fault/rule/digest), or the caller is not
+    a current recipient. 400: decision_inbox.validate_answer.
+
+    First answer wins in one transaction: the tenant-scoped guarded UPDATE, then -- only for
+    an option in decision_inbox.DECISION_OPTIONS -- one decision_ledger row whose evidence is
+    the card's evidence as served (post-redaction) plus a final reason element. 0 rows
+    updated: the same caller's same answer is a retry (200); anything else, including the
+    scan superseding the card, is 409 stale."""
+    not_found = error("not found", 404)
+    row = decision_cards.get_for_answer(conn, raw_card)
+    if row is None or decision_inbox.is_excluded(row) or not _has_answerable_option(row):
+        return not_found                            # same visibility as GET
+    cid = str(row["card_id"])
+    role = _inbox_recipient_roles(conn, caller, [row]).get(cid)
+    if role is None:
+        return not_found
+    if body is None:
+        return error("invalid JSON body", 400)
+    option_id, reason = body.get("option_id"), body.get("reason")
+    problem = decision_inbox.validate_answer(row, option_id, reason)
+    if problem is not None:
+        return error(problem, 400)
+    reason_text = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    kind = decision_inbox.DECISION_OPTIONS.get((row.get("rule_id"), option_id))
+    evidence = None
+    if kind is not None and row["status"] == "open":
+        # Only a card that can still be answered needs its served evidence (S3 + tombstone
+        # reads): on a non-open card the UPDATE matches nothing and the 0-row path (retry
+        # 200 / 409) never reads `evidence`, so an S3 fault cannot turn a retry into a 500.
+        evidence = _inbox_view(conn, [row])[0]["evidence"]
+        if reason_text is not None:
+            evidence = evidence + [{"kind": "reason", "text": reason_text}]
+    answered = decision_cards.answer(conn, row["card_id"], row["company_id"], row["site_id"],
+                                     caller["id"], option_id, reason_text)
+    if answered is None:
+        current = decision_cards.get_for_answer(conn, row["card_id"])
+        if (current is not None and current["company_id"] == row["company_id"]
+                and current["site_id"] == row["site_id"] and current["status"] == "answered"
+                and str(current["answered_by"]) == str(caller["id"])
+                and current["answered_option"] == option_id):
+            logger.info("decision-inbox answer retry card=%s option=%s by=%s",
+                        cid, option_id, caller["id"])
+            return ok({"status": "answered", "applied": None})
+        logger.info("decision-inbox answer stale card=%s option=%s by=%s",
+                    cid, option_id, caller["id"])
+        return ok({"status": "stale"}, 409)
+    if kind is not None:
+        decision_ledger.append(conn, {
+            "company_id": row["company_id"], "site_id": row["site_id"],
+            "card_id": row["card_id"], "subject_ref": row["subject_ref"],
+            "decision": option_id, "kind": kind, "decided_by": caller["id"],
+            "authority_basis": role, "evidence": evidence, "source": "card"})
+    logger.info("decision-inbox answer card=%s option=%s by=%s", cid, option_id, caller["id"])
+    return ok({"status": "answered", "applied": None})
 
 
 def decision_shadow_summary(rows, since=None):
@@ -1941,6 +2121,11 @@ def dispatch(conn, event, method, route):
     # anything else answers exactly the unknown-route 404 below.
     if route == "/decision-shadow" or route.startswith("/decision-shadow/"):
         return decision_shadow_route(conn, caller, event, method, route)
+
+    # Decision card inbox (P1 web route). Behind DECISION_INBOX=companies and
+    # SITE_DECISION_LOOP=shadow: anything else answers exactly the unknown-route 404 below.
+    if route == "/decision-cards" or route.startswith("/decision-cards/"):
+        return decision_cards_route(conn, caller, event, method, route)
 
     if route == "/me":
         if method == "GET":
@@ -3178,10 +3363,33 @@ def _redacted_or_hidden(r, redacted, deleted):
     The one rule both `_report_rows_in_scope` (which drops these rows) and
     `_excluded_topics_for` (which reports them) apply, so there is a single
     place that defines "excluded" rather than two copies that can drift."""
-    if r["id"] in redacted or r.get("work_class") == "non_work":
-        return True
+    return _exclusion_reason(r, redacted, deleted) is not None
+
+
+#: The redaction the non-work expiry sweep writes (lambda_nonwork_expiry.REASON):
+#: the policy, not a person, so it is still an automatic exclusion.
+AUTO_NON_WORK_REDACTION = "non_work_auto_expiry"
+
+
+def _exclusion_reason(r, redacted, deleted):
+    """Why `r` is excluded -- "deleted" (under a tombstoned prefix),
+    "redacted" (a person removed it), "auto_non_work" (classified non_work,
+    or the expiry sweep's redaction of such a topic) -- or None. The rule
+    `_redacted_or_hidden` answers yes/no from, kept in one place.
+
+    The difference matters only to `_excluded_topics_for` (spec 2026-11-13):
+    what a person removed is cut whole; an automatic non_work range is cut
+    only where no work topic covers it."""
     key = r.get("source_s3_key") or ""
-    return any(key.startswith(p) for p in deleted)
+    if any(key.startswith(p) for p in deleted):
+        return "deleted"
+    red = redacted.get(r["id"]) if isinstance(redacted, dict) else (
+        {} if r["id"] in (redacted or ()) else None)
+    if red is not None and (red or {}).get("reason") != AUTO_NON_WORK_REDACTION:
+        return "redacted"
+    if red is not None or r.get("work_class") == "non_work":
+        return "auto_non_work"
+    return None
 
 
 def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
@@ -3714,7 +3922,7 @@ def _excluded_topics_for(conn, caller, folder, date, session_id=None):
         return []
     redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
     deleted = _deleted_prefixes_for_rows(conn, rows, date)
-    out = []
+    scoped = []
     for r in rows:
         # Same first cut `_report_rows_in_scope` makes: a row that is not a
         # recorded-speech extraction (KIND_EXTRACTION) can never correspond to
@@ -3727,8 +3935,22 @@ def _excluded_topics_for(conn, caller, folder, date, session_id=None):
             continue
         if session_id is not None and sid != session_id:
             continue
-        if _redacted_or_hidden(r, redacted, deleted):
+        scoped.append((r, _exclusion_reason(r, redacted, deleted)))
+    # An AUTOMATIC non_work range is cut only where no work topic of the same
+    # scope covers it (spec 2026-11-13): banter spread through a walk became one
+    # topic spanning the walk and cut all its work. What a person removed, and
+    # what is under a deleted prefix, is still cut whole.
+    cover = [r.get("time_range") for r, why in scoped if why is None]
+    out = []
+    for r, why in scoped:
+        if why is None:
+            continue
+        pieces = (transcript_window.uncovered_pieces(r.get("time_range"), cover)
+                  if why == "auto_non_work" else None)
+        if pieces is None:
             out.append({"id": str(r["id"]), "time_range": r.get("time_range")})
+        else:
+            out.extend({"id": str(r["id"]), "time_range": p} for p in pieces)
     return out
 
 

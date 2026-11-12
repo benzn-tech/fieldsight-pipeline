@@ -324,7 +324,7 @@ NOT_EXPORTED = (
     ("keyframe_tombstones", "deleted video keyframes"),
     ("redactions", "deletion / redaction records (deleted content is excluded above)"),
     ("decision_cards", "questions the site decision loop put to people, and their "
-                       "review labels"),
+                       "review labels and answers"),
     ("decision_ledger", "decisions recorded by the site decision loop (who, on what "
                         "authority, when)"),
     ("nightly_reemits", "the nightly agent's record of requests it sent again"),

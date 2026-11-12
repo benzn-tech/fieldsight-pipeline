@@ -296,6 +296,16 @@ Parameters:
       records miss into a spoken offer to search online, honouring a yes or no
       to it. Set via TEST_/PROD_ repo vars; unset is false.
 
+  AskKeepWarm:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      A 5-minute schedule invokes AskAgent with {"mode": "warm"}: imports and AWS
+      clients only, no model or HTTP call. A device's first question after idle
+      started in 4.8 s server-side (6.3 s client) against 2.1 s warm (TEST
+      2026-11-12), past the device's 5 s restatement window. Set via TEST_/PROD_
+      repo vars; unset is false.
   AskVoiceAutoWeb:
     Type: String
     Default: 'false'
@@ -1681,6 +1691,33 @@ Parameters:
       site events and the hub stores routed cards with status open -- nothing is sent
       (no SES, push, voice, Lambda invoke or model call).
 
+  # Decision card inbox, P1 web route (spec 2026-11-12-decision-card-inbox-design rev 2 §2).
+  # Pinned by tests/unit/test_decision_inbox_template.py. Env on OrgApiFunction only.
+  # off (default): GET/POST /api/org/decision-cards answer 404. companies: served for cards
+  # whose company is in DecisionInboxCompanies, and only while SiteDecisionLoop=shadow.
+  # ('internal' is not used: on org-api ACTION_PACKS=internal already means
+  # platform_admin-only.) Set per environment by TEST_DECISION_INBOX / PROD_DECISION_INBOX
+  # and TEST_DECISION_INBOX_COMPANIES / PROD_DECISION_INBOX_COMPANIES -- SAM keeps a stack's
+  # previous value, so the workflow variable, not this Default, is what sets it.
+  # Kill switch: set X_DECISION_INBOX=off. Unsetting X_DECISION_INBOX_COMPANIES does NOT clear
+  # the allow-list (the override is only passed when set, and SAM keeps the old value).
+  DecisionInbox:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'companies']
+    Description: >-
+      off (default) makes the decision-card inbox routes answer 404. companies serves the
+      inbox for the companies listed in DecisionInboxCompanies (requires
+      SiteDecisionLoop=shadow).
+
+  DecisionInboxCompanies:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[0-9a-fA-F-]+(,[0-9a-fA-F-]+)*$'
+    Description: >-
+      Comma-separated company UUIDs (no spaces) whose decision cards the inbox serves when
+      DecisionInbox=companies. Empty serves no company.
+
   # Nightly re-match agent (spec 2026-11-10-nightly-rematch-agent-design §4.3). Pinned by
   # tests/unit/test_nightly_rematch.py. off (default): no tick, no worker, no writer.
   # shadow: the hourly tick runs, the hub's nightly.due run-rule counts J3 markers and
@@ -1874,6 +1911,7 @@ Mappings:
 
 Conditions:
   HasVoiceprintSpreadOverride: !Not [!Equals [!Ref VoiceprintMaxFrameSpread, 'default']]
+  ShouldKeepAskWarm: !Equals [!Ref AskKeepWarm, 'true']
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
   ShouldEnableRecordingBlocks: !Equals [!Ref EnableRecordingBlocks, 'true']
@@ -2599,6 +2637,14 @@ Resources:
       # ON on TEST. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
       Timeout: 28
       MemorySize: 256
+      Events:
+        KeepWarm:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keep AskAgent warm for the device's first voice question
+            State: !If [ShouldKeepAskWarm, ENABLED, DISABLED]
+            Input: '{"mode": "warm"}'
       Environment:
         Variables:
           # Under the Lambda Timeout above, or the runtime hard-kills this function
@@ -3304,6 +3350,9 @@ Resources:
           LAKE_BUCKET: !Ref IngestBucketName
           # Site decision loop (off | shadow): the decision-card routes read it.
           SITE_DECISION_LOOP: !Ref SiteDecisionLoop
+          # off -> /decision-cards (the inbox) answers 404 (see the DecisionInbox parameter)
+          DECISION_INBOX: !Ref DecisionInbox
+          DECISION_INBOX_COMPANIES: !Ref DecisionInboxCompanies
           # Site voice: dedicated off-the-record prefix (matches no S3 trigger).
           VOICE_PREFIX: voice/
           # Phase 3 Task 4 — graded-roles cutover flag, wired the same way as
@@ -6860,6 +6909,15 @@ Resources:
                 StringLike:
                   s3:prefix: ['ask_turns/*']
       Events:
+        # Same flag and reason as AskAgent's KeepWarm: the device's /ask/voice/start
+        # reaches AskAgent through this function, so a cold one costs the same window.
+        KeepWarm:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keep ApiFunction warm for the device's first voice question
+            State: !If [ShouldKeepAskWarm, ENABLED, DISABLED]
+            Input: '{"mode": "warm"}'
         HealthCheck:
           Type: Api
           Properties:

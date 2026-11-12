@@ -1,7 +1,8 @@
 # Site decision loop P0 engineering gate (spec docs/superpowers/specs/2026-11-05-site-decision-loop-design.md §12):
 # the replay judge, the SQL invariants and the mutation gate, plus the scan's own
 # integration tests, every night against a fresh Postgres.
-# "No answer counted twice" cannot be exercised until P1 (spec §12).
+# "No answer counted twice": first-answer-wins and one ledger row per answer are proven by
+# test_decision_inbox_answer.py (P1 inbox, spec 2026-11-12).
 # 15:00 UTC = 03:00/04:00 NZ. Same Postgres service, env and dependency list as test.yml.
 name: Nightly decision loop
 on:
@@ -32,4 +33,4 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements-test.txt
-      - run: python -m pytest -v tests/integration/test_decision_replay.py tests/integration/test_decision_mutations.py tests/integration/test_decision_scan.py
+      - run: python -m pytest -v tests/integration/test_decision_replay.py tests/integration/test_decision_mutations.py tests/integration/test_decision_scan.py tests/integration/test_decision_inbox_answer.py

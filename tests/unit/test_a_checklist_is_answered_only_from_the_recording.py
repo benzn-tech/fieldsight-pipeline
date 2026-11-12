@@ -288,4 +288,5 @@ def test_an_on_site_answer_names_the_templates_own_item():
 def test_the_prompt_asks_for_a_whole_clause_and_a_confirmed_claim():
     s = checklist.shape_sentence()
     assert "at least three words" in s
-    assert "is not confirmed: leave the item out" in s
+    assert "that nobody then confirms is not an answer: leave the" in s
+    assert "whoever says it" in s and "inspector agrees" not in s

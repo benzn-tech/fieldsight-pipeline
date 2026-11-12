@@ -167,3 +167,57 @@ def run_scripted_day(conn, mutate=None):
         _drain(conn, DAY2, scope)
     return {"companies": scope, "home": home, "co": co, "sites": [a1, b1, b2],
             "fence_ref": fence_ref}
+
+
+def answer_cards(conn, day, mutate=None):
+    """Answer three of the scripted day's open cards through the REAL org-api POST route
+    (decision card inbox, spec 2026-11-12 rev 2 §5), so the judge sees what production
+    writes: `remind` on A1's open todo.overdue card (no ledger row), `done` on B1's
+    (a 'decided' row) and `accept` with a reason on one of B1's checklist.gap cards.
+    `mutate(mp)` patches lambda_org_api / decision_inbox through the same MonkeyPatch, undone
+    before return. No asserts (a planted fault must surface through the judge). Returns
+    {option: card_id}."""
+    import json
+
+    import lambda_org_api as org
+    home, co = day["home"], day["co"]
+    a1, b1, _ = day["sites"]
+
+    def open_card(site, rule_id, option):
+        return conn.execute(
+            "SELECT card_id, recipients FROM decision_cards WHERE site_id = %s "
+            "AND rule_id = %s AND status = 'open' AND options @> %s::jsonb "
+            "ORDER BY created_at, card_id LIMIT 1",
+            (site["id"], rule_id, json.dumps([{"id": option}]))).fetchone()
+
+    plan = (("remind", open_card(a1, "todo.overdue", "remind"), None),
+            ("done", open_card(b1, "todo.overdue", "done"), None),
+            ("accept", open_card(b1, "checklist.gap", "accept"), "Rail fixed on site"))
+    out = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SITE_DECISION_LOOP", "shadow")
+        mp.setenv("DECISION_INBOX", "companies")
+        mp.setenv("DECISION_INBOX_COMPANIES", f"{home['id']},{co['id']}")
+        mp.delenv("COMPANY_STATUS_ENFORCE", raising=False)
+        mp.setattr(org, "s3", lambda: FakeS3())
+        mp.setattr(org, "S3_BUCKET", "data-bucket")
+        if mutate is not None:
+            mutate(mp)
+        for option, found, reason in plan:
+            if found is None:
+                continue
+            card_id, recipients = found
+            pm = next(r for r in recipients if r.get("role") == "pm")
+            sub = conn.execute("SELECT cognito_sub FROM users WHERE id = %s",
+                               (pm["user_id"],)).fetchone()[0]
+            body = {"option_id": option}
+            if reason:
+                body["reason"] = reason
+            route = f"/decision-cards/{card_id}/answer"
+            org.dispatch(conn, {"httpMethod": "POST", "path": "/api/org" + route,
+                                "queryStringParameters": None, "body": json.dumps(body),
+                                "headers": {},
+                                "requestContext": {"authorizer": {"claims": {"sub": sub}}}},
+                         "POST", route)
+            out[option] = card_id
+    return out

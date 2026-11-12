@@ -274,3 +274,82 @@ def test_cli_exit_code(migrated_db_url, monkeypatch, capsys, rep, inv, code):
     out = capsys.readouterr().out
     for f in rep + inv:
         assert f in out
+
+
+# ---------------------------------------------------------------- inbox answers (P1)
+
+def test_replay_is_clean_after_inbox_answers(db):
+    """Answers written by the real POST route (remind, done, gap accept with a reason) leave
+    the judge with nothing to say, and the day really holds what the new checks look at."""
+    from tests.integration.decision_scripted_day import answer_cards
+    day = run_scripted_day(db)
+    scope = day["companies"]
+    answered = answer_cards(db, day)
+    assert set(answered) == {"remind", "done", "accept"}, answered
+    rows = {opt: db.execute(
+        "SELECT c.status, c.answered_option, (SELECT count(*) FROM decision_ledger l "
+        "WHERE l.card_id = c.card_id AND l.source = 'card') FROM decision_cards c "
+        "WHERE c.card_id = %s", (cid,)).fetchone() for opt, cid in answered.items()}
+    assert rows == {"remind": ("answered", "remind", 0), "done": ("answered", "done", 1),
+                    "accept": ("answered", "accept", 1)}, rows
+    assert decision_replay.replay(db, company_id=scope) == []
+    assert decision_replay.invariants(db, company_ids=scope) == []
+
+
+def test_older_answered_card_then_a_new_open_card_on_the_key_is_clean(db, monkeypatch):
+    """A remind frees the card key: the next day's todo.overdue event cards again, so one
+    key holds an older 'answered' card and a newer open one -- consistent, 0 findings."""
+    import json
+
+    import lambda_org_api as org
+    from repositories import users
+    co, site, pm, admin = _world(db)
+    _overdue_item(db, site)
+    lds.emit_todo_overdue(db, NOW)
+    lds.process(db, NOW)
+    [card_id] = [r[0] for r in db.execute(
+        "SELECT card_id FROM decision_cards WHERE company_id = %s AND status = 'open'",
+        (co["id"],)).fetchall()]
+    monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
+    monkeypatch.setenv("DECISION_INBOX", "companies")
+    monkeypatch.setenv("DECISION_INBOX_COMPANIES", str(co["id"]))
+    monkeypatch.delenv("COMPANY_STATUS_ENFORCE", raising=False)
+    sub = users.get_user_by_sub(db, pm["cognito_sub"])["cognito_sub"]
+    route = f"/decision-cards/{card_id}/answer"
+    res = org.dispatch(db, {"httpMethod": "POST", "path": "/api/org" + route,
+                            "queryStringParameters": None,
+                            "body": json.dumps({"option_id": "remind"}), "headers": {},
+                            "requestContext": {"authorizer": {"claims": {"sub": sub}}}},
+                       "POST", route)
+    assert res["statusCode"] == 200, res
+    day2 = NOW + dt.timedelta(days=1)
+    lds.emit_todo_overdue(db, day2)
+    assert lds.process(db, day2)["cards"] == 1
+    st = [r[0] for r in db.execute(
+        "SELECT status FROM decision_cards WHERE company_id = %s ORDER BY created_at",
+        (co["id"],)).fetchall()]
+    assert st == ["answered", "open"], st
+    assert decision_replay.replay(db, company_id=co["id"]) == []
+    assert decision_replay.invariants(db, company_ids=[co["id"]]) == []
+    # an older card in any other status under the same key is still reported
+    db.execute("UPDATE decision_cards SET status = 'done' WHERE card_id = %s", (card_id,))
+    out = decision_replay.replay(db, company_id=co["id"])
+    assert any("not superseded or answered" in m for m in out), out
+    assert any("only open / superseded / answered" in m for m in out), out
+
+
+def test_answer_column_invariants_report_tampering(db):
+    """Hand-edited answer columns (no route writes these shapes) are reported."""
+    from tests.integration.decision_scripted_day import answer_cards
+    day = run_scripted_day(db)
+    scope = day["companies"]
+    answered = answer_cards(db, day)
+    db.execute("UPDATE decision_cards SET answered_at = NULL WHERE card_id = %s",
+               (answered["remind"],))
+    open_id = db.execute(
+        "SELECT card_id FROM decision_cards WHERE company_id = ANY(%s::uuid[]) "
+        "AND status = 'open' LIMIT 1", ([str(c) for c in scope],)).fetchone()[0]
+    db.execute("UPDATE decision_cards SET answer_reason = 'x' WHERE card_id = %s", (open_id,))
+    out = decision_replay.invariants(db, company_ids=scope)
+    assert any("answered card without answered_by" in m for m in out), out
+    assert any("open card with answer columns set" in m for m in out), out

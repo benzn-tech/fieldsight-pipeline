@@ -127,18 +127,21 @@ jobs:
         # DB secret ARN: read from the db stack's export; passed as a plain
         # parameter because {{resolve:secretsmanager:...}} can't compose
         # with Fn::ImportValue (only with Parameters).
+        # OrgApiReservedConcurrency: test and prod are separate stacks in the SAME
+        # account, so both reservations come out of the one 1000-slot pool. TEST
+        # carries no customer traffic, so it takes a token slice (25) and leaves
+        # prod's 200 intact. (Comments cannot live inside the --parameter-overrides
+        # continuation below: a '#' after a line-continuation backslash comments out
+        # the REST of the command.)
+        # Decision card inbox (spec 2026-11-12 §2): DecisionInbox defaults to off; the
+        # DecisionInboxCompanies allow-list uses the same bare-"Key=" guard as the
+        # other _PARAM overrides (appended only when TEST_DECISION_INBOX_COMPANIES is set).
         run: |
           # A space inside any --parameter-overrides "Key=Value" breaks SAM's parser.
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
           # SAM's --parameter-overrides REJECTS a bare "Key=" with an empty value, so the
           # ffmpeg-layer override is only appended when the var is actually set; unset =>
           # the token is omitted and the template Default ('') keeps the stack uncreated.
-          # OrgApiReservedConcurrency: test and prod are separate stacks in the SAME
-          # account, so both reservations come out of the one 1000-slot pool. TEST
-          # carries no customer traffic, so it takes a token slice (25) and leaves
-          # prod's 200 intact. (Comments cannot live inside the --parameter-overrides
-          # continuation below: a '#' after a line-continuation backslash comments out
-          # the REST of the command.)
           # Optional by design: an Ask key that is not set means the elevenlabs
           # STT provider REFUSES rather than borrowing the pipeline's key, so an
           # empty secret must not become a bare `ElevenLabsAskApiKey=` and exit 2
@@ -210,6 +213,10 @@ jobs:
           ACTION_PACKS_PARAM=""
           if [ -n "${{ vars.TEST_ACTION_PACKS }}" ]; then
             ACTION_PACKS_PARAM="ActionPacks=${{ vars.TEST_ACTION_PACKS }}"
+          fi
+          DECISION_INBOX_COMPANIES_PARAM=""
+          if [ -n "${{ vars.TEST_DECISION_INBOX_COMPANIES }}" ]; then
+            DECISION_INBOX_COMPANIES_PARAM="DecisionInboxCompanies=${{ vars.TEST_DECISION_INBOX_COMPANIES }}"
           fi
           # The pack verifier (spec 2026-11-01 §14 S6): empty = the cheap model in code.
           # Same bare-"Key=" guard.
@@ -363,6 +370,7 @@ jobs:
               $ASK_THREADS_PARAM \
               $COMPANY_STATUS_ENFORCE_PARAM \
               $ACTION_PACKS_PARAM \
+              $DECISION_INBOX_COMPANIES_PARAM \
               $ACTION_VERIFIER_MODEL_PARAM \
               $ACTION_VERIFIER_FALLBACKS_PARAM \
               $ACTION_WRITER_MODEL_PARAM \
@@ -405,6 +413,7 @@ jobs:
               "AskVoiceRestate=${{ vars.TEST_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.TEST_ASK_VOICE_CONVO || 'false' }}" \
               "AskVoiceAutoWeb=${{ vars.TEST_ASK_VOICE_AUTO_WEB || 'false' }}" \
+              "AskKeepWarm=${{ vars.TEST_ASK_KEEP_WARM || 'true' }}" \
               "VoiceWebEnabled=${{ vars.TEST_VOICE_WEB_ENABLED || 'false' }}" \
               "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
               "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \
@@ -442,6 +451,7 @@ jobs:
               "StatusSuggestions=${{ vars.TEST_STATUS_SUGGESTIONS || 'false' }}" \
               "ReconcileStatus=${{ vars.TEST_RECONCILE_STATUS || 'false' }}" \
               "SiteDecisionLoop=${{ vars.TEST_SITE_DECISION_LOOP || 'off' }}" \
+              "DecisionInbox=${{ vars.TEST_DECISION_INBOX || 'off' }}" \
               "NightlyRematch=${{ vars.TEST_NIGHTLY_REMATCH || 'off' }}" \
               "ContinuityLinker=${{ vars.TEST_CONTINUITY_LINKER || 'false' }}" \
               "CrossDayContinuity=${{ vars.TEST_CROSS_DAY_CONTINUITY || 'off' }}" \

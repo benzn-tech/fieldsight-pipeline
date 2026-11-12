@@ -4,7 +4,11 @@ status. One OPEN card per card_key (partial unique index), so a superseded card 
 
 Every function is scoped by company_id and site_id except list_shadow, get_shadow,
 evidence_sources, overdue_item_states, shadow_summary_rows (platform-admin reads across
-every company) and set_label (platform-admin write by card id)."""
+every company), set_label (platform-admin write by card id), and the inbox reads inbox_rows
+(by allow-listed companies + recipient) and get_for_answer (by card id; the caller checks
+visibility). P1 (migration 0103): the inbox's answer() moves open -> answered."""
+import re
+
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -195,3 +199,60 @@ def set_label(conn, card_id, label, note, user_id):
         "UPDATE decision_cards SET shadow_label = %s, label_note = %s, labelled_by = %s, "
         f"labelled_at = now() WHERE card_id = %s RETURNING {_COLS}",
         (label, note, user_id, card_id)).fetchone()
+
+
+# --- decision-card inbox (spec 2026-11-12-decision-card-inbox-design rev 2 §4, §5) ---------
+# Scoped by the caller's allow-listed companies and recipient membership (inbox_rows), by
+# card id for the POST's visibility check (get_for_answer), and by tenant for the write
+# (answer). The event payload is joined on the SAME tenant, so another tenant's event never
+# lends a card its text.
+
+_ANSWER_COLS = "c.answered_by, c.answered_option, c.answered_at, c.answer_reason"
+_INBOX_SELECT = (
+    f"SELECT {_C_COLS}, {_ANSWER_COLS}, s.name AS site_name, e.payload AS payload "
+    "FROM decision_cards c JOIN sites s ON s.id = c.site_id "
+    "LEFT JOIN site_events e ON e.event_id = c.event_id "
+    "  AND e.company_id = c.company_id AND e.site_id = c.site_id ")
+
+
+_UUID_PAT = re.compile(_UUID_RE)
+
+
+def _uuids(values):
+    return [str(v) for v in values if v is not None and _UUID_PAT.match(str(v))]
+
+
+def inbox_rows(conn, company_ids, user_id):
+    """Open cards of these companies whose recipients contain `user_id`, with site_name and
+    the originating event's payload (None without one) and the answer columns. Includes
+    todo.overdue_backlog and fault rows: the caller splits/excludes. A company id that is not
+    a uuid is dropped (never cast), so a malformed allow-list entry matches nothing."""
+    ids = _uuids(company_ids)
+    if not ids or not _uuids([user_id]):
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        _INBOX_SELECT
+        + "WHERE c.company_id = ANY(%s::uuid[]) AND c.status = 'open' "
+        "AND c.recipients @> %s::jsonb ORDER BY c.created_at, c.card_id",
+        (ids, Jsonb([{"user_id": str(user_id)}]))).fetchall()
+
+
+def get_for_answer(conn, card_id):
+    """One card in inbox_rows' shape (any status), or None; None for a card id that is not a
+    uuid. Visibility is decided by the caller."""
+    if not _uuids([card_id]):
+        return None
+    return conn.cursor(row_factory=dict_row).execute(
+        _INBOX_SELECT + "WHERE c.card_id = %s::uuid", (str(card_id),)).fetchone()
+
+
+def answer(conn, card_id, company_id, site_id, user_id, option_id, reason):
+    """First answer wins: open -> answered with who/what/when/why, for this tenant's card.
+    The row (with the answer columns), or None when no open card matched (already answered,
+    superseded, or another tenant's)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE decision_cards SET status = 'answered', answered_by = %s, answered_option = %s, "
+        "answered_at = now(), answer_reason = %s "
+        "WHERE card_id = %s AND company_id = %s AND site_id = %s AND status = 'open' "
+        f"RETURNING {_COLS}, answered_by, answered_option, answered_at, answer_reason",
+        (user_id, option_id, reason, card_id, company_id, site_id)).fetchone()
