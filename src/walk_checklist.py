@@ -14,7 +14,16 @@ customer wording and order as an ordinary check. On top of that:
     and without stretches it must claim a line of its own that no other
     unit's all-good claimed (R45) -- one quote never covers two units;
   * a finding that names no unit goes to General -- kept, never guessed into
-    a unit -- if its evidence is in the transcript;
+    a unit -- if its evidence is in the transcript. A numbered General
+    answer said before he walked into the first unit is SITE-WIDE (R53,
+    spec 2026-11-13): it is answered once, in General, and each unit's row
+    for that item points to it (state "site_wide", origin "general") unless
+    the unit answered the item itself. A site-wide row is neither not
+    checked nor failed in the unit, all-good never fills it, and the summary
+    shows it as "<answer> (G)". "Before the first unit" is decided by the
+    first entered mark's place in the text, else (report only) by a General
+    stretch before the first unit stretch, else not at all -- then nothing
+    is site-wide;
   * the walk's units are the opening's names, the units he entered and the
     units in the rows (R44): a unit named or walked into with no rows still
     gets its section, every item not checked; a unit not named in the opening
@@ -40,6 +49,9 @@ OUTSIDE = "all good outside the unit"
 NO_EVIDENCE = "evidence not in the transcript"
 NOT_YES = "all good answer is not Yes"
 NOT_PLACED = "all good not placed"
+TWICE = "answered twice"
+SITE_WIDE = "site_wide"
+SITE_WIDE_COMMENT = "Site-wide — see General"
 _SUMMARY_CELL = {"not_checked": "Not checked", "check": "Check"}
 _TIME_RE = re.compile(r"^\[(\d\d:\d\d(?::\d\d)?)")
 
@@ -121,13 +133,36 @@ def render(unit):
     return paragraphs, line_refs
 
 
+def _summary_cell(r):
+    if r["state"] == SITE_WIDE:
+        return r["answer"] + " (G)"
+    return _SUMMARY_CELL.get(r["state"], r["answer"])
+
+
 def summary(units, items):
-    """The unit-by-item grid: Yes / No / N/A when answered, else Not checked or
-    Check."""
+    """The unit-by-item grid: Yes / No / N/A when answered, "<answer> (G)" when
+    site-wide (answered in General), else Not checked or Check."""
     rows = []
     for u in units:
-        rows.append([u["unit"]] + [_SUMMARY_CELL.get(r["state"], r["answer"]) for r in u["rows"]])
+        rows.append([u["unit"]] + [_summary_cell(r) for r in u["rows"]])
     return {"columns": list(items), "rows": rows}
+
+
+def recount(unit):
+    """A unit's report counts, rebuilt from its rows: `answered` (answered
+    rows), `site_wide` (rows answered in General), `gaps` -- not checked rows
+    and answered Nos; a site-wide row is in neither -- and `evidence` (every
+    row that has some). Shared by build and the on-site overlay."""
+    rows, report = unit["rows"], unit["report"]
+    report["answered"] = sum(1 for r in rows if r["state"] == "answered")
+    report["site_wide"] = sum(1 for r in rows if r["state"] == SITE_WIDE)
+    report["gaps"] = {
+        "not_covered": [{"n": r["n"], "text": r["item"]} for r in rows if r["state"] == "not_checked"],
+        "failed": [{"n": r["n"], "text": r["item"], "comment": r["comment"] or "",
+                    "responsible": r["responsible"] or "", "due": r["due"] or ""}
+                   for r in rows if r["state"] == "answered" and r["answer"] == "No"],
+    }
+    report["evidence"] = {r["n"]: r["evidence"] for r in rows if r["evidence"]}
 
 
 # ---- all good -------------------------------------------------------------------
@@ -210,6 +245,51 @@ def _mark_places(text, marks):
             return None
         out.append((place, units_mod._entered_unit(m)))
         after = place
+    return out
+
+
+def _first_mark_place(text, marks):
+    """The word index where he first walked into a unit -- the earliest named
+    mark by time, its first place in the text -- or None when that mark is not
+    found. Unlike _mark_places, a later mark that is not found does not
+    matter: only the first entry bounds what was said before any unit."""
+    named = [m for m in marks or [] if units_mod._entered_unit(m)]
+    if not named:
+        return None
+    first = min(named, key=lambda m: units_mod._hhmmss(m) or "")
+    hits = text.hits(str(first.get("quote") or ""))
+    return hits[0] if hits else None
+
+
+def _site_wide(general, text, first_place, stretches, transcript_text):
+    """{item n: General row} of the General answers said before he walked
+    into the first unit (R53). Only rows with an item number and an answer.
+
+    With the first mark placed: every place the evidence was said lies before
+    it, and there is at least one. Otherwise, with a unit stretch (report
+    only): every transcript line holding the evidence is timed and falls in a
+    General stretch before the first unit stretch. Otherwise nothing: when it
+    is not known where he was, nothing is site-wide. Both rely on the
+    transcript being in time order (oldest recording first)."""
+    rows = [g for g in general if g.get("n") and g.get("answer")]
+    if not rows:
+        return {}
+    out = {}
+    if first_place is not None:
+        for g in rows:
+            hits = text.hits(g["evidence"])
+            if hits and max(hits) < first_place:
+                out[g["n"]] = g
+        return out
+    unit_starts = [units_mod._seconds_form(s["from"]) for s in stretches or [] if s.get("unit")]
+    if not unit_starts:
+        return out
+    first_unit = min(unit_starts)
+    for g in rows:
+        lines = _matching_lines(g["evidence"], transcript_text)
+        if lines and all(t and units_mod._seconds_form(t) < first_unit
+                         and units_mod.unit_at(stretches, t) is None for _, t in lines):
+            out[g["n"]] = g
     return out
 
 
@@ -299,7 +379,8 @@ def _apply_all_good(rows, quote, at, report):
 
 # ---- the walk -------------------------------------------------------------------
 
-def _unit_section(unit, model_rows, items, transcript_text, good, all_dropped, report_date):
+def _unit_section(unit, model_rows, items, transcript_text, good, all_dropped, report_date,
+                  site_wide=None):
     section = {"paragraphs": list(model_rows), "line_refs": [[] for _ in model_rows]}
     paragraphs, line_refs, report = checklist.rebuild(section, items, transcript_text, report_date)
     rows = []
@@ -311,21 +392,49 @@ def _unit_section(unit, model_rows, items, transcript_text, good, all_dropped, r
                      "state": "answered" if answer else "not_checked", "origin": "recording"})
     report["dropped"].extend(all_dropped)
     out = {"unit": unit, "rows": rows, "report": report}
+    # R53: an item answered site-wide in General points there, unless the unit
+    # answered it itself -- before all-good, which fills only not-checked rows.
+    linked = False
+    for r in rows:
+        g = (site_wide or {}).get(r["n"])
+        if g and r["state"] == "not_checked":
+            r.update(answer=g["answer"], comment=SITE_WIDE_COMMENT, responsible="", due="",
+                     evidence=g["evidence"], refs=[], state=SITE_WIDE, origin="general")
+            linked = True
     if good:
         _apply_all_good(rows, good[0], good[1], report)
+    # rebuild counted before the link: the counts come from the rows.
+    recount(out)
+    if good or linked:
         paragraphs, line_refs = render(out)
     out["paragraphs"], out["line_refs"] = paragraphs, line_refs
     return out
 
 
-def _general(model_rows, t_words):
-    kept, dropped = [], []
+def _general(model_rows, t_words, items):
+    """(kept, dropped) General rows. Each kept row keeps its item number `n`
+    (None when the cell is not an item of the list) with the item's text, and
+    its normalized `answer` ("" when not Yes, No or N/A). An all-good row is
+    dropped (OUTSIDE: all-good belongs to a unit); a row whose evidence is
+    not in the transcript is dropped; an item answered twice keeps the
+    first."""
+    kept, dropped, seen = [], [], set()
     for line in model_rows:
         cells = (checklist._cells(line) + [""] * 6)[:6]
+        num = cells[0].strip()
+        n = int(num) if re.match(r"^\d+$", num) and 1 <= int(num) <= len(items) else None
+        answer = checklist.ANSWERS.get(cells[1].strip().lower(), "")
         entry = {"comment": cells[2], "evidence": cells[5]}
-        why = checklist.evidence_reason(entry["evidence"], t_words)
+        if num.upper() == ALL:
+            why = OUTSIDE
+        else:
+            why = checklist.evidence_reason(entry["evidence"], t_words)
+        if why is None and n and answer:
+            why = TWICE if n in seen else None
+            seen.add(n)
         if why is None:
-            kept.append(entry)
+            kept.append(dict({"n": n, "item": items[n - 1] if n else "", "answer": answer},
+                             **entry))
         else:
             dropped.append(dict(entry, reason=why))
     return kept, dropped
@@ -362,12 +471,16 @@ def build(model_text, items, transcript_text, opening, stretches=None, report_da
         if u not in order:
             order.append(u)
     t_words = checklist.transcript_words(transcript_text)
+    general, general_dropped = _general(grouped.get(GENERAL, []), t_words, items)
     # All-good rows are timed in row order, so an earlier unit claims its
     # line before a later unit that said the same words.
     goods, all_dropped, claimed = {}, {}, set()
     alls = list(dict.fromkeys(u for u, row in parsed if u in order and _is_all(row)))
-    text = _Text(transcript_text) if alls and entered else None
-    places = _mark_places(text, entered) if text else None
+    numbered = any(g["n"] and g["answer"] for g in general)
+    text = _Text(transcript_text) if (alls or numbered) and entered else None
+    places = _mark_places(text, entered) if text and alls else None
+    first = _first_mark_place(text, entered) if text and numbered else None
+    site_wide = _site_wide(general, text, first, stretches, transcript_text)
     for u in alls:
         all_dropped[u] = []
         goods[u] = _all_good(grouped[u], t_words, transcript_text, u, stretches,
@@ -375,10 +488,9 @@ def build(model_text, items, transcript_text, opening, stretches=None, report_da
     walk = []
     for u in order:
         sec = _unit_section(u, grouped.get(u, []), items, transcript_text, goods.get(u),
-                            all_dropped.get(u, []), report_date)
+                            all_dropped.get(u, []), report_date, site_wide)
         sec["flagged_unlisted"] = bool(names) and u not in names
         walk.append({k: sec[k] for k in ("unit", "paragraphs", "line_refs", "report",
                                          "flagged_unlisted", "rows")})
-    general, general_dropped = _general(grouped.get(GENERAL, []), t_words)
     return {"units": walk, "general": general, "general_dropped": general_dropped,
             "summary": summary(walk, items)}

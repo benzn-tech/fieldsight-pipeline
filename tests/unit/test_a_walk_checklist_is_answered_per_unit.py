@@ -136,7 +136,7 @@ def test_general_rows_are_kept_not_guessed():
         "| General | - | No | skip bin overflowing | | | The skip bin by the gate is overflowing |\n"
         "| the gate | 1 | No | made up | | | the gate was left wide open all night |\n")
     got = wc.build(text, ITEMS, TRANSCRIPT, OPENING)
-    assert got["general"] == [{"comment": "skip bin overflowing",
+    assert got["general"] == [{"n": None, "item": "", "answer": "No", "comment": "skip bin overflowing",
                                "evidence": "The skip bin by the gate is overflowing"}]
     assert got["general_dropped"] == [{"comment": "made up",
                                        "evidence": "the gate was left wide open all night",
