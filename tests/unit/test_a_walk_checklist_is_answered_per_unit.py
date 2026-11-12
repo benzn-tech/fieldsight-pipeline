@@ -434,4 +434,5 @@ def test_the_walk_prompt_scopes_a_back_reference_and_asks_for_confirmed_claims()
     assert "covers only the findings said with the back-reference" in s
     assert "the unit he walked into last" in s
     assert "at least three words" in s
-    assert "is not confirmed: leave the item out" in s
+    assert "that nobody then confirms is not an answer: leave the" in s
+    assert "whoever says it" in s and "inspector agrees" not in s

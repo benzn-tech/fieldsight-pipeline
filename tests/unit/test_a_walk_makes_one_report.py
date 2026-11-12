@@ -495,7 +495,7 @@ def test_r44_an_on_site_answer_that_cannot_be_applied_is_shown_in_the_report(run
 # the walk branch existed (captured on 44f6a273). Re-captured 2026-11-13: only the
 # checklist shape sentence changed (spec 2026-11-13 D2/D4), checked by running the
 # test against the old checklist.py.
-NO_WALK_SNAPSHOT = "4b87420c017f4c3e70b0a5329dbaf27b4ae812c4b7a12d1db986cca0e7b3d4b9"
+NO_WALK_SNAPSHOT = "28c47ee4714aa7db5788070babe63278c39f804af1a739957860c9a9725b661f"
 
 
 def _fingerprint(sections, prompts, meta):
