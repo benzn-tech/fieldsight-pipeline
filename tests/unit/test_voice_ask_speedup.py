@@ -248,3 +248,24 @@ def test_the_screen_still_sends_the_original_words(monkeypatch):
              history=[{"question": "what about B2", "answer": "poured"}]),
         ScriptChat(final("x [R1]")))
     assert seen == ["and the cover? search online"]
+
+
+def test_sentences_keep_their_decimals_and_clause_numbers():
+    # TEST 2026-11-12: the device spoke only "14 for uplift fixings." as the answer.
+    import lambda_ask_agent as laa
+    text = ("For a 2.4 m opening NZS 3604 Table 8.9 gives a 2/190x45 lintel. "
+            "Use Table 8.14 for uplift fixings. Check the span against clause 8.6.1.3 too.")
+    assert laa._SENTENCE.findall(text) == [
+        "For a 2.4 m opening NZS 3604 Table 8.9 gives a 2/190x45 lintel.",
+        "Use Table 8.14 for uplift fixings.",
+        "Check the span against clause 8.6.1.3 too."]
+
+
+def test_a_long_web_answer_is_cut_to_its_first_two_whole_sentences():
+    import lambda_ask_agent as laa
+    long_tail = " ".join(["Further detail follows here."] * 20)
+    text = ("For a 2.4 m opening Table 8.9 gives a 2/190x45 lintel. "
+            "Use Table 8.14 for uplift fixings. " + long_tail)
+    assert laa._speakable_web_answer(text, None) == (
+        "For a 2.4 m opening Table 8.9 gives a 2/190x45 lintel. "
+        "Use Table 8.14 for uplift fixings.")
