@@ -52,7 +52,11 @@ def source_label(rule_id: str, payload) -> str:
         due = _parse_date(_payload(payload).get("deadline"))
         if due is None:
             return "Overdue"
-        return f"Overdue since {_day_month(due + timedelta(days=1))}"
+        try:
+            since = due + timedelta(days=1)
+        except OverflowError:                         # 9999-12-31: no next day
+            return "Overdue"
+        return f"Overdue since {_day_month(since)}"
     if rule_id == "checklist.gap":
         return "Missing from the inspection"
     return "From the site"
@@ -61,7 +65,7 @@ def source_label(rule_id: str, payload) -> str:
 def digest_title(per_site: list[tuple[str, int]]) -> Optional[str]:
     """Title of the digest over (site_name, live stale count) pairs; None when no site
     contributes. Sites with 0 are left out; the site clause appears only when more than one
-    site contributes (names sorted, at most 3, then ' and N more sites')."""
+    site contributes (names sorted, at most 3, then ' and 1 more site' / ' and N more sites')."""
     sites = [(name, n) for name, n in per_site if n and n > 0]
     total = sum(n for _, n in sites)
     if total <= 0:
@@ -72,7 +76,8 @@ def digest_title(per_site: list[tuple[str, int]]) -> Optional[str]:
         names = sorted(name for name, _ in sites)
         title += " on " + ", ".join(names[:3])
         if len(names) > 3:
-            title += f" and {len(names) - 3} more sites"
+            extra = len(names) - 3
+            title += f" and {extra} more site{'s' if extra != 1 else ''}"
     return title
 
 
@@ -139,8 +144,8 @@ def card_view(row: dict, question: str, options: list, evidence: list, site_name
            "audio": None}
           for e in (evidence or []) if isinstance(e, dict)][:2]
     return {
-        "card_id": str(row.get("card_id")), "kind": row.get("kind"),
-        "site_id": str(row.get("site_id")), "site_name": site_name,
+        "card_id": str(row["card_id"]), "kind": row.get("kind"),
+        "site_id": str(row["site_id"]), "site_name": site_name,
         "created_at": _iso_utc(row.get("created_at")),
         "source_label": source_label(rule_id, payload), "sub_label": None,
         "question": question, "item": item, "options": opts, "evidence": ev,

@@ -31,7 +31,7 @@ def test_source_label_overdue_is_deadline_plus_one_day():
 
 def test_source_label_overdue_malformed_or_absent():
     for payload in (None, {}, {"deadline": None}, {"deadline": ""}, {"deadline": "soon"},
-                    {"deadline": "2026-13-40"}, "not json", [], 7):
+                    {"deadline": "2026-13-40"}, {"deadline": "9999-12-31"}, "not json", [], 7):
         assert source_label("todo.overdue", payload) == "Overdue", payload
 
 
@@ -59,6 +59,11 @@ def test_digest_title_multi_site_sorted():
 def test_digest_title_more_than_three_sites():
     got = digest_title([("E", 1), ("C", 1), ("A", 1), ("D", 1), ("B", 1)])
     assert got == "5 overdue to-dos more than 3 days old on A, B, C and 2 more sites"
+
+
+def test_digest_title_four_sites_singular_tail():
+    got = digest_title([("D", 1), ("C", 1), ("B", 1), ("A", 1)])
+    assert got == "4 overdue to-dos more than 3 days old on A, B, C and 1 more site"
 
 
 def test_digest_title_zero_sites_left_out():
@@ -246,3 +251,12 @@ def test_module_has_no_io_imports():
         elif isinstance(node, ast.ImportFrom):
             mods.add((node.module or "").split(".")[0])
     assert mods <= {"json", "datetime", "typing", "decision_rules"}, mods
+
+
+def test_card_view_requires_card_id_and_site_id():
+    import pytest
+    for missing in ("card_id", "site_id"):
+        row = _overdue_row()
+        del row[missing]
+        with pytest.raises(KeyError):
+            card_view(row, "q", _OPTS, [], "S", False)
