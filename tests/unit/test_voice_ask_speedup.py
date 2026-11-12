@@ -285,3 +285,42 @@ def test_an_unspeakable_answer_logs_counts_not_text(caplog):
     with caplog.at_level(logging.WARNING):
         assert laa._speakable_web_answer(secret, None) == voice_web.NO_CLEAR_ANSWER
     assert "not speakable: words=70" in caplog.text and "secretword" not in caplog.text
+
+
+# ------------------------------------------------------------------ pre-check is the gate
+
+def _precheck(monkeypatch, verdict):
+    monkeypatch.setattr(llm_tools_client, "complete_json_within", lambda *a, **k:
+                        ChatTurn(text=json.dumps({"web": verdict})))
+
+
+def test_after_a_precheck_no_the_judge_cannot_take_a_voice_question_online(monkeypatch):
+    from tests.unit.test_ask_orchestrator_judge import calls
+    monkeypatch.setenv("ASK_VOICE_AUTO_WEB", "true")
+    _precheck(monkeypatch, "no")
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block())
+    chat = ScriptChat(calls(("web_search", {"query": "who is the plumber"})),
+                      final("No record names the plumber."))
+    run(voice_body("Who is doing the plumbing on this job?"), chat, channel="voice")
+    assert seen == []
+    assert "web_search" not in [t["function"]["name"] for t in chat.calls[0]["tools"]]
+
+
+def test_after_a_precheck_yes_the_web_runs(monkeypatch):
+    monkeypatch.setenv("ASK_VOICE_AUTO_WEB", "true")
+    _precheck(monkeypatch, "yes")
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block())
+    run(voice_body("What size are timber lintels under NZS 3604?"),
+        ScriptChat(final("Use the section 8 tables.", basis="web")), channel="voice")
+    assert seen == ["What size are timber lintels under NZS 3604?"]
+
+
+def test_voice_drops_a_malformed_ref_the_screen_keeps_its_text():
+    out_v = orch.to_client("No site records mention it [D: none].", [], None, "voice")
+    assert out_v["answer"] == "No site records mention it."
+    out_s = orch.to_client("No site records mention it [D: none].", [], None, "screen")
+    assert "[D: none]" in out_s["answer"]
