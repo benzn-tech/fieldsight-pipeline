@@ -302,6 +302,8 @@ _REF_GROUP = re.compile(
 # One token inside a group: a ref, or a range `R1-R3` / `R1-3`.
 _REF_TOKEN = re.compile(r"([RWD]?)(\d+)(?:\s*[-–]\s*([RWD]?)(\d+))?")
 _RANGE_MAX = 50
+# Voice only: a short bracketed leftover after ref mapping ("[D: none]", "[R?]").
+_VOICE_LEFTOVER_BRACKET = re.compile(r"[ \t]*\[[^\[\]\n]{0,24}\]")
 # Item kinds a citation card can be built for. A person or a metric is valid
 # evidence with no card: its ref is stripped from the text, never counted bad.
 _CARD_KINDS = ("chunk", "topic")
@@ -418,6 +420,11 @@ def to_client(answer_text, envelopes, web_block, channel) -> dict:
     # Numeric markers first: the [n] that repl writes must not be stripped.
     text = _NUMERIC_GROUP.sub(numeric, answer_text or "")
     text = _REF_GROUP.sub(repl, text)
+    if voice:
+        # Anything still in brackets is a malformed ref the groups above did not
+        # parse, and a listener hears it read out: on TEST 2026-11-12 a device said
+        # "...no site records mention it, D none" from a judge's "[D: none]".
+        text = _VOICE_LEFTOVER_BRACKET.sub("", text)
     text = _MULTI_BLANK.sub(" ", text).strip()
 
     web = None
@@ -1454,6 +1461,14 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
             t.web_failed = wmeta.get("error") or "upstream"
             route["web_failed"] = t.web_failed
     shown = list(batches[0])
+
+    # Voice `auto`: the pre-check is the gate, not a hint. Without this the judge kept
+    # `web_search` for the whole turn and could take a question about the team's own
+    # work online after the pre-check said "no" -- which the owner was told never
+    # happens (2026-11-12). A failed or late pre-check counts as "no", as in round 1.
+    if voice and pol == "auto" and route.get("precheck") != "yes":
+        pol = t.pol = "never"
+        route["web_withheld"] = True
 
     # ---- judge loop (spec §6.4)
     if chat is None:
