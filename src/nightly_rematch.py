@@ -26,7 +26,9 @@ with a RunContext. `run` does, for the event's site:
      LAST, after every read that can raise, each stamped with the flag. In shadow the
      worker is not wired, so nothing reads them.
 
-  4. J1 catch-up for late arrivals (spec §3 J1), after the J2 plan and BEFORE the J2 puts
+  4. J1 catch-up for late arrivals (spec §3 J1), in J1's own mode (j1_mode: NIGHTLY_J1
+     over the run flag; `on`/`shadow` below mean that mode, and in off J1 is skipped with
+     no detection reads), after the J2 plan and BEFORE the J2 puts
      (the J2 artifacts stay the run's last writes). `stale_pairs`: a session L whose
      final was written in the last 72 h makes an earlier-written final N stale when L was
      RECORDED before N (continuity_xday.recorded_earlier, the #1273 rule) and inside N's
@@ -45,7 +47,10 @@ Returns "nothing" when there was no work, else "done". One counts line per run (
 counts and enums only -- never item text).
 
 In shadow the only DB writes are the hub's own event and run rows: J3 counts, J2 writes
-S3 objects only, J1 counts.
+S3 objects only, J1 counts -- J1 aside: J1 has its own flag, NIGHTLY_J1
+(docs/superpowers/specs/2026-11-13-nightly-j1-gate-design.md, see j1_mode), so with
+NIGHTLY_J1=on J1 writes nightly_reemits rows and puts reconcile / cross-day requests even
+while NIGHTLY_REMATCH is shadow; with NIGHTLY_J1=off it does no detection reads at all.
 """
 import datetime as _dt
 import hashlib
@@ -94,6 +99,9 @@ J1_MAX = 10
 # pairs make the overlap safe.
 J1_LATE_HOURS = 72
 J1_WINDOW_DAYS = continuity_xday.WINDOW_DAYS
+# J1's own flag (spec 2026-11-13-nightly-j1-gate): inherit (default) | off | shadow | on.
+J1_ENV = "NIGHTLY_J1"
+_J1_VALUES = ("inherit", "off", "shadow", "on")
 
 COUNT_KEYS = ("j2_sessions", "j2_items", "j3_recomputed", "j3_failed", "j3_pending",
               "budget_paused", "skipped_no_window", "skipped_no_text", "skipped_group",
@@ -182,10 +190,11 @@ def run_counts(conn, event, ctx, *, clock=time.monotonic):
 
     # J1 BEFORE the J2 puts: its detection reads can raise (a failed hub attempt), and must
     # do so while no J2 artifact exists yet. Its re-emits each run in their own savepoint
-    # (put last) and never raise out of the run.
+    # (put last) and never raise out of the run. J1 off: no detection reads at all.
+    mode = j1_mode(ctx.flag)
     groups = _stale_groups(conn, company_id=company_id, site_id=site_id,
-                           now_utc=ctx.now_utc)
-    _j1_catch_up(conn, ctx, night, groups, counts, started, clock)
+                           now_utc=ctx.now_utc) if mode else []
+    _j1_catch_up(conn, ctx, night, groups, counts, started, clock, mode)
 
     # Last: the J2 artifacts. Nothing below can be undone by a later raise.
     for key, body in planned:
@@ -196,12 +205,24 @@ def run_counts(conn, event, ctx, *, clock=time.monotonic):
 
     logger.info(
         "nightly site=%s j2_sessions=%d j2_items=%d j3_recomputed=%d budget_paused=%d "
-        "skipped_no_window=%d j1_stale=%d j1_reemitted=%d flag=%s counts=%s", site_id,
-        counts["j2_sessions"], counts["j2_items"], counts["j3_recomputed"],
+        "skipped_no_window=%d j1_stale=%d j1_reemitted=%d flag=%s j1_mode=%s counts=%s",
+        site_id, counts["j2_sessions"], counts["j2_items"], counts["j3_recomputed"],
         counts["budget_paused"], counts["skipped_no_window"], counts["j1_stale"],
-        counts["j1_reemitted"], ctx.flag, json.dumps(counts, sort_keys=True))
+        counts["j1_reemitted"], ctx.flag, mode or "off", json.dumps(counts, sort_keys=True))
     worked = counts["j2_sessions"] or counts["j3_recomputed"] or counts["j1_reemitted"]
     return ("done" if worked else "nothing"), counts
+
+
+def j1_mode(run_flag):
+    """J1's effective mode: "on", "shadow" or None (off). Fails closed: a run flag that is
+    not exactly "shadow" or "on" is off whatever NIGHTLY_J1 says. NIGHTLY_J1 is read at call
+    time; "inherit", empty or unknown take the run flag, "off"/"shadow"/"on" override it."""
+    if run_flag not in ("shadow", "on"):
+        return None
+    j1 = (os.environ.get(J1_ENV) or "inherit").strip().lower()
+    if j1 not in _J1_VALUES or j1 == "inherit":
+        return run_flag
+    return None if j1 == "off" else j1
 
 
 def _over_budget(started, clock, counts):
@@ -474,10 +495,11 @@ class _NothingToEmit(Exception):
         self.reason = reason
 
 
-def _j1_catch_up(conn, ctx, night, groups, counts, started, clock):
-    """`groups` from _stale_groups, read by the caller before any J2 put."""
+def _j1_catch_up(conn, ctx, night, groups, counts, started, clock, mode):
+    """`groups` from _stale_groups, read by the caller before any J2 put. `mode` is
+    j1_mode(ctx.flag): re-emits only when it is "on"."""
     counts["j1_stale"] = sum(len(g["l_keys"]) for g in groups)
-    if ctx.flag != "on" or not groups:
+    if mode != "on" or not groups:
         return
     emitted = 0
     for i, g in enumerate(groups):
@@ -487,13 +509,13 @@ def _j1_catch_up(conn, ctx, night, groups, counts, started, clock):
         if _over_budget(started, clock, counts):
             counts["j1_time_paused"] = len(groups) - i
             break
-        mode = _line_mode(g["line"])
-        if mode is None:
+        line_mode = _line_mode(g["line"])
+        if line_mode is None:
             counts["j1_line_off"] += 1
             continue
         try:
             with conn.transaction():
-                outcome = _reemit(conn, ctx, night, g, mode, started, clock)
+                outcome = _reemit(conn, ctx, night, g, line_mode, started, clock)
         except _NothingToEmit as stop:
             outcome = stop.reason
         except Exception as exc:  # noqa: BLE001 - one pair never stops the night

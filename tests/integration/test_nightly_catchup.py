@@ -136,6 +136,12 @@ class Seed:
             (self.site["id"],)).fetchall()
 
 
+@pytest.fixture(autouse=True)
+def _j1_inherit(monkeypatch):
+    """NIGHTLY_J1 unset (inherit) unless a test sets it: J1 follows the run flag."""
+    monkeypatch.delenv("NIGHTLY_J1", raising=False)
+
+
 @pytest.fixture
 def lines_on(monkeypatch):
     monkeypatch.setenv("CROSS_DAY_CONTINUITY", "on")
@@ -402,4 +408,90 @@ def test_line_in_shadow_is_not_reemitted(db, monkeypatch):
     s.session(MON, written=NOW - dt.timedelta(hours=2), opened_at=_at(MON, 9))
     outcome, counts = nr.run_counts(db, s.event(), s.ctx("on"))
     assert counts["j1_stale"] == 1 and counts["j1_line_off"] == 1
+    assert s.s3.gets == [] and s.j1_puts() == [] and s.reemits() == []
+
+
+# ---------------------------------------------------------------- NIGHTLY_J1 (J1's own flag)
+# Spec docs/superpowers/specs/2026-11-13-nightly-j1-gate-design.md §2, §6. The tests above
+# set no NIGHTLY_J1 (inherit): J1 follows the run flag exactly as before.
+
+_TABLES = ("decision_records", "event_links", "nightly_reemits", "nightly_requested_items")
+
+
+def _table_counts(db):
+    return {t: db.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in _TABLES}
+
+
+def _late_same_day(s):
+    """N recorded 10:00 written 10 h ago; L recorded 08:00 written 1 h ago: stale on both
+    lines (the shape of test_shadow_counts_without_put)."""
+    n = s.session(TUE, written=NOW - dt.timedelta(hours=10), opened_at=_at(TUE, 10),
+                  items=("synthetic rebar delivery",))
+    late = s.session(TUE, written=NOW - dt.timedelta(hours=1), opened_at=_at(TUE, 8),
+                     items=("synthetic rebar delivery booked",))
+    return n, late
+
+
+def test_j1_on_while_rematch_shadow_reemits_reconcile_only_writes(db, monkeypatch):
+    monkeypatch.setenv("NIGHTLY_J1", "on")
+    monkeypatch.setenv("RECONCILE_STATUS", "true")
+    monkeypatch.setenv("CROSS_DAY_CONTINUITY", "shadow")
+
+    def no_breaker(*a, **k):
+        raise AssertionError("the breaker is a J2 brake, not consulted in shadow")
+    monkeypatch.setattr(nr, "_breaker_open", no_breaker)
+    s = Seed(db)
+    n, late = _late_same_day(s)
+    before = _table_counts(db)
+
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("shadow"))
+    assert outcome == "done"
+    assert counts["j1_stale"] == 2 and counts["j1_reemitted"] == 1
+    assert counts["j1_line_off"] == 1                 # cross-day is in shadow
+    assert counts["j3_recomputed"] == 0               # J3 count-only
+    [rkey] = s.s3.under(RECON)
+    assert s.s3.under(XDAY) == []
+    assert rkey == reconcile_request.request_key(str(s.site["id"]), TUE.isoformat(), n["key"])
+    assert s.s3.body(rkey)["trigger"] == "nightly"
+    assert s.reemits() == [("reconcile", n["key"], late["key"], rkey, NIGHT)]
+    after = _table_counts(db)
+    assert after["nightly_reemits"] == before["nightly_reemits"] + 1
+    for t in ("decision_records", "event_links", "nightly_requested_items"):
+        assert after[t] == before[t], t
+    for key in s.s3.under(nr.PREFIX):
+        assert s.s3.body(key)["flag"] == "shadow"
+
+
+def test_j1_off_skips_detection_even_when_rematch_on(db, lines_on, monkeypatch):
+    monkeypatch.setenv("NIGHTLY_J1", "off")
+    s = Seed(db)
+    _late_same_day(s)
+
+    def boom(*a, **k):
+        raise AssertionError("J1 off must not read")
+    monkeypatch.setattr(nr.nightly, "site_finals", boom)
+    monkeypatch.setattr(nr.nightly, "recorded_reemit_pairs", boom)
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("on"))
+    assert counts["j1_stale"] == 0 and counts["j1_reemitted"] == 0
+    assert s.j1_puts() == [] and s.reemits() == []
+
+
+def test_j1_shadow_while_rematch_on_counts_only(db, lines_on, monkeypatch):
+    monkeypatch.setenv("NIGHTLY_J1", "shadow")
+    s = Seed(db)
+    _late_same_day(s)
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("on"))
+    assert counts["j1_stale"] == 2 and counts["j1_reemitted"] == 0
+    assert s.j1_puts() == [] and s.reemits() == []
+
+
+def test_j1_on_but_reconcile_line_off_emits_nothing(db, monkeypatch):
+    monkeypatch.setenv("NIGHTLY_J1", "on")
+    monkeypatch.setenv("RECONCILE_STATUS", "false")
+    monkeypatch.setenv("CROSS_DAY_CONTINUITY", "off")
+    s = Seed(db)
+    _late_same_day(s)
+    outcome, counts = nr.run_counts(db, s.event(), s.ctx("shadow"))
+    assert counts["j1_stale"] == 2 and counts["j1_line_off"] == 2
+    assert counts["j1_reemitted"] == 0
     assert s.s3.gets == [] and s.j1_puts() == [] and s.reemits() == []
