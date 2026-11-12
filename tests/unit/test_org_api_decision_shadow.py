@@ -481,6 +481,10 @@ def test_session_under_prefixes_spellings_and_boundaries():
     assert under(f, d, "sidabcd", [f"extractions/{f}/{d}/abcd"])
     assert under(f, d, "abcd", [f"extractions/{f}/{d}/sidabcd"])
     assert under(f, d, "sidabcd", [f"extractions/{f}/{d}/"])            # whole day
+    # fail closed (review M-1): a deeper prefix, or a base that extends the session id
+    assert under(f, d, "sidabcd", [f"extractions/{f}/{d}/sidabcd/part"])
+    assert under(f, d, "sidabcd", [f"extractions/{f}/{d}/sidabcd_x"])
+    assert under(f, d, "abcd", [f"extractions/{f}/{d}/abcd_x"])
     assert not under(f, d, "sidabcd", [f"extractions/{f}/{d}/sidzzzz"])
     assert not under(f, d, "sidabcd", [f"extractions/Ben_Lin2/{d}/sidabcd"])
     assert not under(f, d, "sidabcd", [f"extractions/{f}/2026-11-10/sidabcd"])

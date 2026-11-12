@@ -9,7 +9,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from deleted_predicates import visible_topics_predicate
-from repositories.topics import _topic_not_hidden
+from repositories.action_items import item_shown_predicate
 
 _COLS = ("card_id, event_id, company_id, site_id, rule_id, subject_ref, purpose, card_key, "
          "kind, question, consequence, options, evidence, urgency, deadline_at, "
@@ -152,7 +152,11 @@ def overdue_item_states(conn, card_ids):
     without an event); `visible` is whether the action item the card names (subject_ref =
     its stable_id) may still be shown: its NEWEST row passing visible_topics_predicate (not
     deleted by topic or recording, not superseded -- the row get_live_by_stable_id picks)
-    also passes topics._topic_not_hidden (not non_work, no active redaction of any scope).
+    ON THE CARD'S OWN SITE, whose site belongs to the card's company, also passes
+    action_items.item_shown_predicate (not non_work, no active redaction of any scope) --
+    the same rule overdue_open applies before emitting. An item with that stable_id under
+    another site or company never makes the card look live (an item that moved site reads
+    as removed: fail closed).
     A subject_ref that is not a uuid matches nothing (guarded before the cast, so it never
     aborts the transaction) and reads as not visible. Every card id given gets a row."""
     if not card_ids:
@@ -164,9 +168,11 @@ def overdue_item_states(conn, card_ids):
         "LEFT JOIN site_events e ON e.event_id = c.event_id "
         "  AND e.company_id = c.company_id AND e.site_id = c.site_id "
         "LEFT JOIN LATERAL ("
-        f"  SELECT ({_topic_not_hidden('t')}) AS shown "
+        f"  SELECT ({item_shown_predicate('t')}) AS shown "
         "  FROM action_items a JOIN topics t ON t.id = a.topic_id "
-        "  WHERE a.stable_id = (CASE WHEN c.subject_ref ~ %s "
+        "  JOIN sites s ON s.id = a.site_id "
+        "  WHERE a.site_id = c.site_id AND s.company_id = c.company_id "
+        "  AND a.stable_id = (CASE WHEN c.subject_ref ~ %s "
         "                       THEN c.subject_ref::uuid END) "
         f"  AND {visible_topics_predicate('t')} "
         "  ORDER BY a.created_at DESC LIMIT 1"
