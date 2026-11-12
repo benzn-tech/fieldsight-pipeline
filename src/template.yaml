@@ -6864,6 +6864,15 @@ Resources:
                 StringLike:
                   s3:prefix: ['ask_turns/*']
       Events:
+        # Same flag and reason as AskAgent's KeepWarm: the device's /ask/voice/start
+        # reaches AskAgent through this function, so a cold one costs the same window.
+        KeepWarm:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keep ApiFunction warm for the device's first voice question
+            State: !If [ShouldKeepAskWarm, ENABLED, DISABLED]
+            Input: '{"mode": "warm"}'
         HealthCheck:
           Type: Api
           Properties:
