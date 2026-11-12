@@ -409,6 +409,7 @@ jobs:
               "SiteDecisionLoop=${{ vars.PROD_SITE_DECISION_LOOP || 'off' }}" \
               "DecisionInbox=${{ vars.PROD_DECISION_INBOX || 'off' }}" \
               "NightlyRematch=${{ vars.PROD_NIGHTLY_REMATCH || 'off' }}" \
+              "NightlyJ1=${{ vars.PROD_NIGHTLY_J1 || 'inherit' }}" \
               "ContinuityLinker=${{ vars.PROD_CONTINUITY_LINKER || 'false' }}" \
               "CrossDayContinuity=${{ vars.PROD_CROSS_DAY_CONTINUITY || 'off' }}" \
               "StatusEvidenceFloorTokens=${{ vars.PROD_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \

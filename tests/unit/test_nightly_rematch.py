@@ -107,6 +107,35 @@ def test_request_key_is_deterministic_per_session_and_night():
                                "extractions/f/2026-11-10/sidx.json")
 
 
+_UNSET = object()
+
+
+@pytest.mark.parametrize("run_flag,j1,want", [
+    *[(rf, j1, None) for rf in ("off", "", None, "bogus") for j1 in (_UNSET, "on")],
+    ("shadow", _UNSET, "shadow"), ("on", _UNSET, "on"), ("shadow", "inherit", "shadow"),
+    ("shadow", "on", "on"), ("on", "off", None), ("on", "shadow", "shadow"),
+    ("on", "on", "on"), ("shadow", "shadow", "shadow"), ("on", "SHADOW", "shadow"),
+    ("shadow", "off", None),
+    ("shadow", " ON ", "on"), ("on", "", "on"), ("shadow", "bogus", "shadow"),
+])
+def test_j1_mode_table(monkeypatch, run_flag, j1, want):
+    """Spec 2026-11-13-nightly-j1-gate section 2: NIGHTLY_J1 overrides J1 only under a run flag of
+    exactly shadow/on; unknown or empty reads as inherit; fails closed otherwise."""
+    import nightly_rematch as nr
+    if j1 is _UNSET:
+        monkeypatch.delenv("NIGHTLY_J1", raising=False)
+    else:
+        monkeypatch.setenv("NIGHTLY_J1", j1)
+    assert nr.J1_ENV == "NIGHTLY_J1"
+    assert nr.j1_mode(run_flag) == want
+
+
+def test_counts_line_carries_j1_mode():
+    src = io.open(os.path.join(REPO, "src", "nightly_rematch.py"), encoding="utf-8").read()
+    m = re.search(r'logger\.info\(\s*"nightly site=(.*?)counts=%s"', src, re.S)
+    assert m and "j1_mode=%s" in m.group(1)
+
+
 def test_rule_registered_and_decision_rules_stays_importable_without_db():
     import decision_rules
     rule = decision_rules.RULES["nightly.due"]
@@ -127,6 +156,25 @@ def test_nightly_flag_wired_three_places(doc):
         assert line in text, env
         other = "PROD" if env == "TEST" else "TEST"
         assert f"{other}_NIGHTLY_REMATCH" not in text, env
+
+
+def test_nightly_j1_flag_wired_three_places(doc):
+    """Spec 2026-11-13-nightly-j1-gate section 4: J1's own flag, inherit by default, reaches
+    the decision scan only; each workflow passes its own environment's variable with an
+    explicit fallback (SAM keeps a stack's previous value)."""
+    p = doc["Parameters"]["NightlyJ1"]
+    assert p["Default"] == "inherit"
+    assert p["AllowedValues"] == ["inherit", "off", "shadow", "on"]
+    assert _env(doc, SCAN)["NIGHTLY_J1"] == {"Ref": "NightlyJ1"}
+    for env, path in WORKFLOWS.items():
+        text = io.open(path, encoding="utf-8").read()
+        line = "\"NightlyJ1=${{ vars.%s_NIGHTLY_J1 || 'inherit' }}\" \\" % env
+        assert line in text, env
+        other = "PROD" if env == "TEST" else "TEST"
+        assert f"{other}_NIGHTLY_J1" not in text, env
+    for name, res in doc["Resources"].items():
+        if name != SCAN:
+            assert "NightlyJ1" not in json.dumps(res), name
 
 
 def test_condition_needs_the_decision_loop_and_the_flag(doc):
