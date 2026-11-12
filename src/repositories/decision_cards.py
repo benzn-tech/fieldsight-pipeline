@@ -3,10 +3,13 @@
 status. One OPEN card per card_key (partial unique index), so a superseded card frees its key.
 
 Every function is scoped by company_id and site_id except list_shadow, get_shadow,
-evidence_sources, shadow_summary_rows (platform-admin reads across every company) and
-set_label (platform-admin write by card id)."""
+evidence_sources, overdue_item_states, shadow_summary_rows (platform-admin reads across
+every company) and set_label (platform-admin write by card id)."""
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+from deleted_predicates import visible_topics_predicate
+from repositories.action_items import item_shown_predicate
 
 _COLS = ("card_id, event_id, company_id, site_id, rule_id, subject_ref, purpose, card_key, "
          "kind, question, consequence, options, evidence, urgency, deadline_at, "
@@ -112,19 +115,70 @@ def get_shadow(conn, card_id):
 def evidence_sources(conn, card_ids):
     """Platform-admin read, ONE query for a page of cards: where each card's evidence came
     from -- card -> originating event (same tenant) -> the checklist report its payload
-    names. Rows of (card_id, user_folder, report_date, session); a card with no event, or
-    whose event names no existing report, has no row. The report id is compared as text,
-    so a malformed payload value matches nothing instead of aborting the transaction."""
+    names. Rows of (card_id, user_folder, report_date, session, walk_key, walk_parts); a
+    card with no event, or whose event names no existing report, has no row. The report id
+    is compared as text, so a malformed payload value matches nothing instead of aborting
+    the transaction.
+
+    A multi-unit walk report (walk_key set, migration 0096) draws on several recordings:
+    walk_parts lists every inspection window of that walk in the report's folder (the key
+    already names the day; scoped by folder as inspection_windows.walk_rows is), as
+    [{user_folder, report_date, session}], [] when none resolves. NULL walk_key -> []."""
     if not card_ids:
         return []
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT c.card_id, cr.user_folder, cr.report_date, cr.session "
+        "SELECT c.card_id, cr.user_folder, cr.report_date, cr.session, cr.walk_key, "
+        "  CASE WHEN cr.walk_key IS NULL THEN '[]'::jsonb ELSE COALESCE(("
+        "    SELECT jsonb_agg(jsonb_build_object('user_folder', w.user_folder, "
+        "      'report_date', w.report_date::text, 'session', w.session) "
+        "      ORDER BY w.start_at, w.session) "
+        "    FROM inspection_windows w "
+        "    WHERE w.walk_key = cr.walk_key AND w.user_folder = cr.user_folder"
+        "  ), '[]'::jsonb) END AS walk_parts "
         "FROM decision_cards c "
         "JOIN site_events e ON e.event_id = c.event_id "
         "  AND e.company_id = c.company_id AND e.site_id = c.site_id "
         "JOIN checklist_reports cr ON cr.id::text = e.payload->>'report_id' "
         "WHERE c.card_id = ANY(%s::uuid[]) ORDER BY c.created_at, c.card_id",
         ([str(i) for i in card_ids],)).fetchall()
+
+
+_UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+
+def overdue_item_states(conn, card_ids):
+    """Platform-admin read, ONE query for a page of todo.overdue cards: rows of (card_id,
+    deadline, visible). `deadline` is the originating event's payload deadline (text, None
+    without an event); `visible` is whether the action item the card names (subject_ref =
+    its stable_id) may still be shown: its NEWEST row passing visible_topics_predicate (not
+    deleted by topic or recording, not superseded -- the row get_live_by_stable_id picks)
+    ON THE CARD'S OWN SITE, whose site belongs to the card's company, also passes
+    action_items.item_shown_predicate (not non_work, no active redaction of any scope) --
+    the same rule overdue_open applies before emitting. An item with that stable_id under
+    another site or company never makes the card look live (an item that moved site reads
+    as removed: fail closed).
+    A subject_ref that is not a uuid matches nothing (guarded before the cast, so it never
+    aborts the transaction) and reads as not visible. Every card id given gets a row."""
+    if not card_ids:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT c.card_id, e.payload->>'deadline' AS deadline, "
+        "  COALESCE(li.shown, false) AS visible "
+        "FROM decision_cards c "
+        "LEFT JOIN site_events e ON e.event_id = c.event_id "
+        "  AND e.company_id = c.company_id AND e.site_id = c.site_id "
+        "LEFT JOIN LATERAL ("
+        f"  SELECT ({item_shown_predicate('t')}) AS shown "
+        "  FROM action_items a JOIN topics t ON t.id = a.topic_id "
+        "  JOIN sites s ON s.id = a.site_id "
+        "  WHERE a.site_id = c.site_id AND s.company_id = c.company_id "
+        "  AND a.stable_id = (CASE WHEN c.subject_ref ~ %s "
+        "                       THEN c.subject_ref::uuid END) "
+        f"  AND {visible_topics_predicate('t')} "
+        "  ORDER BY a.created_at DESC LIMIT 1"
+        ") li ON true "
+        "WHERE c.card_id = ANY(%s::uuid[]) ORDER BY c.created_at, c.card_id",
+        (_UUID_RE, [str(i) for i in card_ids])).fetchall()
 
 
 def shadow_summary_rows(conn):
