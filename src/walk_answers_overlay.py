@@ -15,8 +15,15 @@ answers, oldest first. `apply` lays them over `walk_checklist.build`'s output:
     silently wins. Answer is empty, the Comment names both, the summary cell
     is Check, and the item is listed in `conflicts` for the inspector to choose;
   * move -- `move_to_unit` is set: the source unit's No goes to the named
-    unit's same item (replacing a Yes or a not-checked row, merged into a No),
-    and the source item becomes not checked.
+    unit's same item (replacing a Yes, a not-checked or a site-wide row,
+    merged into an answered No), and the source item becomes not checked --
+    or site-wide again, when it was site-wide before the recording or an
+    on-site answer filled it.
+
+A site-wide row (answered once in General, R53, spec 2026-11-13) has no base:
+an on-site answer on it is a fill, never an agreement or a conflict, and it
+cannot be moved (it is not the unit's own No). When neither a base nor an
+on-site answer is left, the row is drawn site-wide again, not "not checked".
 
 Answers match by unit and by item TEXT (whitespace and case folded), never by
 number, so they survive a template version that reorders its items. What
@@ -29,8 +36,9 @@ otherwise "recording" -- what the final check reads to know an item was
 already decided on site.
 
 Each row keeps its BASE (what the recording said, or what a move brought;
-None when not checked) apart from the latest on-site answer, and is redrawn
-from the two whenever an answer lands. So a later answer replaces an earlier
+None when not checked or site-wide) apart from the latest on-site answer and
+its FALLBACK (the site-wide row, or None), and is redrawn from the three
+whenever an answer lands. So a later answer replaces an earlier
 one; an answer on a conflicted item is judged against the recording again; an
 answer on an item an earlier on-site answer filled is a new fill, not a
 conflict.
@@ -70,12 +78,15 @@ def _not_checked(row):
                evidence="", refs=[], state="not_checked", origin="recording")
 
 
-def _draw(row, base, site, report):
-    """Redraw `row` from its base ({"row", "on_site"} or None) and the latest
-    on-site answer (or None). Returns the conflict, or None."""
+def _draw(row, base, site, report, fallback=None):
+    """Redraw `row` from its base ({"row", "on_site"} or None), the latest
+    on-site answer (or None) and its fallback (the site-wide row, or None).
+    Returns the conflict, or None."""
     report["evidence"].pop(row["n"], None)
     if site is None:
-        if base is None:
+        if base is None and fallback is not None:
+            row.update(copy.deepcopy(fallback))
+        elif base is None:
             _not_checked(row)
         else:
             row.update(copy.deepcopy(base["row"]))
@@ -119,26 +130,21 @@ def _draw(row, base, site, report):
 
 
 def _recount(unit):
-    rows, report = unit["rows"], unit["report"]
-    report["answered"] = sum(1 for r in rows if r["state"] == "answered")
-    report["gaps"] = {
-        "not_covered": [{"n": r["n"], "text": r["item"]} for r in rows if r["state"] == "not_checked"],
-        "failed": [{"n": r["n"], "text": r["item"], "comment": r["comment"] or "",
-                    "responsible": r["responsible"] or "", "due": r["due"] or ""}
-                   for r in rows if r["state"] == "answered" and r["answer"] == "No"],
-    }
+    wc.recount(unit)
     unit["paragraphs"], unit["line_refs"] = wc.render(unit)
 
 
 def _moved(src_row, target_row, source, at):
-    """The row a move brings to the target: the source's No, merged into a
-    target No (comments joined with "; "; the target's evidence, refs,
-    Responsible and Due are kept, the source's fill what the target lacks)."""
+    """The row a move brings to the target: the source's No, merged into an
+    answered target No (comments joined with "; "; the target's evidence,
+    refs, Responsible and Due are kept, the source's fill what the target
+    lacks). Any other target -- a Yes, not checked, a site-wide No -- is
+    replaced."""
     note = "(moved from %s on site%s)" % (source, ", " + at if at else "")
     moved = copy.deepcopy(src_row)
     moved["comment"] = _with(moved["comment"], note)
     moved["origin"] = "on_site"
-    if target_row["answer"] != "No":
+    if target_row["state"] != "answered" or target_row["answer"] != "No":
         return moved
     merged = copy.deepcopy(target_row)
     merged["origin"] = target_row.get("origin") or "recording"
@@ -158,11 +164,13 @@ def apply(walk, answers, items):
     walk["conflicts"], walk["unmatched_answers"] = [], []
     by_unit = {_unit_key(u["unit"]): u for u in walk["units"]}
     known = {_fold(i) for i in items}
-    state = {}  # (unit name, n) -> [base, site]
+    state = {}  # (unit name, n) -> [base, site, fallback]
     for u in walk["units"]:
         for r in u["rows"]:
-            base = None if r["state"] == "not_checked" else {"row": copy.deepcopy(r), "on_site": False}
-            state[(u["unit"], r["n"])] = [base, None]
+            base = (None if r["state"] in ("not_checked", wc.SITE_WIDE)
+                    else {"row": copy.deepcopy(r), "on_site": False})
+            fallback = copy.deepcopy(r) if r["state"] == wc.SITE_WIDE else None
+            state[(u["unit"], r["n"])] = [base, None, fallback]
     conflicts = {}  # (unit name, n) -> conflict, in the order first raised
     touched = set()
 
@@ -170,8 +178,8 @@ def apply(walk, answers, items):
         return next(r for r in unit["rows"] if _fold(r["item"]) == text)
 
     def redraw(unit, row):
-        base, site = state[(unit["unit"], row["n"])]
-        c = _draw(row, base, site, unit["report"])
+        base, site, fallback = state[(unit["unit"], row["n"])]
+        c = _draw(row, base, site, unit["report"], fallback)
         key = (unit["unit"], row["n"])
         if c:
             c["unit"] = unit["unit"]
@@ -203,8 +211,9 @@ def apply(walk, answers, items):
                 on_site = (s_base is None or s_base["on_site"]) and (
                     dst["answer"] != "No" or d_base is None or d_base["on_site"])
                 state[(target["unit"], dst["n"])] = [
-                    {"row": _moved(src, dst, unit["unit"], _hhmm(a)), "on_site": on_site}, None]
-                state[(unit["unit"], src["n"])] = [None, None]
+                    {"row": _moved(src, dst, unit["unit"], _hhmm(a)), "on_site": on_site}, None,
+                    state[(target["unit"], dst["n"])][2]]
+                state[(unit["unit"], src["n"])] = [None, None, state[(unit["unit"], src["n"])][2]]
                 redraw(unit, src)
                 redraw(target, dst)
         elif a.get("answer") in units_mod.ANSWERS:

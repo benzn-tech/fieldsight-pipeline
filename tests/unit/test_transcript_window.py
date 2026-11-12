@@ -139,3 +139,17 @@ def test_the_object_cap_is_read_from_the_environment(monkeypatch):
     finally:
         monkeypatch.delenv("MAX_TRANSCRIPT_OBJECTS")
         importlib.reload(transcript_window)
+
+
+# ---- uncovered_pieces (2026-11-13) ------------------------------------------------
+
+def test_uncovered_pieces_are_closed_seconds_around_minute_widened_cover():
+    from transcript_window import uncovered_pieces
+    assert uncovered_pieces("10:00 – 10:10", ["10:02 – 10:03", "10:05 – 10:05"]) == [
+        "10:00:00 – 10:01:59", "10:04:00 – 10:04:59", "10:06:00 – 10:10:00"]
+    assert uncovered_pieces("10:00 – 10:10", ["09:00 – 11:00"]) == []
+    assert uncovered_pieces("10:00 – 10:10", []) == ["10:00:00 – 10:10:00"]
+    assert uncovered_pieces("10:00 – 10:10", ["nonsense", "10:20 – 10:10"]) == [
+        "10:00:00 – 10:10:00"]                       # unplaceable / inverted cover: ignored
+    assert uncovered_pieces("23:58 – 00:02", ["23:59 – 23:59"]) is None   # inverted: unchanged
+    assert uncovered_pieces("", []) is None

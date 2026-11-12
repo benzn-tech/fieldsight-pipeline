@@ -73,7 +73,8 @@ def test_answers_are_normalised(answer, kept):
 @pytest.mark.parametrize("row,reason", [
     ("1 | Probably | | | | they get serviced twice a week", "answer is not Yes, No or N/A"),
     ("9 | Yes | | | | they get serviced twice a week", "no such item"),
-    ("1 | Yes | | | | serviced", "evidence not in the transcript"),       # too short to count
+    ("1 | Yes | | | | serviced", "evidence too short"),       # under three words
+    ("1 | Yes | | | | they get serviced every hour on the hour", "evidence not in the transcript"),
 ])
 def test_a_bad_row_is_dropped_with_its_reason(row, reason):
     _, _, report = checklist.rebuild(model_section([row]), ITEMS, TRANSCRIPT)
@@ -282,3 +283,10 @@ def test_an_on_site_answer_names_the_templates_own_item():
     assert checklist.item_in(tpl, "TRUSSES") == "Trusses"
     assert checklist.item_in(tpl, "Not a checklist") is None
     assert checklist.item_in({}, "Trusses") is None
+
+
+def test_the_prompt_asks_for_a_whole_clause_and_a_confirmed_claim():
+    s = checklist.shape_sentence()
+    assert "at least three words" in s
+    assert "that nobody then confirms is not an answer: leave the" in s
+    assert "whoever says it" in s and "inspector agrees" not in s

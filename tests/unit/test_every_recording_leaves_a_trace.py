@@ -224,6 +224,21 @@ def test_a_report_records_its_template_and_each_checklist():
                    ("checklist", "no_match"), ("glossary", "applied"), ("glossary", "no_match")]
 
 
+def test_a_walk_unit_answered_only_site_wide_is_not_logged_no_match():
+    # R53 (spec 2026-11-13): a unit whose only answers are site-wide General
+    # rows is answered, and the trace says how many were site-wide.
+    import lambda_session_report as sr
+    pipeline_trace.begin("session-report", user_folder="f", date="2026-11-13")
+    sr._trace_report({"templateName": "Pre-roof", "templateVersion": 1,
+                      "checklists": {"Unit 3 — Pre-roof": {"items": 43, "answered": 0,
+                                                              "site_wide": 10, "dropped": []}}})
+    s3 = Puts()
+    pipeline_trace.flush(s3, "b")
+    got = [e for e in events_of(s3.puts[0]) if e["step"] == "checklist"]
+    assert [e["result"] for e in got] == ["answered"]
+    assert got[0]["detail"]["site_wide"] == 10 and got[0]["detail"]["answered"] == 0
+
+
 def test_the_four_steps_may_write_their_traces():
     t = open(os.path.join(os.path.dirname(__file__), "..", "..", "src", "template.yaml"),
              encoding="utf-8").read()

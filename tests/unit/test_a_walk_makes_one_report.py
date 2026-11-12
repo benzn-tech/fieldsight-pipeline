@@ -492,8 +492,10 @@ def test_r44_an_on_site_answer_that_cannot_be_applied_is_shown_in_the_report(run
 # ---- no walk: today's report ------------------------------------------------------------
 
 # The prompt and the sections the renderer got, as the worker wrote them before
-# the walk branch existed (captured on 44f6a273).
-NO_WALK_SNAPSHOT = "66caefa685091f0412e0bd7c5cccb0f6800501326fd9cbbf15e4ca23ae396dd6"
+# the walk branch existed (captured on 44f6a273). Re-captured 2026-11-13: only the
+# checklist shape sentence changed (spec 2026-11-13 D2/D4), checked by running the
+# test against the old checklist.py.
+NO_WALK_SNAPSHOT = "28c47ee4714aa7db5788070babe63278c39f804af1a739957860c9a9725b661f"
 
 
 def _fingerprint(sections, prompts, meta):
@@ -533,3 +535,45 @@ def test_two_units_all_goods_in_one_long_line_both_place_in_the_report(run):
     meta, _, _ = run(walk=walk, lines=lines, walk_answer=answer)
     assert meta["walk"]["summary"]["rows"] == [["Unit 1", "Yes", "Yes", "Yes"],
                                                ["Unit 2", "Yes", "Yes", "Yes"]]
+
+
+# ---- on-site corrections reach the prose (spec 2026-11-13 D3) ------------------
+
+CORRECTIONS = "Corrections the inspector gave on site after the recording"
+
+
+def _main_prompt(prompts):
+    return next(p for p in prompts if IS_WALK not in p)
+
+
+def test_a_move_and_a_read_back_override_reach_the_main_prompt_and_a_fill_does_not(run):
+    move = dict(ANSWER_ROW, answer=None, move_to_unit="Unit 2", comment="that was unit two",
+                asked_kind="confirm_no")
+    override = dict(ANSWER_ROW, item_text=ITEMS[0], answer="No", comment="one stud bowed",
+                    asked_kind="confirm_no")
+    fill = dict(ANSWER_ROW, item_text=ITEMS[2], asked_kind="not_checked", comment="lintels fine")
+    _, _, prompts = run(walk=dict(WALK, answers=[move, override, fill]))
+    main = _main_prompt(prompts)
+    block = main[main.index(CORRECTIONS):]
+    assert "- Unit 1 -- %s: moved to Unit 2 (that was unit two)" % ITEMS[1] in block
+    assert "- Unit 1 -- %s: No (one stud bowed)" % ITEMS[0] in block
+    assert ITEMS[2] not in block
+    assert main.index("## Transcript") < main.index(CORRECTIONS)     # in the data region
+    assert not any(CORRECTIONS in p for p in prompts if IS_WALK in p)
+
+
+def test_no_answers_or_no_walk_means_no_corrections_block(run):
+    for walk in (WALK, dict(WALK, answers="garbage"), None):
+        _, _, prompts = run(walk=walk)
+        assert not any(CORRECTIONS in p for p in prompts)
+
+
+def test_the_corrections_block_is_capped_and_one_line_each():
+    import walk_report
+    rows = [dict(ANSWER_ROW, answer="No", asked_kind="confirm_no",
+                 comment="x\n" * 300) for _ in range(40)]
+    block = walk_report.corrections_block(rows)
+    lines = [ln for ln in block.splitlines() if ln.startswith("- ")]
+    assert len(lines) == walk_report.MAX_CORRECTIONS == 30
+    assert all(len(ln) <= walk_report.MAX_CORRECTION_CHARS for ln in lines)
+    assert walk_report.corrections_block([]) == "" and walk_report.corrections_block(None) == ""

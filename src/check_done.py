@@ -345,7 +345,10 @@ def walk_questions(walk_result, items, ask_units=None):
     An item the on-site answers already decided is not asked again. An item
     under conflict (on site and the recording disagree) is asked by what the
     recording said: a No is read back ("confirm_no"), anything else is asked
-    as not checked."""
+    as not checked.
+
+    An item answered site-wide in General (state "site_wide", R53) is not
+    asked per unit: it was answered once, in General."""
     conflicts = {(c.get("unit"), _fold(c.get("item"))): c
                  for c in (walk_result or {}).get("conflicts") or []}
     order = {_fold(t): i for i, t in enumerate(items or [])}
@@ -367,6 +370,8 @@ def walk_questions(walk_result, items, ask_units=None):
                     open_.append(q)
             elif r["state"] == "not_checked":
                 open_.append(q)
+            elif r["state"] == walk_checklist.SITE_WIDE:
+                continue
             elif r.get("answer") == "No" and r.get("origin") != "on_site":
                 nos.append(dict(q, kind="confirm_no", comment=r.get("comment") or ""))
         out += open_ + nos

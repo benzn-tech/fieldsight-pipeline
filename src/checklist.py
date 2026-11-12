@@ -36,6 +36,10 @@ MAX_ITEMS = 120
 MAX_ITEM_CHARS = 300
 MIN_EVIDENCE_WORDS = 3
 EVIDENCE_MATCH = 0.9
+#: Why a quote under MIN_EVIDENCE_WORDS words is dropped. The words may well be in
+#: the transcript; two of them ("no steel") match too much to count (2026-11-13).
+EVIDENCE_TOO_SHORT = "evidence too short"
+EVIDENCE_NOT_FOUND = "evidence not in the transcript"
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _TAG_RE = re.compile(r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\]\s*$", re.IGNORECASE)
@@ -54,7 +58,10 @@ def shape_sentence():
             "a No, what is wrong. Responsible and Due are who will put right what is "
             "wrong and by when, only when that was said; otherwise leave them empty. "
             "Evidence is the exact words from the transcript that "
-            "answer the item, copied verbatim. Leave out every item the recording "
+            "answer the item, copied verbatim: at least three words, the whole clause "
+            "that answers it. A statement met straight away with doubt (\"hmm\", "
+            "\"are you sure\") that nobody then confirms is not an answer: leave the "
+            "item out. A statement nobody questions counts, whoever says it. Leave out every item the recording "
             "did not address -- do not guess, and do not answer from general "
             "expectation" % " | ".join(MODEL_COLUMNS))
 
@@ -88,6 +95,13 @@ def transcript_words(transcript_text):
     head removed, so a quote spoken across two turns or two recording chunks
     matches as the one sentence it was."""
     return _words(_HEAD_RE.sub("", transcript_text or ""))
+
+
+def evidence_reason(quote, transcript_words):
+    """Why `quote` cannot be evidence, or None when it can (evidence_found)."""
+    if len(_words(quote)) < MIN_EVIDENCE_WORDS:
+        return EVIDENCE_TOO_SHORT
+    return None if evidence_found(quote, transcript_words) else EVIDENCE_NOT_FOUND
 
 
 def evidence_found(quote, transcript_words):
@@ -162,8 +176,8 @@ def rebuild(section, items, transcript_text, report_date=None):
             why = "answered twice"
         elif (answer or "").strip().lower() not in ANSWERS:
             why = "answer is not Yes, No or N/A"
-        elif not evidence_found(quote, t_words):
-            why = "evidence not in the transcript"
+        else:
+            why = evidence_reason(quote, t_words)
         if why:
             report["dropped"].append({"item": num, "reason": why})
             continue

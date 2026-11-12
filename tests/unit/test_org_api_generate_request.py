@@ -435,3 +435,68 @@ def test_site_less_report_uses_the_folder_owners_home_company(monkeypatch):
     assert org._report_email_suppression("C", "email", [], "Ada_L") == "company_inactive"
     assert org._report_email_suppression("C", "email", [None], "Bo_K") is None
     assert org._report_email_suppression("C", "download", [], "Ada_L") is None
+
+
+# ----------------------------------------------------------
+# 2026-11-13: an automatic non_work range cuts only what no work topic covers.
+# A banter topic spread through a pre-roof walk ("00:36 - 00:40") cut every work
+# line of the walk (TEST sid1fa36140): the walk call got 171 of 898 words.
+# ----------------------------------------------------------
+
+def _excluded(day, rows, redacted=None):
+    mp, puts = day
+    mp.setattr(org.topics, "list_topics_for_source_prefix", lambda conn, prefix, **k: list(rows))
+    mp.setattr(org.redactions, "list_active_for_topics",
+               lambda conn, ids: {k: v for k, v in (redacted or {}).items() if k in ids})
+    res, puts_out = _generate_raw((mp, puts), _body())
+    assert res["statusCode"] == 202, res
+    return json.loads(puts_out[0]["Body"])["excludedTopics"]
+
+
+WORK = [_row(id="w1", time_range="13:00 – 13:10"), _row(id="w2", time_range="13:12 – 13:20")]
+
+
+def test_a_non_work_range_covered_by_work_cuts_nothing(day):
+    banter = _row(id="nw", title="Banter", time_range="13:02 – 13:09", work_class="non_work")
+    assert _excluded(day, WORK + [banter]) == []
+
+
+def test_a_partly_covered_non_work_range_cuts_only_the_uncovered_seconds(day):
+    banter = _row(id="nw", title="Banter", time_range="12:55 – 13:30", work_class="non_work")
+    got = _excluded(day, WORK + [banter])
+    # work is widened to whole minutes: 13:00:00-13:10:59 and 13:12:00-13:20:59
+    assert got == [{"id": "nw", "time_range": "12:55:00 – 12:59:59"},
+                   {"id": "nw", "time_range": "13:11:00 – 13:11:59"},
+                   {"id": "nw", "time_range": "13:21:00 – 13:30:00"}]
+
+
+def test_a_person_confirmed_redaction_still_cuts_its_whole_range(day):
+    banter = _row(id="nw", title="Banter", time_range="13:02 – 13:20", work_class="non_work")
+    human = {"nw": {"reason": "confirm_non_work", "actor_role": "site_manager"}}
+    assert _excluded(day, WORK + [banter], human) == [{"id": "nw", "time_range": "13:02 – 13:20"}]
+
+
+def test_the_automatic_expiry_redaction_is_still_automatic(day):
+    import lambda_nonwork_expiry
+    banter = _row(id="nw", title="Banter", time_range="13:02 – 13:09", work_class="non_work")
+    auto = {"nw": {"reason": lambda_nonwork_expiry.REASON, "actor_role": "system"}}
+    assert _excluded(day, WORK + [banter], auto) == []
+
+
+def test_an_unplaceable_non_work_range_is_sent_unchanged(day):
+    banter = _row(id="nw", title="Banter", time_range="soon", work_class="non_work")
+    bad_work = _row(id="w3", time_range="later")
+    assert _excluded(day, WORK + [bad_work, banter]) == [{"id": "nw", "time_range": "soon"}]
+
+
+def test_work_in_another_session_does_not_cover(day):
+    banter = _row(id="nw", title="Banter", time_range="14:05 – 14:08", work_class="non_work",
+                  source_s3_key=KEY_1405)
+    other = _row(id="w9", time_range="14:00 – 14:30")             # session 13:00, not 14:05
+    got = _excluded(day, [other, banter])
+    assert got == []                                              # day scope: covered
+
+
+def test_the_auto_redaction_reason_matches_the_sweep():
+    import lambda_nonwork_expiry
+    assert org.AUTO_NON_WORK_REDACTION == lambda_nonwork_expiry.REASON
