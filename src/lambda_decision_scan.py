@@ -109,6 +109,14 @@ def _counts():
     return dict.fromkeys(RESULT_KEYS, 0)
 
 
+def _add(out, part):
+    """Fold a savepoint's own counts into `out`. Called only AFTER the savepoint block has
+    exited cleanly: a raise later in the same savepoint rolls its rows back, and counting
+    inside the block would keep counts for rows that were never written."""
+    for k, v in part.items():
+        out[k] += v
+
+
 def _utc(dt):
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
@@ -151,17 +159,22 @@ def emit_todo_overdue(conn, now):
     stale = {}                                     # (company_id, site_id) -> [item]
     for item in action_items.overdue_open(conn, today_nz):
         try:
+            part = _counts()
             with conn.transaction():
-                if _emit_overdue_item(conn, item, today_nz, now, out):
-                    stale.setdefault((item["company_id"], item["site_id"]), []).append(item)
+                is_stale = _emit_overdue_item(conn, item, today_nz, now, part)
+            _add(out, part)
+            if is_stale:
+                stale.setdefault((item["company_id"], item["site_id"]), []).append(item)
         except Exception as exc:  # noqa: BLE001 - one bad item never stops the scan
             out["errors"] += 1
             logger.warning("decision-scan overdue: item %s not emitted: %r",
                            item.get("stable_id"), exc)
     for (company_id, site_id), items in stale.items():
         try:
+            part = _counts()
             with conn.transaction():
-                _emit_overdue_backlog(conn, company_id, site_id, items, today_nz, now, out)
+                _emit_overdue_backlog(conn, company_id, site_id, items, today_nz, now, part)
+            _add(out, part)
         except Exception as exc:  # noqa: BLE001 - one bad site never stops the scan
             out["errors"] += 1
             logger.warning("decision-scan overdue: backlog of site %s not emitted: %r",
@@ -216,14 +229,13 @@ def emit_nightly_due(conn, now):
     today_nz = nz_time.to_nz(now).date()
     for due in nightly_rematch.due_sites(conn, now):
         try:
+            part = _counts()
             with conn.transaction():
                 ev = _new_event(due["company_id"], due["site_id"], nightly_rematch.SOURCE,
                                 NIGHTLY_TYPE, str(due["site_id"]), now, now,
                                 {"night": due["night"].isoformat()})
-                if _insert_event(conn, ev, today_nz):
-                    out["emitted"] += 1
-                else:
-                    out["duplicates"] += 1
+                part["emitted" if _insert_event(conn, ev, today_nz) else "duplicates"] += 1
+            _add(out, part)
         except Exception as exc:  # noqa: BLE001 - one bad site never stops the tick
             out["errors"] += 1
             logger.warning("decision-scan nightly: site %s not emitted: %r",
@@ -248,7 +260,8 @@ def _gap_items(gaps):
 
 
 def _emit_report(conn, rep, gaps, company_id, site_id, now, out):
-    """One report's events, supersedes and seen-mark (caller holds the savepoint)."""
+    """One report's events, supersedes and seen-mark (caller holds the savepoint; `out` is
+    that savepoint's own counts, folded in by the caller once it exits)."""
     session = rep["session"]
     report_date = rep["report_date"]
     occurred_at = _report_midnight_utc(report_date)
@@ -311,8 +324,10 @@ def emit_checklist_gaps(conn, read_result, now):
             if status != "done":
                 out["skipped_pending"] += 1
                 continue
+            part = _counts()
             with conn.transaction():
-                _emit_report(conn, rep, gaps, company_id, site_id, now, out)
+                _emit_report(conn, rep, gaps, company_id, site_id, now, part)
+            _add(out, part)
         except Exception as exc:  # noqa: BLE001 - one bad report never stops the scan
             out["errors"] += 1
             logger.warning("decision-scan gap: report not scanned %s: %r", ref, exc)

@@ -1193,3 +1193,64 @@ def test_handler_passes_storage_to_process_only_with_a_bucket(db, monkeypatch):
     lds.lambda_handler({"scan": "process"}, None)
     assert got == [{"s3_client": None, "bucket": None},
                    {"s3_client": "s3-client", "bucket": "lake"}]
+
+
+# ---------------------------------------------------------------- counts follow the savepoint
+# A raise after the insert in the same savepoint rolls the row back; the count must go too.
+
+def test_overdue_item_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    _overdue_item(db, site)
+
+    def boom(*a, **k):
+        raise RuntimeError("after the insert")
+    monkeypatch.setattr(lds, "is_late", boom)
+    out = lds.emit_todo_overdue(db, NOW)
+    assert out["emitted"] == 0 and out["duplicates"] == 0 and out["errors"] >= 1
+    assert _events(db, co["id"], "todo.overdue") == []
+
+
+def test_overdue_backlog_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    _overdue_item(db, site, "Stale A", deadline=STALE_DEADLINE)
+    real = lds._emit_overdue_backlog
+
+    def insert_then_raise(conn, company_id, site_id, items, today_nz, now, out):
+        real(conn, company_id, site_id, items, today_nz, now, out)
+        if site_id == site["id"]:
+            raise RuntimeError("after the insert")
+    monkeypatch.setattr(lds, "_emit_overdue_backlog", insert_then_raise)
+    out = lds.emit_todo_overdue(db, NOW)
+    # the item event is kept and counted; the digest is rolled back and not counted
+    assert len(_live_events(db, co["id"], "todo.overdue")) == 1
+    assert _live_events(db, co["id"], "todo.overdue_backlog") == []
+    mine = [e for e in _events(db, co["id"]) if e["status"] != "duplicate"]
+    assert out["emitted"] == len(mine) == 1 and out["errors"] == 1
+
+
+def test_nightly_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    monkeypatch.setattr(lds.nightly_rematch, "due_sites", lambda conn, now: [
+        {"company_id": co["id"], "site_id": site["id"], "night": dt.date(2026, 11, 9)}])
+    real = lds._insert_event
+
+    def insert_then_raise(conn, ev, today_nz):
+        real(conn, ev, today_nz)
+        raise RuntimeError("after the insert")
+    monkeypatch.setattr(lds, "_insert_event", insert_then_raise)
+    out = lds.emit_nightly_due(db, NOW)
+    assert (out["emitted"], out["duplicates"], out["errors"]) == (0, 0, 1)
+    assert _events(db, co["id"]) == []
+
+
+def test_gap_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, folder, session = _gap_world(db)
+    fake = FakeS3({"k-1": _done(**{"Pre-pour": _gaps(nc=[(1, "One"), (2, "Two")])})})
+    rid = _report(db, co["id"], folder, session, "k-1")
+
+    def boom(*a, **k):
+        raise RuntimeError("after the inserts")
+    monkeypatch.setattr(lds.checklist_reports, "mark_seen", boom)
+    out = lds.emit_checklist_gaps(db, _reader(fake), NOW)
+    assert (out["emitted"], out["duplicates"], out["errors"]) == (0, 0, 1)
+    assert _events(db, co["id"]) == [] and _seen(db, rid) == 0
