@@ -178,19 +178,22 @@ its own pre-registration). The owner's ruling stands, so the order is:
    - items extracted before the locator was on, so no re-extraction is needed;
    - items the locator refused: `unparseable`, `not_shown` (elided), `no_line`, `ambiguous_stamp`,
      `outside_topic`, and separately `no_locator`.
-   J2's N0 run (pipeline#1276) waits for the locator's result, then:
-   - **Strata are fixed per `item_ref` from the locator run's output**, on the same manifest
-     digest, recorded as a hashed input before J2 runs. Offline, every session predates the locator,
-     so only the refusal strata narrow the set.
-   - **`no_locator` is scored as its own stratum.** There the model said no single line raises the
-     item, so a nightly pick contradicts it. It is never pooled with stamp failures (Track C,
-     2026-11-10).
-   - **Size check before spending.** Bar 1 needs at least 59 accepted links per rep in the scored set,
-     and bar 2 needs at least 30 cross-language links. If the refused held-out subset cannot reach
-     that, J2 is reported "insufficient" without a paid run.
-   - The prompt still covers every item of a session, so calls drop only by the sessions with no
-     stratum item. The re-stated count goes to the owner before any call. If the locator alone clears the
-   60% line and the owner sees no need to backfill history, J2 is not built.
+   J2's N0 run (pipeline#1276) waits for the locator's result. **Corrected 2026-11-12**: the earlier
+   text fixed J2's strata per `item_ref` from the locator run. That cannot work. Track C's locator
+   arms re-extract the sessions with a new prompt, so their items are a different item set from J2's
+   gold (`done.agent.jsonl`, over the stored extraction); the ref format matches but the items do
+   not. The refused subset is also far too small to score: fit v1 had 19 refusals of 340, re-test v2
+   w1 had 19 of 337 (5 `ambiguous_stamp`, 14 `no_locator`), against the 59 accepted links per rep
+   that bar 1 needs. So:
+   - **Refusal strata are reported from Track C's locator items and gold only, as counts**
+     (`done.locator.agent.jsonl`). J2 does not score them and no `--stratum-file` is built.
+     `no_locator` stays its own count, never pooled with stamp failures (Track C, 2026-11-10).
+   - **J2's scored N0 is the full offline set** (every offline session predates the locator; 150
+     calls, ceiling 198), with the §7 J2 bars unchanged. It runs only in one of two branches, each
+     after the owner approves the call count:
+     - **(a)** the locator fails its held-out bars, so J2 becomes the fallback for every item;
+     - **(b)** the locator passes, but the owner wants history backfilled (pre-locator items).
+   - If the locator passes and the owner sees no need to backfill history, J2 is not built.
 - J2, if built, is the **fallback writer**: it writes only where no live link of any method
   exists, and a per-session writer (lexical or prompt-index), if ever turned on, keeps first claim
   on new pass rows. `write_pass` writes links for each pass's own new rows, so the two never compete
@@ -358,7 +361,7 @@ exists. This line pings the status line then.
 
 | Phase | What | Gate |
 |---|---|---|
-| N0 | after Track C's locator measurement: J2 offline on the strata the locator leaves (owner approves the re-stated call count first), then owner adjudication | §7 J2 bars |
+| N0 | only in branch (a) locator failed held-out, or (b) owner wants history backfill: J2 offline on the full set (owner approves the call count first), then owner adjudication | §7 J2 bars |
 | N1 | tick + hub handler in `shadow` on TEST (needs P0 Tasks 1-4) | 2 weeks of counts; errors under 2% of nights |
 | N2 | J3 `on`, and J2 `on` if N0 passed, on TEST | invariants hold; orphan count reported |
 | N3 | J1 `on` on TEST if its precondition is met and shadow counts justify it; J4 once cross-day continuity is `on` | §7 |
