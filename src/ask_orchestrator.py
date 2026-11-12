@@ -1407,9 +1407,11 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     # The web gets the asker's question with a "search online" phrase removed, as
     # the voice worker already does before this point (voice_web.detect_intent).
     web_question = voice_web.detect_intent(question)[1] if (wi and not voice) else question
-    if route.get("web_intent_from_rewrite"):
-        # The spoken words were a bare "yes, checking online": search the rewritten
-        # question, as a yes to a spoken offer already searches the offered `asked`.
+    if voice and wi and rewritten:
+        # A spoken follow-up that asks for the web searches the rewritten question,
+        # as a yes to a spoken offer already searches the offered `asked`. Live on
+        # TEST 2026-11-12: "And for a 2.4-metre opening, check online" sent the
+        # fragment "And for a 2.4-metre opening" and came back with nothing.
         web_question = voice_web.detect_intent(asked)[1]
 
     tools = tools or _real_tools()
