@@ -1901,7 +1901,7 @@ def _inbox_digest(conn, backlog_rows, now):
     """{count, title, href} over the sites of the caller's visible backlog cards, counted
     LIVE: the stale subset (decision_hub.is_late under RULES["todo.overdue"], on the scan's
     own per-item event) of today's action_items.overdue_open for each site. None when no
-    site contributes. One overdue_open call."""
+    site contributes. One overdue_open call, restricted in SQL to those sites."""
     if not backlog_rows:
         return None
     from lambda_decision_scan import overdue_item_event   # the scan's builder, shared
@@ -1910,7 +1910,8 @@ def _inbox_digest(conn, backlog_rows, now):
     names = {(str(r["company_id"]), str(r["site_id"])): r.get("site_name") or ""
              for r in backlog_rows}
     counts = dict.fromkeys(names, 0)
-    for item in action_items.overdue_open(conn, today_nz):
+    for item in action_items.overdue_open(conn, today_nz,
+                                          site_ids=sorted({k[1] for k in names})):
         key = (str(item["company_id"]), str(item["site_id"]))
         if key in counts and decision_hub.is_late(overdue_item_event(item, now), rule,
                                                   today_nz):
@@ -1971,8 +1972,8 @@ def answer_decision_card(conn, caller, raw_card, body):
     scan superseding the card, is 409 stale."""
     not_found = error("not found", 404)
     row = decision_cards.get_for_answer(conn, raw_card)
-    if row is None or decision_inbox.is_excluded(row):
-        return not_found
+    if row is None or decision_inbox.is_excluded(row) or not _has_answerable_option(row):
+        return not_found                            # same visibility as GET
     cid = str(row["card_id"])
     role = _inbox_recipient_roles(conn, caller, [row]).get(cid)
     if role is None:
@@ -1986,7 +1987,10 @@ def answer_decision_card(conn, caller, raw_card, body):
     reason_text = reason.strip() if isinstance(reason, str) and reason.strip() else None
     kind = decision_inbox.DECISION_OPTIONS.get((row.get("rule_id"), option_id))
     evidence = None
-    if kind is not None:
+    if kind is not None and row["status"] == "open":
+        # Only a card that can still be answered needs its served evidence (S3 + tombstone
+        # reads): on a non-open card the UPDATE matches nothing and the 0-row path (retry
+        # 200 / 409) never reads `evidence`, so an S3 fault cannot turn a retry into a 500.
         evidence = _inbox_view(conn, [row])[0]["evidence"]
         if reason_text is not None:
             evidence = evidence + [{"kind": "reason", "text": reason_text}]

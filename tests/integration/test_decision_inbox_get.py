@@ -454,3 +454,39 @@ def test_query_count_bounded(db, env, allow):
     assert res["statusCode"] == 200 and len(body["cards"]) == 3 and body["more"] == 7
     assert body["digest"]["count"] == 2
     assert counting.n <= 8, counting.n
+
+
+def test_digest_ignores_other_tenants_stale_items(db, env, allow):
+    co, site, pm = _world(db, allow, name="Alpha")
+    other_co = companies.create_company(db, f"Co-oth-{_tag()}")          # not allow-listed
+    other_site = sites.create_site(db, other_co["id"], "Zulu")
+    _item(db, site, STALE_DEADLINE)
+    for _ in range(4):
+        _item(db, other_site, STALE_DEADLINE)
+    _card(db, co, site, [(pm, "pm")], rule_id="todo.overdue_backlog", kind="fact",
+          subject_ref=str(site["id"]), options=[{"id": "open_list", "label": "Open"}])
+    assert _call(db, pm)[1]["digest"]["count"] == 1
+    # the site filter is in the SQL: the other tenant's rows never come back from it
+    today = dt.date(2026, 11, 10)
+    got = action_items.overdue_open(db, today, site_ids=[site["id"]])
+    assert {str(r["site_id"]) for r in got} == {str(site["id"])} and len(got) == 1
+    everything = action_items.overdue_open(db, today)                     # the scan's call
+    assert sum(1 for r in everything if r["site_id"] == other_site["id"]) == 4
+    assert action_items.overdue_open(db, today, site_ids=[]) == []
+
+
+def test_overdue_open_site_filter_keeps_the_newest_row_rule(db, env, allow):
+    """An item whose newest live row moved to another site is not counted under the old
+    site: the filter runs after DISTINCT ON picks the newest row (same predicate)."""
+    co, a, pm = _world(db, allow)
+    b = sites.create_site(db, co["id"], f"Site-dib-{_tag()}")
+    old = _item(db, a, STALE_DEADLINE)
+    t = topics.upsert_topic(db, b["id"], "2026-11-09", f"T-{_tag()}",
+                            source_s3_key=f"extractions/y/2026-11-09/{_tag()}.json")
+    newer = action_items.insert_item(db, t["id"], b["id"], "moved", deadline=STALE_DEADLINE)
+    db.execute("UPDATE action_items SET stable_id = %s, created_at = now() + interval '1 hour' "
+               "WHERE id = %s", (old["stable_id"], newer["id"]))
+    today = dt.date(2026, 11, 10)
+    assert action_items.overdue_open(db, today, site_ids=[a["id"]]) == []
+    moved = action_items.overdue_open(db, today, site_ids=[b["id"]])
+    assert [str(r["site_id"]) for r in moved] == [str(b["id"])]

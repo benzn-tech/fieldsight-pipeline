@@ -390,3 +390,123 @@ def test_two_connections_first_answer_wins(migrated_db_url, monkeypatch, a_commi
         conn_a.close()
         conn_b.close()
         _cleanup(url, co, site, a, b, card)
+
+
+# ---------------------------------------------------------------- fix round (batch B review)
+
+def test_retry_on_an_answered_card_is_200_even_if_the_deletion_pass_fails(db, world,
+                                                                          monkeypatch):
+    co, site, pm, _ = world
+    card = _card(db, co, site, [(pm, "pm")])
+    assert _post(db, pm, card["card_id"], {"option_id": "done"}) == (200, ANSWERED)
+
+    def mirror_down(conn, rows):
+        raise RuntimeError("S3 deletion mirror unavailable")
+    monkeypatch.setattr(org, "_removed_source_cards", mirror_down)
+    assert _post(db, pm, card["card_id"], {"option_id": "done"}) == (200, ANSWERED)
+    assert _post(db, pm, card["card_id"], {"option_id": "not_needed"}) == \
+        (409, {"status": "stale"})
+    assert len(_ledger(db, card["card_id"])) == 1
+    # an OPEN card still fails closed: no unredacted evidence reaches the ledger
+    fresh = _card(db, co, site, [(pm, "pm")])
+    with pytest.raises(RuntimeError):
+        _post(db, pm, fresh["card_id"], {"option_id": "done"})
+
+
+def test_card_without_an_option_id_is_404(db, world):
+    co, site, pm, _ = world
+    for options in ([], [{"label": "no id"}]):
+        card = _card(db, co, site, [(pm, "pm")], options=options)
+        assert _post(db, pm, card["card_id"], {"option_id": "done"})[0] == 404
+
+
+def test_company_admin_recipient_answers(db, world):
+    co, site, _, _ = world
+    admin = _user(db, co, "gm")
+    card = _gap_card(db, co, site, [(admin, "company_admin")])
+    assert _post(db, admin, card["card_id"], {"option_id": "accept", "reason": "ok"})[0] == 200
+    [row] = _ledger(db, card["card_id"])
+    assert (row[6], row[7]) == (admin["id"], "company_admin")
+
+
+def test_external_member_of_the_allow_listed_site_answers(db, world):
+    co, site, _, _ = world
+    home = companies.create_company(db, f"Co-ext-{_tag()}")              # NOT allow-listed
+    ext = _user(db, home)
+    memberships.add_external_membership(db, ext["id"], site["id"], "pm")
+    card = _card(db, co, site, [(ext, "pm")])
+    assert _post(db, ext, card["card_id"], {"option_id": "done"}) == (200, ANSWERED)
+    [row] = _ledger(db, card["card_id"])
+    assert (row[6], row[7]) == (ext["id"], "pm")
+
+
+def test_inactive_company_with_enforce_on_is_404(db, world, monkeypatch):
+    co, site, _, _ = world
+    home = companies.create_company(db, f"Co-home-{_tag()}")
+    ext = _user(db, home)                       # an active caller, so dispatch lets it through
+    memberships.add_external_membership(db, ext["id"], site["id"], "pm")
+    card = _card(db, co, site, [(ext, "pm")])
+    db.execute("UPDATE companies SET status = 'suspended' WHERE id = %s", (co["id"],))
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    assert _post(db, ext, card["card_id"], {"option_id": "done"})[0] == 404
+    assert _state(db, card["card_id"])[0] == "open" and _ledger(db, card["card_id"]) == []
+
+
+def _cleanup_with_ledger(url, co, site, users_, card):
+    """Delete the committed rows INCLUDING the card's ledger row. The append-only trigger is
+    bypassed only inside this one transaction (SET LOCAL session_replication_role = replica,
+    superuser only); other sessions never see the trigger off."""
+    with psycopg.connect(url) as c:
+        with c.transaction():
+            c.execute("SET LOCAL session_replication_role = replica")
+            c.execute("DELETE FROM decision_ledger WHERE card_id = %s", (card["card_id"],))
+        c.execute("DELETE FROM decision_cards WHERE card_id=%s", (card["card_id"],))
+        c.execute("DELETE FROM memberships WHERE site_id=%s", (site["id"],))
+        c.execute("DELETE FROM users WHERE id = ANY(%s)", ([u["id"] for u in users_],))
+        c.execute("DELETE FROM sites WHERE id=%s", (site["id"],))
+        c.execute("DELETE FROM companies WHERE id=%s", (co["id"],))
+
+
+def test_two_connections_same_user_same_option_both_200_one_ledger_row(migrated_db_url,
+                                                                       monkeypatch):
+    url = migrated_db_url
+    with psycopg.connect(url) as c:
+        superuser = c.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+                              ).fetchone()[0]
+    if not superuser:
+        pytest.skip("cleanup of a committed ledger row needs a superuser test role")
+    co, site, a, b, card = _committed_world(url)
+    _setenv(monkeypatch, str(co["id"]))
+    conn_a, conn_b = psycopg.connect(url), psycopg.connect(url)
+    result = {}
+    try:
+        # A: the real route, a decision option, uncommitted (UPDATE + ledger row held)
+        assert _post(conn_a, a, card["card_id"], {"option_id": "done"}) == (200, ANSWERED)
+
+        def run_b():
+            try:
+                result["b"] = _post(conn_b, a, card["card_id"], {"option_id": "done"})
+                conn_b.commit()
+            except Exception as exc:  # noqa: BLE001 - surfaced by the assert below
+                result["exc"] = exc
+
+        t = threading.Thread(target=run_b)
+        t.start()
+        assert _wait_until_blocked(url, conn_b.info.backend_pid), "B never blocked on A"
+        assert "b" not in result
+        conn_a.commit()
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert "exc" not in result, result.get("exc")
+        assert result["b"] == (200, ANSWERED)
+        with psycopg.connect(url) as c:
+            n = c.execute("SELECT count(*) FROM decision_ledger WHERE card_id = %s",
+                          (card["card_id"],)).fetchone()[0]
+            st = c.execute("SELECT status, answered_by, answered_option FROM decision_cards "
+                           "WHERE card_id = %s", (card["card_id"],)).fetchone()
+        assert n == 1
+        assert st == ("answered", a["id"], "done")
+    finally:
+        conn_a.close()
+        conn_b.close()
+        _cleanup_with_ledger(url, co, site, [a, b], card)
