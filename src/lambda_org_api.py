@@ -45,6 +45,10 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
                                              (site-authority ACL + member-validated reassignment)
   POST  /api/org/action-items/{id}/status-suggestion → accept/dismiss a status heard in
                                              speech (same ACL; accept = the PATCH, audited)
+  GET   /api/org/status-pick-cards[?site=]   → pending pick cards (which task was "that one"?)
+                                             on reachable sites, live candidates only, max 50
+  POST  /api/org/status-pick-cards/{id}      → decide one: choose a candidate (= the PATCH,
+                                             audited) or none (site authority / every candidate)
   GET   /api/org/action-items/closures?from=&to= → action items CLOSED per NZ
                                              calendar day in the window + the same-length
                                              window before it, from the content_edits
@@ -225,6 +229,8 @@ import deletion_mirror
 import speaker_match_request
 from repositories import speaker_name_proposals
 from repositories import status_suggestions as status_suggestions_repo
+from repositories import status_pick_cards as status_pick_cards_repo
+from status_candidates import canon_uuid, drop_reason
 from repositories import company_status as company_status_repo
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
@@ -1948,6 +1954,12 @@ def dispatch(conn, event, method, route):
     m_ais = re.match(r"^/action-items/([^/]+)/status-suggestion$", route)
     if m_ais and method == "POST":
         return decide_status_suggestion(conn, caller, m_ais.group(1), parse_body(event))
+    # Literal GET first, ahead of the {id} POST.
+    if route == "/status-pick-cards" and method == "GET":
+        return list_status_pick_cards(conn, caller, event)
+    m_spc = re.match(r"^/status-pick-cards/([^/]+)$", route)
+    if m_spc and method == "POST":
+        return decide_status_pick_card(conn, caller, m_spc.group(1), parse_body(event))
 
     # Track B Task 5 Step 2 -- addressed by topic_questions.stable_id, not .id (see
     # patch_question's docstring for why that differs from action-items above).
@@ -9283,12 +9295,16 @@ def _action_item_edit_acl(conn, caller, action_item_id):
     return (None, denied) if denied is not None else (row, None)
 
 
-def _action_item_edit_denial(conn, caller, row):
+def _action_item_edit_denial(conn, caller, row, *, allowed_site_ids=None, site_roles=None):
     """The predicate behind _action_item_edit_acl, on a row already in hand: None when the
     caller may edit it, else the error response. `row` needs company_id, site_id,
     responsible and topic_user_id (get_action_item's and get_live_by_stable_id's shapes);
     None is "not found". Action-pack apply (Task 7) calls this on the live row it read under
-    the source lock, so it never goes through get_action_item's rollback-on-error path."""
+    the source lock, so it never goes through get_action_item's rollback-on-error path.
+
+    `allowed_site_ids` / `site_roles` let a caller that checks many rows (the pick-card
+    read) pass _allowed_site_ids and memberships.caller_site_roles hoisted once per
+    request; None fetches them here, as before."""
     # platform_admin (is_cross_company) edits across every tenant; company roles
     # stay pinned to their own company (mirrors the Team/sites fix in #96).
     cross = is_cross_company(caller["global_role"])
@@ -9296,9 +9312,13 @@ def _action_item_edit_denial(conn, caller, row):
             conn, caller, row["company_id"], row["site_id"])):
         return error("action item not found", 404)                  # incl. cross-company
     site_id = str(row["site_id"])
-    if site_id not in _allowed_site_ids(conn, caller):
+    if allowed_site_ids is None:
+        allowed_site_ids = _allowed_site_ids(conn, caller)
+    if site_id not in allowed_site_ids:
         return error("access denied to this task's site", 403)      # reach gate
-    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    if site_roles is None:
+        site_roles = memberships.caller_site_roles(conn, caller["id"])
+    site_role = site_roles.get(site_id)
     is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = _is_assignee(row, caller)
@@ -9350,6 +9370,165 @@ def decide_status_suggestion(conn, caller, action_item_id, body):
         return e.response
     return ok({"suggestion_id": str(s["id"]), "state": done["state"],
                "status": s["suggested_status"] if decision == "accept" else row["status"]})
+
+
+PICK_CARDS_SHOWN_MAX = 50
+
+
+def _pick_card_live_candidates(conn, card):
+    """The card's LIVE candidates as `[(canonical stable_id, live row)]`, in stored order: the
+    shared drop rule (status_candidates.drop_reason) against a fresh read of each. One rule
+    for GET and decide, so a card the GET hides is a 404 to decide too."""
+    site_id = canon_uuid(card["site_id"])
+    live = []
+    for raw in card.get("candidates") or []:
+        sid = canon_uuid(raw)
+        if sid is None:
+            continue
+        row = action_items.get_live_by_stable_id(conn, sid)
+        if drop_reason(row, site_id, card["suggested_status"]) is None:
+            live.append((sid, row))
+    return live
+
+
+def _pick_card_can_choose(conn, caller, live, allowed, roles):
+    """One bool per live candidate: does the caller pass _action_item_edit_denial on it?"""
+    return [_action_item_edit_denial(conn, caller, row, allowed_site_ids=allowed,
+                                     site_roles=roles) is None for _sid, row in live]
+
+
+def _pick_card_can_dismiss(conn, caller, card, roles, can_choose):
+    """May this caller answer "none of these" (spec §4.2 step 6)? Site authority -- admin/gm
+    of the card's company or this site's pm/site_manager, the tiers _action_item_edit_denial
+    uses minus the assignee, with its company pin -- or edit rights on EVERY live candidate
+    (`can_choose`, one bool per live candidate). Shared by GET's `can_dismiss` and decide."""
+    cross = is_cross_company(caller["global_role"])
+    if _is_company_admin_of(caller, card["company_id"], cross):
+        return True
+    if roles.get(str(card["site_id"])) in ("pm", "site_manager") and (
+            cross or _row_company_ok(conn, caller, card["company_id"], card["site_id"])):
+        return True
+    return bool(can_choose) and all(can_choose)
+
+
+def list_status_pick_cards(conn, caller, event):
+    """GET /status-pick-cards[?site=<id|slug>] (spec 2026-11-12 §4.1): pending pick cards on the
+    caller's reachable sites (or the one `?site=`, through _resolve_site_param), newest first.
+    Only live candidates are shown, in stored order, each with `can_choose`; a card with none
+    is hidden; at most PICK_CARDS_SHOWN_MAX cards, counted after that filter. Never writes."""
+    params = event.get("queryStringParameters") or {}
+    if params.get("site"):
+        site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+        if err is not None:
+            return err
+        site_ids = [site_id]
+    else:
+        site_ids = None
+    allowed = _allowed_site_ids(conn, caller)
+    roles = memberships.caller_site_roles(conn, caller["id"])
+    if site_ids is None:
+        site_ids = sorted(allowed)
+    pending = status_pick_cards_repo.pending_for_sites(conn, site_ids)
+    shown = []
+    for card in pending:
+        if len(shown) >= PICK_CARDS_SHOWN_MAX:
+            break
+        if canon_uuid(card["site_id"]) not in allowed:
+            continue
+        live = _pick_card_live_candidates(conn, card)
+        if not live:
+            continue
+        shown.append((card, live, _pick_card_can_choose(conn, caller, live, allowed, roles)))
+    task_nos = _task_numbers(conn, [str(row["id"]) for _c, live, _f in shown
+                                    for _sid, row in live])
+    names = {}
+    if shown:
+        names = {str(s["id"]): s.get("name") for s in sites.list_sites_by_ids(
+            conn, sorted({str(c["site_id"]) for c, _l, _f in shown}))}
+    cards = []
+    for card, live, flags in shown:
+        created = card.get("created_at")
+        cards.append({
+            "id": str(card["id"]),
+            "site_id": str(card["site_id"]),
+            "site_name": names.get(str(card["site_id"])),
+            "status": card["suggested_status"],
+            "quote": card["quote"],
+            "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+            "can_dismiss": _pick_card_can_dismiss(conn, caller, card, roles, flags),
+            "candidates": [{"stable_id": sid, "action_item_id": str(row["id"]),
+                            "text": row.get("text"), "status": row.get("status"),
+                            "responsible": row.get("responsible"),
+                            "task_no": task_nos.get(str(row["id"])), "can_choose": can}
+                           for (sid, row), can in zip(live, flags)],
+        })
+    logger.info("pick cards listed sites=%d pending=%d shown=%d",
+                len(site_ids), len(pending), len(cards))
+    return ok({"cards": cards})
+
+
+def decide_status_pick_card(conn, caller, card_id, body):
+    """POST /status-pick-cards/{id} {decision: choose, stable_id} | {decision: none}
+    (spec 2026-11-12 §4.2). Order: body (400); card + reach (404, ACL-first); live set empty
+    (404, as GET hides it); not pending (409 `card already decided`). choose: a stable_id not
+    on the card is 400 `not a candidate`; one on the card that is no longer live -- now or
+    under the lock -- is 409 `item no longer open`; then the normal PATCH (audited, actor =
+    the person) and the CAS resolve in ONE transaction, so a lost CAS rolls the PATCH back.
+    none: site authority or edit rights on every live candidate (else 403), then the CAS."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    decision = body.get("decision")
+    if decision not in ("choose", "none"):
+        return error("decision must be choose or none", 400)
+    sid = None
+    if decision == "choose":
+        sid = canon_uuid(body.get("stable_id"))
+        if sid is None:
+            return error("stable_id must be a uuid", 400)
+    card = status_pick_cards_repo.get_pick_card(conn, card_id)
+    allowed = _allowed_site_ids(conn, caller)
+    if card is None or canon_uuid(card["site_id"]) not in allowed:
+        return error("pick card not found", 404)
+    live = _pick_card_live_candidates(conn, card)
+    if not live:
+        return error("pick card not found", 404)
+    if card["state"] != "pending":
+        return error("card already decided", 409)
+    status = card["suggested_status"]
+    if decision == "choose":
+        if sid not in {canon_uuid(c) for c in card.get("candidates") or []}:
+            return error("not a candidate", 400)
+        try:
+            with conn.transaction():
+                item = action_items.get_live_by_stable_id(conn, sid, for_update=True)
+                if drop_reason(item, canon_uuid(card["site_id"]), status) is not None:
+                    raise _SuggestionNotApplied(error("item no longer open", 409))
+                res = patch_action_item(conn, caller, str(item["id"]), {"status": status})
+                if res.get("statusCode") != 200:
+                    raise _SuggestionNotApplied(res)
+                done = status_pick_cards_repo.resolve_pick_card(
+                    conn, card["id"], "chosen", sid, caller["id"])
+                if done is None:                   # someone decided it first
+                    raise _SuggestionNotApplied(error("card already decided", 409))
+        except _SuggestionNotApplied as e:
+            logger.info("pick card choose refused card=%s site=%s code=%s", card["id"],
+                        card["site_id"], e.response.get("statusCode"))
+            return e.response
+        action_item_id = str(item["id"])
+    else:
+        roles = memberships.caller_site_roles(conn, caller["id"])
+        flags = _pick_card_can_choose(conn, caller, live, allowed, roles)
+        if not _pick_card_can_dismiss(conn, caller, card, roles, flags):
+            return error("site authority or edit rights on every candidate needed", 403)
+        done = status_pick_cards_repo.resolve_pick_card(conn, card["id"], "none", None,
+                                                        caller["id"])
+        if done is None:
+            return error("card already decided", 409)
+        action_item_id = None
+    logger.info("pick card decided card=%s site=%s state=%s live=%d", card["id"],
+                card["site_id"], done["state"], len(live))
+    return ok({"id": str(card["id"]), "state": done["state"], "status": status,
+               "action_item_id": action_item_id})
 
 
 def patch_action_item(conn, caller, action_item_id, body):
