@@ -44,5 +44,22 @@
    "expected_middle": "you're asking when the backfill is due"},
   {"name": "possessive of a name in the question is the same name", "question": "is hanlon on site",
    "middle": "you're asking about Hanlon's crew", "ok": true,
-   "expected_middle": "you're asking about Hanlon's crew"}
+   "expected_middle": "you're asking about Hanlon's crew"},
+  {"name": "spelled-out digits read as the number (TEST 2026-11-12)", "question": "what does nzs three one oh one say about cover",
+   "middle": "you're asking what NZS 3101 says about cover", "ok": true,
+   "expected_middle": "you're asking what NZS 3101 says about cover"},
+  {"name": "spelled pairs read as the number", "question": "what does nzs thirty six oh four say about lintels",
+   "middle": "you're asking what NZS 3604 says about lintels", "ok": true,
+   "expected_middle": "you're asking what NZS 3604 says about lintels"},
+  {"name": "spelled decimal", "question": "what lintel for a two point four metre opening",
+   "middle": "you're asking which lintel suits a 2.4 metre opening", "ok": true,
+   "expected_middle": "you're asking which lintel suits a 2.4 metre opening"},
+  {"name": "spelled hundreds", "question": "do we have twenty four hundred bricks on site",
+   "middle": "you're asking whether we have 2400 bricks on site", "ok": true,
+   "expected_middle": "you're asking whether we have 2400 bricks on site"},
+  {"name": "thousands separator is the same number", "question": "do we have 2400 bricks on site",
+   "middle": "you're asking whether we have 2,400 bricks on site", "ok": true,
+   "expected_middle": "you're asking whether we have 2,400 bricks on site"},
+  {"name": "a spelled number never licenses a different one", "question": "what does nzs three one oh one say about cover",
+   "middle": "you're asking what NZS 3604 says about cover", "ok": false, "reason": "guard_number"}
 ]
