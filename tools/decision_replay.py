@@ -45,9 +45,13 @@ replay() contract
   for its subject; a 'nothing' event needs an earlier event's card under the same card_key;
   every card names a 'done' event in scope. Per card_key: done-events-with-card = cards
   (exactly one carding done event per card), at most one card open, and every card but the
-  newest is 'superseded'. Card status is otherwise NOT recomputed: supersede is decided by
-  the checklist scan from S3 content, which the database does not hold. Recipients are not
-  compared (membership changes over time).
+  newest is 'superseded' or 'answered' (an inbox answer frees the key like a supersede).
+  Card status is otherwise NOT recomputed: supersede is decided by the checklist scan from
+  S3 content, and an answer by a person, neither of which the database lets the judge
+  re-derive. Recipients are not compared (membership changes over time).
+* Answers (P1 inbox, spec 2026-11-12-decision-card-inbox-design rev 2 §6) are judged by
+  invariants(): answer columns vs status, and source='card' ledger rows vs
+  decision_inbox.DECISION_OPTIONS (imported, not restated; pure like the hub).
 * Runs: a pre-dispatch or duplicate event has no run; a done / nothing event has exactly
   one non-failed run (a merged event only has to be in some run), and a 'done' event's run outcome is 'done' iff it has a card.
 * Run-rules (the matched rule has `run`, e.g. the nightly job): no card and no ledger. A
@@ -82,8 +86,11 @@ if _SRC not in sys.path:
 import decision_hub  # noqa: E402
 import tenancy_status  # noqa: E402
 from decision_hub import FAULT_AT, FAULT_RULE_ID, STOP_AT, Event  # noqa: E402
+from decision_inbox import DECISION_OPTIONS  # noqa: E402  (pure; the one decision table)
 
 KNOWN_FALSE = "KNOWN_FALSE: "
+# P0 writes open / superseded; the P1 inbox answer moves open -> answered (migration 0103).
+CARD_STATUSES = ("open", "superseded", "answered")
 
 PRE_DISPATCH = ("late", "unmatched", "blocked", "too_deep")
 DISPATCHED = ("done", "nothing", "merged", "failed")
@@ -348,9 +355,9 @@ def replay(conn, company_id=None):
             if ev_row["status"] != "done":
                 out.append(f"card {c['card_id']} ({c['card_key']}): its event {eid} is "
                            f"{ev_row['status']}, not done")
-            if c["status"] not in ("open", "superseded"):
-                out.append(f"card {c['card_id']}: status {c['status']} (P0 has only open / "
-                           "superseded)")
+            if c["status"] not in CARD_STATUSES:
+                out.append(f"card {c['card_id']}: status {c['status']} (only open / "
+                           "superseded / answered are written)")
             per_key[c["card_key"]].append((ev_row["seq"], c))
     for key, lst in per_key.items():
         if done_with_card.get(key, 0) != len(lst):
@@ -360,9 +367,10 @@ def replay(conn, company_id=None):
         if sum(1 for _, c in lst if c["status"] == "open") > 1:
             out.append(f"card_key {key!r}: more than one open card")
         for _, c in lst[:-1]:
-            if c["status"] != "superseded":
+            # an answered card frees its key too (dedupe holds only while a card is open)
+            if c["status"] not in ("superseded", "answered"):
                 out.append(f"card_key {key!r}: older card {c['card_id']} is {c['status']}, "
-                           "not superseded")
+                           "not superseded or answered")
 
     # fault cards, through failed-run counts
     for eid, row in by_id.items():
@@ -409,6 +417,55 @@ def _check(conn, out, label, sql, params=()):
         out.append(f"{label}: {len(rows)} row(s), e.g. {sample}")
 
 
+def _answer_invariants(conn, out, scoped):
+    """The inbox answer (spec 2026-11-12-decision-card-inbox-design rev 2 §5, §6): an
+    answered card names who/what/when; an open card has no answer columns and no
+    source='card' ledger row; only an answered card has card ledger rows, at most one, and
+    exactly one iff (rule_id, answered_option) is in decision_inbox.DECISION_OPTIONS, with
+    decision = the option and kind = the table's kind."""
+    rules = [k[0] for k in DECISION_OPTIONS]
+    opts = [k[1] for k in DECISION_OPTIONS]
+    kinds = [DECISION_OPTIONS[k] for k in DECISION_OPTIONS]
+    is_decision = ("EXISTS (SELECT 1 FROM unnest(%s::text[], %s::text[]) AS d(rule_id, opt) "
+                   "WHERE d.rule_id = c.rule_id AND d.opt = c.answered_option)")
+    card_rows = ("(SELECT count(*) FROM decision_ledger l WHERE l.card_id = c.card_id "
+                 "AND l.source = 'card')")
+    s, p = scoped("c.company_id")
+    _check(conn, out, "answered card without answered_by / answered_option / answered_at",
+           "SELECT c.card_id FROM decision_cards c WHERE c.status = 'answered' AND "
+           "(c.answered_by IS NULL OR c.answered_option IS NULL OR c.answered_at IS NULL)" + s,
+           p)
+    _check(conn, out, "open card with answer columns set",
+           "SELECT c.card_id FROM decision_cards c WHERE c.status = 'open' AND "
+           "(c.answered_by IS NOT NULL OR c.answered_option IS NOT NULL "
+           " OR c.answered_at IS NOT NULL OR c.answer_reason IS NOT NULL)" + s, p)
+    _check(conn, out, "card ledger row (source card) on a card that is not answered",
+           "SELECT c.card_id, c.status FROM decision_cards c WHERE c.status <> 'answered' "
+           f"AND {card_rows} > 0" + s, p)
+    _check(conn, out, "answered card with more than one card ledger row",
+           f"SELECT c.card_id, {card_rows} FROM decision_cards c WHERE c.status = 'answered' "
+           f"AND {card_rows} > 1" + s, p)
+    _check(conn, out, "answered with a decision option but no card ledger row",
+           "SELECT c.card_id, c.answered_option FROM decision_cards c "
+           f"WHERE c.status = 'answered' AND {is_decision} AND {card_rows} = 0" + s,
+           (rules, opts) + p)
+    _check(conn, out, "card ledger row for an answer that is not a decision option",
+           "SELECT c.card_id, c.answered_option FROM decision_cards c "
+           f"WHERE c.status = 'answered' AND NOT {is_decision} AND {card_rows} > 0" + s,
+           (rules, opts) + p)
+    _check(conn, out, "card ledger row whose decision / kind / tenant differs from the answer",
+           "SELECT c.card_id, l.decision, l.kind FROM decision_cards c "
+           "JOIN decision_ledger l ON l.card_id = c.card_id AND l.source = 'card' "
+           "WHERE c.status = 'answered' AND (l.decision IS DISTINCT FROM c.answered_option "
+           " OR l.company_id <> c.company_id OR l.site_id <> c.site_id "
+           " OR l.subject_ref <> c.subject_ref "
+           " OR l.decided_by IS DISTINCT FROM c.answered_by "
+           " OR l.kind IS DISTINCT FROM (SELECT d.kind FROM unnest(%s::text[], %s::text[], "
+           "   %s::text[]) AS d(rule_id, opt, kind) "
+           "   WHERE d.rule_id = c.rule_id AND d.opt = c.answered_option))" + s,
+           (rules, opts, kinds) + p)
+
+
 def invariants(conn, company_ids=None):
     """SQL invariant checks; human-readable failures, [] when all hold."""
     ids = _scope(company_ids)
@@ -438,6 +495,7 @@ def invariants(conn, company_ids=None):
            " GROUP BY card_key HAVING count(*) > 1", p)
     _check(conn, out, "decision_ledger row of kind defaulted (none in P0)",
            "SELECT entry_id FROM decision_ledger WHERE kind = 'defaulted'" + s, p)
+    _answer_invariants(conn, out, scoped)
     s, p = scoped("e.company_id")
     _check(conn, out, "merged event not in run_events",
            "SELECT e.event_id FROM site_events e WHERE e.status = 'merged' "
