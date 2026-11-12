@@ -432,13 +432,17 @@ def test_judge_env_is_on_the_worker_only(tmpl):
     # The action agent (spec 2026-11-01) writes through the same llm_tools_client as the
     # judge, so it carries the judge's model/fallback/provider/reasoning settings -- but it
     # never runs the orchestrator, so not ASK_AGENTIC.
-    agent = res["ActionAgentFunction"]["Properties"]["Environment"]["Variables"]
-    assert "ASK_AGENTIC" not in agent
-    for key in ("ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS", "ASK_JUDGE_PROVIDER",
-                "ASK_JUDGE_REASONING"):
-        assert agent[key] == worker[key], key
+    # AskAgent's own rewrite has called ask_rewrite.judge_call since #1292 (the
+    # prompt_only voice path and the sync fallback), so it carries them too (#1303) --
+    # and it never runs the orchestrator either.
+    for fn in ("ActionAgentFunction", "AskAgentFunction"):
+        agent = res[fn]["Properties"]["Environment"]["Variables"]
+        assert "ASK_AGENTIC" not in agent, fn
+        for key in ("ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS", "ASK_JUDGE_PROVIDER",
+                    "ASK_JUDGE_REASONING"):
+            assert agent[key] == worker[key], (fn, key)
     for name, r in res.items():
-        if name in ("AskVoiceWorkerFunction", "ActionAgentFunction"):
+        if name in ("AskVoiceWorkerFunction", "ActionAgentFunction", "AskAgentFunction"):
             continue
         env = ((r.get("Properties") or {}).get("Environment") or {}).get("Variables") or {}
         assert not {"ASK_AGENTIC", "ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS",
