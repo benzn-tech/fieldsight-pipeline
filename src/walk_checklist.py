@@ -49,7 +49,9 @@ def shape_sentence():
     return ("as a markdown table with exactly these columns, in this order: "
             "%s. One row per (unit, checklist item) THE RECORDING ACTUALLY ADDRESSED. "
             "Unit is the unit the finding is ABOUT, not the unit he happens to be "
-            "standing in: a finding for \"back to Unit 2\" is Unit 2. Write the unit as "
+            "standing in: a finding for \"back to Unit 2\" is Unit 2 -- that covers only "
+            "the findings said with the back-reference; a later finding that names no "
+            "unit is about the unit he walked into last. Write the unit as "
             "its name and number, e.g. Unit 2 or Lot 150. Use Unit General for a "
             "finding that names no unit. Item no is the item's number from the list "
             "under the heading. When he says the rest of a unit is fine (\"this one's "
@@ -60,7 +62,10 @@ def shape_sentence():
             "item -- for a No, what is wrong. Responsible and Due are who will put "
             "right what is wrong and by when, only when that was said; otherwise leave "
             "them empty. Evidence is the exact words from the transcript that answer "
-            "the item, copied verbatim. Leave out every item the recording did not "
+            "the item, copied verbatim: at least three words, the whole clause that "
+            "answers it. A claim answered with doubt, silence (\"hmm\") or a change of "
+            "subject is not confirmed: leave the item out; a claim counts when the "
+            "inspector agrees, repeats it or checks it. Leave out every item the recording did not "
             "address -- do not guess, and do not answer from general expectation"
             % " | ".join(MODEL_COLUMNS))
 
@@ -244,8 +249,8 @@ def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dr
         at, why = None, None
         if checklist.ANSWERS.get(answer) != "Yes":
             why = NOT_YES
-        elif not checklist.evidence_found(quote, t_words):
-            why = NO_EVIDENCE
+        elif checklist.evidence_reason(quote, t_words):
+            why = checklist.evidence_reason(quote, t_words)
         elif places is not None:
             # Placed by where it was said: the unit he last walked into
             # before these words. A place is claimed once (R45).
@@ -318,10 +323,11 @@ def _general(model_rows, t_words):
     for line in model_rows:
         cells = (checklist._cells(line) + [""] * 6)[:6]
         entry = {"comment": cells[2], "evidence": cells[5]}
-        if checklist.evidence_found(entry["evidence"], t_words):
+        why = checklist.evidence_reason(entry["evidence"], t_words)
+        if why is None:
             kept.append(entry)
         else:
-            dropped.append(dict(entry, reason=NO_EVIDENCE))
+            dropped.append(dict(entry, reason=why))
     return kept, dropped
 
 

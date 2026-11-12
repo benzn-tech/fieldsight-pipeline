@@ -206,3 +206,5 @@ def test_the_model_is_asked_for_units_entered_not_units_mentioned():
     src = open(es.__file__, encoding="utf-8").read()
     assert "walks INTO a unit" in src and "not a unit he only mentions" in src
     assert "an ordinary check in one room leaves it empty" in src
+    # 2026-11-13: "back to unit one" inside a walk was put in `resumed`.
+    assert "`resumed` is only for coming back to a CHECK after a different check" in src

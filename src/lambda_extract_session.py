@@ -1028,8 +1028,9 @@ def _instructions_block(locator=False):
      lists each moment he walks INTO a unit (Unit 2, Lot 167, Room 102), not a unit he only mentions.
      units_named is only for an opening that names units for a walk through several units --
      an ordinary check in one room leaves it empty and unit_count null. "Back to Unit 2, forgot
-     the nogs" or "next door Unit 5 is the same" is not entering it. Most checks have no
-     entered marks; [] is the normal answer.
+     the nogs" or "next door Unit 5 is the same" is not entering it -- and it is not
+     `resumed` either: `resumed` is only for coming back to a CHECK after a different check.
+     Most checks have no entered marks; [] is the normal answer.
 1. Split the transcript into topics BY SUBJECT -- one topic per distinct subject or work item.
    - Start a NEW topic whenever the conversation moves to a genuinely DIFFERENT subject (a
      different work item, trade, location, or concern) -- even if only a minute passes, even if the
