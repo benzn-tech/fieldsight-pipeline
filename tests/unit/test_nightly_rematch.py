@@ -157,6 +157,25 @@ def test_nightly_flag_wired_three_places(doc):
         assert f"{other}_NIGHTLY_REMATCH" not in text, env
 
 
+def test_nightly_j1_flag_wired_three_places(doc):
+    """Spec 2026-11-13-nightly-j1-gate section 4: J1's own flag, inherit by default, reaches
+    the decision scan only; each workflow passes its own environment's variable with an
+    explicit fallback (SAM keeps a stack's previous value)."""
+    p = doc["Parameters"]["NightlyJ1"]
+    assert p["Default"] == "inherit"
+    assert p["AllowedValues"] == ["inherit", "off", "shadow", "on"]
+    assert _env(doc, SCAN)["NIGHTLY_J1"] == {"Ref": "NightlyJ1"}
+    for env, path in WORKFLOWS.items():
+        text = io.open(path, encoding="utf-8").read()
+        line = "\"NightlyJ1=${{ vars.%s_NIGHTLY_J1 || 'inherit' }}\" \\" % env
+        assert line in text, env
+        other = "PROD" if env == "TEST" else "TEST"
+        assert f"{other}_NIGHTLY_J1" not in text, env
+    for name, res in doc["Resources"].items():
+        if name != SCAN:
+            assert "NightlyJ1" not in json.dumps(res), name
+
+
 def test_condition_needs_the_decision_loop_and_the_flag(doc):
     cond = doc["Conditions"][COND]["And"]
     assert {"Condition": "ShouldRunDecisionLoop"} in cond and OFF in cond

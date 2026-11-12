@@ -1723,8 +1723,10 @@ Parameters:
   # shadow: the hourly tick runs, the hub's nightly.due run-rule counts J3 markers and
   # writes J2 request artifacts to nightly_requests/ -- the worker exists but is NOT wired
   # to S3 (scripts/wire-s3-events.sh adds that trigger only with WIRE_NIGHTLY_TURN_PICK=true),
-  # so no model call. on: J3 recomputes, and J2 requests are answered once the operator
-  # wires the worker. Needs SiteDecisionLoop=shadow too (the hub). Set per environment by
+  # so no model call (J1 aside, see NightlyJ1: with NightlyJ1=on J1 writes nightly_reemits
+  # rows and puts reconcile / cross-day requests even while this is shadow). on: J3
+  # recomputes, and J2 requests are answered once the operator wires the worker. Needs
+  # SiteDecisionLoop=shadow too (the hub). Set per environment by
   # TEST_NIGHTLY_REMATCH / PROD_NIGHTLY_REMATCH (SAM keeps a stack's previous value).
   NightlyRematch:
     Type: String
@@ -1732,8 +1734,25 @@ Parameters:
     AllowedValues: ['off', 'shadow', 'on']
     Description: >-
       off (default) creates nothing nightly. shadow schedules the hourly nightly tick and
-      writes J2 request artifacts without any model call; on also runs J3 recomputes and
-      lets a wired worker answer J2 requests. Requires SiteDecisionLoop=shadow.
+      writes J2 request artifacts without any model call (J1 aside, see NightlyJ1); on also
+      runs J3 recomputes and lets a wired worker answer J2 requests. Requires
+      SiteDecisionLoop=shadow.
+
+  # J1's own flag (spec 2026-11-13-nightly-j1-gate-design §2, §4). Pinned by
+  # tests/unit/test_nightly_rematch.py. Read by the decision scan's nightly handler for J1
+  # (late-arrival catch-up) only, and only while NightlyRematch is shadow or on (off: J1
+  # never runs). inherit (default): J1 follows NightlyRematch. off: no J1 detection reads.
+  # shadow: J1 counts stale pairs only. on: J1 re-emits -- it writes nightly_reemits rows
+  # and puts reconcile / cross-day requests even while NightlyRematch is shadow, each line
+  # only while that line's own flag is on. Set per environment by TEST_NIGHTLY_J1 /
+  # PROD_NIGHTLY_J1 (SAM keeps a stack's previous value).
+  NightlyJ1:
+    Type: String
+    Default: 'inherit'
+    AllowedValues: ['inherit', 'off', 'shadow', 'on']
+    Description: >-
+      Nightly J1 catch-up mode (inherit follows NightlyRematch; on re-emits even while
+      NightlyRematch is shadow).
 
   VoiceprintMaxFrameSpread:
     Type: String
@@ -6155,6 +6174,9 @@ Resources:
           SITE_DECISION_LOOP: !Ref SiteDecisionLoop
           # Gates every run-rule (the nightly.due handler): off | shadow | on.
           NIGHTLY_REMATCH: !Ref NightlyRematch
+          # J1's own mode over NIGHTLY_REMATCH (nightly_rematch.j1_mode): inherit | off |
+          # shadow | on.
+          NIGHTLY_J1: !Ref NightlyJ1
           # J1 catch-up re-emits a line's request only while that line is on, read exactly
           # as the item writer reads them (nightly_rematch._line_mode).
           CROSS_DAY_CONTINUITY: !Ref CrossDayContinuity
