@@ -14,6 +14,9 @@ What the day contains (each is something a planted fault has to show up on):
   * an external recorder (home company A) recording on company B's site -> gap events under
     B, never A (`wrong_company`);
   * a gap report dated 8 days back -> 'late' (`skip_late`);
+  * a STALE overdue item on A1 (due 7 days before NOW's NZ day) -> its todo.overdue event is
+    'late' and A1 gets one todo.overdue_backlog digest card (spec 6.5 rev 6); skipping the
+    late check cards the stale item itself (`skip_late`, caught on the todo.overdue row);
   * the overdue scan run twice at the same instant -> 'duplicate' rows (`skip_dedupe`,
     `duplicate_event`);
   * one overdue event whose handler is forced to fail until it stops (5 attempts, fault card
@@ -31,9 +34,9 @@ import decision_hub
 import lambda_decision_scan as lds
 from repositories import memberships
 from repositories import site_events as se
-from tests.integration.test_decision_scan import (NOW, FakeS3, _company, _done, _gaps,
-                                                  _overdue_item, _reader, _record_on,
-                                                  _report, _site, _tag, _user)
+from tests.integration.test_decision_scan import (NOW, STALE_DEADLINE, FakeS3, _company,
+                                                  _done, _gaps, _overdue_item, _reader,
+                                                  _record_on, _report, _site, _tag, _user)
 
 DAY2 = NOW + dt.timedelta(days=1)
 OLD_DATE = "2026-11-02"                        # 8 days before NOW's NZ day (late_after 7)
@@ -102,6 +105,7 @@ def run_scripted_day(conn, mutate=None):
 
     # overdue items (deadline before NOW's NZ day)
     _overdue_item(conn, a1, "Order the rebar")
+    _overdue_item(conn, a1, "Old pour plan", deadline=STALE_DEADLINE)   # stale: late + digest
     _overdue_item(conn, b1, "Book the pump")
     fence = _overdue_item(conn, b2, "Fix the site fence")         # forced to fail on day 1
     _overdue_item(conn, b2, "Order the forms")

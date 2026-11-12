@@ -119,10 +119,12 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET    /api/org/programme/delay-flags           → open flags for a site
   POST   /api/org/programme/delay-flags/{id}/acknowledge → PM has seen it
   POST   /api/org/programme/delay-flags/{id}/resolve     → PM has dealt with it
-  GET    /api/org/decision-shadow?label=&limit=&offset= → platform_admin: site decision
+  GET    /api/org/decision-shadow?label=&limit=&offset=&since= → platform_admin: site decision
                                                     loop shadow cards of every company,
                                                     newest first, + label summary
-                                                    (404 unless SITE_DECISION_LOOP=shadow)
+                                                    (since=YYYY-MM-DD NZ date limits the
+                                                    summary; 404 unless
+                                                    SITE_DECISION_LOOP=shadow)
   POST   /api/org/decision-shadow/{card_id}/label → platform_admin: shadow label
                                                     {label, note}; never changes status
 
@@ -792,7 +794,9 @@ def _non_negative_int(raw, default):
 def list_decision_shadow(conn, event):
     """GET /api/org/decision-shadow?label=&limit=&offset= -- newest first. `label` is one
     of DECISION_SHADOW_LABELS or absent; limit defaults to 50 and is capped at 200 (0 or
-    a non-integer is a 400). The summary covers EVERY card, not just this page."""
+    a non-integer is a 400). The summary covers EVERY card, not just this page; with
+    `since` (YYYY-MM-DD, an NZ date; anything else is a 400) its label counts and p95 cover
+    only cards created on or after that NZ date (spec §12 rev 6). The card list ignores it."""
     p = event.get("queryStringParameters") or {}
     label = p.get("label")
     if label in (None, ""):
@@ -804,9 +808,27 @@ def list_decision_shadow(conn, event):
     if limit is None or limit == 0 or offset is None:
         return error("limit must be a positive integer and offset a non-negative one", 400)
     limit = min(limit, DECISION_SHADOW_MAX_LIMIT)
+    raw_since = p.get("since")
+    since = None
+    if raw_since not in (None, ""):
+        since = _strict_iso_date(raw_since)
+        if since is None:
+            return error("since must be YYYY-MM-DD", 400)
     rows = decision_cards.list_shadow(conn, limit, offset, label=label)
     return ok({"cards": _decision_card_views(conn, rows),
-               "summary": decision_shadow_summary(decision_cards.shadow_summary_rows(conn))})
+               "summary": decision_shadow_summary(decision_cards.shadow_summary_rows(conn),
+                                                  since=since)})
+
+
+def _strict_iso_date(raw):
+    """A YYYY-MM-DD string -> date; anything else (other shapes, impossible dates) -> None."""
+    s = str(raw).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return None
+    try:
+        return _date.fromisoformat(s)
+    except ValueError:
+        return None
 
 
 def label_decision_card(conn, caller, raw_card, body):
@@ -906,8 +928,11 @@ def _decision_card_views(conn, rows):
     return out
 
 
-def decision_shadow_summary(rows):
-    """Counts over EVERY card (rows of shadow_summary_rows).
+def decision_shadow_summary(rows, since=None):
+    """Counts over EVERY card (rows of shadow_summary_rows), or, with `since` (a date),
+    only over cards whose NZ calendar day of created_at is on or after it (the raw NZ day,
+    before the Sunday fold; a row without a created_at is then left out). `since` is echoed
+    back as an ISO date or None.
 
     precision = needed / (needed + not_needed), None when that is 0 (wrong_evidence is
     neither). cards_per_recipient_day_p95 is the spec's <=3 gate: cards per (recipient
@@ -918,11 +943,15 @@ def decision_shadow_summary(rows):
     counts = {k: 0 for k in DECISION_SHADOW_LABELS}
     per_pair = {}
     for r in rows:
+        created = r.get("created_at")
+        nz_day = nz_time.to_nz(created).date() if isinstance(created, datetime) else None
+        if since is not None and (nz_day is None or nz_day < since):
+            continue
         if r.get("shadow_label") in counts:
             counts[r["shadow_label"]] += 1
-        if r.get("kind") == "fault" or not isinstance(r.get("created_at"), datetime):
+        if r.get("kind") == "fault" or nz_day is None:
             continue
-        day = nz_time.to_nz(r["created_at"]).date()
+        day = nz_day
         if day.weekday() == 6:
             day += timedelta(days=1)
         for uid in {str(rc.get("user_id")) for rc in (r.get("recipients") or [])
@@ -935,7 +964,9 @@ def decision_shadow_summary(rows):
         p95 = float(ordered[math.ceil(0.95 * len(ordered)) - 1])
     return {"labelled": sum(counts.values()), **counts,
             "precision": counts["needed"] / judged if judged else None,
-            "cards_per_recipient_day_p95": p95}
+            "cards_per_recipient_day_p95": p95,
+            "since": since.isoformat() if since is not None else None}
+
 
 def _pack_reader(conn, caller):
     return action_packs.reader_for(caller, memberships.caller_site_roles(conn, caller["id"]))

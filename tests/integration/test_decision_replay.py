@@ -50,6 +50,17 @@ def test_replay_of_a_scripted_day_is_clean(db):
     assert db.execute("SELECT count(*) FROM site_events WHERE company_id = %s "
                       "AND type = 'checklist.gap' AND status <> 'late'",
                       (day["home"]["id"],)).fetchone()[0] == 0
+    # rev 6: the stale overdue item ended 'late' on both days and A1 got one digest card,
+    # which the judge must reproduce from the pure hub like any other card
+    a1 = day["sites"][0]["id"]
+    assert db.execute("SELECT count(*) FROM site_events WHERE site_id = %s "
+                      "AND type = 'todo.overdue' AND status = 'late'",
+                      (a1,)).fetchone()[0] == 2
+    assert db.execute("SELECT status FROM site_events WHERE site_id = %s "
+                      "AND type = 'todo.overdue_backlog' AND status <> 'duplicate' "
+                      "ORDER BY seq", (a1,)).fetchall() == [("done",), ("nothing",)]
+    assert db.execute("SELECT count(*) FROM decision_cards WHERE site_id = %s "
+                      "AND rule_id = 'todo.overdue_backlog'", (a1,)).fetchone()[0] == 1
 
     assert decision_replay.replay(db, company_id=scope) == []
     assert decision_replay.invariants(db, company_ids=scope) == []

@@ -19,6 +19,7 @@ import psycopg
 import pytest
 
 import checklist_reports
+import nz_time
 import decision_hub
 import lambda_decision_scan as lds
 from repositories import action_items, companies, memberships, sites, topics, users
@@ -149,7 +150,13 @@ def _seen(conn, report_id):
                         (report_id,)).fetchone()[0]
 
 
-def _overdue_item(conn, site, text="Order the rebar", deadline=dt.date(2026, 11, 3),
+#: Default deadline: NEWLY overdue on NOW's NZ day and the next (rev 6: carded while
+#: today - (deadline + 1) <= 2). STALE_DEADLINE is past that on NOW's day -> late + digest.
+FRESH_DEADLINE = dt.date(2026, 11, 8)
+STALE_DEADLINE = dt.date(2026, 11, 3)
+
+
+def _overdue_item(conn, site, text="Order the rebar", deadline=FRESH_DEADLINE,
                   responsible="Mike"):
     t = topics.upsert_topic(conn, site["id"], DATE, f"T-{_tag()}",
                             source_s3_key=f"extractions/x/{DATE}/{_tag()}.json")
@@ -214,7 +221,11 @@ def test_overdue_scan_emits_and_processes_in_one_call(db, monkeypatch):
     """There is no process schedule (Aurora must be able to pause): a scan call emits AND
     runs the hub in the same invocation and connection, and reports both counts."""
     co, site, pm, admin = _world(db)
-    _overdue_item(db, site)
+    # lambda_handler reads the real clock, so the item is due yesterday in REAL NZ time: a
+    # fixed date would turn stale (rev 6: no per-item card, plus a backlog digest) as the
+    # calendar moves on.
+    real_today = nz_time.to_nz(dt.datetime.now(UTC)).date()
+    _overdue_item(db, site, deadline=real_today - dt.timedelta(days=1))
     monkeypatch.setenv("SITE_DECISION_LOOP", "shadow")
     monkeypatch.setattr(lds, "get_connection", _Borrowed(db))
     out = lds.lambda_handler({"scan": "todo_overdue"}, None)
@@ -279,13 +290,165 @@ def test_overdue_item_becomes_one_open_card_per_item(db):
         open_cards = [c for c in _cards(db, co["id"], "open") if c["subject_ref"] == sid]
         assert len(open_cards) == 1
     ev = next(e for e in _events(db, co["id"]) if e["subject_ref"] == str(a["stable_id"]))
-    assert ev["payload"] == {"text": "Order the rebar", "deadline": "2026-11-03",
+    assert ev["payload"] == {"text": "Order the rebar", "deadline": "2026-11-08",
                              "responsible": "Mike"}
-    assert ev["occurred_at"] == NOW and ev["received_at"] == NOW
+    # occurred_at = 00:00 NZDT on 9 Nov (the day after the deadline) = 11:00Z on 8 Nov
+    assert ev["occurred_at"] == dt.datetime(2026, 11, 8, 11, 0, tzinfo=UTC)
+    assert ev["received_at"] == NOW
     assert ev["company_id"] == co["id"] and ev["site_id"] == site["id"]
     card = next(c for c in _cards(db, co["id"]) if c["subject_ref"] == str(a["stable_id"]))
     assert card["recipients"] == [{"user_id": str(pm["id"]), "role": "pm"}]
     assert card["rule_id"] == "todo.overdue" and card["status"] == "open"
+
+
+def _live_events(conn, company_id, type_):
+    return [e for e in _events(conn, company_id, type_) if e["status"] != "duplicate"]
+
+
+def test_overdue_new_items_carded_stale_ones_late_and_digested(db):
+    """Rev 6 (owner option B). NOW's NZ day is Tue 10 Nov: due 9 Nov (today-1) and 7 Nov
+    (today-3) are newly overdue and carded; due 6 Nov (today-4) is stale: its own event is
+    'late' (no card) and it is listed in the site's one backlog digest."""
+    co, site, pm, admin = _world(db)
+    d1 = _overdue_item(db, site, "Due yesterday", deadline=dt.date(2026, 11, 9))
+    d3 = _overdue_item(db, site, "Due three days ago", deadline=dt.date(2026, 11, 7))
+    d4 = _overdue_item(db, site, "Due four days ago", deadline=dt.date(2026, 11, 6),
+                       responsible="Ana")
+    out = lds.emit_todo_overdue(db, NOW)
+    assert (out["emitted"], out["duplicates"], out["errors"]) == (4, 0, 0)  # 3 items + digest
+    lds.process(db, NOW)
+    by_ref = {e["subject_ref"]: e for e in _live_events(db, co["id"], "todo.overdue")}
+    assert by_ref[str(d1["stable_id"])]["status"] == "done"
+    assert by_ref[str(d3["stable_id"])]["status"] == "done"
+    assert by_ref[str(d4["stable_id"])]["status"] == "late"
+    # NZ midnight starting 7 Nov (NZDT, +13) = 11:00Z on 6 Nov
+    assert by_ref[str(d4["stable_id"])]["occurred_at"] == dt.datetime(2026, 11, 6, 11, 0,
+                                                                       tzinfo=UTC)
+    [dg] = _live_events(db, co["id"], "todo.overdue_backlog")
+    assert dg["status"] == "done" and dg["subject_ref"] == str(site["id"])
+    assert dg["source"] == "action_items" and dg["bucket"] == DATE
+    assert dg["occurred_at"] == NOW and dg["received_at"] == NOW
+    assert dg["payload"] == {"count": 1, "site_name": site["name"], "items": [
+        {"stable_id": str(d4["stable_id"]), "text": "Due four days ago",
+         "deadline": "2026-11-06", "responsible": "Ana"}]}
+    cards = _cards(db, co["id"], "open")
+    assert sorted(c["rule_id"] for c in cards) == ["todo.overdue", "todo.overdue",
+                                                   "todo.overdue_backlog"]
+    assert str(d4["stable_id"]) not in {c["subject_ref"] for c in cards}
+    [digest] = [c for c in cards if c["rule_id"] == "todo.overdue_backlog"]
+    assert digest["kind"] == "fact" and digest["purpose"] == "overdue_backlog"
+    assert digest["question"] == f"1 to-do on {site['name']} is more than 3 days overdue"
+    assert digest["deadline_at"] is None
+    assert digest["options"] == [{"id": "open_list", "label": "Open the list",
+                                  "recommended": True}]
+    assert digest["recipients"] == [{"user_id": str(pm["id"]), "role": "pm"}]
+
+
+def test_overdue_digest_routed_to_site_manager_too(db):
+    co, site, pm, admin = _world(db)
+    sm = _user(db, co)
+    memberships.add_membership(db, sm["id"], site["id"], "site_manager")
+    worker = _user(db, co)
+    memberships.add_membership(db, worker["id"], site["id"], "worker")
+    _overdue_item(db, site, deadline=STALE_DEADLINE)
+    lds.emit_todo_overdue(db, NOW)
+    lds.process(db, NOW)
+    [digest] = _cards(db, co["id"], "open")
+    assert digest["rule_id"] == "todo.overdue_backlog"
+    assert sorted((r["role"], r["user_id"]) for r in digest["recipients"]) == sorted(
+        [("pm", str(pm["id"])), ("site_manager", str(sm["id"]))])
+
+
+def test_overdue_digest_one_per_site_and_none_for_fresh_only_site(db):
+    co, site, pm, admin = _world(db)
+    site2 = _site(db, co)
+    site3 = _site(db, co)
+    for s in (site2, site3):
+        memberships.add_membership(db, pm["id"], s["id"], "pm")
+    _overdue_item(db, site, "S1 old", deadline=STALE_DEADLINE)
+    _overdue_item(db, site, "S1 older", deadline=dt.date(2026, 10, 20))
+    _overdue_item(db, site, "S1 new", deadline=dt.date(2026, 11, 9))
+    _overdue_item(db, site2, "S2 old", deadline=dt.date(2026, 11, 1))
+    _overdue_item(db, site3, "S3 new", deadline=FRESH_DEADLINE)        # fresh only
+    out = lds.emit_todo_overdue(db, NOW)
+    assert (out["emitted"], out["errors"]) == (5 + 2, 0)
+    digests = {e["subject_ref"]: e for e in _live_events(db, co["id"], "todo.overdue_backlog")}
+    assert set(digests) == {str(site["id"]), str(site2["id"])}
+    s1 = digests[str(site["id"])]["payload"]
+    assert s1["count"] == 2
+    assert [i["text"] for i in s1["items"]] == ["S1 older", "S1 old"]      # deadline ASC
+    assert digests[str(site2["id"])]["payload"]["count"] == 1
+    assert digests[str(site2["id"])]["site_id"] == site2["id"]
+    lds.process(db, NOW)
+    open_digests = [c for c in _cards(db, co["id"], "open")
+                    if c["rule_id"] == "todo.overdue_backlog"]
+    assert sorted(str(c["site_id"]) for c in open_digests) == sorted(
+        [str(site["id"]), str(site2["id"])])
+    assert {c["question"] for c in open_digests} == {
+        f"2 to-dos on {site['name']} are more than 3 days overdue",
+        f"1 to-do on {site2['name']} is more than 3 days overdue"}
+
+
+def test_overdue_digest_lists_50_items_and_counts_all(db):
+    co, site, pm, admin = _world(db)
+    first = dt.date(2026, 9, 1)
+    for i in range(55):
+        _overdue_item(db, site, f"Old {i:02d}", deadline=first + dt.timedelta(days=i))
+    out = lds.emit_todo_overdue(db, NOW)
+    assert (out["emitted"], out["errors"]) == (56, 0)
+    [dg] = _live_events(db, co["id"], "todo.overdue_backlog")
+    p = dg["payload"]
+    assert p["count"] == 55 and len(p["items"]) == 50
+    assert [i["text"] for i in p["items"]] == [f"Old {i:02d}" for i in range(50)]
+    assert [i["deadline"] for i in p["items"]] == sorted(i["deadline"] for i in p["items"])
+
+
+def test_overdue_digest_ties_on_deadline_break_by_stable_id(db):
+    co, site, pm, admin = _world(db)
+    items = [_overdue_item(db, site, f"Same {i}", deadline=STALE_DEADLINE) for i in range(4)]
+    lds.emit_todo_overdue(db, NOW)
+    [dg] = _live_events(db, co["id"], "todo.overdue_backlog")
+    assert [i["stable_id"] for i in dg["payload"]["items"]] == sorted(
+        str(i["stable_id"]) for i in items)
+
+
+def test_overdue_second_scan_same_day_is_all_duplicates(db):
+    co, site, pm, admin = _world(db)
+    _overdue_item(db, site, "Fresh")
+    _overdue_item(db, site, "Stale", deadline=STALE_DEADLINE)
+    first = lds.emit_todo_overdue(db, NOW)
+    assert (first["emitted"], first["duplicates"]) == (3, 0)
+    lds.process(db, NOW)
+    again = lds.emit_todo_overdue(db, NOW + dt.timedelta(hours=3))
+    assert (again["emitted"], again["duplicates"]) == (0, 3)
+    assert lds.process(db, NOW + dt.timedelta(hours=3))["cards"] == 0
+    # next NZ day: new bucket, the open digest card absorbs it ('nothing'), no second card
+    now2 = NOW + dt.timedelta(days=1)
+    day2 = lds.emit_todo_overdue(db, now2)
+    assert (day2["emitted"], day2["duplicates"]) == (3, 0)
+    assert lds.process(db, now2)["cards"] == 0
+    assert [e["status"] for e in _live_events(db, co["id"], "todo.overdue_backlog")] == [
+        "done", "nothing"]
+    assert len([c for c in _cards(db, co["id"])
+                if c["rule_id"] == "todo.overdue_backlog"]) == 1
+
+
+def test_overdue_bad_site_digest_counted_in_errors(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    site2 = _site(db, co)
+    _overdue_item(db, site, "Stale A", deadline=STALE_DEADLINE)
+    _overdue_item(db, site2, "Stale B", deadline=STALE_DEADLINE)
+    real = lds._emit_overdue_backlog
+
+    def flaky(conn, company_id, site_id, items, today_nz, now, out):
+        if site_id == site["id"]:
+            raise RuntimeError("boom")
+        return real(conn, company_id, site_id, items, today_nz, now, out)
+    monkeypatch.setattr(lds, "_emit_overdue_backlog", flaky)
+    out = lds.emit_todo_overdue(db, NOW)
+    assert (out["emitted"], out["errors"]) == (3, 1)
+    assert [e["subject_ref"] for e in _live_events(db, co["id"], "todo.overdue_backlog")] == [
+        str(site2["id"])]
 
 
 def test_overdue_skips_superseded_topic_and_archived_site(db):
