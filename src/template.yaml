@@ -2619,6 +2619,13 @@ Resources:
           # here, both workflows).
           ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
           ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
+          # The rewrite here is ask_rewrite.judge_call (since #1292), which reads the
+          # judge's model and routing. Without these it fell to gemini with thinking
+          # on (llm_tools_client.DEFAULT_MODEL) for the prompt_only voice path.
+          ASK_JUDGE_MODEL: !Ref AskJudgeModel
+          ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
+          ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
+          ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
           ASK_DISTANCE_GATE: !Ref AskDistanceGate
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
