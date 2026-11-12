@@ -49,6 +49,7 @@ import os
 from datetime import datetime, time, timedelta, timezone
 
 import checklist_reports
+import decision_rules
 import nz_time
 import tenancy_status
 from db.connection import get_connection
