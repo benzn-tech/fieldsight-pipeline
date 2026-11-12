@@ -298,3 +298,245 @@ def test_since_filters_labels_and_p95_but_not_the_list(db, env):
     assert s["precision"] == 1.0 and s["cards_per_recipient_day_p95"] == 2.0
     status, body = _call(db, admin, "GET", "/decision-shadow", query={"since": "11-11-2026"})
     assert (status, body["error"]) == (400, "since must be YYYY-MM-DD")
+
+
+# ---------------------------------------------------------------- removed sources (fix round)
+# Aurora recording tombstones, multi-unit walk parts, person names and overdue item text.
+
+from repositories import action_items, redactions, topics  # noqa: E402
+
+NAMED = [{"id": "remind", "label": "Remind Tom to recheck", "recommended": True},
+         {"id": "accept", "label": "Accept with reason", "recommended": False,
+          "reason_required": True}]
+
+
+def _tombstone(db, co, admin, folder, base, date=DATE):
+    redactions.create_recording_tombstone(
+        db, co["id"], f"extractions/{folder}/{date}/{base}", "deleted by the user",
+        admin["id"], "platform_admin", batch_id=str(uuid.uuid4()))
+
+
+def _walk_report(db, co, folder, session, walk_key, date=DATE):
+    return db.execute(
+        "INSERT INTO checklist_reports (company_id, user_folder, report_date, session, "
+        "template_name, check_name, start_at, request_id, result_key, walk_key) "
+        "VALUES (%s,%s,%s,%s,'Pre-line','pre-line',%s,%s,%s,%s) RETURNING id",
+        (co["id"], folder, date, session, f"09:{_tag()[:2]}", _tag(), f"k-{_tag()}",
+         walk_key)).fetchone()[0]
+
+
+def _window(db, co, folder, session, walk_key, start_at, date=DATE):
+    db.execute(
+        "INSERT INTO inspection_windows (company_id, user_folder, report_date, session, "
+        "name, start_at, end_source, walk_key) VALUES (%s,%s,%s,%s,'pre-line',%s,"
+        "'recording_stop',%s)", (co["id"], folder, date, session, start_at, walk_key))
+
+
+def _gap_card_on(db, co, site, rid, session, evidence=(), options=NAMED):
+    eid = _event(db, co, site, {"session": session, "report_date": DATE,
+                                "report_id": str(rid)})
+    return _card(db, co, site, event_id=eid, evidence=list(evidence), options=options)
+
+
+def _view(db, admin, card):
+    status, body = _call(db, admin, "GET", "/decision-shadow")
+    assert status == 200
+    [c] = [x for x in body["cards"] if x["card_id"] == str(card["card_id"])]
+    return c
+
+
+def test_aurora_tombstone_drops_evidence_and_names(db, env):
+    co, site, admin = _world(db)
+    folder = f"F_{_tag()}"
+    gone = _gap_card(db, co, site, folder, "sideeee1111", "rails are loose")
+    db.execute("UPDATE decision_cards SET options=%s WHERE card_id=%s",
+               (json.dumps(NAMED), gone["card_id"]))
+    kept = _gap_card(db, co, site, folder, "sidffff2222", "toe board missing")
+    db.execute("UPDATE decision_cards SET options=%s WHERE card_id=%s",
+               (json.dumps(NAMED), kept["card_id"]))
+    _tombstone(db, co, admin, folder, "eeee1111")       # bare spelling; no S3 mirror at all
+    g, k = _view(db, admin, gone), _view(db, admin, kept)
+    assert g["evidence"] == []
+    assert g["options"][0]["label"] == "Remind the inspector to recheck"
+    assert k["evidence"] == [{"quote": "toe board missing", "at": None}]
+    assert k["options"][0]["label"] == "Remind Tom to recheck"
+
+
+def test_reverted_tombstone_shows_again(db, env):
+    co, site, admin = _world(db)
+    folder = f"F_{_tag()}"
+    card = _gap_card(db, co, site, folder, "sid1234abcd", "q")
+    _tombstone(db, co, admin, folder, "sid1234abcd")
+    assert _view(db, admin, card)["evidence"] == []
+    db.execute("UPDATE redactions SET reverted_at = now() WHERE target_type = 'recording' "
+               "AND target_key = %s", (f"extractions/{folder}/{DATE}/sid1234abcd",))
+    assert _view(db, admin, card)["evidence"] == [{"quote": "q", "at": None}]
+
+
+def test_gap_without_evidence_but_named_person_and_deleted_source(db, env):
+    co, site, admin = _world(db)
+    folder = f"F_{_tag()}"
+    rid = _report(db, co, folder, "sid9999aaaa")
+    card = _gap_card_on(db, co, site, rid, "sid9999aaaa")
+    assert _view(db, admin, card)["options"][0]["label"] == "Remind Tom to recheck"
+    _tombstone(db, co, admin, folder, "sid9999aaaa")
+    c = _view(db, admin, card)
+    assert c["options"][0]["label"] == "Remind the inspector to recheck"
+    assert c["evidence"] == []
+    # the stored row is untouched (read-time rewrite only)
+    stored = db.execute("SELECT options FROM decision_cards WHERE card_id=%s",
+                        (card["card_id"],)).fetchone()[0]
+    assert stored[0]["label"] == "Remind Tom to recheck"
+
+
+def test_walk_report_with_one_deleted_part_is_removed(db, env):
+    co, site, admin = _world(db)
+    folder, wk = f"F_{_tag()}", f"walk-{_tag()}"
+    rid = _walk_report(db, co, folder, "sidopen0001", wk)
+    _window(db, co, folder, "sidopen0001", wk, "09:00:00")
+    _window(db, co, folder, "sidpart0002", wk, "10:00:00")
+    card = _gap_card_on(db, co, site, rid, "sidopen0001", [{"quote": "q", "at": None}])
+    rows = dc.evidence_sources(db, [card["card_id"]])
+    assert rows[0]["walk_key"] == wk
+    assert [p["session"] for p in rows[0]["walk_parts"]] == ["sidopen0001", "sidpart0002"]
+    assert rows[0]["walk_parts"][0]["report_date"] == DATE
+    assert _view(db, admin, card)["evidence"] == [{"quote": "q", "at": None}]
+    _tombstone(db, co, admin, folder, "sidpart0002")    # a part, not the recorded session
+    c = _view(db, admin, card)
+    assert c["evidence"] == [] and c["options"][0]["label"] == "Remind the inspector to recheck"
+
+
+def test_walk_part_in_s3_mirror_is_removed(db, env):
+    co, site, admin = _world(db)
+    folder, wk = f"F_{_tag()}", f"walk-{_tag()}"
+    rid = _walk_report(db, co, folder, "sidopen0003", wk)
+    _window(db, co, folder, "sidopen0003", wk, "09:00:00")
+    _window(db, co, folder, "sidpart0004", wk, "10:00:00")
+    card = _gap_card_on(db, co, site, rid, "sidopen0003", [{"quote": "q", "at": None}])
+    env.objs[("data-bucket", deletion_mirror.mirror_key(folder, DATE))] = json.dumps(
+        {"sessions": ["part0004"]}).encode()
+    assert _view(db, admin, card)["evidence"] == []
+
+
+def test_walk_report_with_unresolvable_parts_is_removed(db, env):
+    co, site, admin = _world(db)
+    folder, wk = f"F_{_tag()}", f"walk-{_tag()}"
+    rid = _walk_report(db, co, folder, "sidopen0005", wk)
+    # a window of the same walk key in ANOTHER folder is not this report's part
+    _window(db, co, f"Other_{_tag()}", "sidopen0005", wk, "09:00:00")
+    card = _gap_card_on(db, co, site, rid, "sidopen0005", [{"quote": "q", "at": None}])
+    assert dc.evidence_sources(db, [card["card_id"]])[0]["walk_parts"] == []
+    c = _view(db, admin, card)
+    assert c["evidence"] == [] and c["options"][0]["label"] == "Remind the inspector to recheck"
+
+
+def _overdue_world(db, co, site, text="Order the rebar"):
+    t = topics.upsert_topic(db, site["id"], DATE, f"T-{_tag()}",
+                            source_s3_key=f"extractions/OF/{DATE}/sid{_tag()}.json")
+    item = action_items.insert_item(db, t["id"], site["id"], text, responsible="Mike",
+                                    deadline=dt.date(2026, 11, 1))
+    row, _ = se.insert(db, {
+        "company_id": co["id"], "site_id": site["id"], "source": "action_items",
+        "type": "todo.overdue", "subject_ref": str(item["stable_id"]), "bucket": DATE,
+        "occurred_at": NOW, "received_at": NOW, "summary": None, "link": None,
+        "payload": {"text": text, "deadline": "2026-11-01", "responsible": "Mike"},
+        "dedupe_key": f"dsh:{_tag()}", "status": "done"})
+    card = _card(db, co, site, rule_id="todo.overdue", purpose="overdue",
+                 subject_ref=str(item["stable_id"]), event_id=row["event_id"],
+                 question=f"'{text}' was due 1 Nov 2026, still open",
+                 options=[{"id": "remind", "label": "Remind Mike", "recommended": True},
+                          {"id": "done", "label": "Mark done", "recommended": False}])
+    return t, item, card
+
+
+def test_overdue_live_item_unchanged(db, env):
+    co, site, admin = _world(db)
+    _, _, card = _overdue_world(db, co, site)
+    c = _view(db, admin, card)
+    assert c["question"] == "'Order the rebar' was due 1 Nov 2026, still open"
+    assert c["options"][0]["label"] == "Remind Mike"
+
+
+@pytest.mark.parametrize("how", ["topic_tombstone", "recording_tombstone", "redacted",
+                                 "non_work"])
+def test_overdue_removed_item_has_no_text_and_no_person(db, env, how):
+    co, site, admin = _world(db)
+    t, item, card = _overdue_world(db, co, site, "Call Dave about the crane")
+    if how == "topic_tombstone":
+        redactions.create_redaction(db, co["id"], t["id"], "x", admin["id"], "platform_admin",
+                                    target_type="topic", scope="deleted")
+    elif how == "recording_tombstone":
+        redactions.create_recording_tombstone(
+            db, co["id"], t["source_s3_key"].rsplit(".", 1)[0], "x", admin["id"],
+            "platform_admin", batch_id=str(uuid.uuid4()))
+    elif how == "redacted":
+        redactions.create_redaction(db, co["id"], t["id"], "x", admin["id"], "platform_admin",
+                                    target_type="topic", scope="analysis")
+    else:
+        db.execute("UPDATE topics SET work_class = 'non_work' WHERE id = %s", (t["id"],))
+    c = _view(db, admin, card)
+    assert c["question"] == "A to-do that was removed was due 1 Nov 2026, still open"
+    assert c["options"][0]["label"] == "Remind the owner"
+    assert "Dave" not in json.dumps(c) and "Mike" not in json.dumps(c)
+
+
+def test_overdue_item_states_is_batched_and_text_safe(db, env):
+    co, site, admin = _world(db)
+    _, _, live = _overdue_world(db, co, site)
+    bad = _card(db, co, site, rule_id="todo.overdue", purpose="overdue",
+                subject_ref="not-a-uuid")
+    ghost = _card(db, co, site, rule_id="todo.overdue", purpose="overdue",
+                  subject_ref=str(uuid.uuid4()))
+    rows = {r["card_id"]: r for r in dc.overdue_item_states(
+        db, [live["card_id"], bad["card_id"], ghost["card_id"]])}
+    assert (rows[live["card_id"]]["visible"], rows[live["card_id"]]["deadline"]) == (
+        True, "2026-11-01")
+    assert (rows[bad["card_id"]]["visible"], rows[bad["card_id"]]["deadline"]) == (False, None)
+    assert rows[ghost["card_id"]]["visible"] is False
+    # the transaction is still usable after the malformed subject_ref
+    assert db.execute("SELECT 1").fetchone()[0] == 1
+    c = _view(db, admin, bad)
+    assert c["question"] == "A to-do that was removed is past its date, still open"
+
+
+def test_overdue_superseded_pass_reads_the_live_row(db, env):
+    """A re-extraction supersedes the old topic; the carried row (same stable_id) is live."""
+    co, site, admin = _world(db)
+    t, item, card = _overdue_world(db, co, site)
+    t2 = topics.upsert_topic(db, site["id"], DATE, f"T-{_tag()}",
+                             source_s3_key=f"extractions/OF/{DATE}/sid{_tag()}.json")
+    new = action_items.insert_item(db, t2["id"], site["id"], "Order the rebar",
+                                   deadline=dt.date(2026, 11, 1))
+    db.execute("UPDATE action_items SET stable_id=%s WHERE id=%s",
+               (item["stable_id"], new["id"]))
+    db.execute("UPDATE topics SET superseded_at = now() WHERE id = %s", (t["id"],))
+    assert _view(db, admin, card)["question"].startswith("'Order the rebar'")
+    db.execute("UPDATE topics SET work_class = 'non_work' WHERE id = %s", (t2["id"],))
+    assert _view(db, admin, card)["question"].startswith("A to-do that was removed")
+
+
+def test_overdue_item_of_another_company_or_site_does_not_look_live(db, env):
+    """Review M-3: the item is resolved on the card's own site and company. An item carrying
+    the same stable_id elsewhere never makes the card look live."""
+    co, site, admin = _world(db)
+    t, item, card = _overdue_world(db, co, site, "Call Dave about the crane")
+    # the card's own item is deleted ...
+    redactions.create_redaction(db, co["id"], t["id"], "x", admin["id"], "platform_admin",
+                                target_type="topic", scope="deleted")
+    # ... while live items with the SAME stable_id sit on another company's site and on
+    # another site of this company
+    co2 = companies.create_company(db, f"Co-dsh-{_tag()}")
+    elsewhere = [sites.create_site(db, co2["id"], f"Site-dsh-{_tag()}"),
+                 sites.create_site(db, co["id"], f"Site-dsh-{_tag()}")]
+    for other in elsewhere:
+        t2 = topics.upsert_topic(db, other["id"], DATE, f"T-{_tag()}",
+                                 source_s3_key=f"extractions/OF/{DATE}/sid{_tag()}.json")
+        twin = action_items.insert_item(db, t2["id"], other["id"], "Call Dave about the crane",
+                                        deadline=dt.date(2026, 11, 1))
+        db.execute("UPDATE action_items SET stable_id=%s WHERE id=%s",
+                   (item["stable_id"], twin["id"]))
+    [st] = dc.overdue_item_states(db, [card["card_id"]])
+    assert st["visible"] is False
+    c = _view(db, admin, card)
+    assert c["question"] == "A to-do that was removed was due 1 Nov 2026, still open"
+    assert "Dave" not in json.dumps(c)

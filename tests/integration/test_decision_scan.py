@@ -1042,3 +1042,75 @@ def test_overdue_bucket_is_the_nz_day_of_now(db):
     [ev] = _events(db, co["id"])
     assert ev["bucket"] == "2026-11-07" and ev["received_at"] == late_utc
     assert ev["subject_ref"] == str(item["stable_id"])
+# ---------------------------------------------------------------- counts follow the savepoint
+# A raise after the insert in the same savepoint rolls the row back; the count must go too.
+
+def test_overdue_item_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    _overdue_item(db, site)
+
+    def boom(*a, **k):
+        raise RuntimeError("after the insert")
+    monkeypatch.setattr(lds, "is_late", boom)
+    out = lds.emit_todo_overdue(db, NOW)
+    assert out["emitted"] == 0 and out["duplicates"] == 0 and out["errors"] >= 1
+    assert _events(db, co["id"], "todo.overdue") == []
+
+
+def test_overdue_backlog_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, pm, admin = _world(db)
+    _overdue_item(db, site, "Stale A", deadline=STALE_DEADLINE)
+    real = lds._emit_overdue_backlog
+
+    def insert_then_raise(conn, company_id, site_id, items, today_nz, now, out):
+        real(conn, company_id, site_id, items, today_nz, now, out)
+        if site_id == site["id"]:
+            raise RuntimeError("after the insert")
+    monkeypatch.setattr(lds, "_emit_overdue_backlog", insert_then_raise)
+    out = lds.emit_todo_overdue(db, NOW)
+    # the item event is kept and counted; the digest is rolled back and not counted
+    assert len(_live_events(db, co["id"], "todo.overdue")) == 1
+    assert _live_events(db, co["id"], "todo.overdue_backlog") == []
+    mine = [e for e in _events(db, co["id"]) if e["status"] != "duplicate"]
+    assert out["emitted"] == len(mine) == 1 and out["errors"] == 1
+
+
+def test_gap_raise_after_insert_is_not_counted(db, monkeypatch):
+    co, site, folder, session = _gap_world(db)
+    fake = FakeS3({"k-1": _done(**{"Pre-pour": _gaps(nc=[(1, "One"), (2, "Two")])})})
+    rid = _report(db, co["id"], folder, session, "k-1")
+
+    def boom(*a, **k):
+        raise RuntimeError("after the inserts")
+    monkeypatch.setattr(lds.checklist_reports, "mark_seen", boom)
+    out = lds.emit_checklist_gaps(db, _reader(fake), NOW)
+    assert (out["emitted"], out["duplicates"], out["errors"]) == (0, 0, 1)
+    assert _events(db, co["id"]) == [] and _seen(db, rid) == 0
+
+
+# ---------------------------------------------------------------- emitter agrees with the page
+# Review M-5: a non_work or redacted item is hidden on the shadow page, so the scan emits no
+# todo.overdue event for it and leaves it out of the backlog digest.
+
+def test_hidden_items_are_not_overdue_and_not_in_the_digest(db):
+    from repositories import redactions
+    co, site, pm, admin = _world(db)
+    live = _overdue_item(db, site, "Stale live", deadline=STALE_DEADLINE)
+    non_work = _overdue_item(db, site, "Stale personal", deadline=STALE_DEADLINE)
+    db.execute("UPDATE topics SET work_class = 'non_work' WHERE id = %s",
+               (non_work["topic_id"],))
+    redacted = _overdue_item(db, site, "Stale redacted", deadline=STALE_DEADLINE)
+    redactions.create_redaction(db, co["id"], redacted["topic_id"], "x", admin["id"],
+                                "admin", target_type="topic", scope="analysis")
+    fresh_nw = _overdue_item(db, site, "Fresh personal")
+    db.execute("UPDATE topics SET work_class = 'non_work' WHERE id = %s",
+               (fresh_nw["topic_id"],))
+    rows = [r for r in action_items.overdue_open(db, TODAY) if r["company_id"] == co["id"]]
+    assert [str(r["stable_id"]) for r in rows] == [str(live["stable_id"])]
+    out = lds.emit_todo_overdue(db, NOW)
+    assert (out["emitted"], out["errors"]) == (2, 0)                    # live item + digest
+    assert [e["subject_ref"] for e in _live_events(db, co["id"], "todo.overdue")] == [
+        str(live["stable_id"])]
+    [dg] = _live_events(db, co["id"], "todo.overdue_backlog")
+    assert dg["payload"]["count"] == 1
+    assert [i["stable_id"] for i in dg["payload"]["items"]] == [str(live["stable_id"])]
