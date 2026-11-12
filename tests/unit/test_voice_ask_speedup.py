@@ -324,3 +324,36 @@ def test_voice_drops_a_malformed_ref_the_screen_keeps_its_text():
     assert out_v["answer"] == "No site records mention it."
     out_s = orch.to_client("No site records mention it [D: none].", [], None, "screen")
     assert "[D: none]" in out_s["answer"]
+
+
+# ---- AskAgent's own rewrite reads the judge env (2026-11-13) ----------------
+
+def _template_env(resource):
+    import os
+    yaml = pytest.importorskip("yaml")
+
+    class _L(yaml.SafeLoader):
+        pass
+
+    def _tag(loader, suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return {suffix: loader.construct_scalar(node)}
+        if isinstance(node, yaml.MappingNode):
+            return {suffix: loader.construct_mapping(node, deep=True)}
+        return {suffix: loader.construct_sequence(node, deep=True)}
+
+    _L.add_multi_constructor("!", _tag)
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "src", "template.yaml")
+    with open(path, encoding="utf-8") as f:
+        tpl = yaml.load(f, Loader=_L)
+    return tpl["Resources"][resource]["Properties"]["Environment"]["Variables"]
+
+
+@pytest.mark.parametrize("name", ["ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS",
+                                  "ASK_JUDGE_PROVIDER", "ASK_JUDGE_REASONING"])
+def test_ask_agent_rewrite_gets_the_same_judge_env_as_the_worker(name):
+    """lambda_ask_agent's rewrite calls ask_rewrite.judge_call. Without these the
+    prompt_only voice path ran on llm_tools_client.DEFAULT_MODEL (gemini, thinking
+    on) -- found by the 2026-11-13 old-vs-new comparison."""
+    assert _template_env("AskAgentFunction")[name] == _template_env("AskVoiceWorkerFunction")[name]
