@@ -208,7 +208,7 @@ import checklist
 import units as units_mod
 import walk_report
 from repositories import action_packs
-from repositories import decision_cards
+from repositories import decision_cards, decision_ledger
 import action_pack_view
 from repositories import project_docs
 from repositories import voice_note_photo
@@ -1957,8 +1957,61 @@ def list_decision_inbox(conn, caller):
 
 
 def answer_decision_card(conn, caller, raw_card, body):
-    """POST /api/org/decision-cards/{card_id}/answer (Task 6)."""
-    return error("not found", 404)
+    """POST /api/org/decision-cards/{card_id}/answer, body {option_id, reason?} (spec §5).
+
+    Every 404/400 is decided BEFORE any write (an error() return is a clean exit and the
+    request transaction commits). 404 (existence not leaked): unknown/malformed id, company
+    not allow-listed or inactive, excluded universe (fault/rule/digest), or the caller is not
+    a current recipient. 400: decision_inbox.validate_answer.
+
+    First answer wins in one transaction: the tenant-scoped guarded UPDATE, then -- only for
+    an option in decision_inbox.DECISION_OPTIONS -- one decision_ledger row whose evidence is
+    the card's evidence as served (post-redaction) plus a final reason element. 0 rows
+    updated: the same caller's same answer is a retry (200); anything else, including the
+    scan superseding the card, is 409 stale."""
+    not_found = error("not found", 404)
+    row = decision_cards.get_for_answer(conn, raw_card)
+    if row is None or decision_inbox.is_excluded(row):
+        return not_found
+    cid = str(row["card_id"])
+    role = _inbox_recipient_roles(conn, caller, [row]).get(cid)
+    if role is None:
+        return not_found
+    if body is None:
+        return error("invalid JSON body", 400)
+    option_id, reason = body.get("option_id"), body.get("reason")
+    problem = decision_inbox.validate_answer(row, option_id, reason)
+    if problem is not None:
+        return error(problem, 400)
+    reason_text = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    kind = decision_inbox.DECISION_OPTIONS.get((row.get("rule_id"), option_id))
+    evidence = None
+    if kind is not None:
+        evidence = _inbox_view(conn, [row])[0]["evidence"]
+        if reason_text is not None:
+            evidence = evidence + [{"kind": "reason", "text": reason_text}]
+    answered = decision_cards.answer(conn, row["card_id"], row["company_id"], row["site_id"],
+                                     caller["id"], option_id, reason_text)
+    if answered is None:
+        current = decision_cards.get_for_answer(conn, row["card_id"])
+        if (current is not None and current["company_id"] == row["company_id"]
+                and current["site_id"] == row["site_id"] and current["status"] == "answered"
+                and str(current["answered_by"]) == str(caller["id"])
+                and current["answered_option"] == option_id):
+            logger.info("decision-inbox answer retry card=%s option=%s by=%s",
+                        cid, option_id, caller["id"])
+            return ok({"status": "answered", "applied": None})
+        logger.info("decision-inbox answer stale card=%s option=%s by=%s",
+                    cid, option_id, caller["id"])
+        return ok({"status": "stale"}, 409)
+    if kind is not None:
+        decision_ledger.append(conn, {
+            "company_id": row["company_id"], "site_id": row["site_id"],
+            "card_id": row["card_id"], "subject_ref": row["subject_ref"],
+            "decision": option_id, "kind": kind, "decided_by": caller["id"],
+            "authority_basis": role, "evidence": evidence, "source": "card"})
+    logger.info("decision-inbox answer card=%s option=%s by=%s", cid, option_id, caller["id"])
+    return ok({"status": "answered", "applied": None})
 
 
 def decision_shadow_summary(rows, since=None):
