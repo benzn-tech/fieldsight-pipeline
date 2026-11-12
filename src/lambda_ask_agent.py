@@ -833,7 +833,12 @@ def _announce_web_start(on_web_start):
         logger.warning("  on_web_start failed: %s", exc)
 
 
-_SENTENCE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)")
+# A sentence ends at . ! or ? FOLLOWED BY whitespace or the end, so a decimal or a
+# clause number stays inside it. The old `[^.!?]+[.!?]+(?=\s|$)` could not cross a
+# "." at all: "Table 8.9 gives a 190x45 lintel. Use Table 8.14 for uplift fixings."
+# came out as "9 gives a 190x45 lintel." and "14 for uplift fixings.", and on TEST
+# 2026-11-12 a device spoke only "14 for uplift fixings." as the whole answer.
+_SENTENCE = re.compile(r"\S.*?[.!?]+(?=\s|$)", re.S)
 _VOICE_CITATION = re.compile(r"\s*\[\d+(?:\s*[,\-–]\s*\d+)*\]")
 
 
