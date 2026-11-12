@@ -1682,17 +1682,22 @@ def _session_under_prefixes(folder, date, session, prefixes):
     `extractions/{folder}/{date}/{session}...` does exactly when `base` is a prefix of the
     session id. Compared on the segment after `/{folder}/{date}/`, whatever the area in
     front of it, and in both spellings (the delete endpoint stores whatever base it had).
-    A prefix ending at the day (no base) or a deeper one covers the session: both
-    over-match, the safe direction for a reader that hides."""
+
+    Over-matches on purpose, the safe direction for a reader that hides: the session is
+    also covered when the day has no base (a whole-day prefix), when the prefix goes deeper
+    than the session (`.../{session}/x`), and when `base` EXTENDS the session id
+    (`.../{session}_x`) -- either string being a prefix of the other counts. The cost is
+    hiding a session whose id is a strict prefix of a deleted one's; live ids are
+    fixed-length `sid{32hex}`, so that does not happen between two of them."""
     bare = session[3:] if session.startswith("sid") else session
-    spellings = (session, bare, "sid" + bare)
+    spellings = [sp for sp in (session, bare, "sid" + bare) if sp]
     anchor = f"/{folder}/{date}/"
     for p in prefixes:
         i = p.find(anchor)
         if i < 0:
             continue
         base = p[i + len(anchor):].split("/")[0]
-        if any(sp.startswith(base) for sp in spellings):
+        if any(sp.startswith(base) or base.startswith(sp) for sp in spellings):
             return True
     return False
 

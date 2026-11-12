@@ -513,3 +513,30 @@ def test_overdue_superseded_pass_reads_the_live_row(db, env):
     assert _view(db, admin, card)["question"].startswith("'Order the rebar'")
     db.execute("UPDATE topics SET work_class = 'non_work' WHERE id = %s", (t2["id"],))
     assert _view(db, admin, card)["question"].startswith("A to-do that was removed")
+
+
+def test_overdue_item_of_another_company_or_site_does_not_look_live(db, env):
+    """Review M-3: the item is resolved on the card's own site and company. An item carrying
+    the same stable_id elsewhere never makes the card look live."""
+    co, site, admin = _world(db)
+    t, item, card = _overdue_world(db, co, site, "Call Dave about the crane")
+    # the card's own item is deleted ...
+    redactions.create_redaction(db, co["id"], t["id"], "x", admin["id"], "platform_admin",
+                                target_type="topic", scope="deleted")
+    # ... while live items with the SAME stable_id sit on another company's site and on
+    # another site of this company
+    co2 = companies.create_company(db, f"Co-dsh-{_tag()}")
+    elsewhere = [sites.create_site(db, co2["id"], f"Site-dsh-{_tag()}"),
+                 sites.create_site(db, co["id"], f"Site-dsh-{_tag()}")]
+    for other in elsewhere:
+        t2 = topics.upsert_topic(db, other["id"], DATE, f"T-{_tag()}",
+                                 source_s3_key=f"extractions/OF/{DATE}/sid{_tag()}.json")
+        twin = action_items.insert_item(db, t2["id"], other["id"], "Call Dave about the crane",
+                                        deadline=dt.date(2026, 11, 1))
+        db.execute("UPDATE action_items SET stable_id=%s WHERE id=%s",
+                   (item["stable_id"], twin["id"]))
+    [st] = dc.overdue_item_states(db, [card["card_id"]])
+    assert st["visible"] is False
+    c = _view(db, admin, card)
+    assert c["question"] == "A to-do that was removed was due 1 Nov 2026, still open"
+    assert "Dave" not in json.dumps(c)

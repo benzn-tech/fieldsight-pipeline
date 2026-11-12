@@ -4,7 +4,19 @@ import psycopg
 from psycopg.rows import dict_row
 
 from deleted_predicates import visible_topics_predicate
+from repositories.topics import _topic_not_hidden
 from tenancy_status import not_migrated
+
+
+def item_shown_predicate(alias: str = "t") -> str:
+    """May an action item's text be put on a decision card? Applied to the item's topic
+    `alias` AFTER the newest live row per stable_id was picked (live = visible_topics_predicate:
+    not deleted, not superseded): not non_work and no active redaction of any scope
+    (topics._topic_not_hidden). The ONE rule shared by the todo.overdue scan
+    (overdue_open, which emits nothing for a hidden item) and the shadow review's read
+    (decision_cards.overdue_item_states, which renders a hidden item as removed), so the
+    emitter and the page cannot disagree."""
+    return _topic_not_hidden(alias)
 
 # Whitelist of columns PATCH /api/org/action-items/{id} may set. text/site_id/
 # topic_id/created_at are intentionally NOT here -- editing a task must never
@@ -172,7 +184,9 @@ def overdue_open(conn, today_nz) -> list[dict]:
 
     Live = its topic passes `visible_topics_predicate` (not deleted, not superseded by a
     later pass); a carried-forward chain shares one stable_id, so DISTINCT ON keeps the
-    newest row, as get_live_by_stable_id does. An archived site's items are left out.
+    newest row, as get_live_by_stable_id does. That row must then pass item_shown_predicate
+    (not non_work, no active redaction): a hidden item is not overdue for the loop. An
+    archived site's items are left out.
     `company_id` is the SITE's company (project-owned tenancy). Items with no deadline are
     never overdue. Every company: this is the scan's global read. `site_name` (the site's
     name) is for the per-site backlog digest (spec rev 6)."""
@@ -183,14 +197,14 @@ def overdue_open(conn, today_nz) -> list[dict]:
         f"SELECT stable_id, text, deadline, responsible, site_id, company_id, site_name FROM ("
         f"  SELECT DISTINCT ON (a.stable_id) a.stable_id, a.text, a.deadline, "
         f"  a.responsible, a.site_id, a.status, s.company_id, s.archived_at, "
-        f"  s.name AS site_name "
+        f"  s.name AS site_name, ({item_shown_predicate('t')}) AS shown "
         f"  FROM action_items a "
         f"  JOIN topics t ON t.id = a.topic_id "
         f"  JOIN sites s ON s.id = a.site_id "
         f"  WHERE {visible_topics_predicate('t')} "
         f"  ORDER BY a.stable_id, a.created_at DESC"
         f") live "
-        f"WHERE status = 'open' AND deadline IS NOT NULL AND deadline < %s "
+        f"WHERE shown AND status = 'open' AND deadline IS NOT NULL AND deadline < %s "
         f"AND archived_at IS NULL ORDER BY stable_id",
         (today_nz,),
     ).fetchall()
