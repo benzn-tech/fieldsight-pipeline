@@ -68,3 +68,21 @@ def test_each_stage_passes_the_flag(wf, line):
     passes it every time; prod stays off until the owner sets PROD_ASK_KEEP_WARM."""
     with open(os.path.join(REPO, ".github", "workflows", wf), encoding="utf-8") as f:
         assert line in f.read()
+
+
+# ---- ApiFunction: the device's /ask/voice/start hop -------------------------
+
+def test_api_warm_returns_before_the_legacy_call_line(monkeypatch, caplog):
+    api = pytest.importorskip("lambda_fieldsight_api")
+    made = []
+    monkeypatch.setattr(api.ask_voice_turn, "_get_s3", lambda: made.append("s3"))
+    with caplog.at_level("INFO"):
+        assert api.lambda_handler({"mode": "warm"}, None) == {"warm": True, "ok": True}
+    assert made == ["s3"]
+    assert "LEGACY_CALL" not in caplog.text, "a ping must not count as a caller of this gateway"
+
+
+def test_api_schedule_shares_the_askagent_flag():
+    ev = _template()["Resources"]["ApiFunction"]["Properties"]["Events"]["KeepWarm"]
+    assert ev["Properties"]["State"] == {"If": ["ShouldKeepAskWarm", "ENABLED", "DISABLED"]}
+    assert ev["Properties"]["Input"] == '{"mode": "warm"}'

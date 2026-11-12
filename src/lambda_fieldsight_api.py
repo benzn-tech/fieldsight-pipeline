@@ -720,7 +720,20 @@ KNOWN_ROUTES = frozenset(CLOSED_ROUTES) | frozenset({
 })
 
 
+
+def _warm():
+    """{"warm": True, "ok": bool}: the turn store's S3 client, nothing else. Never raises."""
+    try:
+        ask_voice_turn._get_s3()
+        return {"warm": True, "ok": True}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("api warm failed: %s", type(e).__name__)
+        return {"warm": True, "ok": False}
 def lambda_handler(event, context):
+    if event.get('mode') == 'warm':
+        # The KeepWarm schedule (template AskKeepWarm, 2026-11-13). Returns before the
+        # LEGACY_CALL line on purpose: a ping every 5 minutes must not count as a caller.
+        return _warm()
     logger.info(f"Request: {event.get('httpMethod','GET')} {event.get('path','/')}")
     method = event.get('httpMethod', 'GET').upper()
     path = event.get('path', '/')
