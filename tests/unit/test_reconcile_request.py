@@ -80,6 +80,7 @@ def calls(monkeypatch):
         seen.append(kw)
         return [_row()]
     monkeypatch.setattr(rr.item_history, "find_items", fake_find_items)
+    monkeypatch.setattr(rr.item_history, "session_recorded_at", lambda conn, key: None)
     return seen
 
 
@@ -180,3 +181,62 @@ def test_build_logs_ids_and_counts_only(calls, caplog):
     msgs = " ".join(r.getMessage() for r in caplog.records)
     assert f"reconcile site={SITE['id']} candidates=1" in msgs
     assert "Synthetic task" not in msgs
+
+
+# --- later-recorded candidates (first_seen_recorded_at vs this session's start) ----------
+
+UTC = datetime.timezone.utc
+START = datetime.datetime(2026, 11, 10, 4, 0, tzinfo=UTC)
+
+
+def _ordered(monkeypatch, rows, started=START):
+    monkeypatch.setattr(rr.item_history, "find_items", lambda conn, **kw: rows)
+    monkeypatch.setattr(rr.item_history, "session_recorded_at", lambda conn, key: started)
+
+
+def _sid(n):
+    return uuid.UUID(int=n)
+
+
+def test_candidate_first_heard_after_this_session_started_is_dropped(monkeypatch):
+    rows = [_row(stable_id=_sid(1), first_seen_recorded_at=START - datetime.timedelta(hours=3)),
+            _row(stable_id=_sid(2), first_seen_recorded_at=START + datetime.timedelta(minutes=1)),
+            _row(stable_id=_sid(3), first_seen_recorded_at=None)]
+    _ordered(monkeypatch, rows)
+    body = _build()
+    assert [c["stable_id"] for c in body["candidates"]] == [str(_sid(1)), str(_sid(3))]
+
+
+def test_same_start_instant_is_kept(monkeypatch):
+    _ordered(monkeypatch, [_row(first_seen_recorded_at=START)])
+    assert len(_build()["candidates"]) == 1
+
+
+def test_unknown_session_start_keeps_every_candidate(monkeypatch):
+    rows = [_row(stable_id=_sid(1), first_seen_recorded_at=START + datetime.timedelta(hours=5))]
+    _ordered(monkeypatch, rows, started=None)
+    assert len(_build()["candidates"]) == 1
+
+
+def test_only_later_candidates_means_no_request(monkeypatch):
+    _ordered(monkeypatch, [_row(first_seen_recorded_at=START + datetime.timedelta(hours=1))])
+    assert _build() is None
+
+
+def test_order_is_by_recording_instant_across_timezones(monkeypatch):
+    # 17:00 NZDT is 04:00Z: an aware non-UTC instant equal to START is not "later".
+    nz = datetime.timezone(datetime.timedelta(hours=13))
+    _ordered(monkeypatch, [_row(first_seen_recorded_at=datetime.datetime(
+        2026, 11, 10, 17, 0, tzinfo=nz))])
+    assert len(_build()["candidates"]) == 1
+
+
+def test_start_lookup_failure_sends_nothing(monkeypatch, caplog):
+    monkeypatch.setattr(rr.item_history, "find_items", lambda conn, **kw: [_row()])
+
+    def boom(conn, key):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(rr.item_history, "session_recorded_at", boom)
+    conn = FakeConn()
+    assert _build(conn=conn) is None
+    assert conn.savepoints == 1

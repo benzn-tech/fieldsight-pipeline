@@ -24,6 +24,7 @@ import json
 import logging
 import os
 
+import continuity_xday
 from lake_put import lake_put
 from repositories import item_history
 
@@ -66,6 +67,23 @@ def _candidate(row):
     }
 
 
+def _recorded_after(row, started):
+    """Was this candidate first heard in a session that STARTED recording after this one?
+
+    Such an item did not exist when this session's speaker talked, so nothing said here can
+    report on it. Without this, a session re-extracted after a later one (or reconciled
+    again once an earlier one arrives late) would offer the model work assigned after it
+    ended. Ordered by RECORDING time on
+    both sides (Track C's first_seen_recorded_at, item_history.session_recorded_at), never
+    by arrival or write time. Either instant unknown: kept (R0's same-day window still bounds
+    it). Equal instants: kept."""
+    first = row.get("first_seen_recorded_at")
+    if started is None or first is None:
+        return False
+    return continuity_xday.recorded_earlier(
+        (None, started.isoformat()), (None, first.isoformat()))
+
+
 def build(conn, extraction, extraction_key, site, owner_company_id, *, user_folder, date,
           session_base):
     """The reconcile_requests/ artifact body for one extraction, or None.
@@ -87,11 +105,14 @@ def build(conn, extraction, extraction_key, site, owner_company_id, *, user_fold
                 conn, company_id=owner_company_id, site_id=site_id, kinds=KINDS,
                 statuses=STATUSES, since=date, until=date, recorded_by=user_folder,
                 exclude_source_keys=[extraction_key], limit=CANDIDATE_CAP)
-        candidates = [_candidate(r) for r in rows]
+            started = item_history.session_recorded_at(conn, extraction_key)
+        kept = [r for r in rows if not _recorded_after(r, started)]
+        candidates = [_candidate(r) for r in kept]
     except Exception:  # noqa: BLE001 -- see the docstring: never fatal
         logger.exception("reconcile: candidate lookup failed for %s", extraction_key)
         return None
-    logger.info("reconcile site=%s candidates=%d", site_id, len(candidates))
+    logger.info("reconcile site=%s candidates=%d later_dropped=%d", site_id,
+                len(candidates), len(rows) - len(kept))
     if not candidates:
         return None
     return {

@@ -295,8 +295,8 @@ git commit -m "feat(reconcile): pure guards, prompt and parser for cross-session
   - zero rows on east PVC and unit 3;
   - zero for the plan, hearsay, never-assigned and "all done" lines;
   - pick cards: zero expected. Record any that appear, with the reason.
-- [ ] **Step 4:** Script C (day 2) at R0 gives zero suggestions and no artifact (no candidates, because of the date filter).
-- [ ] **Step 5:** Record the results table here: per statement, expected vs actual, and every miss with its cause (ASR, a guard by name, the model, duplicate, ordering). Report to the owner. The R1 decision is the owner's.
+- [x] **Step 4:** Script C (day 2) at R0 gives zero suggestions and no artifact (no candidates, because of the date filter).
+- [x] **Step 5:** Record the results table here: per statement, expected vs actual, and every miss with its cause (ASR, a guard by name, the model, duplicate, ordering). Report to the owner. The R1 decision is the owner's.
 
 ### TEST results, run 1 (2026-11-11)
 
@@ -340,9 +340,26 @@ Wrong-item: 0. False positives: 0. Recall: 0 of 3.
 - copper → done, unit 4 → closed, skip bin → blocked: 3 kept, 0 cards;
 - the twin traps (the same quotes aimed at east PVC and unit 3): both dropped by label_conflict.
 
-**Still owed:**
-- a replay of B's request on TEST after the deploy, with the real model call;
-- Step 4 (C on 11-12).
+### TEST results, run 2 (2026-11-11/12, after #1291)
+
+**Replay of B.** The stale pick card was deleted and B's request copied to a fresh key, so the worker ran on the deployed code with the real model call (19.9 s). Counts: offered=2, kept=2, picks=0.
+
+| B statement | Expected | Actual | Cause |
+|---|---|---|---|
+| west copper ordered | copper/west → done | done (pending) | |
+| unit four cancelled | unit 4 → closed | closed (pending) | |
+| skip bin stuck | skip bin → blocked | none | ASR: heard "Skip the MRR for now"; the model did not tie it to the skip bin |
+| as-built tomorrow (plan) | none | none | |
+| paint "I heard" (hearsay) | none | none | |
+| gutter finished (never assigned) | none | none | |
+| "that's all done" | none | none | |
+| east PVC, unit 3 (twins) | none | none | |
+
+Wrong-item: 0. False positives: 0. Recall: 2 of 3 (the miss is ASR).
+
+**C (Step 4).** The user had no device, so C was synthesised (Polly Aria en-NZ, 10.8 s of speech) and pushed through the device path: org-api `/open` with the site, one 30 s chunk to `users/Ben_Lin_test2/audio/2026-11-12/`, `/close {"intent":"end"}`. Session `sid29eb9174…`, finalized `sent` in about 2 minutes. The final extraction has the east PVC topic with a verified quote, so ASR was clean. No `reconcile_requests/d104ebbe…/2026-11-12/` artifact, zero suggestions: R0's same-day window holds.
+
+**Late arrivals.** A session that uploads after a later same-day session has been reconciled is the nightly re-match job's J1 catch-up (`nightly_rematch._j1_catch_up`, the reconcile arm), not a second trigger here. J1 runs only when the nightly flag is `on`, which also turns on J2. `reconcile_request.build` now drops candidates first heard in a session that started recording after this one (`first_seen_recorded_at` against `item_history.session_recorded_at`, both by recording time), so a J1 re-run never offers the model work assigned after the session ended.
 
 **Follow-ups, not in this plan:**
 - The UI pick card and its accept endpoint (UI line plus org-api). Until they exist, pick cards are visible only in the DB on TEST.
