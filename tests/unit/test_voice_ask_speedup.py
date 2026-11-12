@@ -357,3 +357,36 @@ def test_ask_agent_rewrite_gets_the_same_judge_env_as_the_worker(name):
     prompt_only voice path ran on llm_tools_client.DEFAULT_MODEL (gemini, thinking
     on) -- found by the 2026-11-13 old-vs-new comparison."""
     assert _template_env("AskAgentFunction")[name] == _template_env("AskVoiceWorkerFunction")[name]
+
+# ---- spoken answers are cut to whole sentences (2026-11-13) -----------------
+
+LONG = ("Yesterday the crew poured the ground-floor slab on Block B and finished the edge "
+        "boxing on the east side. The plumber completed first-fix in units 3 and 4, and "
+        "the scaffold inspection was signed off by Safe Scaffolds in the afternoon. "
+        "Two RFIs were raised about the window flashing details on the north elevation. "
+        "The concrete truck was forty minutes late, which pushed the finish to 5 pm.")
+
+
+def test_voice_answer_over_the_limit_keeps_whole_sentences_only():
+    out = orch.to_client(LONG, [], None, "voice")["answer"]
+    assert len(out.split()) <= orch.VOICE_MAX_WORDS
+    assert out.startswith("Yesterday the crew poured")
+    assert out.endswith(".") and LONG.startswith(out)
+
+
+def test_screen_answer_is_never_trimmed():
+    assert orch.to_client(LONG, [], None, "screen")["answer"] == LONG
+
+
+def test_short_voice_answer_is_untouched():
+    assert orch.voice_trim("You poured slab A. It went well.") == "You poured slab A. It went well."
+
+
+def test_a_long_first_sentence_is_kept_whole():
+    first = " ".join(["word"] * 60) + "."
+    assert orch.voice_trim(first + " Second sentence here.", max_words=45) == first
+
+
+def test_a_decimal_is_not_a_sentence_end():
+    text = "Use the lintel in Table 8.14 for that span. " + " ".join(["more"] * 50) + "."
+    assert orch.voice_trim(text, max_words=20) == "Use the lintel in Table 8.14 for that span."

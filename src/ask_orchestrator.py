@@ -313,6 +313,36 @@ _CARD_KINDS = ("chunk", "topic")
 # never left to collide with the renumbered [n] cards.
 _NUMERIC_GROUP = re.compile(r"[ \t]*\[\s*\d+(?:\s*[-–,;]\s*\d+)*\s*\]")
 _MULTI_BLANK = re.compile(r"[ \t]{2,}")
+# Voice only: the spoken answer is cut to whole sentences within this many words.
+# The channel rule asks for "one or two short spoken sentences" and the judge does
+# not always listen: on TEST 2026-11-12 "What did we do yesterday?" was answered in
+# 101 words, 44 s of audio on a site. 45 words is about 15 s at the device's 1.2x.
+VOICE_MAX_WORDS = int(os.environ.get("ASK_VOICE_MAX_WORDS", "45"))
+# A sentence ends at . ! ? followed by a blank or the end; "Table 8.14" is not an end.
+_VOICE_SENTENCE = re.compile(r"\S.*?[.!?]+(?=\s|$)", re.S)
+
+
+def voice_trim(text, max_words=None):
+    """Whole sentences from the start while they fit `max_words`; the first sentence
+    always stays, even when it alone is longer (cutting mid-sentence is worse than
+    a long sentence). Text without a sentence end is returned as it is."""
+    limit = VOICE_MAX_WORDS if max_words is None else max_words
+    if len(text.split()) <= limit:
+        return text
+    sentences = _VOICE_SENTENCE.findall(text)
+    if not sentences:
+        return text
+    kept, words = [], 0
+    for sent in sentences:
+        n = len(sent.split())
+        if kept and words + n > limit:
+            break
+        kept.append(sent.strip())
+        words += n
+    out = " ".join(kept)
+    logger.info("ask orch voice_trim words=%d->%d sentences=%d->%d",
+                len(text.split()), len(out.split()), len(sentences), len(kept))
+    return out
 
 
 def _card(item):
@@ -426,6 +456,8 @@ def to_client(answer_text, envelopes, web_block, channel) -> dict:
         # "...no site records mention it, D none" from a judge's "[D: none]".
         text = _VOICE_LEFTOVER_BRACKET.sub("", text)
     text = _MULTI_BLANK.sub(" ", text).strip()
+    if voice:
+        text = voice_trim(text)
 
     web = None
     if web_block and cited_w:
