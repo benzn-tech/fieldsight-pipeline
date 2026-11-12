@@ -40,6 +40,20 @@ def _parse_date(value) -> Optional[date]:
         return None
 
 
+# The person-free remind labels. Also what the shadow review (lambda_org_api) shows in place
+# of a named person when a card's source was deleted or can no longer be resolved.
+REMIND_OWNER = "Remind the owner"
+REMIND_INSPECTOR = "Remind the inspector to recheck"
+
+
+def removed_overdue_question(due: Optional[date]) -> str:
+    """A todo.overdue question without the item's text, for an item that is no longer
+    visible (deleted, redacted, non_work) or cannot be resolved."""
+    if due is not None:
+        return f"A to-do that was removed was due {format_date(due)}, still open"
+    return "A to-do that was removed is past its date, still open"
+
+
 # --- todo.overdue -----------------------------------------------------------
 
 def _build_overdue(event: Event) -> CardDraft:
@@ -47,17 +61,18 @@ def _build_overdue(event: Event) -> CardDraft:
     text = _text(p.get("text"))
     due = _parse_date(p.get("deadline"))
     person = _text(p.get("responsible"))
+    subject = f"'{text}'" if text else "A to-do"
     if due is not None:
-        question = f"'{text}' was due {format_date(due)}, still open"
+        question = f"{subject} was due {format_date(due)}, still open"
     else:
-        question = f"'{text}' is past its date, still open"
+        question = f"{subject} is past its date, still open"
     return CardDraft(
         kind="choose",
         question=question,
         consequence="It stays on the open to-do list until someone acts.",
         options=[
             {"id": "remind",
-             "label": f"Remind {person}" if person else "Remind the owner",
+             "label": f"Remind {person}" if person else REMIND_OWNER,
              "recommended": True},
             {"id": "done", "label": "Mark done", "recommended": False},
             {"id": "new_date", "label": "Set a new date", "recommended": False},
@@ -114,7 +129,14 @@ def _build_gap(event: Event) -> CardDraft:
     quote = _text(p.get("quote"))
     safety = is_safety(checklist) or is_safety(item)
 
-    question = f"'{item}' on the {checklist} checklist {verb}"
+    if item and checklist:
+        question = f"'{item}' on the {checklist} checklist {verb}"
+    elif checklist:
+        question = f"An item on the {checklist} checklist {verb}"
+    elif item:
+        question = f"'{item}' on a checklist {verb}"
+    else:
+        question = f"A checklist item {verb}"
     consequence = "The item stays open on the checklist until it is rechecked or accepted."
     if safety:
         consequence += (" This is a safety item: accepting it needs a reason and "
@@ -126,8 +148,7 @@ def _build_gap(event: Event) -> CardDraft:
         consequence=consequence,
         options=[
             {"id": "remind",
-             "label": (f"Remind {person} to recheck" if person
-                       else "Remind the inspector to recheck"),
+             "label": f"Remind {person} to recheck" if person else REMIND_INSPECTOR,
              "recommended": True},
             {"id": "accept", "label": "Accept with reason", "recommended": False,
              "reason_required": True},
