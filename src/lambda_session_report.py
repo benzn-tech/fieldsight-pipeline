@@ -1111,7 +1111,10 @@ def _generate_document(artifact, context=None):
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
         _action_items_for_prompt(content, topic_offer, date),
-        "\n".join(t["line"] for t in turns),
+        "\n".join(t["line"] for t in turns)
+        # A regenerated walk: its on-site moves and read-back answers, so the
+        # prose follows them (spec 2026-11-13 D3); "" for an ordinary report.
+        + (walk_report.corrections_block(walk.get("answers")) if walk else ""),
         source=source,
         topics=topic_offer)
 

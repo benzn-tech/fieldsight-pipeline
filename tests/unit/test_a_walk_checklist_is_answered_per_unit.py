@@ -414,3 +414,24 @@ def test_an_all_good_said_before_any_unit_was_entered_is_no_units():
     u1 = _unit(got, "Unit 1")
     assert "all_good" not in u1["report"]
     assert {"item": "ALL", "reason": wc.NOT_PLACED} in u1["report"]["dropped"]
+
+
+def test_a_two_word_quote_is_too_short_not_missing():
+    text = HEADER + (
+        "| Unit 1 | 1 | Yes | alarm ok | | | smoke alarm |\n"
+        "| Unit 1 | ALL | Yes | | | | all good |\n"
+        "| General | - | No | skip | | | skip bin |\n")
+    got = wc.build(text, ITEMS, TRANSCRIPT, OPENING)
+    assert _unit(got, "Unit 1")["report"]["dropped"] == [
+        {"item": 1, "reason": "evidence too short"},
+        {"item": "ALL", "reason": "evidence too short"},
+    ]
+    assert got["general_dropped"][0]["reason"] == "evidence too short"
+
+
+def test_the_walk_prompt_scopes_a_back_reference_and_asks_for_confirmed_claims():
+    s = wc.shape_sentence()
+    assert "covers only the findings said with the back-reference" in s
+    assert "the unit he walked into last" in s
+    assert "at least three words" in s
+    assert "is not confirmed: leave the item out" in s
