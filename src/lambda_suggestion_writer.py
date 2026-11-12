@@ -111,8 +111,8 @@ Environment Variables:
 """
 import datetime
 import logging
-import uuid
 
+import status_candidates
 from db.connection import get_connection
 from repositories import (action_items, decision_records, findings, programme_suggestions,
                           sites, status_pick_cards, status_suggestions)
@@ -199,32 +199,12 @@ def _record_verdict(conn, entry, company_id_cache):
     return True
 
 
-_TERMINAL = ("done", "closed")
 _MAX_PICK_CANDIDATES = 4   # status_pick_cards CHECK: 2-4 candidates
 
-
-def _canon_uuid(value):
-    """Canonical string form of a uuid (any case, with or without braces/dashes), or None
-    when `value` is missing or malformed -- never raises."""
-    try:
-        return str(uuid.UUID(str(value)))
-    except (TypeError, ValueError, AttributeError):
-        return None
-
-
-def _candidate_drop_reason(row, site_id, suggested_status):
-    """Why a re-read item must NOT be offered for `suggested_status` on `site_id`, or None
-    when it may. Shared by status suggestions and pick-card candidates. `site_id` is
-    already canonical (None when the event's was malformed, which never matches)."""
-    if row is None:
-        return "gone"
-    if site_id is None or _canon_uuid(row["site_id"]) != site_id:
-        return "moved_site"
-    if row["status"] in _TERMINAL:
-        return "terminal"
-    if row["status"] == suggested_status:
-        return "same"
-    return None
+# The candidate rule lives in status_candidates (org-api decides with the same one);
+# these aliases keep the writer's call sites and tests unchanged.
+_canon_uuid = status_candidates.canon_uuid
+_candidate_drop_reason = status_candidates.drop_reason
 
 
 def _write_status_suggestion(conn, entry):
