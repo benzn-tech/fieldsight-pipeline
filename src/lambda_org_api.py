@@ -161,7 +161,7 @@ import extraction_pending
 import folder_key as folder_key_mod
 import nz_time
 import checklist_reports
-import decision_rules
+import decision_card_copy
 import pipeline_trace
 import trace_views
 import voice_session
@@ -1668,12 +1668,6 @@ def label_decision_card(conn, caller, raw_card, body):
     return ok(_decision_card_views(conn, [row])[0])
 
 
-# The person-free remind label per rule, served in place of "Remind <name>..." when a card's
-# source is removed. The same wording the rules use when no person is known.
-_GENERIC_REMIND = {"checklist.gap": decision_rules.REMIND_INSPECTOR,
-                   "todo.overdue": decision_rules.REMIND_OWNER}
-
-
 def _session_under_prefixes(folder, date, session, prefixes):
     """Is `session` of (folder, date) under one of these recording tombstone prefixes
     (redactions.deleted_source_prefixes)? A tombstone's key is
@@ -1804,26 +1798,8 @@ def _decision_card_views(conn, rows):
     out = []
     for r in rows:
         cid = str(r["card_id"])
-        is_removed = cid in removed
-        question = r.get("question")
-        if is_removed and r.get("rule_id") == "todo.overdue":
-            question = decision_rules.removed_overdue_question(removed_due.get(cid))
-        generic_remind = _GENERIC_REMIND.get(r.get("rule_id")) if is_removed else None
-        options = []
-        for o in r.get("options") or []:
-            if not isinstance(o, dict):
-                continue
-            label = o.get("label")
-            if generic_remind is not None and o.get("id") == "remind":
-                label = generic_remind
-            view = {"id": o.get("id"), "label": label,
-                    "recommended": bool(o.get("recommended"))}
-            if "reason_required" in o:
-                view["reason_required"] = bool(o["reason_required"])
-            options.append(view)
-        evidence = [] if is_removed else [
-            {"quote": e.get("quote"), "at": e.get("at")}
-            for e in (r.get("evidence") or []) if isinstance(e, dict)]
+        question, options, evidence = decision_card_copy.redact(
+            r, cid in removed, removed_due.get(cid))
         recipients = [
             {"user_id": str(rc.get("user_id")), "role": rc.get("role"),
              "display_name": names.get(str(rc.get("user_id")), "")}
