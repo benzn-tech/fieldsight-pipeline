@@ -853,12 +853,22 @@ def _speakable_web_answer(answer, records_answer):
     # Too long is the common miss (measured on TEST 2026-10-15): the first two
     # sentences usually carry the answer and its source, so try them before
     # giving the turn away to the records text.
-    head = " ".join(s.strip() for s in _SENTENCE.findall(cleaned)[:2])
-    if head and voice_web.speakable(head):
-        return head
+    sentences = [s.strip() for s in _SENTENCE.findall(cleaned)]
+    for n in (2, 1):
+        # One sentence as well (2026-11-12): two long sentences can pass 60 words
+        # together while the first alone still answers the question.
+        head = " ".join(sentences[:n])
+        if head and voice_web.speakable(head):
+            return head
     fallback = _VOICE_CITATION.sub("", records_answer or "").strip()
     if fallback and voice_web.speakable(fallback):
         return fallback
+    # Counts only, never text: why a web answer was not spoken.
+    low = cleaned.lower()
+    logger.warning("  voice web answer not speakable: words=%d sentences=%d url=%s bullet=%s",
+                   len(cleaned.split()), len(sentences),
+                   "http" in low or "www." in low or "](" in cleaned,
+                   bool(re.search(r"^\s*[-*•]\s", cleaned, re.M)))
     return voice_web.NO_CLEAR_ANSWER
 
 
