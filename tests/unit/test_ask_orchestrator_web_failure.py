@@ -92,11 +92,16 @@ def test_voice_short_records_answer_is_prefixed(monkeypatch):
     assert "web" not in out
 
 
-def test_voice_long_records_answer_keeps_its_first_two_sentences(monkeypatch):
+def test_voice_long_records_answer_keeps_whole_leading_sentences(monkeypatch):
+    # 2026-11-13: to_client already cuts a spoken answer to whole sentences within
+    # VOICE_MAX_WORDS, so the join behind WEB_UNREACHABLE is speakable as it is.
+    import voice_web
     web_fails(monkeypatch)
     long = ("We poured B2 [R1]. The pump arrived late. " + "Then the crew cleaned up. " * 12)
     out = run(voice_body(ASK, web_intent=True), ScriptChat(final(long)), channel="voice")
-    assert out["answer"] == orch.WEB_UNREACHABLE + " We poured B2. The pump arrived late."
+    assert out["answer"].startswith(orch.WEB_UNREACHABLE + " We poured B2. The pump arrived late.")
+    assert out["answer"].endswith(".") and voice_web.speakable(out["answer"])
+    assert len(out["answer"].split()) <= len(orch.WEB_UNREACHABLE.split()) + orch.VOICE_MAX_WORDS
 
 
 def test_voice_unspeakable_head_says_only_the_fixed_sentences(monkeypatch):
