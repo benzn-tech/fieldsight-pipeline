@@ -161,6 +161,7 @@ import extraction_pending
 import folder_key as folder_key_mod
 import nz_time
 import checklist_reports
+import decision_rules
 import pipeline_trace
 import trace_views
 import voice_session
@@ -744,8 +745,7 @@ def _uuid_or_none(value):
 
 
 
-
-# ----------------------------------------------------------
+# ----------------------------------------------------------
 # Site decision loop P0 shadow review (spec 2026-11-05-site-decision-loop-design rev 5;
 # plan 2026-11-08 Task 6). A platform admin reads every company's shadow cards and labels
 # each one. The response names are fixed by the fieldsight-ui page (ui#469). Labelling never
@@ -853,36 +853,115 @@ def label_decision_card(conn, caller, raw_card, body):
     return ok(_decision_card_views(conn, [row])[0])
 
 
-def _removed_evidence_cards(conn, rows):
-    """Card ids (str) of these rows whose evidence must not be served: the transcript it
-    quotes belongs to a session its owner deleted, or its source cannot be resolved (no
-    report behind the originating event -- fail closed: unverifiable is not shown).
+# The person-free remind label per rule, served in place of "Remind <name>..." when a card's
+# source is removed. The same wording the rules use when no person is known.
+_GENERIC_REMIND = {"checklist.gap": decision_rules.REMIND_INSPECTOR,
+                   "todo.overdue": decision_rules.REMIND_OWNER}
 
-    The deletion check is the one GET /sessions|days/.../report/status uses
-    (`_session_was_removed` / `_any_session_removed`): the S3 deletion mirror read STRICT,
-    compared in both spellings. It is keyed on (folder, date), not on the caller, so a
-    platform admin uses it unchanged. ONE mirror read per distinct (folder, date) in the
-    page, ONE query for the sources. An unreadable mirror raises, as it does there."""
-    with_evidence = [r for r in rows if r.get("evidence")]
-    if not with_evidence:
-        return set()
+
+def _session_under_prefixes(folder, date, session, prefixes):
+    """Is `session` of (folder, date) under one of these recording tombstone prefixes
+    (redactions.deleted_source_prefixes)? A tombstone's key is
+    `extractions/{folder}/{date}/{base}` (`_source_prefixes_for`) and a row is hidden when
+    its key starts with it (`_redacted_or_hidden`): the session's key
+    `extractions/{folder}/{date}/{session}...` does exactly when `base` is a prefix of the
+    session id. Compared on the segment after `/{folder}/{date}/`, whatever the area in
+    front of it, and in both spellings (the delete endpoint stores whatever base it had).
+    A prefix ending at the day (no base) or a deeper one covers the session: both
+    over-match, the safe direction for a reader that hides."""
+    bare = session[3:] if session.startswith("sid") else session
+    spellings = (session, bare, "sid" + bare)
+    anchor = f"/{folder}/{date}/"
+    for p in prefixes:
+        i = p.find(anchor)
+        if i < 0:
+            continue
+        base = p[i + len(anchor):].split("/")[0]
+        if any(sp.startswith(base) for sp in spellings):
+            return True
+    return False
+
+
+def _removed_source_cards(conn, rows):
+    """(removed, due): `removed` is the card ids (str) of these rows that must serve no
+    transcript-derived text -- no evidence, no person named in a remind label, and for
+    todo.overdue no item text in the question; `due` maps each removed todo.overdue card
+    to its event's deadline (a date, or None) for the person-free question.
+
+    Which cards are checked, by rule (an unresolvable source is removed -- fail closed:
+    unverifiable is not shown):
+    * checklist.gap, and any other card carrying evidence: card -> event -> checklist report
+      (decision_cards.evidence_sources). Removed when the report is not found, has no
+      session, or ANY recording it draws on was deleted -- the report's own session and,
+      for a multi-unit walk report, every part session of the walk (a walk whose parts do
+      not resolve is removed).
+    * todo.overdue: the action item its subject_ref names (decision_cards.
+      overdue_item_states); removed when that item is no longer visible (deleted,
+      redacted, non_work) or cannot be found.
+    * todo.overdue_backlog and hub fault cards carry no transcript text and no person:
+      unchecked.
+
+    A session counts as deleted by EITHER authority: the S3 deletion mirror (read STRICT,
+    both spellings, as GET /sessions|days/.../report/status does) or Aurora's recording
+    tombstones (redactions.deleted_source_prefixes, STRICT like
+    `_deleted_prefixes_for_rows`: a failed lookup raises). Both are keyed on (folder, date),
+    not on the caller, so a platform admin uses them unchanged. Bounded per page: ONE
+    query for the report sources, ONE for the overdue items, and per distinct (folder,
+    date) one mirror read and one tombstone query."""
+    removed, due = set(), {}
+    overdue = [r for r in rows if r.get("rule_id") == "todo.overdue"]
+    if overdue:
+        states = {str(st["card_id"]): st for st in
+                  decision_cards.overdue_item_states(conn, [r["card_id"] for r in overdue])}
+        for r in overdue:
+            cid = str(r["card_id"])
+            st = states.get(cid)                       # no row: unresolvable, removed
+            if st is None or not st.get("visible"):
+                removed.add(cid)
+                raw_due = (st or {}).get("deadline")
+                due[cid] = _strict_iso_date(str(raw_due)[:10]) if raw_due else None
+    sourced = [r for r in rows if r.get("rule_id") == "checklist.gap" or (
+        r.get("evidence") and str(r["card_id"]) not in removed)]
+    if not sourced:
+        return removed, due
     sources = {str(s["card_id"]): s for s in
-               decision_cards.evidence_sources(conn, [r["card_id"] for r in with_evidence])}
-    removed_by_day = {}
-    out = set()
-    for r in with_evidence:
+               decision_cards.evidence_sources(conn, [r["card_id"] for r in sourced])}
+    days = {}
+
+    def _gone(folder, date, session):
+        if not folder or not date or not session:
+            return True
+        day = (folder, date)
+        if day not in days:
+            mirror = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
+            prefixes = [p for p in redactions.deleted_source_prefixes(conn, folder, date) or []
+                        if isinstance(p, str) and p]
+            days[day] = (mirror, prefixes)
+        mirror, prefixes = days[day]
+        return (_is_removed_spelling(session, mirror)
+                or _session_under_prefixes(folder, date, session, prefixes))
+
+    for r in sourced:
         cid = str(r["card_id"])
         src = sources.get(cid)
         if src is None or not src.get("session"):
-            out.add(cid)
+            removed.add(cid)
             continue
-        day = (src["user_folder"], str(src["report_date"])[:10])
-        if day not in removed_by_day:
-            removed_by_day[day] = deletion_mirror.deleted_sessions_strict(
-                s3(), S3_BUCKET, day[0], day[1])
-        if _is_removed_spelling(src["session"], removed_by_day[day]):
-            out.add(cid)
-    return out
+        folder, date = src["user_folder"], str(src["report_date"])[:10]
+        parts = [(folder, date, src["session"])]
+        if src.get("walk_key"):
+            walk = src.get("walk_parts")
+            if isinstance(walk, str):
+                walk = json.loads(walk)
+            walk = [w for w in walk or [] if isinstance(w, dict)]
+            if not walk:
+                removed.add(cid)
+                continue
+            parts += [(w.get("user_folder"), str(w.get("report_date") or "")[:10],
+                       w.get("session")) for w in walk]
+        if any(_gone(*part) for part in parts):
+            removed.add(cid)
+    return removed, due
 
 
 def _iso_utc(value):
@@ -893,24 +972,36 @@ def _iso_utc(value):
 
 
 def _decision_card_views(conn, rows):
-    """Rows -> the ui#469 card shape. ONE users lookup for every recipient on the page."""
+    """Rows -> the ui#469 card shape. ONE users lookup for every recipient on the page.
+
+    Rewritten at read time, stored rows untouched (spec ruling for P0): a card whose
+    source is removed (`_removed_source_cards`) serves no evidence, a person-free remind
+    label, and for todo.overdue a question without the item's text."""
     ids = {str(rc.get("user_id")) for r in rows for rc in (r.get("recipients") or [])
            if isinstance(rc, dict) and rc.get("user_id")}
     names = users.display_names_for_ids(conn, ids) if ids else {}
-    removed = _removed_evidence_cards(conn, rows)
+    removed, removed_due = _removed_source_cards(conn, rows)
     out = []
     for r in rows:
         cid = str(r["card_id"])
+        is_removed = cid in removed
+        question = r.get("question")
+        if is_removed and r.get("rule_id") == "todo.overdue":
+            question = decision_rules.removed_overdue_question(removed_due.get(cid))
+        generic_remind = _GENERIC_REMIND.get(r.get("rule_id")) if is_removed else None
         options = []
         for o in r.get("options") or []:
             if not isinstance(o, dict):
                 continue
-            view = {"id": o.get("id"), "label": o.get("label"),
+            label = o.get("label")
+            if generic_remind is not None and o.get("id") == "remind":
+                label = generic_remind
+            view = {"id": o.get("id"), "label": label,
                     "recommended": bool(o.get("recommended"))}
             if "reason_required" in o:
                 view["reason_required"] = bool(o["reason_required"])
             options.append(view)
-        evidence = [] if cid in removed else [
+        evidence = [] if is_removed else [
             {"quote": e.get("quote"), "at": e.get("at")}
             for e in (r.get("evidence") or []) if isinstance(e, dict)]
         recipients = [
@@ -921,7 +1012,7 @@ def _decision_card_views(conn, rows):
             "card_id": cid, "company_name": r.get("company_name"),
             "site_name": r.get("site_name"), "rule_id": r.get("rule_id"),
             "kind": r.get("kind"), "purpose": r.get("purpose"), "urgency": r.get("urgency"),
-            "question": r.get("question"), "consequence": r.get("consequence"),
+            "question": question, "consequence": r.get("consequence"),
             "created_at": _iso_utc(r.get("created_at")),
             "shadow_label": r.get("shadow_label"), "label_note": r.get("label_note"),
             "options": options, "evidence": evidence, "recipients": recipients})
