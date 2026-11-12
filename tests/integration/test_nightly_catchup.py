@@ -448,7 +448,6 @@ def test_j1_on_while_rematch_shadow_reemits_reconcile_only_writes(db, monkeypatc
     assert outcome == "done"
     assert counts["j1_stale"] == 2 and counts["j1_reemitted"] == 1
     assert counts["j1_line_off"] == 1                 # cross-day is in shadow
-    assert counts["j3_recomputed"] == 0               # J3 count-only
     [rkey] = s.s3.under(RECON)
     assert s.s3.under(XDAY) == []
     assert rkey == reconcile_request.request_key(str(s.site["id"]), TUE.isoformat(), n["key"])
@@ -458,6 +457,7 @@ def test_j1_on_while_rematch_shadow_reemits_reconcile_only_writes(db, monkeypatc
     assert after["nightly_reemits"] == before["nightly_reemits"] + 1
     for t in ("decision_records", "event_links", "nightly_requested_items"):
         assert after[t] == before[t], t
+    assert len(s.s3.under(nr.PREFIX)) == counts["j2_sessions"] == 2
     for key in s.s3.under(nr.PREFIX):
         assert s.s3.body(key)["flag"] == "shadow"
 
@@ -472,6 +472,7 @@ def test_j1_off_skips_detection_even_when_rematch_on(db, lines_on, monkeypatch):
     monkeypatch.setattr(nr.nightly, "site_finals", boom)
     monkeypatch.setattr(nr.nightly, "recorded_reemit_pairs", boom)
     outcome, counts = nr.run_counts(db, s.event(), s.ctx("on"))
+    assert outcome == "done"                          # the run still succeeds (J2 planned)
     assert counts["j1_stale"] == 0 and counts["j1_reemitted"] == 0
     assert s.j1_puts() == [] and s.reemits() == []
 

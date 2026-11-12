@@ -114,6 +114,7 @@ _UNSET = object()
     *[(rf, j1, None) for rf in ("off", "", None, "bogus") for j1 in (_UNSET, "on")],
     ("shadow", _UNSET, "shadow"), ("on", _UNSET, "on"), ("shadow", "inherit", "shadow"),
     ("shadow", "on", "on"), ("on", "off", None), ("on", "shadow", "shadow"),
+    ("on", "on", "on"), ("shadow", "shadow", "shadow"), ("on", "SHADOW", "shadow"),
     ("shadow", "off", None),
     ("shadow", " ON ", "on"), ("on", "", "on"), ("shadow", "bogus", "shadow"),
 ])
