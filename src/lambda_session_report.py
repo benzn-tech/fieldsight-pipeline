@@ -1420,9 +1420,10 @@ def _trace_report(meta):
         rep = rep or {}
         pipeline_trace.event(
             "checklist", "omitted_by_model" if rep.get("omitted_by_model")
-            else ("answered" if rep.get("answered") else "no_match"),
+            # A walk unit answered only by site-wide General rows (R53) is answered.
+            else ("answered" if rep.get("answered") or rep.get("site_wide") else "no_match"),
             detail={"checklist": title, "items": rep.get("items"),
-                    "answered": rep.get("answered"),
+                    "answered": rep.get("answered"), "site_wide": rep.get("site_wide"),
                     "dropped": [d.get("reason") for d in rep.get("dropped") or []]})
 
 

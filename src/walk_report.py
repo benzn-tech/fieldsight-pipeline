@@ -209,9 +209,15 @@ def unit_title(unit, checklist_title):
 
 
 def general_section(entries):
+    """General's paragraphs: a row answering a checklist item (walk_checklist
+    keeps its `n`, `item` and `answer`) reads "<item>: <answer> — <comment>";
+    any other row "<comment> — "<evidence>""."""
     paragraphs = []
     for e in entries or []:
         comment, evidence = (e.get("comment") or "").strip(), (e.get("evidence") or "").strip()
+        if e.get("n") and e.get("item") and e.get("answer"):
+            paragraphs.append("%s: %s%s" % (e["item"], e["answer"], DASH + comment if comment else ""))
+            continue
         paragraphs.append('%s%s"%s"' % (comment, DASH if comment else "", evidence))
     return _section(GENERAL, paragraphs, [[] for _ in paragraphs])
 
