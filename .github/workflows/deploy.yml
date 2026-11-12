@@ -413,6 +413,7 @@ jobs:
               "AskVoiceRestate=${{ vars.TEST_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.TEST_ASK_VOICE_CONVO || 'false' }}" \
               "AskVoiceAutoWeb=${{ vars.TEST_ASK_VOICE_AUTO_WEB || 'false' }}" \
+              "AskKeepWarm=${{ vars.TEST_ASK_KEEP_WARM || 'true' }}" \
               "VoiceWebEnabled=${{ vars.TEST_VOICE_WEB_ENABLED || 'false' }}" \
               "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
               "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \

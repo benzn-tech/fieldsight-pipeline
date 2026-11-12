@@ -173,14 +173,16 @@ jobs:
         # Decision card inbox (spec 2026-11-12 §2): DecisionInbox defaults to off; the
         # DecisionInboxCompanies allow-list uses the same bare-"Key=" guard as the
         # other _PARAM overrides (appended only when PROD_DECISION_INBOX_COMPANIES is set).
+        # EL_ASK_KEY_PARAM / EL_TTS_KEY_PARAM in the run block below (moved here: the
+        # run block is near GitHub's expression limit, test_template_workflow_parameter_wiring):
+        # Optional by design: an Ask key that is not set means the elevenlabs
+        # STT provider REFUSES rather than borrowing the pipeline's key, so an
+        # empty secret must not become a bare `ElevenLabsAskApiKey=` and exit 2
+        # at SAM argument parsing -- which is exactly what QwenChatApiKey did.
+        # Same reasoning as EL_ASK_KEY_PARAM: optional by design, so an unset
+        # secret must not become a bare `ElevenLabsTtsApiKey=` and exit 2.
         run: |
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
-          # Optional by design: an Ask key that is not set means the elevenlabs
-          # STT provider REFUSES rather than borrowing the pipeline's key, so an
-          # empty secret must not become a bare `ElevenLabsAskApiKey=` and exit 2
-          # at SAM argument parsing -- which is exactly what QwenChatApiKey did.
-          # Same reasoning as EL_ASK_KEY_PARAM: optional by design, so an unset
-          # secret must not become a bare `ElevenLabsTtsApiKey=` and exit 2.
           EL_TTS_KEY_PARAM=""
           if [ -n "$ELEVENLABS_API_KEY_TTS" ]; then
             EL_TTS_KEY_PARAM="ElevenLabsTtsApiKey=$ELEVENLABS_API_KEY_TTS"
@@ -485,6 +487,7 @@ jobs:
               "AskVoiceRestate=${{ vars.PROD_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.PROD_ASK_VOICE_CONVO || 'false' }}" \
               "AskVoiceAutoWeb=${{ vars.PROD_ASK_VOICE_AUTO_WEB || 'false' }}" \
+              "AskKeepWarm=${{ vars.PROD_ASK_KEEP_WARM || 'false' }}" \
               "VoiceWebEnabled=${{ vars.PROD_VOICE_WEB_ENABLED || 'false' }}" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
               "DashScopeApiKey=$DASHSCOPE_API_KEY" \

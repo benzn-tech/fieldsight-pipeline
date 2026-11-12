@@ -296,6 +296,16 @@ Parameters:
       records miss into a spoken offer to search online, honouring a yes or no
       to it. Set via TEST_/PROD_ repo vars; unset is false.
 
+  AskKeepWarm:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      A 5-minute schedule invokes AskAgent with {"mode": "warm"}: imports and AWS
+      clients only, no model or HTTP call. A device's first question after idle
+      started in 4.8 s server-side (6.3 s client) against 2.1 s warm (TEST
+      2026-11-12), past the device's 5 s restatement window. Set via TEST_/PROD_
+      repo vars; unset is false.
   AskVoiceAutoWeb:
     Type: String
     Default: 'false'
@@ -1901,6 +1911,7 @@ Mappings:
 
 Conditions:
   HasVoiceprintSpreadOverride: !Not [!Equals [!Ref VoiceprintMaxFrameSpread, 'default']]
+  ShouldKeepAskWarm: !Equals [!Ref AskKeepWarm, 'true']
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
   ShouldEnableRecordingBlocks: !Equals [!Ref EnableRecordingBlocks, 'true']
@@ -2626,6 +2637,14 @@ Resources:
       # ON on TEST. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
       Timeout: 28
       MemorySize: 256
+      Events:
+        KeepWarm:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keep AskAgent warm for the device's first voice question
+            State: !If [ShouldKeepAskWarm, ENABLED, DISABLED]
+            Input: '{"mode": "warm"}'
       Environment:
         Variables:
           # Under the Lambda Timeout above, or the runtime hard-kills this function

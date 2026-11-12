@@ -2350,6 +2350,21 @@ def _corroborate(body):
         return empty
 
 
+
+def _warm():
+    """{"warm": True, "ok": bool}. Never raises: a warm-up that fails must not alarm."""
+    try:
+        import ask_voice_turn
+        import voice_restate  # noqa: F401
+        import voice_web  # noqa: F401
+        import ask_history  # noqa: F401
+        import elevenlabs_utils  # noqa: F401
+        ask_voice_turn._get_s3()
+        ask_voice_turn._get_lambda()
+        return {"warm": True, "ok": True}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ask warm failed: %s", type(e).__name__)
+        return {"warm": True, "ok": False}
 def lambda_handler(event, context):
     """
     POST /api/ask
@@ -2361,6 +2376,12 @@ def lambda_handler(event, context):
         "topic_id": 2              // optional: narrow to specific topic
     }
     """
+    if event.get('mode') == 'warm':
+        # The KeepWarm schedule (template AskKeepWarm, 2026-11-13). Imports and AWS
+        # clients only -- no model, no HTTP, no S3 read -- so the device's first voice
+        # question after idle does not pay them inside its 5 s restatement window.
+        return _warm()
+
     logger.info("=" * 50)
     logger.info("Ask Agent v1.0 - Starting")
 
