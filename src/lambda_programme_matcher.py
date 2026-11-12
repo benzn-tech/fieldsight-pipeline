@@ -121,13 +121,14 @@ import json
 import logging
 import math
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import unquote_plus
 
 import boto3
 
 import llm_utils
 import dashscope_utils
+from lake_put import lake_put
 from repositories import programme
 
 logger = logging.getLogger()
@@ -925,6 +926,9 @@ def _process_impacts(topic, topic_findings, finding_vecs, cands, task_vecs, prog
 #: reconcile_worker.PREFIX (and reconcile_request.PREFIX), repeated so routing needs no
 #: import; tests pin the three equal.
 RECONCILE_PREFIX = "reconcile_requests/"
+#: reconcile_request.RESULTS_PREFIX, repeated for the same reason (reconcile_request is in-VPC
+#: and pulls psycopg); a test pins _results_key to reconcile_request.results_key.
+RECONCILE_RESULTS_PREFIX = "reconcile_results/"
 #: Seconds kept back from the Lambda's remaining time for the writer invoke and teardown.
 RECONCILE_DEADLINE_MARGIN_S = 60
 
@@ -935,6 +939,42 @@ def _reconcile_deadline_s(context):
     if remaining is None:
         return None
     return remaining() / 1000 - RECONCILE_DEADLINE_MARGIN_S
+
+
+def _results_key(request_key):
+    """reconcile_request.results_key without the import: the prefix swapped, the rest
+    byte-identical."""
+    return RECONCILE_RESULTS_PREFIX + request_key[len(RECONCILE_PREFIX):]
+
+
+def _write_reconcile_markers(processed):
+    """One reconcile_results/ marker per processed reconcile request, so nightly J1 can tell
+    a dropped request from one that produced nothing. Counts and ids only -- never a quote,
+    item text or transcript. Called only after the writer step succeeded (or had nothing to
+    send). A failed put is logged with the key only and never raised: raising would retry
+    the whole S3 event and repeat a paid model call, while a missing marker costs at most one
+    nightly re-emit that the writer's unique keys absorb."""
+    for key, req, out, input_hash, etag in processed:
+        marker_key = _results_key(key)
+        try:
+            site_id = str(req.get("site_id"))
+            body = {
+                "request_key": key,
+                "site_id": site_id,
+                "date": req.get("date"),
+                "extraction_key": req.get("extraction_key"),
+                "trigger": req.get("trigger"),
+                "counts": out.get("counts"),
+                "input_hash": input_hash,
+                "request_etag": etag,
+                "status_suggestions": len(out.get("status_suggestions") or []),
+                "pick_cards": len(out.get("pick_cards") or []),
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            lake_put(S3_BUCKET, marker_key, json.dumps(body), client=s3(),
+                     owner_hint={"site_id": site_id}, ContentType="application/json")
+        except Exception:  # noqa: BLE001 - a missing marker costs one nightly re-emit
+            logger.warning("reconcile marker put failed: %s", marker_key)
 
 
 def lambda_handler(event, context):
@@ -948,6 +988,9 @@ def lambda_handler(event, context):
     # reconcile_worker and produce these two lists; match_requests/ never does.
     status_suggestions = []
     pick_cards = []
+    # (key, req, out, input_hash, etag) per reconcile record: each gets a reconcile_results/
+    # marker once the writer step below has succeeded.
+    reconcile_processed = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])
         obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
@@ -969,6 +1012,7 @@ def lambda_handler(event, context):
                 req, key, bucket=S3_BUCKET, deadline_s=_reconcile_deadline_s(context))
             status_suggestions.extend(out["status_suggestions"])
             pick_cards.extend(out["pick_cards"])
+            reconcile_processed.append((key, req, out, input_hash, obj.get("ETag")))
             continue
         for topic in req.get("topics") or []:
             suggestion, topic_impacts, topic_verdicts = _process_topic(req, topic, key, input_hash)
@@ -1002,6 +1046,10 @@ def lambda_handler(event, context):
             raise RuntimeError(
                 f"suggestion-writer invoke failed: {resp.get('FunctionError')}"
             )
+
+    # The writer accepted the batch, or there was nothing to send: record each reconcile
+    # request as processed. Never reached in dry_run or after a writer FunctionError.
+    _write_reconcile_markers(reconcile_processed)
 
     return {"suggestions": suggestions, "impacts": impacts, "verdicts": verdicts,
             "status_suggestions": status_suggestions, "pick_cards": pick_cards}

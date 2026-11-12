@@ -37,6 +37,8 @@ RUNG = "R0"
 KINDS = ("action_item",)
 STATUSES = {"action_item": ["open", "in_progress", "blocked"]}
 PREFIX = "reconcile_requests/"
+#: Where MatcherFunction records each processed request (results_key). Counts and ids only.
+RESULTS_PREFIX = "reconcile_results/"
 
 
 def _iso(value):
@@ -130,6 +132,15 @@ def build(conn, extraction, extraction_key, site, owner_company_id, *, user_fold
 def request_key(site_id, date, extraction_key):
     digest = hashlib.sha256(extraction_key.encode("utf-8")).hexdigest()[:16]
     return f"{PREFIX}{site_id}/{date}/{digest}.json"
+
+
+def results_key(request_key):
+    """The reconcile_results/ marker key for a reconcile_requests/ key: the prefix swapped,
+    the rest byte-identical. MatcherFunction writes the marker after the writer step; nightly
+    J1 reads it. Raises ValueError for any other key."""
+    if not isinstance(request_key, str) or not request_key.startswith(PREFIX):
+        raise ValueError(f"not a {PREFIX} key: {request_key!r}")
+    return RESULTS_PREFIX + request_key[len(PREFIX):]
 
 
 def emit(s3, bucket, body):

@@ -90,3 +90,16 @@ def test_matcher_keeps_the_default_http_timeout():
     """The reconcile call is bounded by the Lambda's remaining time, not by LLM_HTTP_TIMEOUT:
     setting it on MatcherFunction would change the programme match/impact calls too."""
     assert not re.search(r"^\s*LLM_HTTP_TIMEOUT:", _block("MatcherFunction"), re.M)
+
+
+def test_matcher_can_write_reconcile_results():
+    """The matcher writes one reconcile_results/ marker per processed request through
+    lake_put, which also appends a lake_manifest/ line in the same bucket."""
+    block = _block("MatcherFunction")
+    lists = re.findall(r"Action: s3:PutObject\s*\n\s*Resource:\s*\n((?:\s*(?:- \S+.*|#.*)\n)+)",
+                       block)
+    assert lists, "MatcherFunction has no PutObject statement"
+    resources = {ln.strip().lstrip("- ") for group in lists for ln in group.splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")}
+    assert "!Sub arn:aws:s3:::${IngestBucketName}/reconcile_results/*" in resources
+    assert "!Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*" in resources

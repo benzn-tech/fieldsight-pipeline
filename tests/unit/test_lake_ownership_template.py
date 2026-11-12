@@ -309,6 +309,8 @@ LAKE_PUT_CALLERS = {
     "LakeOpsFunction": "lambda_org_api and everything it imports",
     # The nightly handler's J2 request artifacts (nightly_rematch, nightly re-match Task 6).
     "DecisionScanFunction": "nightly_rematch (nightly_requests/ via lake_put)",
+    # The per-request reconcile_results/ marker (2026-11-13 reconcile results marker).
+    "MatcherFunction": "lambda_programme_matcher (reconcile_results/ via lake_put)",
 }
 
 
@@ -321,7 +323,6 @@ IMPORTS_BUT_NEVER_WRITES = {
     "ActionAgentFunction": ("imports pipeline_trace via llm_usage; never flushes a trace "
                             "(its only S3 write is web snapshots, recorded by org-api)"),
     "ApiFunction": "imports ask_voice_turn for its turn-store helpers only",
-    "MatcherFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
     "ContinuityXdayLinkerFunction": ("imports pipeline_trace via llm_usage; never flushes a "
                                      "trace (writes nothing to S3: its result rides the invoke)"),
     "SessionActivityFunction": "imports helpers; calls none of the writers",

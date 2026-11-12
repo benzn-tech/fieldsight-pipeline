@@ -46,6 +46,10 @@ _SITE_OR_COMPANY = [
     ("nightly_request", rf"^nightly_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
     # The status-reconcile request (reconcile_request.emit): the same site/day shape as match.
     ("reconcile",   rf"^reconcile_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
+    # The matcher's per-request "processed" marker (reconcile_request.results_key): the
+    # request's own shape. It must parse: lake_owner leaves an unparsed key "unresolved"
+    # before it reads the owner hint, and export/deletion read only lake_objects.
+    ("reconcile_result", rf"^reconcile_results/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
     # weather/ and programmes/ carry a site uuid, or the site slug as a fallback
     ("weather",     rf"^weather/(?P<site_ref>[^/]+)/{_DATE}/[^/]+$"),
     ("programme",   r"^programmes/(?P<site_ref>[^/]+)/[^/]+$"),

@@ -13,8 +13,10 @@ lambda-invoke client -- style of tests/unit/test_lambda_extract_session.py
 time never blows up) and tests/unit/test_lambda_suggestion_writer.py
 (monkeypatching a module attribute, e.g. `sw.programme_suggestions.x`).
 """
+import hashlib
 import io
 import json
+import logging
 import os
 from datetime import date
 
@@ -46,13 +48,28 @@ def _task(**overrides):
 class FakeS3:
     """Minimal S3 client double: object store keyed by S3 key."""
 
-    def __init__(self, objects=None):
+    def __init__(self, objects=None, fail_puts=()):
         self.objects = dict(objects or {})
+        self.put_calls = []  # data puts only; lake_put's lake_manifest/ lines are skipped
+        self.fail_puts = set(fail_puts)
 
     def get_object(self, Bucket, Key):
         body = self.objects[Key]
         raw = body.encode("utf-8") if isinstance(body, str) else body
-        return {"Body": io.BytesIO(raw)}
+        return {"Body": io.BytesIO(raw), "ETag": etag_of(raw)}
+
+    def put_object(self, **kwargs):
+        if kwargs["Key"].startswith("lake_manifest/"):
+            return {}
+        if kwargs["Key"] in self.fail_puts:
+            raise RuntimeError("put failed")
+        self.put_calls.append(kwargs)
+        return {}
+
+
+def etag_of(raw):
+    """S3's ETag for a single-part put: the quoted md5 hex."""
+    return '"%s"' % hashlib.md5(raw).hexdigest()
 
 
 class FakeLambdaClient:
@@ -1031,3 +1048,165 @@ def test_match_path_does_not_import_reconcile_worker():
                          text=True, cwd=src)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False False"
+
+
+# ---------------------------------------------------------------------------
+# reconcile_results/ marker (2026-11-13 plan): one per processed reconcile request, written
+# only after the writer step succeeded, so nightly J1 can tell a dropped request from one
+# that produced nothing.
+# ---------------------------------------------------------------------------
+
+RESULT_KEY = "reconcile_results/site-1/2026-11-10/0123456789abcdef.json"
+
+
+def _markers(fake_s3):
+    return [c for c in fake_s3.put_calls if c["Key"].startswith("reconcile_results/")]
+
+
+def _walk_keys(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k
+            yield from _walk_keys(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_keys(v)
+
+
+def test_results_key_agrees_with_reconcile_request():
+    """The matcher never imports reconcile_request (in-VPC; it pulls psycopg), so it repeats
+    the prefix and the swap. Pin both to the helper nightly J1 uses."""
+    rr = pytest.importorskip("reconcile_request")
+    assert lpm.RECONCILE_RESULTS_PREFIX == rr.RESULTS_PREFIX
+    assert lpm._results_key(RECONCILE_KEY) == rr.results_key(RECONCILE_KEY) == RESULT_KEY
+
+
+def test_marker_written_after_invoke(monkeypatch):
+    _req, _seen, fake_lambda = _reconcile_setup(monkeypatch)
+    fake_s3 = lpm.s3()
+    puts_at_invoke = []
+    real_invoke = fake_lambda.invoke
+
+    def invoke(**kw):
+        puts_at_invoke.append(len(_markers(fake_s3)))
+        return real_invoke(**kw)
+    fake_lambda.invoke = invoke
+
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+
+    assert puts_at_invoke == [0]
+    markers = _markers(fake_s3)
+    assert len(markers) == 1
+    assert markers[0]["Key"] == RESULT_KEY
+    assert markers[0]["Bucket"] == BUCKET
+    assert markers[0]["ContentType"] == "application/json"
+
+
+def test_marker_carries_input_hash_and_etag(monkeypatch):
+    counts = {"offered": 2, "kept": 1, "picks": 1, "dropped_by": {"no_quote": 1}}
+    req, _seen, _fl = _reconcile_setup(monkeypatch, result={
+        "status_suggestions": [_STATUS], "pick_cards": [_PICK], "counts": counts})
+    fake_s3 = lpm.s3()
+    raw = fake_s3.objects[RECONCILE_KEY].encode("utf-8")
+
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+
+    body = json.loads(_markers(fake_s3)[0]["Body"])
+    assert body["request_key"] == RECONCILE_KEY
+    assert body["site_id"] == req["site_id"]
+    assert body["date"] == req["date"]
+    assert body["extraction_key"] == req["extraction_key"]
+    assert body["trigger"] is None
+    assert body["counts"] == counts
+    assert body["input_hash"] == hashlib.sha256(raw).hexdigest()
+    assert body["request_etag"] == etag_of(raw)
+    assert body["status_suggestions"] == 1
+    assert body["pick_cards"] == 1
+    assert body["processed_at"].endswith("+00:00")
+    assert set(body) == {"request_key", "site_id", "date", "extraction_key", "trigger",
+                         "counts", "input_hash", "request_etag", "status_suggestions",
+                         "pick_cards", "processed_at"}
+    keys = set(_walk_keys(body))
+    assert "quote" not in keys and "text" not in keys
+    assert "candidates" not in keys
+
+
+def test_marker_carries_the_request_trigger(monkeypatch):
+    _reconcile_setup(monkeypatch)
+    fake_s3 = lpm.s3()
+    req = json.loads(fake_s3.objects[RECONCILE_KEY])
+    req["trigger"] = "nightly"
+    fake_s3.objects[RECONCILE_KEY] = json.dumps(req)
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+    assert json.loads(_markers(fake_s3)[0]["Body"])["trigger"] == "nightly"
+
+
+def test_no_marker_when_writer_fails(monkeypatch):
+    _reconcile_setup(monkeypatch, function_error="Unhandled")
+    fake_s3 = lpm.s3()
+    with pytest.raises(RuntimeError):
+        lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+    assert fake_s3.put_calls == []
+
+
+def test_no_marker_in_dry_run(monkeypatch):
+    _reconcile_setup(monkeypatch)
+    fake_s3 = lpm.s3()
+    event = _match_request_event(RECONCILE_KEY)
+    event["dry_run"] = True
+    lpm.lambda_handler(event, None)
+    assert fake_s3.put_calls == []
+
+
+def test_marker_when_nothing_to_write(monkeypatch):
+    _req, _seen, fake_lambda = _reconcile_setup(
+        monkeypatch, result={"status_suggestions": [], "pick_cards": [],
+                             "counts": {"offered": 3, "kept": 0}})
+    fake_s3 = lpm.s3()
+    lpm.lambda_handler(_match_request_event(RECONCILE_KEY), None)
+    assert fake_lambda.invoke_calls == []
+    markers = _markers(fake_s3)
+    assert len(markers) == 1
+    body = json.loads(markers[0]["Body"])
+    assert body["status_suggestions"] == 0 and body["pick_cards"] == 0
+    assert body["counts"] == {"offered": 3, "kept": 0}
+
+
+def test_mixed_event_marks_only_reconcile_keys(monkeypatch):
+    match_key, fake_lambda = _clean_match_setup(monkeypatch)
+    match_body = lpm.s3().objects[match_key]
+    req = {"site_id": "site-1", "date": "2026-11-10", "extraction_key": "extractions/x.json",
+           "candidates": [{"x": 1}]}
+    fake_s3 = FakeS3({match_key: match_body, RECONCILE_KEY: json.dumps(req)})
+    monkeypatch.setattr(lpm, "s3", lambda: fake_s3)
+    monkeypatch.setattr(reconcile_worker, "process_request", lambda r, k, **kw: {
+        "status_suggestions": [_STATUS], "pick_cards": [], "counts": {"kept": 1}})
+    event = {"Records": [{"s3": {"object": {"key": match_key}}},
+                         {"s3": {"object": {"key": RECONCILE_KEY}}}]}
+
+    lpm.lambda_handler(event, None)
+
+    assert len(fake_lambda.invoke_calls) == 1
+    assert [c["Key"] for c in fake_s3.put_calls] == [RESULT_KEY]
+
+
+def test_marker_put_failure_is_logged_not_raised(monkeypatch, caplog):
+    second_key = "reconcile_requests/site-1/2026-11-10/fedcba9876543210.json"
+    second_result = "reconcile_results/site-1/2026-11-10/fedcba9876543210.json"
+    req, _seen, _fl = _reconcile_setup(monkeypatch)
+    fake_s3 = FakeS3({RECONCILE_KEY: json.dumps(req), second_key: json.dumps(req)},
+                     fail_puts={RESULT_KEY})
+    monkeypatch.setattr(lpm, "s3", lambda: fake_s3)
+    event = {"Records": [{"s3": {"object": {"key": RECONCILE_KEY}}},
+                         {"s3": {"object": {"key": second_key}}}]}
+
+    with caplog.at_level(logging.WARNING):
+        result = lpm.lambda_handler(event, None)
+
+    assert result["status_suggestions"] == [_STATUS, _STATUS]
+    assert [c["Key"] for c in _markers(fake_s3)] == [second_result]
+    failed = [r for r in caplog.records if "marker" in r.getMessage()]
+    assert len(failed) == 1
+    # The key only: no body, no traceback carrying it, nothing from the request.
+    assert failed[0].args == (RESULT_KEY,)
+    assert failed[0].exc_info is None
