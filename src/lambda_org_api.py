@@ -180,6 +180,7 @@ import location_grouping
 import photo_binding
 import photo_rebind
 import session_scope
+import transcript_window
 import sweep_state
 import tenancy_status
 from db.connection import get_connection
@@ -3178,10 +3179,33 @@ def _redacted_or_hidden(r, redacted, deleted):
     The one rule both `_report_rows_in_scope` (which drops these rows) and
     `_excluded_topics_for` (which reports them) apply, so there is a single
     place that defines "excluded" rather than two copies that can drift."""
-    if r["id"] in redacted or r.get("work_class") == "non_work":
-        return True
+    return _exclusion_reason(r, redacted, deleted) is not None
+
+
+#: The redaction the non-work expiry sweep writes (lambda_nonwork_expiry.REASON):
+#: the policy, not a person, so it is still an automatic exclusion.
+AUTO_NON_WORK_REDACTION = "non_work_auto_expiry"
+
+
+def _exclusion_reason(r, redacted, deleted):
+    """Why `r` is excluded -- "deleted" (under a tombstoned prefix),
+    "redacted" (a person removed it), "auto_non_work" (classified non_work,
+    or the expiry sweep's redaction of such a topic) -- or None. The rule
+    `_redacted_or_hidden` answers yes/no from, kept in one place.
+
+    The difference matters only to `_excluded_topics_for` (spec 2026-11-13):
+    what a person removed is cut whole; an automatic non_work range is cut
+    only where no work topic covers it."""
     key = r.get("source_s3_key") or ""
-    return any(key.startswith(p) for p in deleted)
+    if any(key.startswith(p) for p in deleted):
+        return "deleted"
+    red = redacted.get(r["id"]) if isinstance(redacted, dict) else (
+        {} if r["id"] in (redacted or ()) else None)
+    if red is not None and (red or {}).get("reason") != AUTO_NON_WORK_REDACTION:
+        return "redacted"
+    if red is not None or r.get("work_class") == "non_work":
+        return "auto_non_work"
+    return None
 
 
 def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
@@ -3714,7 +3738,7 @@ def _excluded_topics_for(conn, caller, folder, date, session_id=None):
         return []
     redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
     deleted = _deleted_prefixes_for_rows(conn, rows, date)
-    out = []
+    scoped = []
     for r in rows:
         # Same first cut `_report_rows_in_scope` makes: a row that is not a
         # recorded-speech extraction (KIND_EXTRACTION) can never correspond to
@@ -3727,8 +3751,22 @@ def _excluded_topics_for(conn, caller, folder, date, session_id=None):
             continue
         if session_id is not None and sid != session_id:
             continue
-        if _redacted_or_hidden(r, redacted, deleted):
+        scoped.append((r, _exclusion_reason(r, redacted, deleted)))
+    # An AUTOMATIC non_work range is cut only where no work topic of the same
+    # scope covers it (spec 2026-11-13): banter spread through a walk became one
+    # topic spanning the walk and cut all its work. What a person removed, and
+    # what is under a deleted prefix, is still cut whole.
+    cover = [r.get("time_range") for r, why in scoped if why is None]
+    out = []
+    for r, why in scoped:
+        if why is None:
+            continue
+        pieces = (transcript_window.uncovered_pieces(r.get("time_range"), cover)
+                  if why == "auto_non_work" else None)
+        if pieces is None:
             out.append({"id": str(r["id"]), "time_range": r.get("time_range")})
+        else:
+            out.extend({"id": str(r["id"]), "time_range": p} for p in pieces)
     return out
 
 

@@ -222,6 +222,45 @@ def excluded_spans(date, excluded_topics, win_from=None, win_to=None):
     return spans
 
 
+def _clock(sec):
+    return "%02d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def uncovered_pieces(time_range, cover_ranges):
+    """The parts of `time_range` that no range in `cover_ranges` covers, as
+    "HH:MM:SS – HH:MM:SS" strings (closed seconds, as drop_spans reads them),
+    or None when `time_range` cannot be placed (empty, unparseable, or ending
+    before it starts) -- the caller then sends it unchanged.
+
+    For an automatic non_work topic (spec 2026-11-13): banter spread through
+    a walk becomes one topic whose range spans the whole walk, and cutting
+    all of it cut the work said in it. Cover ranges are widened to whole
+    minutes, because extraction ranges are minute-granular ("10:05 – 10:05"
+    is the minute); the range being cut is not widened. A cover that cannot
+    be placed covers nothing."""
+    placed = chunking.parse_time_range(time_range)
+    if not placed or placed[1] < placed[0]:
+        return None
+    start, end = placed
+    covers = []
+    for tr in cover_ranges or []:
+        c = chunking.parse_time_range(tr)
+        if c and c[1] >= c[0]:
+            covers.append((c[0] - c[0] % 60, c[1] - c[1] % 60 + 59))
+    pieces, cursor = [], start
+    for c_from, c_to in sorted(covers):
+        if c_to < cursor or c_from > end:
+            continue
+        if c_from > cursor:
+            pieces.append((cursor, c_from - 1))
+        cursor = max(cursor, c_to + 1)
+        if cursor > end:
+            break
+    if cursor <= end:
+        pieces.append((cursor, end))
+    return ["%s – %s" % (_clock(a), _clock(b)) for a, b in pieces]
+
+
 def drop_spans(turns, spans):
     """Every turn that OVERLAPS an excluded span goes, not just one whose start
     falls inside it -- a turn that begins before the span and runs into it would
