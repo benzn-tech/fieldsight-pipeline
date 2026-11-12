@@ -199,3 +199,23 @@ more specific, §3 governs.
 ## Addenda
 
 (none)
+
+### Result (2026-11-11, recorded 2026-11-12)
+
+Counts only. The fit gate failed on bar 3, and held-out (116 calls) was not run.
+- Spend: fit 120 + side 24 = 144 calls. All 30 sessions were answered by the primary model,
+  with 0 errors and 0 fallback.
+- Bar 3, link precision: 24 wrong / 321 links, CP upper 10.4% (bar 5%). Fail.
+- Coverage 94.4% (en→en 99.6%, en→zh 82.7%). Stability 92.4%. Admission passed (A 10.78 / B
+  11.03 items per session).
+- Refusals: ambiguous_stamp 17, outside_topic 2. Output tokens +3.6%, latency +1.27 s. Side
+  set: no drop in kept suggestions.
+- Bar 4: 13 twin flags, all of the direction class. They were not answered before the verdict.
+- **Cause.** 22 of the 24 wrong links point to an earlier turn than gold (12 exactly one turn
+  earlier). The prompt asked for the line where the item was FIRST raised, while the gold asks
+  which turn says it. This is a design flaw in the pre-registration, and nothing was rescored.
+- **Deviation.** The eval loader did not copy `LLM_REASONING_EFFORT`, so both arms ran at the
+  default effort.
+- **Follow-up.** The re-test is
+  `docs/superpowers/specs/2026-11-12-item-quote-locator-retest-design.md`; its result is in
+  that document's section 8.

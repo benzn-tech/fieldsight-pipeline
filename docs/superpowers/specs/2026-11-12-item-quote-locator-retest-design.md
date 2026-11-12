@@ -241,3 +241,36 @@ Fable reviewed this design on 2026-11-12. All nine findings are adopted:
 8. An early admission signal from the fit A arms is reported at 0 calls, and bar 6 is reported
    only.
 9. The method-whitelist claim is corrected.
+
+## 8. Result (2026-11-12)
+
+Counts only. Neither wording reached `continue`, so held-out, the side set and the owner
+sample were not run. The locator does not ship: `EMIT_ITEM_LOCATOR` stays off.
+
+| Tune (fit half, B1, 30 sessions, effort high) | w1 | w2 |
+|---|---|---|
+| Items / linked | 337 / 318 | 317 / 309 |
+| Wrong links | 17 | 25 |
+| CP upper (bar 5%) | 7.9% | 11.1% |
+| Coverage | 94.4% | 97.5% |
+| ambiguous_stamp / outside_topic / no_locator | 4 / 1 / 14 | 2 / 6 / 0 |
+| Wrong links one turn early | 3 | 13 |
+| Errors / fallback | 0 / 0 | 0 / 0 |
+| Decision | stop | stop |
+
+- **w1** asks for the line that states the item. It removed the first test's one-sided error:
+  10 of 17 wrong links point earlier and 7 point later. 11 of 17 are within two turns, 16 of 17
+  are on Chinese turns, and 15 of 17 sit in three sessions.
+- **w1 disagreements, adjudicated.** A blind A/B judge saw both candidate turns in random order.
+  It picked gold 12 times (9 with high confidence), both 4 times (the item is split across
+  adjacent turns), neither once, and the locator 0 times. This was a diagnostic and nothing was
+  rescored. Even with the 4 "both" counted correct, 13 wrong is above the stop line.
+- **w2** changed one rule-8 sentence: a combined item takes the line that states its core. It
+  linked more items, but the one-turn-early error came back and English-turn errors rose. The
+  selection rule would pick w1, but it did not reach `continue`.
+- **The ≥ 0.5 s tie-break** cut ambiguous_stamp refusals from 17 (first test) to 4 and 2.
+- **Spend.** 60 calls of the 170 approved. Programme total: 204.
+- **Recorded deviation.** `admission_early` came back null: the first test's fit A runs were not
+  present in the re-test worktree.
+- **Experiment code.** The w2 wording was measured from a local experiment branch and was not
+  merged. Develop carries w1.
