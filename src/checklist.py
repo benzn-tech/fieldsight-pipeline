@@ -59,9 +59,9 @@ def shape_sentence():
             "wrong and by when, only when that was said; otherwise leave them empty. "
             "Evidence is the exact words from the transcript that "
             "answer the item, copied verbatim: at least three words, the whole clause "
-            "that answers it. A claim answered with doubt, silence (\"hmm\") or a "
-            "change of subject is not confirmed: leave the item out; a claim counts "
-            "when the inspector agrees, repeats it or checks it. Leave out every item the recording "
+            "that answers it. A statement met straight away with doubt (\"hmm\", "
+            "\"are you sure\") that nobody then confirms is not an answer: leave the "
+            "item out. A statement nobody questions counts, whoever says it. Leave out every item the recording "
             "did not address -- do not guess, and do not answer from general "
             "expectation" % " | ".join(MODEL_COLUMNS))
 
