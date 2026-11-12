@@ -351,3 +351,28 @@ def test_today_nz_of_at_the_nz_midnight_boundary(utc, nz_day):
     # the overdue dedupe bucket follows the event's NZ day
     assert RULES["todo.overdue"].bucket(e, hub.today_nz_of(e)) == nz_day.isoformat()
     assert hub.dedupe_key(e, hub.today_nz_of(e)).endswith("|" + nz_day.isoformat())
+
+
+# --- empty text never renders '' (fix round: decision cards before leaving shadow) -------
+
+def test_overdue_empty_text_renders_no_empty_quotes():
+    card = RULES["todo.overdue"].build_card(
+        _overdue(payload={"text": "  ", "deadline": "2026-11-01", "responsible": None}))
+    assert card.question == "A to-do was due 1 Nov 2026, still open"
+    card = RULES["todo.overdue"].build_card(
+        _overdue(payload={"text": None, "deadline": "soon", "responsible": None}))
+    assert card.question == "A to-do is past its date, still open"
+
+
+@pytest.mark.parametrize("checklist,item,expected", [
+    ("Pre-pour", "", "An item on the Pre-pour checklist was not covered"),
+    ("", "Cover to reinforcing", "'Cover to reinforcing' on a checklist was not covered"),
+    (None, None, "A checklist item was not covered"),
+    ("Pre-pour", "Cover to reinforcing",
+     "'Cover to reinforcing' on the Pre-pour checklist was not covered"),
+])
+def test_gap_empty_item_or_checklist_renders_no_empty_quotes(checklist, item, expected):
+    card = RULES["checklist.gap"].build_card(_gap(payload={
+        "checklist": checklist, "item": item, "kind": "not_covered", "session": "s1"}))
+    assert card.question == expected
+    assert "''" not in card.question
