@@ -176,6 +176,27 @@ def _recorded_at(first_key, opened_at):
     return recorded_at_from_stem(parsed["session_base"])
 
 
+def session_recorded_at(conn, extraction_key):
+    """When the session behind `extraction_key` STARTED recording, as aware UTC, or None.
+
+    The same rule find_items applies to a candidate's first-seen key (`_recorded_at`), so a
+    caller comparing its own session against `first_seen_recorded_at` orders both sides
+    identically: a sid base reads meeting_session.opened_at (the device's startedAt, so a
+    queued /open still carries the recording time, not the arrival time); a legacy base is
+    its NZ wall-clock stem; anything else is None. One primary-key read for a sid base."""
+    parsed = lake_keys.parse(extraction_key)
+    if not parsed or parsed["kind"] != "extraction" or parsed["group_id"]:
+        return None
+    opened_at = None
+    if parsed["sid"]:
+        cur = conn.cursor(row_factory=dict_row)
+        cur.execute("SELECT opened_at FROM meeting_session WHERE session_id = %s",
+                    (parsed["sid"],))
+        row = cur.fetchone()
+        opened_at = row["opened_at"] if row else None
+    return _recorded_at(extraction_key, opened_at)
+
+
 def _origin(turn):
     if not isinstance(turn, dict):
         return None
