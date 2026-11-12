@@ -146,12 +146,21 @@ def _invoke_statement(function):
                            "Resource": {"GetAtt": "%s.Arn" % function}}]}
 
 
-def test_it_invokes_only_its_db_hop(doc):
+def test_it_invokes_only_its_db_hop_and_item_writer(doc):
+    # Item-writer: a confirmation answer re-queues the walk report (Task 11, R31),
+    # async, with the org-api code item-writer already runs for a spoken check.
+    assert _env(doc, "CheckGapsFunction")["ITEM_WRITER_FUNCTION"] == {"Ref": "ItemWriterFunction"}
     pols = _props(doc, "CheckGapsFunction")["Policies"]
     assert not [p for p in pols if isinstance(p, dict) and "LambdaInvokePolicy" in p]
     invokes = [st for st in _statements(doc, "CheckGapsFunction")
                if "lambda:InvokeFunction" in _as_list(st["Action"])]
-    assert invokes == _invoke_statement("CheckGapsDbFunction")["Statement"]
+    assert invokes == (_invoke_statement("CheckGapsDbFunction")["Statement"]
+                       + _invoke_statement("ItemWriterFunction")["Statement"])
+
+
+def test_the_db_hop_stays_without_s3_or_invoke(doc):
+    # R31: the hop writes walk_answers and nothing else -- no S3, no requeue.
+    assert _props(doc, "CheckGapsDbFunction")["Policies"] == [{"VPCAccessPolicy": {}}]
 
 
 def test_the_worker_reaches_it_only_when_it_exists(doc):
