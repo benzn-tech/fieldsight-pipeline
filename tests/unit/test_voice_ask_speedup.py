@@ -269,3 +269,19 @@ def test_a_long_web_answer_is_cut_to_its_first_two_whole_sentences():
     assert laa._speakable_web_answer(text, None) == (
         "For a 2.4 m opening Table 8.9 gives a 2/190x45 lintel. "
         "Use Table 8.14 for uplift fixings.")
+
+
+def test_two_long_sentences_fall_back_to_the_first(caplog):
+    import lambda_ask_agent as laa
+    first = "NZS 3604 sizes timber lintels from the span tables in section 8 for your opening."
+    second = " ".join(["and the loaded dimension and roof weight also matter"] * 8) + "."
+    assert laa._speakable_web_answer(first + " " + second, None) == first
+
+
+def test_an_unspeakable_answer_logs_counts_not_text(caplog):
+    import logging
+    import lambda_ask_agent as laa
+    secret = "secretword " * 70
+    with caplog.at_level(logging.WARNING):
+        assert laa._speakable_web_answer(secret, None) == voice_web.NO_CLEAR_ANSWER
+    assert "not speakable: words=70" in caplog.text and "secretword" not in caplog.text
