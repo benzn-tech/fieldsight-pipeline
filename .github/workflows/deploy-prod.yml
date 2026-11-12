@@ -153,24 +153,28 @@ jobs:
           # owner 2026-09-22; split it if Ask voice ever carries real load.
           ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
           ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
+        # (Kept outside `run:`: GitHub caps the run template at 21,000 chars.)
+        # KEYFRAME FEATURE — activating it on PROD needs BOTH repo vars set:
+        #   * PROD_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
+        #     (KeyframeFfmpegLayerArn below). Intended value:
+        #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
+        #     — runtime-agnostic (CompatibleRuntimes [python3.11, python3.12]),
+        #     bundles /opt/bin/ffmpeg, loads on the 3.11 KeyframeFunction next to the
+        #     cp311-only PsycopgLayer. Flips HasKeyframeFfmpegLayer -> HasKeyframeStack
+        #     so KeyframeFunction is CREATED. Unset => empty => stack stays uncreated.
+        #     Distinct from PROD_VAD_LAYER_ARN (cp312-only fieldsight-vad-layer for
+        #     VadFunction) — do not conflate.
+        #   * PROD_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
+        #     Default false so a deploy ships inert; flip only after the created stack
+        #     + its IAM are verified.
+        # SAM rejects a bare "Key=" empty value, so the ffmpeg-layer override is appended
+        # only when PROD_KEYFRAME_FFMPEG_LAYER_ARN is set. Until it is, the keyframe stack
+        # is not created and unrelated prod deploys are unaffected (merge-safe).
+        # Decision card inbox (spec 2026-11-12 §2): DecisionInbox defaults to off; the
+        # DecisionInboxCompanies allow-list uses the same bare-"Key=" guard as the
+        # other _PARAM overrides (appended only when PROD_DECISION_INBOX_COMPANIES is set).
         run: |
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
-          # KEYFRAME FEATURE — activating it on PROD needs BOTH repo vars set:
-          #   * PROD_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
-          #     (KeyframeFfmpegLayerArn below). Intended value:
-          #     arn:aws:lambda:ap-southeast-2:509194952652:layer:sitesync-vad-layer:2
-          #     — runtime-agnostic (CompatibleRuntimes [python3.11, python3.12]),
-          #     bundles /opt/bin/ffmpeg, loads on the 3.11 KeyframeFunction next to the
-          #     cp311-only PsycopgLayer. Flips HasKeyframeFfmpegLayer -> HasKeyframeStack
-          #     so KeyframeFunction is CREATED. Unset => empty => stack stays uncreated.
-          #     Distinct from PROD_VAD_LAYER_ARN (cp312-only fieldsight-vad-layer for
-          #     VadFunction) — do not conflate.
-          #   * PROD_ENABLE_KEYFRAMES -> gates item-writer's keyframe_requests/ EMISSION.
-          #     Default false so a deploy ships inert; flip only after the created stack
-          #     + its IAM are verified.
-          # SAM rejects a bare "Key=" empty value, so the ffmpeg-layer override is appended
-          # only when PROD_KEYFRAME_FFMPEG_LAYER_ARN is set. Until it is, the keyframe stack
-          # is not created and unrelated prod deploys are unaffected (merge-safe).
           # Optional by design: an Ask key that is not set means the elevenlabs
           # STT provider REFUSES rather than borrowing the pipeline's key, so an
           # empty secret must not become a bare `ElevenLabsAskApiKey=` and exit 2
@@ -220,6 +224,10 @@ jobs:
           ACTION_PACKS_PARAM=""
           if [ -n "${{ vars.PROD_ACTION_PACKS }}" ]; then
             ACTION_PACKS_PARAM="ActionPacks=${{ vars.PROD_ACTION_PACKS }}"
+          fi
+          DECISION_INBOX_COMPANIES_PARAM=""
+          if [ -n "${{ vars.PROD_DECISION_INBOX_COMPANIES }}" ]; then
+            DECISION_INBOX_COMPANIES_PARAM="DecisionInboxCompanies=${{ vars.PROD_DECISION_INBOX_COMPANIES }}"
           fi
           # The pack verifier (spec 2026-11-01 §14 S6): empty = the cheap model in code.
           # Same bare-"Key=" guard.
@@ -397,6 +405,7 @@ jobs:
               "DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}" \
               "StatusSuggestions=${{ vars.PROD_STATUS_SUGGESTIONS || 'false' }}" \
               "SiteDecisionLoop=${{ vars.PROD_SITE_DECISION_LOOP || 'off' }}" \
+              "DecisionInbox=${{ vars.PROD_DECISION_INBOX || 'off' }}" \
               "NightlyRematch=${{ vars.PROD_NIGHTLY_REMATCH || 'off' }}" \
               "ContinuityLinker=${{ vars.PROD_CONTINUITY_LINKER || 'false' }}" \
               "CrossDayContinuity=${{ vars.PROD_CROSS_DAY_CONTINUITY || 'off' }}" \
@@ -459,6 +468,7 @@ jobs:
               $ASK_THREADS_PARAM \
               $COMPANY_STATUS_ENFORCE_PARAM \
               $ACTION_PACKS_PARAM \
+              $DECISION_INBOX_COMPANIES_PARAM \
               $ACTION_VERIFIER_MODEL_PARAM \
               $ACTION_VERIFIER_FALLBACKS_PARAM \
               $ACTION_WRITER_MODEL_PARAM \
