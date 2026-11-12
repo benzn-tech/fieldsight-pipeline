@@ -86,6 +86,8 @@ CASES = [
     ("continuity_xday_requests/%s/%s/0123456789abcdef.json" % (S, D),
      dict(scope="tenant", kind="xday_request", site_id=S, day=D, folder=None, company_id=None)),
     ("reconcile_requests/%s/%s/h.json" % (S, D), dict(scope="tenant", kind="reconcile", site_id=S, day=D)),
+    # the matcher's per-request "processed" marker: the same site/day shape as its request
+    ("reconcile_results/%s/%s/h.json" % (S, D), dict(scope="tenant", kind="reconcile_result", site_id=S, day=D)),
     ("weather/%s/%s/actual.json" % (S, D), dict(scope="tenant", kind="weather", site_id=S, site_slug=None, day=D)),
     ("weather/tower-a/%s/actual.json" % D, dict(scope="tenant", kind="weather", site_id=None, site_slug="tower-a", day=D)),
     ("programmes/%s/programme.json" % S, dict(scope="tenant", kind="programme", site_id=S, site_slug=None)),
@@ -194,3 +196,15 @@ def test_a_voiceprint_request_names_its_session():
     got = lake_keys.parse("voiceprint_requests/%s/ada_2026-10-01_09-00-00_sid%s/m.json" % (U, sid))
     assert got["sid"] == sid
     assert lake_keys.parse("voiceprint_requests/%s/base1/r.json" % U)["sid"] is None
+
+
+def test_reconcile_results_key_parses():
+    """A reconcile_results/ marker must parse (lake_owner returns 'unresolved' for an
+    unparsed key before it applies the owner hint), with its request's scope."""
+    site = str(uuid.uuid4())
+    req = lake_keys.parse("reconcile_requests/%s/%s/0123456789abcdef.json" % (site, D))
+    got = lake_keys.parse("reconcile_results/%s/%s/0123456789abcdef.json" % (site, D))
+    assert got is not None
+    assert got["kind"] == "reconcile_result"
+    assert got["site_id"] == site
+    assert got["scope"] == req["scope"] == "tenant"

@@ -5898,6 +5898,21 @@ Resources:
                     - reconcile_requests/*
                     - transcripts/*
                     - voice_ask/*
+            - Effect: Allow
+              # The per-request reconcile_results/ marker, written through lake_put after
+              # the writer step. Put only: no read, list, tagging or delete. A denied marker
+              # put is logged and swallowed, so a missing grant here is silent by construction.
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/reconcile_results/*
+            # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+            # the bucket it wrote to. PutObject on that one prefix, nothing else (the house
+            # statement, both buckets). A missing grant costs the manifest line, never the put.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
 
   # ----------------------------------------------------------
   # Lambda 16: RAG Search (Phase 5) — in-VPC ACL-scoped semantic

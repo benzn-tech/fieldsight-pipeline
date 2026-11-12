@@ -240,3 +240,11 @@ def test_start_lookup_failure_sends_nothing(monkeypatch, caplog):
     conn = FakeConn()
     assert _build(conn=conn) is None
     assert conn.savepoints == 1
+
+
+def test_results_key_round_trip():
+    assert rr.RESULTS_PREFIX == "reconcile_results/"
+    assert (rr.results_key("reconcile_requests/S/2026-11-12/ab.json")
+            == "reconcile_results/S/2026-11-12/ab.json")
+    with pytest.raises(ValueError):
+        rr.results_key("match_requests/S/2026-11-12/ab.json")
