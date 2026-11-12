@@ -1689,6 +1689,8 @@ Parameters:
   # platform_admin-only.) Set per environment by TEST_DECISION_INBOX / PROD_DECISION_INBOX
   # and TEST_DECISION_INBOX_COMPANIES / PROD_DECISION_INBOX_COMPANIES -- SAM keeps a stack's
   # previous value, so the workflow variable, not this Default, is what sets it.
+  # Kill switch: set X_DECISION_INBOX=off. Unsetting X_DECISION_INBOX_COMPANIES does NOT clear
+  # the allow-list (the override is only passed when set, and SAM keeps the old value).
   DecisionInbox:
     Type: String
     Default: 'off'
