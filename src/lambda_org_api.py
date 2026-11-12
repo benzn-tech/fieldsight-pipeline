@@ -162,6 +162,9 @@ import folder_key as folder_key_mod
 import nz_time
 import checklist_reports
 import decision_card_copy
+import decision_hub
+import decision_inbox
+import decision_rules
 import pipeline_trace
 import trace_views
 import voice_session
@@ -1815,6 +1818,149 @@ def _decision_card_views(conn, rows):
     return out
 
 
+# ----------------------------------------------------------
+# Decision card inbox, P1 web route (spec 2026-11-12-decision-card-inbox-design rev 2).
+#   GET  /api/org/decision-cards                    -> {cards, digest, more}
+#   POST /api/org/decision-cards/{card_id}/answer   -> {status, applied}
+# Both 404 like an unknown route unless DECISION_INBOX=companies AND SITE_DECISION_LOOP=shadow
+# (read per call). Only cards of companies in DECISION_INBOX_COMPANIES are served, and only to
+# a caller who is still a recipient (`_inbox_recipient_roles`). Pure pieces: decision_inbox;
+# served copy: decision_card_copy.redact, shared with the shadow review.
+# ----------------------------------------------------------
+_DECISION_CARDS_RE = re.compile(r"^/decision-cards(?:/([^/]+)/answer)?$")
+
+
+def _decision_inbox_on():
+    return (os.environ.get("DECISION_INBOX") or "").strip().lower() == "companies"
+
+
+def _decision_inbox_companies():
+    raw = os.environ.get("DECISION_INBOX_COMPANIES") or ""
+    return {c.strip().lower() for c in raw.split(",") if c.strip()}
+
+
+def _inbox_now():
+    return datetime.now(timezone.utc)
+
+
+def decision_cards_route(conn, caller, event, method, route):
+    not_found = error("not found", 404)
+    if not _decision_inbox_on() or not _decision_loop_shadow_on():
+        return not_found
+    m = _DECISION_CARDS_RE.match(route)
+    if not m:
+        return not_found
+    raw_card = m.group(1)
+    if raw_card is None:
+        if method != "GET":
+            return not_found
+        return list_decision_inbox(conn, caller)
+    if method != "POST":
+        return not_found
+    return answer_decision_card(conn, caller, raw_card, parse_body(event))
+
+
+def _inbox_recipient_roles(conn, caller, rows):
+    """{card_id (str): the recipient role the caller still holds} for the rows the caller may
+    see (spec §4 "Still a recipient"); rows not in the map are not served.
+
+    The card's company must be allow-listed and active (tenancy_status evaluated for the
+    CARD's site: no caller exemption), and the caller's STORED recipient role must still
+    hold: pm / site_manager -> the caller is a member of the card's site with that role
+    (memberships.members_for_site: external members included, archived excluded);
+    company_admin -> same company and a decision_hub.COMPANY_ADMIN_GLOBAL_ROLES global role;
+    any other role -> not served. One membership query per distinct (company, site)."""
+    allow = _decision_inbox_companies()
+    inactive = tenancy_status.inactive_site_ids(conn) or set()
+    uid = str(caller["id"])
+    members, out = {}, {}
+    for r in rows:
+        if str(r["company_id"]).lower() not in allow or str(r["site_id"]) in inactive:
+            continue
+        role = next((rc.get("role") for rc in (r.get("recipients") or [])
+                     if isinstance(rc, dict) and str(rc.get("user_id")) == uid), None)
+        if role in ("pm", "site_manager"):
+            key = (str(r["company_id"]), str(r["site_id"]))
+            if key not in members:
+                members[key] = {(str(mb["id"]), mb.get("site_role")) for mb in
+                                memberships.members_for_site(conn, key[0], key[1])}
+            if (uid, role) in members[key]:
+                out[str(r["card_id"])] = role
+        elif role == "company_admin":
+            if (str(caller.get("company_id")) == str(r["company_id"])
+                    and caller.get("global_role") in decision_hub.COMPANY_ADMIN_GLOBAL_ROLES):
+                out[str(r["card_id"])] = role
+    return out
+
+
+def _has_answerable_option(row):
+    return any(isinstance(o, dict) and o.get("id") for o in row.get("options") or [])
+
+
+def _inbox_digest(conn, backlog_rows, now):
+    """{count, title, href} over the sites of the caller's visible backlog cards, counted
+    LIVE: the stale subset (decision_hub.is_late under RULES["todo.overdue"], on the scan's
+    own per-item event) of today's action_items.overdue_open for each site. None when no
+    site contributes. One overdue_open call."""
+    if not backlog_rows:
+        return None
+    from lambda_decision_scan import overdue_item_event   # the scan's builder, shared
+    today_nz = nz_time.to_nz(now).date()
+    rule = decision_rules.RULES["todo.overdue"]
+    names = {(str(r["company_id"]), str(r["site_id"])): r.get("site_name") or ""
+             for r in backlog_rows}
+    counts = dict.fromkeys(names, 0)
+    for item in action_items.overdue_open(conn, today_nz):
+        key = (str(item["company_id"]), str(item["site_id"]))
+        if key in counts and decision_hub.is_late(overdue_item_event(item, now), rule,
+                                                  today_nz):
+            counts[key] += 1
+    per_site = [(names[k], n) for k, n in counts.items()]
+    title = decision_inbox.digest_title(per_site)
+    if title is None:
+        return None
+    return {"count": sum(n for _, n in per_site), "title": title,
+            "href": decision_inbox.DIGEST_HREF}
+
+
+def _inbox_view(conn, rows):
+    """Card views for `rows` (already visible and ordered), with the shared redaction."""
+    removed, due = _removed_source_cards(conn, rows)
+    out = []
+    for r in rows:
+        cid = str(r["card_id"])
+        question, options, evidence = decision_card_copy.redact(r, cid in removed, due.get(cid))
+        out.append(decision_inbox.card_view(r, question, options, evidence,
+                                            r.get("site_name"), cid in removed))
+    return out
+
+
+def list_decision_inbox(conn, caller):
+    """GET /api/org/decision-cards (spec §4): the caller's open cards, ordered and capped on
+    the server, plus the live backlog digest. 200 with empty lists when nothing is served."""
+    rows = decision_cards.inbox_rows(conn, sorted(_decision_inbox_companies()), caller["id"])
+    roles = _inbox_recipient_roles(conn, caller, rows)
+    visible = [r for r in rows if str(r["card_id"]) in roles]
+    backlog = [r for r in visible if r.get("rule_id") == "todo.overdue_backlog"]
+    cards = []
+    for r in visible:
+        if decision_inbox.is_excluded(r):
+            continue
+        if not _has_answerable_option(r):
+            logger.warning("decision-inbox: card %s has no option; skipped", r["card_id"])
+            continue
+        cards.append(r)
+    shown, more = decision_inbox.order_and_cap(cards)
+    return ok({"cards": _inbox_view(conn, shown),
+               "digest": _inbox_digest(conn, backlog, _inbox_now()),
+               "more": more})
+
+
+def answer_decision_card(conn, caller, raw_card, body):
+    """POST /api/org/decision-cards/{card_id}/answer (Task 6)."""
+    return error("not found", 404)
+
+
 def decision_shadow_summary(rows, since=None):
     """Counts over EVERY card (rows of shadow_summary_rows), or, with `since` (a date),
     only over cards whose NZ calendar day of created_at is on or after it (the raw NZ day,
@@ -1911,6 +2057,11 @@ def dispatch(conn, event, method, route):
     # anything else answers exactly the unknown-route 404 below.
     if route == "/decision-shadow" or route.startswith("/decision-shadow/"):
         return decision_shadow_route(conn, caller, event, method, route)
+
+    # Decision card inbox (P1 web route). Behind DECISION_INBOX=companies and
+    # SITE_DECISION_LOOP=shadow: anything else answers exactly the unknown-route 404 below.
+    if route == "/decision-cards" or route.startswith("/decision-cards/"):
+        return decision_cards_route(conn, caller, event, method, route)
 
     if route == "/me":
         if method == "GET":

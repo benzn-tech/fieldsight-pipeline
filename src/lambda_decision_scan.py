@@ -188,16 +188,23 @@ def _overdue_since_utc(deadline):
     return _report_midnight_utc(deadline + timedelta(days=1))
 
 
-def _emit_overdue_item(conn, item, today_nz, now, out):
-    """Insert the item's event; True when the item is STALE (the hub would call its event
-    late), so it belongs in the site's backlog digest instead of a card of its own."""
+def overdue_item_event(item, now):
+    """The todo.overdue hub Event for one overdue_open row (not stored). Shared with org-api's
+    inbox digest, which counts stale items live with is_late on this same event, so the two
+    never disagree on what "stale" means."""
     deadline = item["deadline"]
-    ev = _new_event(
+    return _new_event(
         item["company_id"], item["site_id"], "action_items", OVERDUE_TYPE,
         str(item["stable_id"]), _overdue_since_utc(deadline), now,
         {"text": item.get("text"),
          "deadline": deadline.isoformat(),
          "responsible": item.get("responsible")})
+
+
+def _emit_overdue_item(conn, item, today_nz, now, out):
+    """Insert the item's event; True when the item is STALE (the hub would call its event
+    late), so it belongs in the site's backlog digest instead of a card of its own."""
+    ev = overdue_item_event(item, now)
     if _insert_event(conn, ev, today_nz):
         out["emitted"] += 1
     else:
