@@ -31,6 +31,68 @@ export function modelRejected(model) {
 
 const words = (s) => String(s).split(/\s+/).filter(Boolean);
 const numbers = (s) => String(s).match(/\d+(?:[.,]\d+)*/g) || [];
+// Spoken numbers: speech-to-text writes "three one oh one" where the model writes
+// "3101" (TEST 2026-11-12). Same readings as voice_restate.spoken_numbers.
+const DIGIT_WORDS = { zero: 0, oh: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 };
+const TEEN_WORDS = { ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19 };
+const TENS_WORDS = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+const SCALE_WORDS = { hundred: 100, thousand: 1000 };
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const isNumWord = (t) => has(DIGIT_WORDS, t) || has(TEEN_WORDS, t) || has(TENS_WORDS, t);
+const wordValue = (t) => (has(DIGIT_WORDS, t) ? DIGIT_WORDS[t] : has(TEEN_WORDS, t) ? TEEN_WORDS[t] : has(TENS_WORDS, t) ? TENS_WORDS[t] : 0);
+
+function chunks(run) {
+  let out = "";
+  for (let i = 0; i < run.length; i++) {
+    const t = run[i];
+    if (has(TENS_WORDS, t) && i + 1 < run.length && has(DIGIT_WORDS, run[i + 1]) && DIGIT_WORDS[run[i + 1]]) {
+      out += String(TENS_WORDS[t] + DIGIT_WORDS[run[i + 1]]);
+      i++;
+      continue;
+    }
+    out += String(wordValue(t));
+  }
+  return out;
+}
+
+function cardinal(run) {
+  let total = 0, cur = 0;
+  for (const t of run) {
+    if (t === "thousand") { total += (cur || 1) * 1000; cur = 0; }
+    else if (t === "hundred") cur = (cur || 1) * 100;
+    else cur += wordValue(t);
+  }
+  return String(total + cur);
+}
+
+function readings(run) {
+  const k = run.indexOf("point");
+  if (k >= 0) {
+    const whole = run.slice(0, k), frac = run.slice(k + 1);
+    if (!frac.length || frac.some((t) => !has(DIGIT_WORDS, t))) return [];
+    const heads = whole.length ? readings(whole) : ["0"];
+    return heads.map((h) => `${h}.${frac.map((t) => DIGIT_WORDS[t]).join("")}`);
+  }
+  if (!run.length || (run.length === 1 && has(SCALE_WORDS, run[0]))) return [];
+  if (run.some((t) => has(SCALE_WORDS, t))) return [cardinal(run)];
+  return [chunks(run)];
+}
+
+export function spokenNumbers(text) {
+  const toks = String(text).toLowerCase().match(/[a-z]+/g) || [];
+  const out = [];
+  for (let i = 0; i < toks.length;) {
+    if (!isNumWord(toks[i])) { i++; continue; }
+    let j = i;
+    while (j < toks.length && (isNumWord(toks[j]) || has(SCALE_WORDS, toks[j]) || toks[j] === "point")) j++;
+    out.push(...readings(toks.slice(i, j)));
+    i = j;
+  }
+  return out;
+}
+
+// Every number the caller said, as digits; "2,400" and "2400" are one number.
+const saidNumbers = (q) => new Set([...numbers(q).map((n) => n.replace(/,/g, "")), ...spokenNumbers(q)]);
 const bareWord = (w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").replace(/['’]s$/i, "");
 
 // {ok:true, middle} (trimmed, trailing punctuation removed, leading "You're"
@@ -40,7 +102,8 @@ export function guardMiddle(question, middle) {
   if (!/^you['’]re asking\b/i.test(m)) return { ok: false, reason: "guard_prefix" };
   if (words(m).length > MAX_WORDS || /\.\.\.|…|[\r\n]/.test(m)) return { ok: false, reason: "guard_words" };
   const q = String(question ?? "");
-  if (numbers(m).some((n) => !numbers(q).includes(n))) return { ok: false, reason: "guard_number" };
+  const said = saidNumbers(q);
+  if (numbers(m).some((n) => !said.has(n.replace(/,/g, "")))) return { ok: false, reason: "guard_number" };
   const known = new Set(words(q).map((w) => bareWord(w).toLowerCase()));
   const ws = words(m);
   for (let i = 1; i < ws.length; i++) {   // word 0 is "You're"

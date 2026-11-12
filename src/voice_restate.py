@@ -40,6 +40,86 @@ _TRAILING = re.compile(r"[\s.,;:!?]+$")
 _NUMBER = re.compile(r"[0-9]+(?:[.,][0-9]+)*")   # ASCII digits, as JS \d
 _POSSESSIVE = re.compile(r"['’]s$", re.I)
 
+# Spoken numbers. Speech-to-text writes "three one oh one" where the model then
+# writes "3101" (TEST 2026-11-12: the restatement was refused as guard_number and
+# the fixed line played). The guard still allows only numbers the caller said:
+# these are the readings of what they said, not new numbers.
+_DIGIT_WORDS = {"zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+                "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
+_TEEN_WORDS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+               "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_TENS_WORDS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+               "seventy": 70, "eighty": 80, "ninety": 90}
+_SCALE_WORDS = {"hundred": 100, "thousand": 1000}
+
+
+def _is_num_word(t):
+    return t in _DIGIT_WORDS or t in _TEEN_WORDS or t in _TENS_WORDS
+
+
+def _chunks(run):
+    """"three one oh one" -> "3101", "thirty six oh four" -> "3604", "twenty four" -> "24"."""
+    out, i = "", 0
+    while i < len(run):
+        t = run[i]
+        if t in _TENS_WORDS and i + 1 < len(run) and run[i + 1] in _DIGIT_WORDS and _DIGIT_WORDS[run[i + 1]]:
+            out += str(_TENS_WORDS[t] + _DIGIT_WORDS[run[i + 1]])
+            i += 2
+            continue
+        out += str(_DIGIT_WORDS.get(t, _TEEN_WORDS.get(t, _TENS_WORDS.get(t))))
+        i += 1
+    return out
+
+
+def _cardinal(run):
+    """"twenty four hundred" -> 2400, "two thousand five hundred" -> 2500."""
+    total, cur = 0, 0
+    for t in run:
+        if t == "thousand":
+            total += (cur or 1) * 1000
+            cur = 0
+        elif t == "hundred":
+            cur = (cur or 1) * 100
+        else:
+            cur += _DIGIT_WORDS.get(t, _TEEN_WORDS.get(t, _TENS_WORDS.get(t, 0)))
+    return str(total + cur)
+
+
+def _readings(run):
+    if "point" in run:
+        k = run.index("point")
+        whole, frac = run[:k], run[k + 1:]
+        if not frac or any(t not in _DIGIT_WORDS for t in frac) or "point" in frac:
+            return []
+        heads = _readings(whole) if whole else ["0"]
+        return [h + "." + "".join(str(_DIGIT_WORDS[t]) for t in frac) for h in heads]
+    if not run or run[-1] in _SCALE_WORDS and len(run) == 1:
+        return []
+    if any(t in _SCALE_WORDS for t in run):
+        return [_cardinal(run)]
+    return [_chunks(run)]
+
+
+def spoken_numbers(text) -> list:
+    """Digit strings for the numbers written out as words in `text`."""
+    toks = re.findall(r"[a-z]+", str(text).lower())
+    out, i = [], 0
+    while i < len(toks):
+        if not _is_num_word(toks[i]):
+            i += 1
+            continue
+        j = i
+        while j < len(toks) and (_is_num_word(toks[j]) or toks[j] in _SCALE_WORDS or toks[j] == "point"):
+            j += 1
+        out.extend(_readings(toks[i:j]))
+        i = j
+    return out
+
+
+def _said_numbers(question):
+    """Every number the caller said, as digits; "2,400" and "2400" are one number."""
+    return {n.replace(",", "") for n in _NUMBER.findall(question)} | set(spoken_numbers(question))
+
 
 def is_correction(question) -> bool:
     """"No, I meant ..." re-asks something already restated; do not restate it."""
@@ -75,8 +155,8 @@ def guard_middle(question, middle) -> dict:
     if len(_words(m)) > MAX_WORDS or re.search(r"\.\.\.|…|[\r\n]", m):
         return {"ok": False, "reason": "guard_words"}
     q = str(question if question is not None else "")
-    q_numbers = _NUMBER.findall(q)
-    if any(n not in q_numbers for n in _NUMBER.findall(m)):
+    q_numbers = _said_numbers(q)
+    if any(n.replace(",", "") not in q_numbers for n in _NUMBER.findall(m)):
         return {"ok": False, "reason": "guard_number"}
     known = {_bare_word(w).lower() for w in _words(q)}
     for w in _words(m)[1:]:   # word 0 is "You're"
