@@ -1,0 +1,454 @@
+{
+  "allow_cross_language": false,
+  "bars": {
+    "bar1": {
+      "per_rep": [
+        {
+          "accepted": 184,
+          "cp_upper": 0.056283498158319185,
+          "missing_gold": 0,
+          "verdict": "fail",
+          "wrong": 5
+        },
+        {
+          "accepted": 188,
+          "cp_upper": 0.04802457719709805,
+          "missing_gold": 0,
+          "verdict": "pass",
+          "wrong": 4
+        },
+        {
+          "accepted": 195,
+          "cp_upper": 0.024095218206742968,
+          "missing_gold": 0,
+          "verdict": "pass",
+          "wrong": 1
+        }
+      ],
+      "verdict": "fail"
+    },
+    "bar2": {
+      "per_rep": [
+        {
+          "accepted": 44,
+          "cp_upper": 0.1362585355888381,
+          "missing_gold": 0,
+          "verdict": "fail",
+          "wrong": 2
+        },
+        {
+          "accepted": 43,
+          "cp_upper": 0.1392686149011747,
+          "missing_gold": 0,
+          "verdict": "fail",
+          "wrong": 2
+        },
+        {
+          "accepted": 47,
+          "cp_upper": 0.0617501347108245,
+          "missing_gold": 0,
+          "verdict": "fail",
+          "wrong": 0
+        }
+      ],
+      "verdict": "fail"
+    },
+    "bar3": {
+      "per_rep": [
+        {
+          "by_gold": 0,
+          "confirmed": 0,
+          "flags": 0,
+          "pairs": 0,
+          "unanswered": 0,
+          "verdict": "pass"
+        },
+        {
+          "by_gold": 0,
+          "confirmed": 0,
+          "flags": 0,
+          "pairs": 0,
+          "unanswered": 0,
+          "verdict": "pass"
+        },
+        {
+          "by_gold": 0,
+          "confirmed": 0,
+          "flags": 0,
+          "pairs": 0,
+          "unanswered": 0,
+          "verdict": "pass"
+        }
+      ],
+      "verdict": "pass"
+    },
+    "bar4": {
+      "agree": 217,
+      "agreement": 0.8611111111111112,
+      "items": 252,
+      "verdict": "fail"
+    },
+    "bar5": {
+      "agreement": null,
+      "answered": 0,
+      "n": 45,
+      "verdict": "pending"
+    }
+  },
+  "bars_cross_off": {
+    "bar1": {
+      "per_rep": [
+        {
+          "accepted": 140,
+          "cp_upper": 0.054449264970838435,
+          "missing_gold": 0,
+          "verdict": "fail",
+          "wrong": 3
+        },
+        {
+          "accepted": 145,
+          "cp_upper": 0.04278054490656384,
+          "missing_gold": 0,
+          "verdict": "pass",
+          "wrong": 2
+        },
+        {
+          "accepted": 148,
+          "cp_upper": 0.031650565056610805,
+          "missing_gold": 0,
+          "verdict": "pass",
+          "wrong": 1
+        }
+      ],
+      "verdict": "fail"
+    },
+    "bar3": {
+      "per_rep": [
+        {
+          "by_gold": 0,
+          "confirmed": 0,
+          "flags": 0,
+          "pairs": 0,
+          "unanswered": 0,
+          "verdict": "pass"
+        },
+        {
+          "by_gold": 0,
+          "confirmed": 0,
+          "flags": 0,
+          "pairs": 0,
+          "unanswered": 0,
+          "verdict": "pass"
+        },
+        {
+          "by_gold": 0,
+          "confirmed": 0,
+          "flags": 0,
+          "pairs": 0,
+          "unanswered": 0,
+          "verdict": "pass"
+        }
+      ],
+      "verdict": "pass"
+    },
+    "bar4": {
+      "agree": 217,
+      "agreement": 0.8611111111111112,
+      "items": 252,
+      "verdict": "fail"
+    }
+  },
+  "manifest_digest": "38e50e20da1202fccdd29a9a819e08c51e6b644a514d513f380cb8b861eec2e3",
+  "model": "claude-sonnet-5-5",
+  "owner_files": {
+    "adjudication": {
+      "answered": 0,
+      "of": 1,
+      "required": true
+    },
+    "flags": {
+      "answered": 0,
+      "of": 0,
+      "required": true
+    },
+    "owner_blind": {
+      "answered": 0,
+      "of": 45,
+      "required": true
+    }
+  },
+  "prompt_hash": "46491db1afea",
+  "provisional": true,
+  "reported": {
+    "coverage": {
+      "by_kind": {
+        "action_items": {
+          "median": 0.7857142857142857,
+          "min": 0.7653061224489796,
+          "per_rep": [
+            0.7653061224489796,
+            0.7857142857142857,
+            0.7959183673469388
+          ]
+        },
+        "decisions": {
+          "median": 0.8846153846153846,
+          "min": 0.8846153846153846,
+          "per_rep": [
+            0.8846153846153846,
+            0.8846153846153846,
+            0.9615384615384616
+          ]
+        },
+        "findings": {
+          "median": 0.7037037037037037,
+          "min": 0.6851851851851852,
+          "per_rep": [
+            0.6851851851851852,
+            0.7037037037037037,
+            0.7314814814814815
+          ]
+        },
+        "questions": {
+          "median": 0.6,
+          "min": 0.6,
+          "per_rep": [
+            0.6,
+            0.6,
+            0.65
+          ]
+        }
+      },
+      "by_lang": {
+        "en": {
+          "median": 0.7341772151898734,
+          "min": 0.7172995780590717,
+          "per_rep": [
+            0.7172995780590717,
+            0.7341772151898734,
+            0.7637130801687764
+          ]
+        },
+        "zh": {
+          "median": 0.9333333333333333,
+          "min": 0.9333333333333333,
+          "per_rep": [
+            0.9333333333333333,
+            0.9333333333333333,
+            0.9333333333333333
+          ]
+        }
+      },
+      "line": 0.6,
+      "mixed": {
+        "median": 0.1746031746031746,
+        "min": 0.17063492063492064,
+        "per_rep": [
+          0.1746031746031746,
+          0.17063492063492064,
+          0.1865079365079365
+        ]
+      },
+      "overall": {
+        "median": 0.746031746031746,
+        "min": 0.7301587301587301,
+        "per_rep": [
+          0.7301587301587301,
+          0.746031746031746,
+          0.7738095238095238
+        ]
+      }
+    },
+    "coverage_cross_off": {
+      "by_kind": {
+        "action_items": {
+          "median": 0.5816326530612245,
+          "min": 0.5612244897959183,
+          "per_rep": [
+            0.5612244897959183,
+            0.5816326530612245,
+            0.6020408163265306
+          ]
+        },
+        "decisions": {
+          "median": 0.5769230769230769,
+          "min": 0.5769230769230769,
+          "per_rep": [
+            0.5769230769230769,
+            0.5769230769230769,
+            0.6153846153846154
+          ]
+        },
+        "findings": {
+          "median": 0.6111111111111112,
+          "min": 0.5925925925925926,
+          "per_rep": [
+            0.5925925925925926,
+            0.6111111111111112,
+            0.6203703703703703
+          ]
+        },
+        "questions": {
+          "median": 0.3,
+          "min": 0.3,
+          "per_rep": [
+            0.3,
+            0.35,
+            0.3
+          ]
+        }
+      },
+      "by_lang": {
+        "en": {
+          "median": 0.569620253164557,
+          "min": 0.5485232067510548,
+          "per_rep": [
+            0.5485232067510548,
+            0.569620253164557,
+            0.5822784810126582
+          ]
+        },
+        "zh": {
+          "median": 0.6666666666666666,
+          "min": 0.6666666666666666,
+          "per_rep": [
+            0.6666666666666666,
+            0.6666666666666666,
+            0.6666666666666666
+          ]
+        }
+      },
+      "line": 0.6,
+      "mixed": {
+        "median": 0.0,
+        "min": 0.0,
+        "per_rep": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "overall": {
+        "median": 0.5753968253968254,
+        "min": 0.5555555555555556,
+        "per_rep": [
+          0.5555555555555556,
+          0.5753968253968254,
+          0.5873015873015873
+        ]
+      }
+    },
+    "failed_calls": {
+      "by_reason": {
+        "parse": 13
+      },
+      "calls": 78,
+      "per_rep": [
+        6,
+        4,
+        3
+      ],
+      "total": 13
+    },
+    "lexical_unlinked": {
+      "cross_correct": {
+        "median": 35,
+        "min": 34,
+        "per_rep": [
+          35,
+          34,
+          40
+        ]
+      },
+      "cross_linked": {
+        "median": 37,
+        "min": 36,
+        "per_rep": [
+          37,
+          36,
+          40
+        ]
+      },
+      "items_unlinked": 92,
+      "linked": {
+        "median": 56,
+        "min": 55,
+        "per_rep": [
+          56,
+          55,
+          57
+        ]
+      },
+      "linked_correct": {
+        "median": 51,
+        "min": 51,
+        "per_rep": [
+          51,
+          51,
+          56
+        ]
+      },
+      "point": {
+        "floor": 0.3,
+        "margin": 0.05,
+        "nothing_close": 0.1,
+        "paths": [
+          "quote",
+          "window"
+        ]
+      },
+      "same_correct": {
+        "median": 16,
+        "min": 16,
+        "per_rep": [
+          16,
+          17,
+          16
+        ]
+      },
+      "same_linked": {
+        "median": 19,
+        "min": 17,
+        "per_rep": [
+          19,
+          19,
+          17
+        ]
+      }
+    },
+    "outcomes": [
+      {
+        "abstained": 21,
+        "accepted": 184,
+        "call_failed": 35,
+        "rejected:same_language_floor": 12
+      },
+      {
+        "abstained": 26,
+        "accepted": 188,
+        "call_failed": 24,
+        "rejected:same_language_floor": 14
+      },
+      {
+        "abstained": 25,
+        "accepted": 195,
+        "call_failed": 15,
+        "rejected:same_language_floor": 17
+      }
+    ],
+    "tokens": {
+      "input_tokens": 310743,
+      "output_tokens": 23046
+    },
+    "unknown_aliases": 0,
+    "unknown_script_picks": [
+      1,
+      1,
+      1
+    ]
+  },
+  "reps": 3,
+  "scoring": "first",
+  "split": "heldout",
+  "verdict": "fail"
+}
